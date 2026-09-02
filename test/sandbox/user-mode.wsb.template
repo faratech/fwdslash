@@ -1,0 +1,24 @@
+<Configuration>
+  <VGpu>Disable</VGpu>
+  <Networking>Disable</Networking>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <MemoryInMB>6144</MemoryInMB>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>@@ARTIFACTS@@</HostFolder>
+      <SandboxFolder>C:\Fsw\artifacts</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>@@RESULTS@@</HostFolder>
+      <SandboxFolder>C:\Fsw\results</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\Fsw\artifacts\sandbox-bootstrap.ps1</Command>
+  </LogonCommand>
+</Configuration>

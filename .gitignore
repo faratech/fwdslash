@@ -1,0 +1,94 @@
+# Build trees and generated package payloads
+/.vs/
+/.vscode/
+/.idea/
+/build/
+/out/
+/artifacts/
+/packages/
+**/bin/
+**/obj/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+TestResults/
+
+# Compiler, linker, and binary output
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+*.idb
+*.iobj
+*.ipdb
+*.exp
+*.lib
+*.exe
+*.dll
+*.sys
+*.cat
+*.msi
+*.msix
+*.appx
+*.appxbundle
+*.cab
+*.zip
+
+# Driver signing, verification, and crash artifacts
+*.cer
+*.crt
+*.pfx
+*.pvk
+*.snk
+*.hlk
+*.hlkx
+*.etl
+*.dmp
+*.mdmp
+*.sarif
+
+# VM and installation media
+*.iso
+*.vhd
+*.vhdx
+*.avhd
+*.avhdx
+*.vmcx
+*.vmrs
+*.vmgs
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+secrets.json
+appsettings.*.local.json
+
+# IDE and per-user state
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.code-workspace
+
+# Logs, temporary files, and generated test evidence
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.userprefs
+/test/results/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/

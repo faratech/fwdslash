@@ -1,0 +1,51 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "x64-debug",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/x64-debug",
+      "cacheVariables": {
+        "FSW_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "arm64-debug",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "ARM64",
+      "binaryDir": "${sourceDir}/build/arm64-debug",
+      "cacheVariables": {
+        "FSW_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "x86-debug",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "Win32",
+      "binaryDir": "${sourceDir}/build/x86-debug",
+      "cacheVariables": {
+        "FSW_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "x64-debug", "configurePreset": "x64-debug", "configuration": "Debug" },
+    { "name": "arm64-debug", "configurePreset": "arm64-debug", "configuration": "Debug" },
+    { "name": "x86-debug", "configurePreset": "x86-debug", "configuration": "Debug" }
+  ],
+  "testPresets": [
+    {
+      "name": "x64-debug",
+      "configurePreset": "x64-debug",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "arm64-debug",
+      "configurePreset": "arm64-debug",
+      "configuration": "Debug",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
