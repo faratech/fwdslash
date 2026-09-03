@@ -36,3 +36,19 @@ jobs:
       - name: Build unsigned x64 driver package
         shell: pwsh
         run: .\tools\Build-Driver.ps1 -Architecture x64 -Configuration Debug
+
+  winui-settings:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Win32, x64, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build WinUI 3 settings app
+        shell: pwsh
+        run: |
+          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+          & $msbuild .\src\settings\ForwardSlashWindows.Settings.vcxproj /restore /m:1 /p:UseMultiToolTask=false /p:Configuration=Release /p:Platform=${{ matrix.platform }}
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild exited with $LASTEXITCODE" }

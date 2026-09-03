@@ -4,10 +4,12 @@
 /.idea/
 /build/
 /out/
+**/out/
 /artifacts/
 /packages/
 **/bin/
 **/obj/
+**/Generated Files/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake

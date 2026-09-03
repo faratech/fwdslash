@@ -19,12 +19,14 @@ target_compile_definitions(fswcore PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN 
 target_compile_options(fswcore PRIVATE /W4 /WX /permissive- /utf-8)
 target_link_libraries(fswcore PUBLIC advapi32)
 
-add_executable(fswctl src/controller/main.cpp)
+set(FSW_APP_RESOURCE assets/fwdslash.rc)
+
+add_executable(fswctl src/controller/main.cpp ${FSW_APP_RESOURCE})
 target_link_libraries(fswctl PRIVATE fswcore shell32 user32 advapi32 FltLib)
 target_compile_definitions(fswctl PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(fswctl PRIVATE /W4 /WX /permissive- /utf-8)
 
-add_executable(fswbroker WIN32 src/broker/main.cpp)
+add_executable(fswbroker WIN32 src/broker/main.cpp ${FSW_APP_RESOURCE})
 target_link_libraries(fswbroker PRIVATE fswcore shell32 user32 gdi32 advapi32 ole32 oleaut32 uiautomationcore FltLib uuid)
 target_compile_definitions(fswbroker PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(fswbroker PRIVATE /W4 /WX /permissive- /utf-8)

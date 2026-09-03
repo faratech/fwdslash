@@ -9,6 +9,10 @@ inline constexpr UINT FSW_WM_QUERY_STATE = WM_APP + 10;
 inline constexpr UINT FSW_WM_SET_PAUSED = WM_APP + 11;
 inline constexpr UINT FSW_WM_SHOW_SETTINGS = WM_APP + 12;
 
+inline constexpr wchar_t FSW_SETTINGS_KEY[] =
+    L"Software\\ForwardSlashWindows\\Settings";
+inline constexpr wchar_t FSW_DISABLED_VALUE[] = L"Disabled";
+
 enum FSW_BROKER_STATE : LRESULT {
   FswBrokerUnavailable = 0,
   FswBrokerActive = 1,

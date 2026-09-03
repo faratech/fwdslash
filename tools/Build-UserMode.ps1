@@ -47,6 +47,10 @@ $link = Join-Path $compilerRoot 'link.exe'
 if (-not (Test-Path -LiteralPath $cl) -or -not (Test-Path -LiteralPath $link)) {
     throw "The MSVC $hostFolder-to-$Architecture tools are not installed."
 }
+$rc = Join-Path $kitRoot "bin\$($kitVersion.Name)\x64\rc.exe"
+if (-not (Test-Path -LiteralPath $rc)) {
+    throw 'The Windows SDK resource compiler was not found.'
+}
 
 $targetName = $Architecture.ToLowerInvariant()
 $output = Join-Path $repo "out\user\$targetName\$Configuration"
@@ -108,10 +112,46 @@ $brokerObject = Compile-Source 'broker' 'src\broker\main.cpp'
 $testObject = Compile-Source 'core_tests' 'tests\core_tests.cpp'
 $addressBarTestObject = Compile-Source 'address_bar_integration' 'tests\address_bar_integration.cpp'
 $filesystemTestObject = Compile-Source 'filesystem_integration' 'tests\filesystem_integration.cpp'
-Link-Target 'fswctl' @($controllerObject, $pathObject, $registryObject) 'console' @('shell32.lib', 'user32.lib', 'advapi32.lib', 'FltLib.lib')
-Link-Target 'fswbroker' @($brokerObject, $pathObject, $registryObject) 'windows' @('shell32.lib', 'user32.lib', 'gdi32.lib', 'advapi32.lib', 'ole32.lib', 'oleaut32.lib', 'uiautomationcore.lib', 'FltLib.lib', 'uuid.lib')
+$appResource = Join-Path $objects 'fwdslash.res'
+Invoke-Checked -FilePath $rc -Arguments @(
+    '/nologo', "/i$sdkInclude\um", "/i$sdkInclude\shared",
+    "/fo$appResource", (Join-Path $repo 'assets\fwdslash.rc'))
+Link-Target 'fswctl' @($controllerObject, $pathObject, $registryObject, $appResource) 'console' @('shell32.lib', 'user32.lib', 'advapi32.lib', 'FltLib.lib')
+Link-Target 'fswbroker' @($brokerObject, $pathObject, $registryObject, $appResource) 'windows' @('shell32.lib', 'user32.lib', 'gdi32.lib', 'advapi32.lib', 'ole32.lib', 'oleaut32.lib', 'uiautomationcore.lib', 'FltLib.lib', 'uuid.lib')
 Link-Target 'fswcore_tests' @($testObject, $pathObject) 'console' @('advapi32.lib')
 Link-Target 'fsw_address_bar_integration' @($addressBarTestObject) 'console' @('shell32.lib', 'ole32.lib', 'oleaut32.lib', 'user32.lib')
 Link-Target 'fsw_filesystem_integration' @($filesystemTestObject) 'console'
+
+$msbuild = Join-Path $installation 'MSBuild\Current\Bin\MSBuild.exe'
+if (-not (Test-Path -LiteralPath $msbuild)) {
+    throw 'MSBuild was not found for the WinUI 3 settings application.'
+}
+$settingsProject = Join-Path $repo 'src\settings\ForwardSlashWindows.Settings.vcxproj'
+$settingsIntermediate = Join-Path $output 'settings-obj'
+$settingsPlatform = if ($Architecture -eq 'x86') { 'Win32' } else { $Architecture }
+Invoke-Checked -FilePath $msbuild -Arguments @(
+    $settingsProject,
+    '/restore',
+    '/m:1',
+    "/p:Configuration=$Configuration",
+    "/p:Platform=$settingsPlatform",
+    "/p:OutDir=$output\",
+    "/p:IntDir=$settingsIntermediate\",
+    '/p:UseMultiToolTask=false'
+)
+
+$payloadDirectories = @(
+    @{ Source = 'shell\cmd'; Destination = 'shell\cmd' },
+    @{ Source = 'shell\powershell'; Destination = 'shell\powershell' }
+)
+foreach ($payload in $payloadDirectories) {
+    $destination = Join-Path $output $payload.Destination
+    New-Item -ItemType Directory -Force -Path $destination | Out-Null
+    Copy-Item -Path (Join-Path $repo ($payload.Source + '\*')) -Destination $destination -Force
+}
+foreach ($script in 'Install-CmdAdapter.ps1', 'Uninstall-CmdAdapter.ps1',
+                    'Install-PowerShellAdapter.ps1', 'Uninstall-PowerShellAdapter.ps1') {
+    Copy-Item -LiteralPath (Join-Path $repo "tools\$script") -Destination $output -Force
+}
 
 Write-Host "User-mode $Architecture artifacts built at $output."

@@ -11,6 +11,7 @@
 #include "fsw/path_resolver.hpp"
 #include "fsw/wsl_registry.hpp"
 #include "fsw_filter_protocol.h"
+#include "fsw_resources.h"
 #include "fsw_user_protocol.h"
 
 #include <algorithm>
@@ -23,7 +24,6 @@
 namespace {
 
 constexpr wchar_t kMutexName[] = L"Local\\ForwardSlashWindows.Broker";
-constexpr wchar_t kSettingsWindowClass[] = L"ForwardSlashWindows.Settings";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kProcessEnter = WM_APP + 2;
 constexpr UINT_PTR kTrayId = 1;
@@ -32,11 +32,11 @@ constexpr ULONG_PTR kReplayMarker = 0x4653572F;
 constexpr UINT kMenuSettings = 1001;
 constexpr UINT kMenuPause = 1002;
 constexpr UINT kMenuExit = 1003;
-constexpr UINT kSettingsStatus = 2001;
-constexpr UINT kSettingsRefresh = 2002;
-constexpr UINT kSettingsOpenRoot = 2003;
-constexpr UINT kSettingsPause = 2004;
-constexpr UINT kSettingsClose = 2005;
+constexpr UINT kMenuOpenRoot = 1004;
+constexpr UINT kMenuWindows = 1005;
+constexpr UINT kMenuCmd = 1006;
+constexpr UINT kMenuWindowsPowerShell = 1007;
+constexpr UINT kMenuPowerShell = 1008;
 
 enum class SurfaceKind { unknown, explorer, run, search, common_dialog };
 
@@ -47,12 +47,52 @@ struct EnterRequest {
 HHOOK g_keyboard_hook = nullptr;
 IUIAutomation* g_automation = nullptr;
 HWND g_broker_window = nullptr;
-HWND g_settings_window = nullptr;
 HANDLE g_filter_port = INVALID_HANDLE_VALUE;
 bool g_paused = false;
 bool g_enter_down = false;
 bool g_suppress_enter_up = false;
 std::vector<std::wstring> g_published_distributions;
+
+std::wstring ExecutableDirectory() {
+  std::wstring path(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(nullptr, path.data(),
+                                          static_cast<DWORD>(path.size()));
+  if (length == 0 || length >= path.size()) {
+    return {};
+  }
+  path.resize(length);
+  const size_t separator = path.find_last_of(L"\\/");
+  return separator == std::wstring::npos ? std::wstring{}
+                                         : path.substr(0, separator);
+}
+
+bool ReadDisabled() {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, FSW_SETTINGS_KEY, 0, KEY_QUERY_VALUE,
+                    &key) != ERROR_SUCCESS) {
+    return false;
+  }
+  DWORD value = 0;
+  DWORD type = 0;
+  DWORD bytes = sizeof(value);
+  const LSTATUS status = RegQueryValueExW(
+      key, FSW_DISABLED_VALUE, nullptr, &type,
+      reinterpret_cast<BYTE*>(&value), &bytes);
+  RegCloseKey(key);
+  return status == ERROR_SUCCESS && type == REG_DWORD && value != 0;
+}
+
+void PersistDisabled(const bool disabled) {
+  HKEY key = nullptr;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, FSW_SETTINGS_KEY, 0, nullptr, 0,
+                      KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+    return;
+  }
+  const DWORD value = disabled ? 1U : 0U;
+  RegSetValueExW(key, FSW_DISABLED_VALUE, 0, REG_DWORD,
+                 reinterpret_cast<const BYTE*>(&value), sizeof(value));
+  RegCloseKey(key);
+}
 
 void Diagnostic(const std::wstring_view message) {
   std::wstring path(32768, L'\0');
@@ -443,8 +483,10 @@ void DisconnectFilter() {
 }
 
 void PublishFilterMappings(const bool force) {
-  std::vector<std::wstring> distributions =
-      fsw::ListRegisteredDistributions();
+  std::vector<std::wstring> distributions;
+  if (!g_paused) {
+    distributions = fsw::ListRegisteredDistributions();
+  }
   std::sort(distributions.begin(), distributions.end(),
             [](const std::wstring& left, const std::wstring& right) {
               return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1,
@@ -490,7 +532,8 @@ void SetTrayIcon(const HWND window, const bool add) {
   icon.uID = kTrayId;
   icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
   icon.uCallbackMessage = kTrayMessage;
-  icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  icon.hIcon = LoadIconW(GetModuleHandleW(nullptr),
+                         MAKEINTRESOURCEW(IDI_FSW_APP));
   wcscpy_s(icon.szTip, L"Forward Slash Windows");
   Shell_NotifyIconW(add ? NIM_ADD : NIM_DELETE, &icon);
   if (add) {
@@ -499,131 +542,54 @@ void SetTrayIcon(const HWND window, const bool add) {
   }
 }
 
-std::wstring SettingsStatusText() {
-  const auto distributions = fsw::ListRegisteredDistributions();
-  std::wstring text = L"Shell broker: ";
-  text.append(g_paused ? L"paused"
-                       : g_keyboard_hook != nullptr ? L"active"
-                                                    : L"hook unavailable");
-  text.append(L"\r\nFilesystem driver: ");
-  text.append(g_filter_port != INVALID_HANDLE_VALUE
-                  ? L"connected"
-                  : L"not installed/connected");
-  text.append(L"\r\n\r\n/  ->  \\\\wsl.localhost  (distribution list)\r\n");
-  for (const std::wstring& distribution : distributions) {
-    text.append(L"/");
-    text.append(distribution);
-    text.append(L"  ->  \\\\wsl.localhost\\");
-    text.append(distribution);
-    text.append(L"\r\n");
-  }
-  if (distributions.empty()) {
-    text.append(L"No registered WSL distributions were found.\r\n");
-  }
-  text.append(
-      L"\r\nInvalid slash paths are blocked instead of sent to web search.");
-  return text;
-}
-
-void RefreshSettings() {
-  if (g_settings_window == nullptr) {
-    return;
-  }
-  SetWindowTextW(GetDlgItem(g_settings_window, kSettingsStatus),
-                 SettingsStatusText().c_str());
-  SetWindowTextW(GetDlgItem(g_settings_window, kSettingsPause),
-                 g_paused ? L"Resume" : L"Pause");
-}
-
 void SetPaused(const bool paused) {
   g_paused = paused;
+  PersistDisabled(paused);
   if (paused) {
     RemoveHook();
   } else {
     InstallHook();
   }
-  RefreshSettings();
+  PublishFilterMappings(true);
 }
 
-LRESULT CALLBACK SettingsWindowProcedure(const HWND window, const UINT message,
-                                         const WPARAM wparam,
-                                         const LPARAM lparam) {
-  switch (message) {
-    case WM_CREATE: {
-      const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-      const HWND status = CreateWindowExW(
-          WS_EX_CLIENTEDGE, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
-          16, 16, 580, 260, window,
-          reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSettingsStatus)),
-          nullptr, nullptr);
-      SendMessageW(status, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-      const struct Button {
-        UINT id;
-        const wchar_t* text;
-        int x;
-        int width;
-      } buttons[] = {{kSettingsRefresh, L"Refresh", 16, 90},
-                     {kSettingsOpenRoot, L"Open WSL root", 114, 125},
-                     {kSettingsPause, L"Pause", 247, 90},
-                     {kSettingsClose, L"Close", 506, 90}};
-      for (const Button& button : buttons) {
-        const HWND control = CreateWindowExW(
-            0, L"BUTTON", button.text,
-            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, button.x, 292,
-            button.width, 30, window,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(button.id)), nullptr,
-            nullptr);
-        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
-      }
-      RefreshSettings();
-      return 0;
-    }
-    case WM_COMMAND:
-      switch (LOWORD(wparam)) {
-        case kSettingsRefresh:
-          PublishFilterMappings(true);
-          RefreshSettings();
-          return 0;
-        case kSettingsOpenRoot:
-          OpenResolvedPath(L"\\\\wsl.localhost");
-          return 0;
-        case kSettingsPause:
-          SetPaused(!g_paused);
-          return 0;
-        case kSettingsClose:
-          ShowWindow(window, SW_HIDE);
-          return 0;
-      }
-      break;
-    case WM_CLOSE:
-      ShowWindow(window, SW_HIDE);
-      return 0;
-    case WM_DESTROY:
-      g_settings_window = nullptr;
-      return 0;
+void OpenSettingsSection(const std::wstring_view section) {
+  const std::wstring directory = ExecutableDirectory();
+  if (directory.empty()) {
+    ShowNotification(L"The settings application could not be located.",
+                     NIIF_ERROR);
+    return;
   }
-  return DefWindowProcW(window, message, wparam, lparam);
-}
-
-void ShowSettings(const HWND owner) {
-  if (g_settings_window == nullptr) {
-    g_settings_window = CreateWindowExW(
-        WS_EX_APPWINDOW, kSettingsWindowClass, L"Forward Slash Windows",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 630, 380, owner, nullptr,
-        GetModuleHandleW(nullptr), nullptr);
+  const std::wstring executable = directory + L"\\fswsettings.exe";
+  const std::wstring argument = L"fwdslash://settings/" + std::wstring(section);
+  SHELLEXECUTEINFOW execute{sizeof(execute)};
+  execute.lpVerb = L"open";
+  execute.lpFile = executable.c_str();
+  execute.lpParameters = argument.c_str();
+  execute.nShow = SW_SHOWNORMAL;
+  if (!ShellExecuteExW(&execute)) {
+    ShowNotification(L"The WinUI settings application could not be opened.",
+                     NIIF_ERROR);
   }
-  RefreshSettings();
-  ShowWindow(g_settings_window, SW_SHOWNORMAL);
-  SetForegroundWindow(g_settings_window);
 }
 
 void ShowTrayMenu(const HWND window) {
   POINT cursor{};
   GetCursorPos(&cursor);
   const HMENU menu = CreatePopupMenu();
+  const HMENU integrations = CreatePopupMenu();
   AppendMenuW(menu, MF_STRING, kMenuSettings, L"Settings...");
-  AppendMenuW(menu, MF_STRING, kMenuPause, g_paused ? L"Resume" : L"Pause");
+  AppendMenuW(integrations, MF_STRING, kMenuWindows, L"Windows surfaces");
+  AppendMenuW(integrations, MF_STRING, kMenuCmd, L"Command Prompt");
+  AppendMenuW(integrations, MF_STRING, kMenuWindowsPowerShell,
+              L"Windows PowerShell");
+  AppendMenuW(integrations, MF_STRING, kMenuPowerShell, L"PowerShell 7");
+  AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(integrations),
+              L"Integrations");
+  AppendMenuW(menu, MF_STRING, kMenuOpenRoot, L"Open WSL root");
+  AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+  AppendMenuW(menu, MF_STRING, kMenuPause,
+              g_paused ? L"Enable" : L"Disable");
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, kMenuExit, L"Exit");
   SetForegroundWindow(window);
@@ -642,7 +608,7 @@ LRESULT CALLBACK WindowProcedure(const HWND window, const UINT message,
       SetPaused(wparam != 0);
       return TRUE;
     case FSW_WM_SHOW_SETTINGS:
-      ShowSettings(window);
+      OpenSettingsSection(L"general");
       return TRUE;
     case kProcessEnter:
       HandleEnterRequest(std::unique_ptr<EnterRequest>(
@@ -651,13 +617,27 @@ LRESULT CALLBACK WindowProcedure(const HWND window, const UINT message,
     case WM_TIMER:
       if (wparam == kHealthTimer) {
         PublishFilterMappings(false);
-        RefreshSettings();
       }
       return 0;
     case WM_COMMAND:
       switch (LOWORD(wparam)) {
         case kMenuSettings:
-          ShowSettings(window);
+          OpenSettingsSection(L"general");
+          return 0;
+        case kMenuWindows:
+          OpenSettingsSection(L"windows");
+          return 0;
+        case kMenuCmd:
+          OpenSettingsSection(L"cmd");
+          return 0;
+        case kMenuWindowsPowerShell:
+          OpenSettingsSection(L"windows-powershell");
+          return 0;
+        case kMenuPowerShell:
+          OpenSettingsSection(L"powershell");
+          return 0;
+        case kMenuOpenRoot:
+          OpenResolvedPath(L"\\\\wsl.localhost");
           return 0;
         case kMenuPause:
           SetPaused(!g_paused);
@@ -671,7 +651,7 @@ LRESULT CALLBACK WindowProcedure(const HWND window, const UINT message,
       if (LOWORD(lparam) == WM_RBUTTONUP || LOWORD(lparam) == WM_CONTEXTMENU) {
         ShowTrayMenu(window);
       } else if (LOWORD(lparam) == WM_LBUTTONDBLCLK) {
-        ShowSettings(window);
+        OpenSettingsSection(L"general");
       }
       return 0;
     case WM_CLOSE:
@@ -682,9 +662,6 @@ LRESULT CALLBACK WindowProcedure(const HWND window, const UINT message,
       SetTrayIcon(window, false);
       RemoveHook();
       DisconnectFilter();
-      if (g_settings_window != nullptr) {
-        DestroyWindow(g_settings_window);
-      }
       g_broker_window = nullptr;
       PostQuitMessage(0);
       return 0;
@@ -709,18 +686,11 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, int) {
   WNDCLASSEXW broker_class{sizeof(broker_class)};
   broker_class.lpfnWndProc = WindowProcedure;
   broker_class.hInstance = instance;
-  broker_class.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  broker_class.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_FSW_APP));
+  broker_class.hIconSm = broker_class.hIcon;
   broker_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   broker_class.lpszClassName = FSW_BROKER_WINDOW_CLASS;
-  WNDCLASSEXW settings_class{sizeof(settings_class)};
-  settings_class.lpfnWndProc = SettingsWindowProcedure;
-  settings_class.hInstance = instance;
-  settings_class.hIcon = broker_class.hIcon;
-  settings_class.hCursor = broker_class.hCursor;
-  settings_class.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-  settings_class.lpszClassName = kSettingsWindowClass;
-  if (!RegisterClassExW(&broker_class) ||
-      !RegisterClassExW(&settings_class)) {
+  if (!RegisterClassExW(&broker_class)) {
     CoUninitialize();
     CloseHandle(mutex);
     return 1;
@@ -734,7 +704,8 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR, int) {
     return 1;
   }
   SetTrayIcon(g_broker_window, true);
-  const bool hook_installed = InstallHook();
+  g_paused = ReadDisabled();
+  const bool hook_installed = g_paused || InstallHook();
   PublishFilterMappings(true);
   SetTimer(g_broker_window, kHealthTimer, 5000, nullptr);
   if (!hook_installed) {

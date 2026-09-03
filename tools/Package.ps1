@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('x64', 'ARM64')]
+    [ValidateSet('x86', 'x64', 'ARM64')]
     [string]$Architecture,
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release'
@@ -27,9 +27,15 @@ if (Test-Path -LiteralPath $resolvedStage) {
     Remove-Item -LiteralPath $resolvedStage -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $resolvedStage | Out-Null
-$files = 'fswctl.exe', 'fswbroker.exe'
+$files = 'fswctl.exe', 'fswbroker.exe', 'fswsettings.exe'
 foreach ($file in $files) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination $stage
+}
+foreach ($dependency in 'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'resources.pri', 'fswsettings.pri') {
+    $dependencyPath = Join-Path $source $dependency
+    if (Test-Path -LiteralPath $dependencyPath -PathType Leaf) {
+        Copy-Item -LiteralPath $dependencyPath -Destination $stage
+    }
 }
 
 Copy-Item -LiteralPath (Join-Path $repo 'README.md') -Destination $stage
@@ -37,8 +43,12 @@ Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination $stage
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'shell\cmd') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo 'shell\cmd\fsw-autorun.cmd') -Destination (Join-Path $stage 'shell\cmd')
 Copy-Item -LiteralPath (Join-Path $repo 'shell\cmd\fsw-dir.cmd') -Destination (Join-Path $stage 'shell\cmd')
-Copy-Item -LiteralPath (Join-Path $repo 'tools\Install-CmdAdapter.ps1') -Destination $stage
-Copy-Item -LiteralPath (Join-Path $repo 'tools\Uninstall-CmdAdapter.ps1') -Destination $stage
+New-Item -ItemType Directory -Force -Path (Join-Path $stage 'shell\powershell') | Out-Null
+Copy-Item -LiteralPath (Join-Path $repo 'shell\powershell\ForwardSlashWindows.psm1') -Destination (Join-Path $stage 'shell\powershell')
+foreach ($script in 'Install-CmdAdapter.ps1', 'Uninstall-CmdAdapter.ps1',
+                    'Install-PowerShellAdapter.ps1', 'Uninstall-PowerShellAdapter.ps1') {
+    Copy-Item -LiteralPath (Join-Path $repo "tools\$script") -Destination $stage
+}
 
 if (Test-Path -LiteralPath $archive) {
     Remove-Item -LiteralPath $archive

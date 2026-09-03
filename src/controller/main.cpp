@@ -19,6 +19,11 @@ namespace {
 constexpr wchar_t kRunKey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunValue[] = L"ForwardSlashWindows";
+constexpr wchar_t kProtocolKey[] = L"Software\\Classes\\fwdslash";
+constexpr wchar_t kCmdAdapterKey[] =
+    L"Software\\ForwardSlashWindows\\CmdAdapter";
+constexpr wchar_t kPowerShellAdapterRoot[] =
+    L"Software\\ForwardSlashWindows\\PowerShellAdapter\\";
 
 std::filesystem::path ExecutableDirectory() {
   std::wstring buffer(32768, L'\0');
@@ -34,6 +39,85 @@ std::wstring Quote(const std::filesystem::path& path) {
 
 bool IsBrokerRunning() {
   return FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr) != nullptr;
+}
+
+bool RegistryStringEquals(HKEY root, const std::wstring& path,
+                          const wchar_t* name, const std::wstring& expected) {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(root, path.c_str(), 0, KEY_QUERY_VALUE, &key) !=
+      ERROR_SUCCESS) {
+    return false;
+  }
+  DWORD type = 0;
+  DWORD bytes = 0;
+  LSTATUS status = RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes);
+  std::wstring value;
+  if (status == ERROR_SUCCESS &&
+      (type == REG_SZ || type == REG_EXPAND_SZ) && bytes >= sizeof(wchar_t)) {
+    value.resize(bytes / sizeof(wchar_t));
+    status = RegQueryValueExW(key, name, nullptr, &type,
+                              reinterpret_cast<BYTE*>(value.data()), &bytes);
+    while (!value.empty() && value.back() == L'\0') {
+      value.pop_back();
+    }
+  }
+  RegCloseKey(key);
+  return status == ERROR_SUCCESS && value == expected;
+}
+
+bool RegistryStateInstalled(const std::wstring& path) {
+  return RegistryStringEquals(HKEY_CURRENT_USER, path, L"State", L"installed");
+}
+
+bool IsWindowsIntegrationInstalled() {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &key) !=
+      ERROR_SUCCESS) {
+    return false;
+  }
+  const LSTATUS status = RegQueryValueExW(key, kRunValue, nullptr, nullptr,
+                                          nullptr, nullptr);
+  RegCloseKey(key);
+  return status == ERROR_SUCCESS;
+}
+
+bool IsDisabled() {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, FSW_SETTINGS_KEY, 0, KEY_QUERY_VALUE,
+                    &key) != ERROR_SUCCESS) {
+    return false;
+  }
+  DWORD value = 0;
+  DWORD type = 0;
+  DWORD bytes = sizeof(value);
+  const LSTATUS status = RegQueryValueExW(
+      key, FSW_DISABLED_VALUE, nullptr, &type,
+      reinterpret_cast<BYTE*>(&value), &bytes);
+  RegCloseKey(key);
+  return status == ERROR_SUCCESS && type == REG_DWORD && value != 0;
+}
+
+int PersistDisabled(const bool disabled) {
+  HKEY key = nullptr;
+  const LSTATUS opened = RegCreateKeyExW(HKEY_CURRENT_USER, FSW_SETTINGS_KEY,
+                                          0, nullptr, 0, KEY_SET_VALUE,
+                                          nullptr, &key, nullptr);
+  if (opened != ERROR_SUCCESS) {
+    std::wcerr << L"Unable to open the settings key. Error " << opened
+               << L".\n";
+    return 1;
+  }
+  const DWORD value = disabled ? 1U : 0U;
+  const LSTATUS status = RegSetValueExW(
+      key, FSW_DISABLED_VALUE, 0, REG_DWORD,
+      reinterpret_cast<const BYTE*>(&value), sizeof(value));
+  RegCloseKey(key);
+  if (status != ERROR_SUCCESS) {
+    std::wcerr << L"Unable to persist the disabled state. Error " << status
+               << L".\n";
+    return 1;
+  }
+  return 0;
 }
 
 bool IsDriverAvailable() {
@@ -168,6 +252,177 @@ int SetStartup(const bool enabled) {
   return 0;
 }
 
+int SetSettingsProtocol(const bool enabled) {
+  const std::filesystem::path settings =
+      ExecutableDirectory() / L"fswsettings.exe";
+  const std::wstring command = Quote(settings) + L" \"%1\"";
+  const std::wstring command_key = std::wstring(kProtocolKey) +
+                                   L"\\shell\\open\\command";
+  if (enabled) {
+    if (!std::filesystem::exists(settings)) {
+      std::wcerr << L"The WinUI settings application was not found: "
+                 << settings.wstring() << L"\n";
+      return 1;
+    }
+    HKEY existing = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, command_key.c_str(), 0,
+                      KEY_QUERY_VALUE, &existing) == ERROR_SUCCESS) {
+      RegCloseKey(existing);
+      if (!RegistryStringEquals(HKEY_CURRENT_USER, command_key, nullptr,
+                                command)) {
+        std::wcerr << L"The fwdslash URI scheme is already owned by another "
+                      L"application. No protocol registration was changed.\n";
+        return 1;
+      }
+      return 0;
+    }
+    HKEY root = nullptr;
+    LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, kProtocolKey, 0,
+                                      nullptr, 0, KEY_SET_VALUE, nullptr,
+                                      &root, nullptr);
+    if (status != ERROR_SUCCESS) {
+      std::wcerr << L"Unable to create the fwdslash URI registration. Error "
+                 << status << L".\n";
+      return 1;
+    }
+    const std::wstring description = L"URL:Forward Slash Windows";
+    status = RegSetValueExW(
+        root, nullptr, 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(description.c_str()),
+        static_cast<DWORD>((description.size() + 1) * sizeof(wchar_t)));
+    if (status == ERROR_SUCCESS) {
+      const wchar_t empty[] = L"";
+      status = RegSetValueExW(root, L"URL Protocol", 0, REG_SZ,
+                              reinterpret_cast<const BYTE*>(empty),
+                              sizeof(empty));
+    }
+    RegCloseKey(root);
+    HKEY command_handle = nullptr;
+    if (status == ERROR_SUCCESS) {
+      status = RegCreateKeyExW(HKEY_CURRENT_USER, command_key.c_str(), 0,
+                               nullptr, 0, KEY_SET_VALUE, nullptr,
+                               &command_handle, nullptr);
+    }
+    if (status == ERROR_SUCCESS) {
+      status = RegSetValueExW(
+          command_handle, nullptr, 0, REG_SZ,
+          reinterpret_cast<const BYTE*>(command.c_str()),
+          static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    }
+    if (command_handle != nullptr) {
+      RegCloseKey(command_handle);
+    }
+    if (status != ERROR_SUCCESS) {
+      RegDeleteTreeW(HKEY_CURRENT_USER, kProtocolKey);
+      std::wcerr << L"Unable to complete the fwdslash URI registration. Error "
+                 << status << L".\n";
+      return 1;
+    }
+    return 0;
+  }
+
+  HKEY existing = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, command_key.c_str(), 0,
+                    KEY_QUERY_VALUE, &existing) != ERROR_SUCCESS) {
+    return 0;
+  }
+  RegCloseKey(existing);
+  if (!RegistryStringEquals(HKEY_CURRENT_USER, command_key, nullptr,
+                            command)) {
+    std::wcerr << L"The fwdslash URI handler changed after registration. "
+                  L"Refusing to remove another application's value.\n";
+    return 1;
+  }
+  const LSTATUS status = RegDeleteTreeW(HKEY_CURRENT_USER, kProtocolKey);
+  if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) {
+    std::wcerr << L"Unable to remove the fwdslash URI registration. Error "
+               << status << L".\n";
+    return 1;
+  }
+  return 0;
+}
+
+bool ExecutableAvailable(const wchar_t* name) {
+  std::wstring path(32768, L'\0');
+  const DWORD length = SearchPathW(nullptr, name, nullptr,
+                                   static_cast<DWORD>(path.size()), path.data(),
+                                   nullptr);
+  return length > 0 && length < path.size();
+}
+
+int RunPowerShellScript(const std::filesystem::path& script,
+                        const std::vector<std::wstring>& arguments) {
+  if (!std::filesystem::exists(script)) {
+    std::wcerr << L"Integration script was not found: " << script.wstring()
+               << L"\n";
+    return 1;
+  }
+  std::wstring command = L"powershell.exe -NoLogo -NoProfile -NonInteractive "
+                         L"-ExecutionPolicy Bypass -File " +
+                         Quote(script);
+  for (const std::wstring& argument : arguments) {
+    command.push_back(L' ');
+    command.append(Quote(argument));
+  }
+  STARTUPINFOW startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, 0,
+                      nullptr, ExecutableDirectory().c_str(), &startup,
+                      &process)) {
+    std::wcerr << L"Unable to start the integration transaction. Win32 error "
+               << GetLastError() << L".\n";
+    return 1;
+  }
+  CloseHandle(process.hThread);
+  WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exit_code = 1;
+  GetExitCodeProcess(process.hProcess, &exit_code);
+  CloseHandle(process.hProcess);
+  return static_cast<int>(exit_code);
+}
+
+int SetScriptIntegration(const std::wstring_view id, const bool enabled) {
+  const std::filesystem::path directory = ExecutableDirectory();
+  if (id == L"cmd") {
+    if (RegistryStateInstalled(kCmdAdapterKey) == enabled) {
+      return 0;
+    }
+    const auto script = directory /
+        (enabled ? L"Install-CmdAdapter.ps1" : L"Uninstall-CmdAdapter.ps1");
+    std::vector<std::wstring> arguments;
+    if (enabled) {
+      arguments = {L"-ControllerPath", (directory / L"fswctl.exe").wstring()};
+    }
+    return RunPowerShellScript(script, arguments);
+  }
+
+  std::wstring edition;
+  if (id == L"windows-powershell") {
+    edition = L"WindowsPowerShell";
+  } else if (id == L"powershell") {
+    edition = L"PowerShell";
+    if (enabled && !ExecutableAvailable(L"pwsh.exe")) {
+      std::wcerr << L"PowerShell 7 is not installed.\n";
+      return 1;
+    }
+  } else {
+    return 2;
+  }
+  const std::wstring state_key = std::wstring(kPowerShellAdapterRoot) + edition;
+  if (RegistryStateInstalled(state_key) == enabled) {
+    return 0;
+  }
+  const auto script = directory /
+      (enabled ? L"Install-PowerShellAdapter.ps1"
+               : L"Uninstall-PowerShellAdapter.ps1");
+  std::vector<std::wstring> arguments = {L"-Edition", edition};
+  if (enabled) {
+    arguments.emplace_back(L"-ControllerPath");
+    arguments.emplace_back((directory / L"fswctl.exe").wstring());
+  }
+  return RunPowerShellScript(script, arguments);
+}
+
 std::wstring JsonEscape(const std::wstring_view input) {
   std::wstring output;
   for (const wchar_t character : input) {
@@ -204,6 +459,7 @@ int Status(const bool json) {
     std::wcout << L"{\"broker\":\"" << broker_status
                << L"\",\"driverConnected\":"
                << (IsDriverAvailable() ? L"true" : L"false")
+               << L",\"disabled\":" << (IsDisabled() ? L"true" : L"false")
                << L",\"wslRoot\":\"\\\\\\\\wsl.localhost\","
                   L"\"distributions\":[";
     for (size_t index = 0; index < distributions.size(); ++index) {
@@ -216,6 +472,8 @@ int Status(const bool json) {
     return 0;
   }
   std::wcout << L"broker: " << broker_status << L"\n";
+  std::wcout << L"global state: " << (IsDisabled() ? L"disabled" : L"enabled")
+             << L"\n";
   std::wcout << L"filesystem driver: "
              << (IsDriverAvailable() ? L"connected" : L"not connected")
              << L"\n";
@@ -229,10 +487,14 @@ int Status(const bool json) {
 }
 
 int SetPaused(const bool paused) {
+  if (PersistDisabled(paused) != 0) {
+    return 1;
+  }
   const HWND window = FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr);
   if (window == nullptr) {
-    std::wcerr << L"Forward Slash Windows broker is not running.\n";
-    return 1;
+    std::wcout << (paused ? L"Forward-slash resolution disabled.\n"
+                         : L"Forward-slash resolution enabled.\n");
+    return 0;
   }
   DWORD_PTR result = 0;
   if (!SendMessageTimeoutW(window, FSW_WM_SET_PAUSED, paused ? 1 : 0, 0,
@@ -241,18 +503,73 @@ int SetPaused(const bool paused) {
     std::wcerr << L"The broker did not accept the state change.\n";
     return 1;
   }
-  std::wcout << (paused ? L"Broker paused.\n" : L"Broker resumed.\n");
+  std::wcout << (paused ? L"Forward-slash resolution disabled.\n"
+                        : L"Forward-slash resolution enabled.\n");
   return 0;
 }
 
-int ShowSettings() {
-  const HWND window = FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr);
-  if (window == nullptr) {
-    std::wcerr << L"Forward Slash Windows broker is not running.\n";
+int ShowSettings(const std::wstring_view section) {
+  const std::filesystem::path settings =
+      ExecutableDirectory() / L"fswsettings.exe";
+  if (!std::filesystem::exists(settings)) {
+    std::wcerr << L"The WinUI settings application was not found: "
+               << settings.wstring() << L"\n";
     return 1;
   }
-  PostMessageW(window, FSW_WM_SHOW_SETTINGS, 0, 0);
+  const std::wstring argument = L"fwdslash://settings/" +
+      std::wstring(section.empty() ? L"general" : section);
+  SHELLEXECUTEINFOW execute{sizeof(execute)};
+  execute.lpVerb = L"open";
+  execute.lpFile = settings.c_str();
+  execute.lpParameters = argument.c_str();
+  execute.nShow = SW_SHOWNORMAL;
+  return ShellExecuteExW(&execute) ? 0 : 1;
+}
+
+int IntegrationStatus(const bool json) {
+  const bool windows = IsWindowsIntegrationInstalled();
+  const bool cmd = RegistryStateInstalled(kCmdAdapterKey);
+  const bool windows_powershell = RegistryStateInstalled(
+      std::wstring(kPowerShellAdapterRoot) + L"WindowsPowerShell");
+  const bool powershell = RegistryStateInstalled(
+      std::wstring(kPowerShellAdapterRoot) + L"PowerShell");
+  const bool powershell_available = ExecutableAvailable(L"pwsh.exe");
+  if (json) {
+    std::wcout << L"{\"disabled\":" << (IsDisabled() ? L"true" : L"false")
+               << L",\"windows\":" << (windows ? L"true" : L"false")
+               << L",\"cmd\":" << (cmd ? L"true" : L"false")
+               << L",\"windowsPowerShell\":"
+               << (windows_powershell ? L"true" : L"false")
+               << L",\"powerShell7\":" << (powershell ? L"true" : L"false")
+               << L",\"powerShell7Available\":"
+               << (powershell_available ? L"true" : L"false") << L"}\n";
+    return 0;
+  }
+  std::wcout << L"resolution: " << (IsDisabled() ? L"disabled" : L"enabled")
+             << L"\nWindows surfaces: " << (windows ? L"installed" : L"not installed")
+             << L"\nCommand Prompt: " << (cmd ? L"installed" : L"not installed")
+             << L"\nWindows PowerShell: "
+             << (windows_powershell ? L"installed" : L"not installed")
+             << L"\nPowerShell 7: " << (powershell ? L"installed" : L"not installed")
+             << (powershell_available ? L"" : L" (PowerShell 7 unavailable)")
+             << L"\n";
   return 0;
+}
+
+int SetWindowsIntegration(const bool enabled) {
+  if (enabled) {
+    if (SetSettingsProtocol(true) != 0 || SetStartup(true) != 0) {
+      return 1;
+    }
+    const int started = StartBroker();
+    if (started != 0) {
+      SetStartup(false);
+    }
+    return started;
+  }
+  const int stopped = StopBroker();
+  const int unregistered = SetStartup(false);
+  return stopped != 0 ? stopped : unregistered;
 }
 
 int Doctor(const std::wstring_view path) {
@@ -374,6 +691,9 @@ int List(const std::wstring_view path) {
 }
 
 int CmdList(const std::wstring_view path) {
+  if (IsDisabled()) {
+    return 3;
+  }
   const fsw::ResolveResult resolved = fsw::ResolveRegisteredSlashPath(path);
   if (!resolved.matched()) {
     // Exit 3 tells the batch adapter that this is a native DIR switch or path,
@@ -391,8 +711,11 @@ void Usage() {
       L"  fswctl open /Distro/path\n"
       L"  fswctl list /Distro/path\n"
       L"  fswctl doctor /Distro/path | --all\n"
-      L"  fswctl settings\n"
-      L"  fswctl pause | resume\n"
+      L"  fswctl settings [general|windows|cmd|windows-powershell|powershell]\n"
+      L"  fswctl integrations [--json]\n"
+      L"  fswctl integration <name> enable|disable\n"
+      L"  fswctl disable | enable\n"
+      L"  fswctl pause | resume       Aliases for disable and enable\n"
       L"  fswctl driver status\n"
       L"  fswctl start | stop\n"
       L"  fswctl install       Register and start the per-user broker\n"
@@ -436,13 +759,34 @@ int wmain(const int argc, wchar_t** argv) {
     return std::wstring_view(argv[2]) == L"--all" ? DoctorAll()
                                                    : Doctor(argv[2]);
   }
-  if (command == L"settings" && argc == 2) {
-    return ShowSettings();
+  if (command == L"settings" && (argc == 2 || argc == 3)) {
+    return ShowSettings(argc == 3 ? std::wstring_view(argv[2]) : L"general");
   }
-  if (command == L"pause" && argc == 2) {
+  if (command == L"integrations" &&
+      (argc == 2 || (argc == 3 && std::wstring_view(argv[2]) == L"--json"))) {
+    return IntegrationStatus(argc == 3);
+  }
+  if (command == L"integration" && argc == 4) {
+    const std::wstring_view integration(argv[2]);
+    const std::wstring_view operation(argv[3]);
+    if (operation != L"enable" && operation != L"disable") {
+      Usage();
+      return 2;
+    }
+    const bool enabled = operation == L"enable";
+    if (integration == L"windows") {
+      return SetWindowsIntegration(enabled);
+    }
+    const int result = SetScriptIntegration(integration, enabled);
+    if (result == 2) {
+      Usage();
+    }
+    return result;
+  }
+  if ((command == L"pause" || command == L"disable") && argc == 2) {
     return SetPaused(true);
   }
-  if (command == L"resume" && argc == 2) {
+  if ((command == L"resume" || command == L"enable") && argc == 2) {
     return SetPaused(false);
   }
   if (command == L"driver" && argc == 3 &&
@@ -457,20 +801,12 @@ int wmain(const int argc, wchar_t** argv) {
     return StopBroker();
   }
   if (command == L"install") {
-    const int registered = SetStartup(true);
-    if (registered != 0) {
-      return registered;
-    }
-    const int started = StartBroker();
-    if (started != 0) {
-      SetStartup(false);
-    }
-    return started;
+    return SetWindowsIntegration(true);
   }
   if (command == L"uninstall") {
-    const int stopped = StopBroker();
-    const int unregistered = SetStartup(false);
-    return stopped != 0 ? stopped : unregistered;
+    const int windows = SetWindowsIntegration(false);
+    const int protocol = SetSettingsProtocol(false);
+    return windows != 0 ? windows : protocol;
   }
   Usage();
   return 2;

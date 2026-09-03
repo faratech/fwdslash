@@ -17,6 +17,9 @@ Blank or pending entries are unverified and must not be advertised as working.
 | PowerShell provider | Minifilter after normalization | VM gate pending |
 | Python filesystem APIs | Minifilter | VM gate pending |
 | `cmd.exe dir /` | Optional DOSKEY adapter | Installed adapter; manual new-session gate |
+| Windows PowerShell `dir /`, `ls /Distro` | Optional profile adapter | Automated fresh-process host test |
+| PowerShell 7 `dir /`, `ls /Distro` | Optional profile adapter | Automated fresh-process host test |
+| WinUI 3 settings | Windows App SDK 1.8 | ARM64 host launch and responsiveness verified |
 | Bare `/` in generic APIs | Windows drive-root semantics | Intentionally unsupported |
 | Elevated desktop app | Per-user driver mapping | VM gate pending |
 | Service/AppContainer/SYSTEM | Excluded by policy | Intentionally unsupported |
@@ -31,6 +34,9 @@ Blank or pending entries are unverified and must not be advertised as working.
 - Sandbox install/start/pause/resume/stop/uninstall verification.
 - Cmd adapter functional, native-switch pass-through, exact registry rollback,
   interrupted-transaction recovery, and external-AutoRun-change refusal tests.
+- Each PowerShell profile adapter: fresh-process alias/path tests, byte-exact
+  rollback, interrupted-transaction recovery, external-change refusal, and
+  graceful Controlled Folder Access failure.
 - No lost, duplicated, or delayed Enter behavior in unrelated Explorer views.
 
 ## Driver release gate

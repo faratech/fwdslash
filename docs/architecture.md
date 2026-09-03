@@ -35,6 +35,22 @@ directly and dismisses its flyout.
 Diagnostics record event and error categories only. User-entered and resolved
 paths are not logged.
 
+## Settings and optional shell adapters
+
+The settings process is an unpackaged WinUI 3 desktop app. It delegates every
+state change to `fswctl`; it never edits profiles or registry integration state
+itself. The app uses a Mica system backdrop and extends WinUI content into the
+title bar while retaining the system caption buttons. Tray commands deep-link
+to sections through the per-user `fwdslash` URI registration.
+
+Command Prompt and the two PowerShell editions have separate transactional
+install records. PowerShell installation snapshots the original profile bytes,
+writes a uniquely marked import atomically, and verifies that a fresh process
+of the selected edition loads the aliases. Failure, including a Controlled
+Folder Access denial, restores the original bytes and removes staged state.
+Uninstall removes only the recorded byte sequence and refuses to overwrite an
+externally changed transaction block.
+
 ## Filesystem routing
 
 ```text
@@ -73,5 +89,7 @@ allocation and name-query failure is fail-open.
   services, SYSTEM/session zero, AppContainers, and low integrity.
 - User-mode pause/uninstall always removes the hook without Explorer injection
   or restart.
+- Global disable removes the active hook and makes terminal adapters delegate
+  to native behavior without uninstalling the user's selected integrations.
 - Driver installation remains VM-only until Microsoft signing and release
   validation are complete.

@@ -7,6 +7,7 @@
     <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
+    <FSWDriverProject>true</FSWDriverProject>
     <ProjectGuid>{6732457C-B645-4EA8-970A-BCA453741D1B}</ProjectGuid>
     <RootNamespace>FswFilter</RootNamespace>
     <WindowsTargetPlatformVersion>10.0.28000.0</WindowsTargetPlatformVersion>
