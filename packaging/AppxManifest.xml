@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Template. tools/Package-Msix.ps1 substitutes the doubled-brace tokens below,
+  once per architecture.
+
+  This manifest replaces three things the unpackaged build does at runtime from
+  fwdslash.exe: the HKCU Run value (windows.startupTask), the HKCU
+  Software\Classes\fwdslash protocol registration (windows.protocol), and having
+  the controller on PATH (windows.appExecutionAlias).
+
+  There is one Application even though the package carries three executables:
+  both the startupTask and appExecutionAlias extensions take their own
+  Executable attribute, so the broker and the CLI do not need Store-visible app
+  identities of their own.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
+  IgnorableNamespaces="uap uap5 desktop desktop4 rescap virtualization">
+
+  <Identity
+    Name="{{IDENTITY_NAME}}"
+    Publisher="{{PUBLISHER}}"
+    Version="{{VERSION}}"
+    ProcessorArchitecture="{{ARCHITECTURE}}" />
+
+  <Properties>
+    <DisplayName>fwdslash</DisplayName>
+    <PublisherDisplayName>{{PUBLISHER_DISPLAY_NAME}}</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Type Linux-style WSL paths in File Explorer, Run, Windows Search and Open dialogs.</Description>
+
+    <!--
+      Only HKCU and %USERPROFILE%\AppData are virtualized by MSIX. These three
+      locations must be visible to processes outside the package:
+
+        Command Processor    cmd.exe reads AutoRun to load the dir/ls adapter.
+        ForwardSlashWindows  the PowerShell module reads Disabled on every
+                             dir/ls from an unpackaged shell.
+        LocalAppData\...     holds the adapter payload that cmd.exe and
+                             powershell.exe execute by absolute path.
+
+      The user's PowerShell profile lives under Documents, which MSIX does not
+      virtualize, so it needs no exclusion.
+
+      These targeted exclusions are honoured on Windows 11 and later, which is
+      why TargetDeviceFamily below starts at 10.0.22000.0. They require the
+      unvirtualizedResources restricted capability declared further down.
+    -->
+    <virtualization:RegistryWriteVirtualization>
+      <virtualization:ExcludedKeys>
+        <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\Microsoft\Command Processor</virtualization:ExcludedKey>
+        <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\ForwardSlashWindows</virtualization:ExcludedKey>
+      </virtualization:ExcludedKeys>
+    </virtualization:RegistryWriteVirtualization>
+
+    <virtualization:FileSystemWriteVirtualization>
+      <virtualization:ExcludedDirectories>
+        <virtualization:ExcludedDirectory>$(KnownFolder:LocalAppData)\ForwardSlashWindows</virtualization:ExcludedDirectory>
+      </virtualization:ExcludedDirectories>
+    </virtualization:FileSystemWriteVirtualization>
+  </Properties>
+
+  <Dependencies>
+    <!-- Windows 11: targeted virtualization exclusions are not honoured before it. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26200.0" />
+    <!--
+      Version comes from the SDK's own MicrosoftWindowsAppSDKFoundationAppXVersion
+      for the Microsoft.WindowsAppSDK 1.8.260804001 package reference, not from
+      whatever runtime happens to be installed on the build machine.
+    -->
+    <PackageDependency
+      Name="Microsoft.WindowsAppRuntime.1.8"
+      MinVersion="8000.946.1701.0"
+      Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <!--
+      Required by the virtualization exclusions above. This capability needs
+      Microsoft approval before the package can be published to the Store, and
+      App Installer refuses packages that declare it, so local installs must use
+      Add-AppxPackage.
+    -->
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+
+  <Applications>
+    <!-- SupportsMultipleInstances is required by the console-subsystem alias below,
+         and matches how fswsettings.exe already behaves: it has no single-instance
+         lock, so each activation is its own process. -->
+    <Application Id="App" Executable="fswsettings.exe" EntryPoint="Windows.FullTrustApplication"
+                 desktop4:SupportsMultipleInstances="true">
+      <uap:VisualElements
+        DisplayName="fwdslash"
+        Description="Type Linux-style WSL paths in native Windows navigation surfaces."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile
+          Wide310x150Logo="Assets\Wide310x150Logo.png"
+          Square71x71Logo="Assets\Square71x71Logo.png"
+          Square310x310Logo="Assets\Square310x310Logo.png" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+
+      <Extensions>
+        <!-- Replaces the HKCU\Software\Classes\fwdslash registration. -->
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="fwdslash">
+            <uap:DisplayName>Forward Slash Windows settings</uap:DisplayName>
+            <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>
+          </uap:Protocol>
+        </uap:Extension>
+
+        <!--
+          Replaces the HKCU Run value. Enabled at install so a Store user reaches
+          the same end state as an unpackaged user who runs "fwdslash install";
+          Windows still lets them turn it off under Startup apps.
+        -->
+        <desktop:Extension Category="windows.startupTask" Executable="fswbroker.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask
+            TaskId="ForwardSlashWindowsBroker"
+            Enabled="true"
+            DisplayName="Forward Slash Windows" />
+        </desktop:Extension>
+
+        <!-- Puts the controller on PATH via %LOCALAPPDATA%\Microsoft\WindowsApps. -->
+        <uap5:Extension Category="windows.appExecutionAlias" Executable="fwdslash.exe" EntryPoint="Windows.FullTrustApplication">
+          <uap5:AppExecutionAlias desktop4:Subsystem="console">
+            <uap5:ExecutionAlias Alias="fwdslash.exe" />
+          </uap5:AppExecutionAlias>
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

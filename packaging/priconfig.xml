@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Indexes packaging\Assets so the scale-* and targetsize-* qualifiers in the
+  filenames resolve to the unqualified names the manifest references
+  (Assets\Square150x150Logo.png and so on).
+
+  The settings app ships its own fswsettings.pri built by MSBuild; that file is
+  excluded here so makepri does not try to re-index it.
+-->
+<resources targetOsVersion="10.0.0" majorVersion="1">
+  <index root="\" startIndexAt="\">
+    <default>
+      <qualifier name="Language" value="en-US" />
+      <qualifier name="Contrast" value="standard" />
+      <qualifier name="Scale" value="200" />
+      <qualifier name="HomeRegion" value="001" />
+      <qualifier name="TargetSize" value="256" />
+      <qualifier name="LayoutDirection" value="LTR" />
+      <qualifier name="Theme" value="dark" />
+      <qualifier name="AlternateForm" value="" />
+      <qualifier name="DXFeatureLevel" value="DX9" />
+      <qualifier name="Configuration" value="" />
+      <qualifier name="DeviceFamily" value="Universal" />
+      <qualifier name="Custom" value="" />
+    </default>
+    <!--
+      Folder indexing only. The settings app ships its own fswsettings.pri built
+      by MSBuild; parsing it here as well makes both indexers claim
+      Files/App.xbf and makepri fails with PRI277 "conflicting values".
+    -->
+    <indexer-config type="folder" foldernameAsQualifier="true" filenameAsQualifier="true" qualifierDelimiter="." />
+  </index>
+</resources>

@@ -3,7 +3,17 @@ param(
     [ValidateSet('x86', 'x64', 'ARM64')]
     [string]$Architecture = $(if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'ARM64' } else { 'x64' }),
     [ValidateSet('Debug', 'Release')]
-    [string]$Configuration = 'Debug'
+    [string]$Configuration = 'Debug',
+
+    # Build the settings app for life inside an MSIX. Unpackaged, the Windows App
+    # SDK compiles in an auto-initializer that calls MddBootstrapInitialize2 and
+    # exit()s on failure; with package identity that bootstrap must not run, and
+    # the framework is reached through the manifest PackageDependency instead.
+    [switch]$Packaged,
+
+    # Primary resource map name for the packaged build. Must equal the package
+    # Identity/Name or ms-appx:// lookups resolve against the wrong map.
+    [string]$PackageIdentityName = '32827MikeFara.fwdslash'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,6 +85,7 @@ function Compile-Source {
 
 $pathObject = Compile-Source 'path_resolver' 'src\core\path_resolver.cpp'
 $registryObject = Compile-Source 'wsl_registry' 'src\core\wsl_registry.cpp'
+$identityObject = Compile-Source 'package_identity' 'src\core\package_identity.cpp'
 $sdkLibraryArchitecture = $targetName
 $vcLibraryArchitecture = $targetName
 $libraryPaths = @(
@@ -116,8 +127,8 @@ $appResource = Join-Path $objects 'fwdslash.res'
 Invoke-Checked -FilePath $rc -Arguments @(
     '/nologo', "/i$sdkInclude\um", "/i$sdkInclude\shared",
     "/fo$appResource", (Join-Path $repo 'assets\fwdslash.rc'))
-Link-Target 'fwdslash' @($controllerObject, $pathObject, $registryObject, $appResource) 'console' @('shell32.lib', 'user32.lib', 'advapi32.lib', 'FltLib.lib')
-Link-Target 'fswbroker' @($brokerObject, $pathObject, $registryObject, $appResource) 'windows' @('shell32.lib', 'user32.lib', 'gdi32.lib', 'advapi32.lib', 'ole32.lib', 'oleaut32.lib', 'uiautomationcore.lib', 'FltLib.lib', 'uuid.lib')
+Link-Target 'fwdslash' @($controllerObject, $pathObject, $registryObject, $identityObject, $appResource) 'console' @('shell32.lib', 'user32.lib', 'advapi32.lib', 'FltLib.lib')
+Link-Target 'fswbroker' @($brokerObject, $pathObject, $registryObject, $identityObject, $appResource) 'windows' @('shell32.lib', 'user32.lib', 'gdi32.lib', 'advapi32.lib', 'ole32.lib', 'oleaut32.lib', 'uiautomationcore.lib', 'FltLib.lib', 'uuid.lib')
 Link-Target 'fswcore_tests' @($testObject, $pathObject) 'console' @('advapi32.lib')
 Link-Target 'fsw_address_bar_integration' @($addressBarTestObject) 'console' @('shell32.lib', 'ole32.lib', 'oleaut32.lib', 'user32.lib')
 Link-Target 'fsw_filesystem_integration' @($filesystemTestObject) 'console'
@@ -129,7 +140,7 @@ if (-not (Test-Path -LiteralPath $msbuild)) {
 $settingsProject = Join-Path $repo 'src\settings\ForwardSlashWindows.Settings.vcxproj'
 $settingsIntermediate = Join-Path $output 'settings-obj'
 $settingsPlatform = if ($Architecture -eq 'x86') { 'Win32' } else { $Architecture }
-Invoke-Checked -FilePath $msbuild -Arguments @(
+$settingsArguments = @(
     $settingsProject,
     '/restore',
     '/m:1',
@@ -139,6 +150,21 @@ Invoke-Checked -FilePath $msbuild -Arguments @(
     "/p:IntDir=$settingsIntermediate\",
     '/p:UseMultiToolTask=false'
 )
+if ($Packaged) {
+    # WindowsPackageType=MSIX is not usable here: it makes the SDK demand an
+    # AppxManifest item on the project, which would drag the whole package
+    # definition into one component's vcxproj. Gate the two auto-initializers
+    # directly instead. WindowsAppSdkBootstrapInitialize defaults to true only
+    # when unset, so setting it false is what removes the MddBootstrapInitialize2
+    # call and its exit() on failure.
+    $settingsArguments += @(
+        '/p:WindowsAppSdkBootstrapInitialize=false',
+        '/p:WindowsAppSdkDeploymentManagerInitialize=false',
+        '/p:PrependPriInitialPath=false',
+        "/p:ProjectPriIndexName=$PackageIdentityName"
+    )
+}
+Invoke-Checked -FilePath $msbuild -Arguments $settingsArguments
 
 $payloadDirectories = @(
     @{ Source = 'shell\cmd'; Destination = 'shell\cmd' },

@@ -2,6 +2,7 @@
 
 #include "App.xaml.h"
 
+#include "fsw/package_identity.hpp"
 #include "fsw_user_protocol.h"
 #include "fsw/wsl_registry.hpp"
 
@@ -578,6 +579,14 @@ class SettingsWindow {
                      L"to Edge or web search.");
     note.Opacity(0.72);
     stack.Children().Append(note);
+    // The packaged build declares its startup entry in the app manifest, so the
+    // toggle above has nothing to write and is shown disabled.
+    if (fsw::HasPackageIdentity()) {
+      auto managed = Text(L"Installed with the app. Turn startup on or off "
+                          L"under Settings > Apps > Startup.");
+      managed.Opacity(0.72);
+      stack.Children().Append(managed);
+    }
     windows_panel_ = Scroller(stack);
     Grid::SetRow(windows_panel_, 1);
     surface.Children().Append(windows_panel_);
@@ -715,7 +724,9 @@ class SettingsWindow {
   void RefreshState() {
     loading_ = true;
     const bool disabled = Disabled();
-    const bool windows = RegistryValuePresent(kRunKey, kRunValue);
+    const bool packaged = fsw::HasPackageIdentity();
+    const bool windows =
+        packaged ? true : RegistryValuePresent(kRunKey, kRunValue);
     const bool cmd = AdapterInstalled(kCmdAdapterKey);
     const bool windows_powershell = AdapterInstalled(
         std::wstring(kPowerShellAdapterRoot) + L"WindowsPowerShell");
@@ -725,6 +736,9 @@ class SettingsWindow {
 
     global_toggle_.IsOn(!disabled);
     windows_toggle_.IsOn(windows);
+    // Windows owns logon start for a packaged build, so the toggle would have
+    // nothing to write; point at where the user can actually change it.
+    windows_toggle_.IsEnabled(!packaged);
     cmd_toggle_.IsOn(cmd);
     windows_powershell_toggle_.IsOn(windows_powershell);
     powershell_toggle_.IsOn(powershell);

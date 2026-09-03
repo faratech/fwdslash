@@ -1,3 +1,4 @@
+#include "fsw/package_identity.hpp"
 #include "fsw/path_resolver.hpp"
 #include "fsw/wsl_registry.hpp"
 #include "fsw_user_protocol.h"
@@ -70,6 +71,11 @@ bool RegistryStateInstalled(const std::wstring& path) {
 }
 
 bool IsWindowsIntegrationInstalled() {
+  // A packaged build declares the startup task and the protocol handler in its
+  // manifest, so they are present for as long as the package is installed.
+  if (fsw::HasPackageIdentity()) {
+    return true;
+  }
   HKEY key = nullptr;
   if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &key) !=
       ERROR_SUCCESS) {
@@ -240,6 +246,16 @@ int StopBroker() {
 }
 
 int SetStartup(const bool enabled) {
+  // The manifest's windows.startupTask owns logon start for a packaged build.
+  // Writing the Run value here would survive uninstall as an orphaned entry
+  // pointing into a WindowsApps directory that no longer exists.
+  if (fsw::HasPackageIdentity()) {
+    if (!enabled) {
+      std::wcerr << L"Startup for the packaged app is controlled by Windows. "
+                    L"Turn it off under Settings > Apps > Startup.\n";
+    }
+    return 0;
+  }
   HKEY key = nullptr;
   const LSTATUS opened = RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr,
                                           0, KEY_SET_VALUE, nullptr, &key,
@@ -271,6 +287,12 @@ int SetStartup(const bool enabled) {
 }
 
 int SetSettingsProtocol(const bool enabled) {
+  // windows.protocol in the manifest owns fwdslash:// for a packaged build.
+  // Registering it again under HKCU\Software\Classes would shadow the package
+  // registration and outlive the package.
+  if (fsw::HasPackageIdentity()) {
+    return 0;
+  }
   const std::filesystem::path settings =
       ExecutableDirectory() / L"fswsettings.exe";
   const std::wstring command = Quote(settings) + L" \"%1\"";

@@ -1,12 +1,24 @@
 [CmdletBinding()]
 param(
-    [string]$Source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\fwdslash-icon-master.png'),
-    [string]$Destination = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\fwdslash.ico'),
-    [string]$TitleBarDestination = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\fwdslash-titlebar.png')
+    [string]$Source,
+    [string]$Destination,
+    [string]$TitleBarDestination,
+
+    # MSIX requires its own logo set at several scales. Generated from the same
+    # master so the Store tiles, the taskbar and the .ico never drift apart.
+    [string]$MsixAssetDirectory
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
+
+# $PSScriptRoot is empty while an advanced function's parameter defaults are
+# evaluated, so the repo-relative defaults are resolved here instead.
+$repo = Split-Path -Parent $PSScriptRoot
+if (-not $Source) { $Source = Join-Path $repo 'assets\fwdslash-icon-master.png' }
+if (-not $Destination) { $Destination = Join-Path $repo 'assets\fwdslash.ico' }
+if (-not $TitleBarDestination) { $TitleBarDestination = Join-Path $repo 'assets\fwdslash-titlebar.png' }
+if (-not $MsixAssetDirectory) { $MsixAssetDirectory = Join-Path $repo 'packaging\Assets' }
 
 $sizes = 16, 20, 24, 32, 40, 48, 64, 128, 256
 $sourceImage = [Drawing.Bitmap]::FromFile([IO.Path]::GetFullPath($Source))
@@ -103,3 +115,88 @@ try {
 }
 
 Write-Host "Generated $titleBarPath for the WinUI title bar."
+
+# --- MSIX logo set -----------------------------------------------------------
+
+# Renders the master centred on a $Width x $Height transparent canvas. The
+# non-square tiles (wide and splash) letterbox the square artwork rather than
+# stretching it.
+function Save-MsixAsset {
+    param(
+        [Drawing.Image]$Source,
+        [int]$Width,
+        [int]$Height,
+        [string]$Path
+    )
+
+    $bitmap = [Drawing.Bitmap]::new($Width, $Height, [Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    try {
+        $bitmap.SetResolution(96, 96)
+        $graphics = [Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $graphics.CompositingQuality = [Drawing.Drawing2D.CompositingQuality]::HighQuality
+            $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::HighQuality
+            $graphics.Clear([Drawing.Color]::Transparent)
+            $edge = [Math]::Min($Width, $Height)
+            $graphics.DrawImage($Source, [Drawing.Rectangle]::new(
+                [int](($Width - $edge) / 2), [int](($Height - $edge) / 2), $edge, $edge))
+        } finally {
+            $graphics.Dispose()
+        }
+        $bitmap.Save($Path, [Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+        $bitmap.Dispose()
+    }
+}
+
+$msixRoot = [IO.Path]::GetFullPath($MsixAssetDirectory)
+New-Item -ItemType Directory -Force -Path $msixRoot | Out-Null
+
+# Base logical sizes; each is emitted at every supported scale factor.
+$msixLogos = @(
+    @{ Name = 'Square44x44Logo';   Width = 44;  Height = 44 },
+    @{ Name = 'Square71x71Logo';   Width = 71;  Height = 71 },
+    @{ Name = 'Square150x150Logo'; Width = 150; Height = 150 },
+    @{ Name = 'Square310x310Logo'; Width = 310; Height = 310 },
+    @{ Name = 'Wide310x150Logo';   Width = 310; Height = 150 },
+    @{ Name = 'StoreLogo';         Width = 50;  Height = 50 },
+    @{ Name = 'SplashScreen';      Width = 620; Height = 300 }
+)
+$msixScales = 100, 125, 150, 200, 400
+
+# Square44x44Logo also drives the taskbar and Alt+Tab, which use target sizes
+# rather than scales. The unplated variants are what Windows shows on the
+# taskbar, where a plate behind the glyph would look wrong.
+$msixTargetSizes = 16, 24, 32, 48, 256
+
+$msixCount = 0
+$masterImage = [Drawing.Bitmap]::FromFile([IO.Path]::GetFullPath($Source))
+try {
+    foreach ($logo in $msixLogos) {
+        foreach ($scale in $msixScales) {
+            $width = [int][Math]::Round($logo.Width * $scale / 100.0)
+            $height = [int][Math]::Round($logo.Height * $scale / 100.0)
+            $path = Join-Path $msixRoot ('{0}.scale-{1}.png' -f $logo.Name, $scale)
+            Save-MsixAsset -Source $masterImage -Width $width -Height $height -Path $path
+            $msixCount++
+        }
+        # A scale-free copy so a manifest reference without a qualifier resolves.
+        Save-MsixAsset -Source $masterImage -Width $logo.Width -Height $logo.Height `
+            -Path (Join-Path $msixRoot ('{0}.png' -f $logo.Name))
+        $msixCount++
+    }
+
+    foreach ($target in $msixTargetSizes) {
+        foreach ($suffix in @('', '_altform-unplated')) {
+            $path = Join-Path $msixRoot ('Square44x44Logo.targetsize-{0}{1}.png' -f $target, $suffix)
+            Save-MsixAsset -Source $masterImage -Width $target -Height $target -Path $path
+            $msixCount++
+        }
+    }
+} finally {
+    $masterImage.Dispose()
+}
+
+Write-Host "Generated $msixCount MSIX assets in $msixRoot."

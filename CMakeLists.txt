@@ -13,7 +13,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(fswcore STATIC
   src/core/path_resolver.cpp
-  src/core/wsl_registry.cpp)
+  src/core/wsl_registry.cpp
+  src/core/package_identity.cpp)
 target_include_directories(fswcore PUBLIC src/core/include include)
 target_compile_definitions(fswcore PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(fswcore PRIVATE /W4 /WX /permissive- /utf-8)
