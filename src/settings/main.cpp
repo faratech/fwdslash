@@ -3,6 +3,7 @@
 #include "App.xaml.h"
 
 #include "fsw_user_protocol.h"
+#include "fsw/wsl_registry.hpp"
 
 #include <algorithm>
 #include <cwctype>
@@ -287,6 +288,10 @@ class SettingsWindow {
   TextBlock status_text_{nullptr};
   TextBlock powershell_caption_{nullptr};
   ToggleSwitch global_toggle_{nullptr};
+  RadioButton list_mode_radio_{nullptr};
+  RadioButton default_mode_radio_{nullptr};
+  ComboBox default_distribution_{nullptr};
+  StackPanel default_distribution_row_{nullptr};
   ToggleSwitch windows_toggle_{nullptr};
   ToggleSwitch cmd_toggle_{nullptr};
   ToggleSwitch windows_powershell_toggle_{nullptr};
@@ -439,6 +444,78 @@ class SettingsWindow {
         L"Disable temporarily without removing selected integrations.",
         global_toggle_));
 
+    Border bare_card;
+    bare_card.Padding(Thickness{18.0, 18.0, 18.0, 18.0});
+    bare_card.CornerRadius(CornerRadius{8.0, 8.0, 8.0, 8.0});
+    bare_card.BorderThickness(Thickness{1.0, 1.0, 1.0, 1.0});
+    ApplyCardBrush(bare_card);
+    StackPanel bare_content;
+    bare_content.Spacing(8.0);
+    bare_content.Children().Append(Text(L"Bare slash ( / ) behavior", 14.0, true));
+    auto bare_caption = Text(L"Choose what typing only / means on enabled surfaces.");
+    bare_caption.Opacity(0.70);
+    bare_content.Children().Append(bare_caption);
+    list_mode_radio_ = RadioButton{};
+    list_mode_radio_.Content(box_value(L"Show all distributions"));
+    list_mode_radio_.GroupName(L"BareSlashMode");
+    AutomationProperties::SetName(list_mode_radio_, L"Show all distributions");
+    list_mode_radio_.Checked(
+        [this](winrt::Windows::Foundation::IInspectable const&,
+               RoutedEventArgs const&) {
+          if (loading_) return;
+          const bool succeeded = RunController(L"bare-slash list");
+          ShowResult(succeeded, L"Bare slash shows all distributions", false);
+          RefreshState();
+        });
+    bare_content.Children().Append(list_mode_radio_);
+    default_mode_radio_ = RadioButton{};
+    default_mode_radio_.Content(box_value(L"Open my default distribution"));
+    default_mode_radio_.GroupName(L"BareSlashMode");
+    AutomationProperties::SetName(default_mode_radio_,
+                                  L"Open my default distribution");
+    default_mode_radio_.Checked(
+        [this](winrt::Windows::Foundation::IInspectable const&,
+               RoutedEventArgs const&) {
+          if (loading_) return;
+          const bool succeeded = RunController(L"bare-slash default");
+          ShowResult(succeeded, L"Bare slash opens the default distribution",
+                     false);
+          RefreshState();
+        });
+    bare_content.Children().Append(default_mode_radio_);
+    StackPanel picker_row;
+    picker_row.Orientation(Orientation::Horizontal);
+    picker_row.Spacing(8.0);
+    auto picker_label = Text(L"Distribution:");
+    picker_label.VerticalAlignment(VerticalAlignment::Center);
+    default_distribution_ = ComboBox{};
+    default_distribution_.MinWidth(240.0);
+    AutomationProperties::SetName(default_distribution_,
+                                  L"Default distribution for bare slash");
+    default_distribution_.SelectionChanged(
+        [this](winrt::Windows::Foundation::IInspectable const&,
+               SelectionChangedEventArgs const&) {
+          if (loading_) return;
+          const int32_t index = default_distribution_.SelectedIndex();
+          bool succeeded;
+          if (index <= 0) {
+            succeeded = RunController(L"bare-slash default");
+          } else {
+            const auto name = unbox_value<hstring>(
+                default_distribution_.Items().GetAt(index));
+            succeeded = RunController(std::wstring(L"bare-slash default \"") +
+                                      std::wstring(name) + L"\"");
+          }
+          ShowResult(succeeded, L"Bare slash default updated", false);
+          RefreshState();
+        });
+    picker_row.Children().Append(picker_label);
+    picker_row.Children().Append(default_distribution_);
+    default_distribution_row_ = picker_row;
+    bare_content.Children().Append(picker_row);
+    bare_card.Child(bare_content);
+    stack.Children().Append(bare_card);
+
     StackPanel buttons;
     buttons.Orientation(Orientation::Horizontal);
     buttons.Spacing(12.0);
@@ -579,8 +656,9 @@ class SettingsWindow {
     StackPanel stack = PageStack();
     stack.Children().Append(PageHeader(L"About", L"Forward Slash Windows 0.0.1"));
     stack.Children().Append(Text(
-        L"Maps / to the WSL distribution list and /Distro/path to "
-        L"\\\\wsl.localhost\\Distro\\path on supported Windows surfaces."));
+        L"Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to "
+        L"either the WSL distribution list or your default distribution, on "
+        L"supported Windows surfaces."));
     auto driver = Text(L"The filesystem minifilter remains production-gated "
                        L"and is not installed by this app.");
     driver.Opacity(0.76);
@@ -652,11 +730,41 @@ class SettingsWindow {
             ? L"Adds the same reversible adapter to the PowerShell 7 profile."
             : L"PowerShell 7 is not installed on this computer.");
 
-    const FSW_BROKER_STATE broker = [] {
-      const HWND window = FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr);
-      if (window == nullptr) return FswBrokerUnavailable;
+    const fsw::BareSlashMode bare_mode = fsw::GetBareSlashMode();
+    const std::wstring pinned = fsw::GetBareSlashOverride();
+    const auto bare_distributions = fsw::ListRegisteredDistributions();
+    const auto wsl_default = fsw::GetDefaultDistribution(bare_distributions);
+    using winrt::Windows::Foundation::IReference;
+    const bool list_mode =
+        bare_mode == fsw::BareSlashMode::distribution_list;
+    list_mode_radio_.IsChecked(
+        winrt::box_value(list_mode).as<IReference<bool>>());
+    default_mode_radio_.IsChecked(
+        winrt::box_value(!list_mode).as<IReference<bool>>());
+    default_distribution_.Items().Clear();
+    default_distribution_.Items().Append(box_value(wsl_default.has_value()
+        ? winrt::hstring(L"Windows default (/" + *wsl_default + L")")
+        : winrt::hstring(L"Windows default")));
+    int32_t selected_distribution = 0;
+    for (size_t index = 0; index < bare_distributions.size(); ++index) {
+      default_distribution_.Items().Append(
+          box_value(winrt::hstring(bare_distributions[index])));
+      if (!pinned.empty() &&
+          fsw::EqualsOrdinalIgnoreCase(bare_distributions[index], pinned)) {
+        selected_distribution = static_cast<int32_t>(index + 1);
+      }
+    }
+    default_distribution_.SelectedIndex(selected_distribution);
+    default_distribution_row_.Visibility(
+        bare_mode == fsw::BareSlashMode::default_distribution
+            ? Visibility::Visible
+            : Visibility::Collapsed);
+
+    const HWND broker_window = FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr);
+    const FSW_BROKER_STATE broker = [broker_window] {
+      if (broker_window == nullptr) return FswBrokerUnavailable;
       DWORD_PTR result = 0;
-      if (!SendMessageTimeoutW(window, FSW_WM_QUERY_STATE, 0, 0,
+      if (!SendMessageTimeoutW(broker_window, FSW_WM_QUERY_STATE, 0, 0,
                                SMTO_ABORTIFHUNG | SMTO_BLOCK, 750, &result)) {
         return FswBrokerUnavailable;
       }

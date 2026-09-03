@@ -127,6 +127,38 @@ ResolveResult ResolveSlashPath(
   return result;
 }
 
+ResolveResult ResolveSlashPathWithBareSlashMode(
+    const std::wstring_view input,
+    const DistributionPredicate& is_registered,
+    const BareSlashMode mode,
+    const std::wstring_view preferred_distribution,
+    const std::wstring_view wsl_default_distribution) {
+  ResolveResult result = ResolveSlashPath(input, is_registered);
+  if (!result.is_wsl_root() || mode == BareSlashMode::distribution_list) {
+    return result;
+  }
+  std::wstring_view target;
+  if (!preferred_distribution.empty() &&
+      is_registered(preferred_distribution)) {
+    target = preferred_distribution;
+  } else if (!wsl_default_distribution.empty() &&
+             is_registered(wsl_default_distribution)) {
+    target = wsl_default_distribution;
+  } else {
+    result.error = ResolveError::no_default_distribution;
+    result.target = ResolveTarget::none;
+    result.distribution.clear();
+    return result;
+  }
+  result.target = ResolveTarget::distribution;
+  result.distribution.assign(target);
+  result.linux_path = L"/";
+  result.unc_path = L"\\\\wsl.localhost\\";
+  result.unc_path.append(target);
+  result.had_trailing_separator = true;
+  return result;
+}
+
 std::wstring ResolveErrorMessage(
     const ResolveError error,
     const std::vector<std::wstring>& registered_distributions) {
@@ -149,6 +181,9 @@ std::wstring ResolveErrorMessage(
       return L"The path contains an invalid character.";
     case ResolveError::traversal_above_root:
       return L"The path cannot traverse above the distribution root.";
+    case ResolveError::no_default_distribution:
+      return L"No default WSL distribution is available. Choose one in "
+             L"Forward Slash Windows settings, or use /Distro/path.";
   }
   if (!registered_distributions.empty()) {
     message.append(L" Try ");
@@ -184,6 +219,8 @@ std::wstring_view ResolveErrorName(const ResolveError error) noexcept {
       return L"embedded_nul";
     case ResolveError::traversal_above_root:
       return L"traversal_above_root";
+    case ResolveError::no_default_distribution:
+      return L"no_default_distribution";
   }
   return L"unknown";
 }

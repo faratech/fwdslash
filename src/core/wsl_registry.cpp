@@ -1,9 +1,11 @@
 #include "fsw/wsl_registry.hpp"
 
 #include "fsw/path_resolver.hpp"
+#include "fsw_user_protocol.h"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <optional>
 
 namespace fsw {
@@ -29,6 +31,27 @@ std::optional<std::wstring> ReadStringValue(const HKEY key,
     return std::nullopt;
   }
   return std::wstring(value.data());
+}
+
+std::optional<DWORD> ReadDwordValue(const HKEY key, const wchar_t* value_name) {
+  DWORD type = 0;
+  DWORD value = 0;
+  DWORD byte_count = sizeof(value);
+  if (RegQueryValueExW(key, value_name, nullptr, &type,
+                       reinterpret_cast<BYTE*>(&value), &byte_count) !=
+          ERROR_SUCCESS ||
+      type != REG_DWORD || byte_count != sizeof(value)) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+bool ContainsOrdinalIgnoreCase(const std::vector<std::wstring>& values,
+                               const std::wstring_view candidate) {
+  return std::any_of(values.begin(), values.end(),
+                     [&candidate](const std::wstring& value) {
+                       return EqualsOrdinalIgnoreCase(value, candidate);
+                     });
 }
 
 }  // namespace
@@ -87,7 +110,8 @@ bool IsRegisteredDistribution(const std::wstring_view distribution) {
   return false;
 }
 
-std::optional<std::wstring> GetDefaultDistribution() {
+std::optional<std::wstring> GetDefaultDistribution(
+    const std::vector<std::wstring>& registered_distributions) {
   HKEY root = nullptr;
   if (RegOpenKeyExW(HKEY_CURRENT_USER, kLxssKey, 0, KEY_READ, &root) ==
       ERROR_SUCCESS) {
@@ -99,8 +123,9 @@ std::optional<std::wstring> GetDefaultDistribution() {
         const auto distribution =
             ReadStringValue(distribution_key, L"DistributionName");
         RegCloseKey(distribution_key);
-        if (distribution.has_value() &&
-            IsRegisteredDistribution(*distribution)) {
+        if (distribution.has_value() && ContainsOrdinalIgnoreCase(
+                                            registered_distributions,
+                                            *distribution)) {
           RegCloseKey(root);
           return distribution;
         }
@@ -108,15 +133,45 @@ std::optional<std::wstring> GetDefaultDistribution() {
     }
     RegCloseKey(root);
   }
-  const auto distributions = ListRegisteredDistributions();
-  if (distributions.size() == 1) {
-    return distributions.front();
+  if (registered_distributions.size() == 1) {
+    return registered_distributions.front();
   }
   return std::nullopt;
 }
 
-ResolveResult ResolveRegisteredSlashPath(const std::wstring_view input) {
-  return ResolveSlashPath(input, IsRegisteredDistribution);
+BareSlashMode GetBareSlashMode() {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, FSW_SETTINGS_KEY, 0, KEY_QUERY_VALUE,
+                    &key) != ERROR_SUCCESS) {
+    return BareSlashMode::distribution_list;
+  }
+  const auto value = ReadDwordValue(key, FSW_BARE_SLASH_MODE_VALUE);
+  RegCloseKey(key);
+  return value.has_value() && *value != 0
+             ? BareSlashMode::default_distribution
+             : BareSlashMode::distribution_list;
+}
+
+std::wstring GetBareSlashOverride() {
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, FSW_SETTINGS_KEY, 0, KEY_QUERY_VALUE,
+                    &key) != ERROR_SUCCESS) {
+    return {};
+  }
+  const auto value = ReadStringValue(key, FSW_BARE_SLASH_DISTRIBUTION_VALUE);
+  RegCloseKey(key);
+  return value.has_value() ? *value : std::wstring{};
+}
+
+ResolveResult ResolveUserSlashPath(const std::wstring_view input) {
+  const std::vector<std::wstring> registered = ListRegisteredDistributions();
+  const DistributionPredicate predicate =
+      [&registered](const std::wstring_view name) {
+        return ContainsOrdinalIgnoreCase(registered, name);
+      };
+  return ResolveSlashPathWithBareSlashMode(
+      input, predicate, GetBareSlashMode(), GetBareSlashOverride(),
+      GetDefaultDistribution(registered).value_or(L""));
 }
 
 }  // namespace fsw

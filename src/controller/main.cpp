@@ -465,6 +465,83 @@ std::wstring JsonEscape(const std::wstring_view input) {
   return output;
 }
 
+int ShowBareSlashState() {
+  const auto distributions = fsw::ListRegisteredDistributions();
+  const fsw::BareSlashMode mode = fsw::GetBareSlashMode();
+  const std::wstring pinned = fsw::GetBareSlashOverride();
+  const auto wsl_default = fsw::GetDefaultDistribution(distributions);
+  const fsw::ResolveResult bare = fsw::ResolveUserSlashPath(L"/");
+  std::wcout << L"bare slash mode: "
+             << (mode == fsw::BareSlashMode::default_distribution
+                     ? L"default distribution"
+                     : L"distribution list")
+             << L"\n";
+  if (!pinned.empty()) {
+    std::wcout << L"pinned distribution: /" << pinned << L"\n";
+  }
+  std::wcout << L"WSL default distribution: "
+             << (wsl_default.has_value() ? L"/" + *wsl_default : L"none")
+             << L"\n";
+  if (bare.matched()) {
+    std::wcout << L"/ resolves to: " << bare.unc_path << L"\n";
+  } else {
+    std::wcout << L"/ is blocked: "
+               << fsw::ResolveErrorMessage(bare.error, distributions) << L"\n";
+  }
+  return 0;
+}
+
+int WriteBareSlashSettings(const bool default_mode,
+                           const std::wstring& pinned_distribution) {
+  HKEY key = nullptr;
+  const LSTATUS opened = RegCreateKeyExW(HKEY_CURRENT_USER, FSW_SETTINGS_KEY, 0,
+                                         nullptr, 0, KEY_SET_VALUE, nullptr,
+                                         &key, nullptr);
+  if (opened != ERROR_SUCCESS) {
+    std::wcerr << L"Unable to open the settings key. Error " << opened
+               << L".\n";
+    return 1;
+  }
+  const DWORD value = default_mode ? 1U : 0U;
+  LSTATUS status =
+      RegSetValueExW(key, FSW_BARE_SLASH_MODE_VALUE, 0, REG_DWORD,
+                     reinterpret_cast<const BYTE*>(&value), sizeof(value));
+  if (status == ERROR_SUCCESS) {
+    if (default_mode && !pinned_distribution.empty()) {
+      status = RegSetValueExW(
+          key, FSW_BARE_SLASH_DISTRIBUTION_VALUE, 0, REG_SZ,
+          reinterpret_cast<const BYTE*>(pinned_distribution.c_str()),
+          static_cast<DWORD>((pinned_distribution.size() + 1) *
+                             sizeof(wchar_t)));
+    } else {
+      status = RegDeleteValueW(key, FSW_BARE_SLASH_DISTRIBUTION_VALUE);
+      if (status == ERROR_FILE_NOT_FOUND) {
+        status = ERROR_SUCCESS;
+      }
+    }
+  }
+  RegCloseKey(key);
+  if (status != ERROR_SUCCESS) {
+    std::wcerr << L"Unable to persist the bare slash mode. Error " << status
+               << L".\n";
+    return 1;
+  }
+  return 0;
+}
+
+int SetBareSlash(const bool default_mode,
+                 const std::wstring& pinned_distribution) {
+  if (default_mode && !pinned_distribution.empty() &&
+      !fsw::IsRegisteredDistribution(pinned_distribution)) {
+    std::wcerr << L"That WSL distribution is not registered.\n";
+    return 1;
+  }
+  if (WriteBareSlashSettings(default_mode, pinned_distribution) != 0) {
+    return 1;
+  }
+  return ShowBareSlashState();
+}
+
 int Status(const bool json) {
   const auto distributions = fsw::ListRegisteredDistributions();
   const FSW_BROKER_STATE broker_state = BrokerState();
@@ -474,10 +551,20 @@ int Status(const bool json) {
       : broker_state == FswBrokerPaused ? L"running (paused)"
                                        : L"running (hook unavailable)";
   if (json) {
+    const fsw::ResolveResult bare = fsw::ResolveUserSlashPath(L"/");
     std::wcout << L"{\"broker\":\"" << broker_status
                << L"\",\"driverConnected\":"
                << (IsDriverAvailable() ? L"true" : L"false")
                << L",\"disabled\":" << (IsDisabled() ? L"true" : L"false")
+               << L",\"bareSlashMode\":\""
+               << (fsw::GetBareSlashMode() ==
+                           fsw::BareSlashMode::default_distribution
+                       ? L"default"
+                       : L"list")
+               << L"\",\"bareSlashTarget\":"
+               << (bare.matched()
+                       ? L"\"" + JsonEscape(bare.unc_path) + L"\""
+                       : L"null")
                << L",\"wslRoot\":\"\\\\\\\\wsl.localhost\","
                   L"\"distributions\":[";
     for (size_t index = 0; index < distributions.size(); ++index) {
@@ -496,7 +583,16 @@ int Status(const bool json) {
              << (IsDriverAvailable() ? L"connected" : L"not connected")
              << L"\n";
   std::wcout << L"registered distributions: " << distributions.size() << L"\n";
-  std::wcout << L"  / -> \\\\wsl.localhost\\ (distribution list)\n";
+  const fsw::ResolveResult bare = fsw::ResolveUserSlashPath(L"/");
+  if (bare.matched()) {
+    std::wcout << L"  / -> " << bare.unc_path
+               << (bare.is_wsl_root() ? L" (distribution list)"
+                                      : L" (default distribution)")
+               << L"\n";
+  } else {
+    std::wcout << L"  / -> blocked. "
+               << fsw::ResolveErrorMessage(bare.error, distributions) << L"\n";
+  }
   for (const std::wstring& distribution : distributions) {
     std::wcout << L"  /" << distribution << L"/ -> \\\\wsl.localhost\\"
                << distribution << L"\\\n";
@@ -591,7 +687,7 @@ int SetWindowsIntegration(const bool enabled) {
 }
 
 int Doctor(const std::wstring_view path) {
-  const fsw::ResolveResult resolved = fsw::ResolveRegisteredSlashPath(path);
+  const fsw::ResolveResult resolved = fsw::ResolveUserSlashPath(path);
   if (!resolved.matched()) {
     std::wcerr << L"resolver: " << fsw::ResolveErrorName(resolved.error) << L"\n";
     return 1;
@@ -633,7 +729,7 @@ int DoctorAll() {
 }
 
 int Resolve(const std::wstring_view path) {
-  const fsw::ResolveResult resolved = fsw::ResolveRegisteredSlashPath(path);
+  const fsw::ResolveResult resolved = fsw::ResolveUserSlashPath(path);
   if (!resolved.matched()) {
     std::wcerr << fsw::ResolveErrorMessage(
                        resolved.error, fsw::ListRegisteredDistributions())
@@ -645,7 +741,7 @@ int Resolve(const std::wstring_view path) {
 }
 
 int Open(const std::wstring_view path) {
-  const fsw::ResolveResult resolved = fsw::ResolveRegisteredSlashPath(path);
+  const fsw::ResolveResult resolved = fsw::ResolveUserSlashPath(path);
   if (!resolved.matched()) {
     std::wcerr << fsw::ResolveErrorMessage(
                        resolved.error, fsw::ListRegisteredDistributions())
@@ -665,7 +761,7 @@ int Open(const std::wstring_view path) {
 }
 
 int List(const std::wstring_view path) {
-  const fsw::ResolveResult resolved = fsw::ResolveRegisteredSlashPath(path);
+  const fsw::ResolveResult resolved = fsw::ResolveUserSlashPath(path);
   if (!resolved.matched()) {
     std::wcerr << fsw::ResolveErrorMessage(
                        resolved.error, fsw::ListRegisteredDistributions())
@@ -712,7 +808,7 @@ int CmdList(const std::wstring_view path) {
   if (IsDisabled()) {
     return 3;
   }
-  const fsw::ResolveResult resolved = fsw::ResolveRegisteredSlashPath(path);
+  const fsw::ResolveResult resolved = fsw::ResolveUserSlashPath(path);
   if (!resolved.matched()) {
     // Exit 3 tells the batch adapter that this is a native DIR switch or path,
     // not one of our registered aliases. It deliberately emits no text.
@@ -732,6 +828,8 @@ void Usage() {
       L"  fswctl settings [general|windows|cmd|windows-powershell|powershell]\n"
       L"  fswctl integrations [--json]\n"
       L"  fswctl integration <name> enable|disable\n"
+      L"  fswctl bare-slash\n"
+      L"  fswctl bare-slash list | default [Distro]\n"
       L"  fswctl disable | enable\n"
       L"  fswctl pause | resume       Aliases for disable and enable\n"
       L"  fswctl driver status\n"
@@ -783,6 +881,23 @@ int wmain(const int argc, wchar_t** argv) {
   if (command == L"integrations" &&
       (argc == 2 || (argc == 3 && std::wstring_view(argv[2]) == L"--json"))) {
     return IntegrationStatus(argc == 3);
+  }
+  if (command == L"bare-slash") {
+    if (argc == 2) {
+      return ShowBareSlashState();
+    }
+    const std::wstring_view operation(argv[2]);
+    if (argc == 3 && operation == L"list") {
+      return SetBareSlash(false, L"");
+    }
+    if (argc == 3 && operation == L"default") {
+      return SetBareSlash(true, L"");
+    }
+    if (argc == 4 && operation == L"default") {
+      return SetBareSlash(true, argv[3]);
+    }
+    Usage();
+    return 2;
   }
   if (command == L"integration" && argc == 4) {
     const std::wstring_view integration(argv[2]);

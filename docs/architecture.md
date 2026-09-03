@@ -27,10 +27,12 @@ key-up. Broker-generated replay input carries a private marker so it cannot
 loop through the resolver.
 
 Explorer and native dialogs receive a UNC rewrite followed by Enter, preserving
-native behavior and the active Explorer tab. Bare `/` is special-cased to the
-WSL provider root, with an Explorer COM navigation fallback for provider-root
-builds that open UNC roots in a new window. Search opens the validated path
-directly and dismisses its flyout.
+native behavior and the active Explorer tab. Bare `/` is special-cased by the
+shared resolver: by default it targets the WSL provider root (with an Explorer
+COM navigation fallback for provider-root builds that open UNC roots in a new
+window), or, when the per-user bare-slash mode opts in, the default
+distribution root. Search opens the validated path directly and dismisses its
+flyout.
 
 Diagnostics record event and error categories only. User-entered and resolved
 paths are not logged.

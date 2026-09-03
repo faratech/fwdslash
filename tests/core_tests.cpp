@@ -25,6 +25,13 @@ void RequireError(const std::wstring_view input,
   Require(result.error == expected, "unexpected resolver error");
 }
 
+fsw::ResolveResult ResolveWithMode(
+    const std::wstring_view input, const fsw::BareSlashMode mode,
+    const std::wstring_view preferred, const std::wstring_view wsl_default) {
+  return fsw::ResolveSlashPathWithBareSlashMode(input, Registered, mode,
+                                                preferred, wsl_default);
+}
+
 }  // namespace
 
 int wmain() {
@@ -74,6 +81,68 @@ int wmain() {
                {L"Ubuntu", L"Dev Distro"})
                .empty(),
           "invalid paths should have a user-facing explanation");
+
+  {
+    const auto result = ResolveWithMode(
+        L"/", fsw::BareSlashMode::distribution_list, L"", L"Ubuntu");
+    Require(result.is_wsl_root(), "list mode keeps the bare slash root");
+    Require(result.unc_path == L"\\\\wsl.localhost",
+            "list mode should target the distribution list");
+  }
+  {
+    const auto result =
+        ResolveWithMode(L"/", fsw::BareSlashMode::default_distribution, L"",
+                        L"Ubuntu");
+    Require(result.matched(), "default mode should resolve the bare slash");
+    Require(result.distribution == L"Ubuntu",
+            "default mode should follow the WSL default distribution");
+    Require(result.linux_path == L"/",
+            "default mode should resolve to the distribution root");
+    Require(result.unc_path == L"\\\\wsl.localhost\\Ubuntu",
+            "default mode should rewrite the bare slash UNC");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/", fsw::BareSlashMode::default_distribution, L"Dev Distro",
+        L"Ubuntu");
+    Require(result.distribution == L"Dev Distro",
+            "a registered preference should win over the WSL default");
+    Require(result.unc_path == L"\\\\wsl.localhost\\Dev Distro",
+            "preference UNC should preserve the distribution name");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/", fsw::BareSlashMode::default_distribution, L"dev distro",
+        L"Ubuntu");
+    Require(result.distribution == L"dev distro",
+            "preference matching should be case-insensitive");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/", fsw::BareSlashMode::default_distribution, L"Debian", L"Ubuntu");
+    Require(result.distribution == L"Ubuntu",
+            "an unregistered preference should fall back to the WSL default");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/", fsw::BareSlashMode::default_distribution, L"Debian", L"");
+    Require(result.error == fsw::ResolveError::no_default_distribution,
+            "no usable default should block the bare slash");
+    Require(!result.matched(), "a blocked bare slash should not match");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/", fsw::BareSlashMode::default_distribution, L"", L"");
+    Require(result.error == fsw::ResolveError::no_default_distribution,
+            "an unknown WSL default should block the bare slash");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/Ubuntu/home", fsw::BareSlashMode::default_distribution, L"Ubuntu",
+        L"");
+    Require(result.unc_path == L"\\\\wsl.localhost\\Ubuntu\\home",
+            "default mode should not change explicit distribution paths");
+  }
 
   std::wcout << L"All resolver tests passed.\n";
   return EXIT_SUCCESS;

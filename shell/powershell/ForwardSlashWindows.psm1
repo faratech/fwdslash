@@ -76,14 +76,14 @@ function Invoke-ForwardSlashWindowsChildItem {
     foreach ($index in $pathIndexes) {
         $value = $forward[$index]
         if ($value -is [string]) {
-            if ($value -eq '/') {
-                $hasBareRoot = $true
-                continue
-            }
             $resolved = Resolve-ForwardSlashWindowsPath -Path $value
             if (-not $resolved) {
                 Microsoft.PowerShell.Management\Get-ChildItem @forward
                 return
+            }
+            if ($resolved -eq '\\wsl.localhost') {
+                # Bare "/" resolved to the provider root: list distributions.
+                $hasBareRoot = $true
             }
             $forward[$index] = $resolved
             continue
@@ -91,16 +91,14 @@ function Invoke-ForwardSlashWindowsChildItem {
         if ($value -is [System.Collections.IEnumerable]) {
             $replacement = @()
             foreach ($item in $value) {
-                if ($item -eq '/') {
-                    $hasBareRoot = $true
-                    $replacement += $item
-                    continue
-                }
                 if ($item -is [string] -and $item.StartsWith('/')) {
                     $resolved = Resolve-ForwardSlashWindowsPath -Path $item
                     if (-not $resolved) {
                         Microsoft.PowerShell.Management\Get-ChildItem @forward
                         return
+                    }
+                    if ($resolved -eq '\\wsl.localhost') {
+                        $hasBareRoot = $true
                     }
                     $replacement += $resolved
                 } else {

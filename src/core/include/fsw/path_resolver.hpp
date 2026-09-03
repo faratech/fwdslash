@@ -22,6 +22,12 @@ enum class ResolveError {
   backslash_not_allowed,
   embedded_nul,
   traversal_above_root,
+  no_default_distribution,
+};
+
+enum class BareSlashMode {
+  distribution_list,
+  default_distribution,
 };
 
 struct ResolveResult {
@@ -47,6 +53,18 @@ using DistributionPredicate =
 [[nodiscard]] ResolveResult ResolveSlashPath(
     std::wstring_view input,
     const DistributionPredicate& is_registered);
+
+// Resolves like ResolveSlashPath and then applies the user's bare-"/" mode.
+// In default_distribution mode a bare "/" resolves to the preferred
+// distribution when it is registered, otherwise to the WSL default
+// distribution when that one is registered, and otherwise fails with
+// ResolveError::no_default_distribution. Explicit /Distro paths are unaffected.
+[[nodiscard]] ResolveResult ResolveSlashPathWithBareSlashMode(
+    std::wstring_view input,
+    const DistributionPredicate& is_registered,
+    BareSlashMode mode,
+    std::wstring_view preferred_distribution,
+    std::wstring_view wsl_default_distribution);
 
 [[nodiscard]] std::wstring_view ResolveErrorName(ResolveError error) noexcept;
 

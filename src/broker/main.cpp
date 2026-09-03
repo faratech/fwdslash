@@ -359,7 +359,7 @@ void ProcessEnterRequest(std::unique_ptr<EnterRequest> request) {
     ReplayEnter();
     return;
   }
-  const fsw::ResolveResult resolved = fsw::ResolveRegisteredSlashPath(input);
+  const fsw::ResolveResult resolved = fsw::ResolveUserSlashPath(input);
   if (!resolved.matched()) {
     Diagnostic(L"event=path_rejected reason=" +
                std::wstring(fsw::ResolveErrorName(resolved.error)));

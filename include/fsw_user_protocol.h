@@ -12,6 +12,9 @@ inline constexpr UINT FSW_WM_SHOW_SETTINGS = WM_APP + 12;
 inline constexpr wchar_t FSW_SETTINGS_KEY[] =
     L"Software\\ForwardSlashWindows\\Settings";
 inline constexpr wchar_t FSW_DISABLED_VALUE[] = L"Disabled";
+inline constexpr wchar_t FSW_BARE_SLASH_MODE_VALUE[] = L"BareSlashMode";
+inline constexpr wchar_t FSW_BARE_SLASH_DISTRIBUTION_VALUE[] =
+    L"BareSlashDistribution";
 
 enum FSW_BROKER_STATE : LRESULT {
   FswBrokerUnavailable = 0,

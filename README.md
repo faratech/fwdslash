@@ -5,13 +5,18 @@ navigation surfaces while preserving a clear boundary around Windows path
 semantics.
 
 ```text
-/                         -> \\wsl.localhost
+/                         -> \\wsl.localhost            (or \\wsl.localhost\Ubuntu, see below)
 /Ubuntu                   -> \\wsl.localhost\Ubuntu
 /Ubuntu/home/alice        -> \\wsl.localhost\Ubuntu\home\alice
 ```
 
-Bare `/` opens the WSL distribution list. It never silently selects a default
-distribution.
+Bare `/` opens the WSL distribution list by default; it never silently selects a
+distribution. If you prefer a default installation root, enable it in the
+settings app or with `fswctl bare-slash default`: bare `/` then resolves to
+your default WSL distribution — following `wsl --set-default`, or a
+distribution you pin in Forward Slash Windows (for example `fswctl bare-slash
+default Ubuntu`). When no usable default exists, bare `/` is blocked with an
+explanation. The tray's **Open WSL root** always opens the distribution list.
 
 ## Current implementation
 
@@ -142,6 +147,8 @@ Useful controller commands:
 
 ```text
 fswctl status [--json]
+fswctl bare-slash
+fswctl bare-slash list | default [Distro]
 fswctl resolve /Distro/path
 fswctl doctor /Distro/path | --all
 fswctl open /Distro/path
