@@ -329,7 +329,7 @@ void ShowNotification(const std::wstring& message, const DWORD flags) {
   Shell_NotifyIconW(NIM_MODIFY, &icon);
 }
 
-void HandleEnterRequest(std::unique_ptr<EnterRequest> request) {
+void ProcessEnterRequest(std::unique_ptr<EnterRequest> request) {
   if (request == nullptr || g_paused ||
       request->foreground != GetForegroundWindow()) {
     ReplayEnter();
@@ -389,6 +389,18 @@ void HandleEnterRequest(std::unique_ptr<EnterRequest> request) {
   }
   if (!OpenResolvedPath(resolved.unc_path)) {
     ShowNotification(L"Windows could not open the WSL location.", NIIF_ERROR);
+  }
+}
+
+void HandleEnterRequest(std::unique_ptr<EnterRequest> request) {
+  try {
+    ProcessEnterRequest(std::move(request));
+  } catch (const std::bad_alloc&) {
+    Diagnostic(L"event=enter_handler_failed reason=allocation");
+    ReplayEnter();
+  } catch (...) {
+    Diagnostic(L"event=enter_handler_failed reason=unknown");
+    ReplayEnter();
   }
 }
 

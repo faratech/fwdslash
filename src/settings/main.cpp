@@ -666,7 +666,8 @@ class SettingsWindow {
     status.append(!windows ? L"not installed"
                   : broker == FswBrokerActive ? L"active"
                   : broker == FswBrokerPaused ? L"disabled"
-                                               : L"stopped");
+                  : broker_window != nullptr ? L"hook unavailable"
+                                             : L"stopped");
     status.append(L"\nFilesystem driver: not installed (production-gated)");
     status_text_.Text(status);
     loading_ = false;

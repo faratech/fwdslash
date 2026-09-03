@@ -146,9 +146,27 @@ FSW_BROKER_STATE BrokerState() {
 
 int StartBroker() {
   if (IsBrokerRunning()) {
-    if (BrokerState() == FswBrokerActive) {
+    const FSW_BROKER_STATE state = BrokerState();
+    if (state == FswBrokerActive) {
       std::wcout << L"Forward Slash Windows broker is already active.\n";
       return 0;
+    }
+    if (state == FswBrokerPaused) {
+      DWORD_PTR result = 0;
+      if (SendMessageTimeoutW(FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr),
+                              FSW_WM_SET_PAUSED, 0, 0,
+                              SMTO_ABORTIFHUNG | SMTO_BLOCK, 2000,
+                              &result) != 0 &&
+          result != 0) {
+        if (BrokerState() == FswBrokerActive) {
+          std::wcout << L"Forward Slash Windows broker resumed and is active.\n";
+          return 0;
+        }
+        std::wcerr << L"Broker resumed but its keyboard hook is unavailable.\n";
+        return 1;
+      }
+      std::wcerr << L"The broker did not accept the state change.\n";
+      return 1;
     }
     std::wcerr << L"Broker is running but its keyboard hook is unavailable.\n";
     return 1;
