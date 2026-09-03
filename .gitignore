@@ -5,6 +5,8 @@
 /build/
 /out/
 **/out/
+/target/
+**/target/
 /artifacts/
 /packages/
 **/bin/

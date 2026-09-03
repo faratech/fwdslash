@@ -22,6 +22,12 @@ CMake (`CMakePresets.json`, Debug-only presets) is a **partial parallel path use
 compile/test coverage**. It does not build the settings app, the driver, or stage the shell
 payloads. Do not assume a CMake build produces a runnable product.
 
+`.github/workflows/build.yml` runs three independent jobs: CMake presets `x64-debug` /
+`arm64-debug` / `x86-debug` (ctest only on `x64-debug`), MSBuild invoked directly against
+`ForwardSlashWindows.Settings.vcxproj` for `Win32`/`x64`/`ARM64` (not via `Build-UserMode.ps1`),
+and a driver-compile job gated to `workflow_dispatch` only — hosted runners ship no WDK
+(`stampinf.exe` is missing), so it needs a self-hosted runner.
+
 **A running broker or settings window will fail the link** — `link.exe` cannot overwrite a
 loaded image. Before rebuilding:
 
@@ -71,6 +77,8 @@ Three user-mode binaries share one static core and cooperate at runtime:
   replays Enter (tagged with a private `dwExtraInfo` marker so the hook ignores its own input).
   Otherwise it replays the keystroke untouched. This swallow-inspect-rewrite-replay cycle is
   the heart of the product; read `ProcessEnterRequest` in `src/broker/main.cpp` first.
+  `docs/architecture.md` has the ASCII data-flow diagrams for this path and for the
+  (excluded-from-build) filesystem-routing path through the driver.
 - **`fwdslash.exe`** — the CLI and the only component that mutates install state. The settings
   app never writes integration state itself; it shells out to this.
 - **`fswsettings.exe`** — unpackaged WinUI 3 desktop app (Windows App SDK 1.8).
@@ -85,6 +93,21 @@ there reaches Explorer, Run, Search and both shell adapters at once. Bare-slash 
 opt-in: in `default_distribution` mode a leading segment that is not a registered distribution
 resolves against the default distro, so `/tmp/build` works unprefixed. A registered
 distribution always wins over a same-named directory.
+
+### Settings persistence
+
+Runtime settings live under `HKCU\Software\ForwardSlashWindows\Settings` — `Disabled` (DWORD,
+global pause), `BareSlashMode` (DWORD, 0 = distribution list / 1 = default distribution), and
+`BareSlashDistribution` (string, the pin). The key path and value names are defined once in
+`include/fsw_user_protocol.h` and shared by the core, broker and controller — **except**
+`shell/powershell/ForwardSlashWindows.psm1`, which hardcodes the same key path as a literal
+string (`Test-ForwardSlashWindowsDisabled`) because it can't include a C++ header. Renaming a
+setting means updating the module too. Each optional integration also has its own
+install-state marker, `HKCU\Software\ForwardSlashWindows\CmdAdapter` and
+`...\PowerShellAdapter\WindowsPowerShell` / `...\PowerShellAdapter\PowerShell`, a `State` value
+of `installed` — this is separate from the transactional snapshot (previous `AutoRun`/profile
+bytes) and is only what `fwdslash integration <name> enable|disable` and
+`fwdslash integrations` check for idempotency.
 
 ### Packaged vs unpackaged duality
 
@@ -130,7 +153,11 @@ The cmd adapter works by `doskey` macros, so **it only takes effect in interacti
 `driver/fswfilter` is a production-gated kernel minifilter, excluded from every normal build
 (only `Build.ps1 -Driver` touches it, gated again by `FSWDriverProject` in
 `Directory.Build.props`). It must never enter a package. Per `SECURITY.md` it is only ever
-loaded in a checkpointed VM.
+loaded in a checkpointed VM. The only code the broker and driver share is the IPC contract in
+`include/fsw_filter_protocol.h`: the broker connects to a Filter Manager port
+(`FSW_FILTER_PORT_NAME`) and publishes a versioned distro-name mapping
+(`PublishFilterMappings` in `src/broker/main.cpp`, resent on a 5s health timer and on any state
+change) whether or not the driver is actually loaded.
 
 ## Conventions
 
@@ -143,6 +170,10 @@ loaded in a checkpointed VM.
   means changing all of them.
 - `docs/compatibility.md` lists release gates; blank entries mean unverified and must not be
   advertised as working.
+- **Never log a path.** `Diagnostic()` in `src/broker/main.cpp` (opt-in only, via the
+  `FSW_DIAGNOSTIC_LOG` env var) writes fixed event/reason category strings such as
+  `event=route_distribution` — never the text the user typed or the UNC path it resolved to.
+  This is a commitment made in `PRIVACY.md`; keep new diagnostic calls category-only.
 
 ### PowerShell gotchas in `tools/`
 

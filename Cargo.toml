@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = ["crates/fsw-path"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/faratech/fwdslash"
+authors = ["Mike Fara", "Fara Technologies LLC"]
+
+# Pinned once here so a member crate can never drift onto a second windows-rs
+# generation by accident. See docs/dependencies.md for the version-island rule:
+# `windows` and `windows-sys` were deliberately NOT published at 0.100.0, so the
+# broker/CLI island (0.62/0.61) and the settings island (0.100) are separate and
+# must never meet inside one binary.
+[workspace.dependencies]
+windows-registry = "0.6.1"
+windows-sys = "0.61.2"
+
+[profile.release]
+opt-level = "s"      # rustc docs: "z" often produces LARGER binaries than "s". Measure per binary.
+lto = "fat"
+codegen-units = 1
+panic = "abort"      # unwinding out of a WH_KEYBOARD_LL callback or a COM vtable is UB
+strip = "symbols"
+debug = 0
+incremental = false
+overflow-checks = false
+
+# Identical to release except opt-level, so `s` vs `z` is a profile switch, not an edit.
+[profile.release-z]
+inherits = "release"
+opt-level = "z"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
