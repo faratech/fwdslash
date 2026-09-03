@@ -37,6 +37,10 @@ foreach ($dependency in 'Microsoft.WindowsAppRuntime.Bootstrap.dll', 'resources.
         Copy-Item -LiteralPath $dependencyPath -Destination $stage
     }
 }
+$appAssets = Join-Path $source 'Assets'
+if (Test-Path -LiteralPath $appAssets -PathType Container) {
+    Copy-Item -LiteralPath $appAssets -Destination $stage -Recurse
+}
 
 Copy-Item -LiteralPath (Join-Path $repo 'README.md') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination $stage

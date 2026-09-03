@@ -38,10 +38,11 @@ filesystem APIs.
 ## Settings app
 
 `fswsettings.exe` is an unpackaged WinUI 3 desktop app. It uses the Windows 11
-Mica backdrop, an app-drawn title bar with native caption buttons, and a compact
-NavigationView. Every integration is independent: turning one off runs its
-reversible uninstall transaction, while the General **Disable** switch pauses
-resolution without forgetting the selected integrations.
+Mica backdrop, the Windows App SDK `TitleBar` control with the branded app icon
+and native caption buttons, and a compact NavigationView. Every integration is
+independent: turning one off runs its reversible uninstall transaction, while
+the General **Disable** switch pauses resolution without forgetting the
+selected integrations.
 
 The tray menu opens the app directly at General, Windows, Command Prompt,
 Windows PowerShell, or PowerShell 7 through the registered

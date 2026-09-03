@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Source = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\fwdslash-icon-master.png'),
-    [string]$Destination = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\fwdslash.ico')
+    [string]$Destination = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\fwdslash.ico'),
+    [string]$TitleBarDestination = (Join-Path (Split-Path -Parent $PSScriptRoot) 'assets\fwdslash-titlebar.png')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -85,3 +86,20 @@ try {
 }
 
 Write-Host "Generated $destinationPath with $($sizes.Count) PNG-backed icon sizes."
+
+$titleBarPath = [IO.Path]::GetFullPath($TitleBarDestination)
+$titleBarDirectory = Split-Path -Parent $titleBarPath
+New-Item -ItemType Directory -Force -Path $titleBarDirectory | Out-Null
+$titleBarTemporary = Join-Path $titleBarDirectory ('.fsw-titlebar-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+try {
+    # Entry 6 is the 64 px rendition, large enough for high-DPI title bars while
+    # remaining inexpensive to decode at startup.
+    [IO.File]::WriteAllBytes($titleBarTemporary, $images[6])
+    Move-Item -LiteralPath $titleBarTemporary -Destination $titleBarPath -Force
+} finally {
+    if (Test-Path -LiteralPath $titleBarTemporary) {
+        Remove-Item -LiteralPath $titleBarTemporary -Force
+    }
+}
+
+Write-Host "Generated $titleBarPath for the WinUI title bar."

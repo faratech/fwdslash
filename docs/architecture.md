@@ -39,9 +39,10 @@ paths are not logged.
 
 The settings process is an unpackaged WinUI 3 desktop app. It delegates every
 state change to `fswctl`; it never edits profiles or registry integration state
-itself. The app uses a Mica system backdrop and extends WinUI content into the
-title bar while retaining the system caption buttons. Tray commands deep-link
-to sections through the per-user `fwdslash` URI registration.
+itself. The app uses a Mica system backdrop and the Windows App SDK `TitleBar`
+control with an `ImageIconSource`, while retaining the system caption buttons.
+Tray commands deep-link to sections through the per-user `fwdslash` URI
+registration.
 
 Command Prompt and the two PowerShell editions have separate transactional
 install records. PowerShell installation snapshots the original profile bytes,

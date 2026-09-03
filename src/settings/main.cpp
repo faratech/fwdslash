@@ -13,6 +13,7 @@ using namespace Microsoft::UI::Xaml;
 using namespace Microsoft::UI::Xaml::Automation;
 using namespace Microsoft::UI::Xaml::Controls;
 using namespace Microsoft::UI::Xaml::Media;
+using namespace Microsoft::UI::Xaml::Media::Imaging;
 
 namespace {
 
@@ -338,39 +339,21 @@ class SettingsWindow {
 
     Grid window_root;
     RowDefinition title_row;
-    title_row.Height(GridLength{48.0, GridUnitType::Pixel});
+    title_row.Height(GridLength{1.0, GridUnitType::Auto});
     RowDefinition body_row;
     body_row.Height(GridLength{1.0, GridUnitType::Star});
     window_root.RowDefinitions().Append(title_row);
     window_root.RowDefinitions().Append(body_row);
 
-    Grid title_bar;
-    title_bar.Height(48.0);
-    title_bar.Padding(Thickness{16.0, 0.0, 148.0, 0.0});
-    StackPanel title_content;
-    title_content.Orientation(Orientation::Horizontal);
-    title_content.Spacing(10.0);
-    title_content.VerticalAlignment(VerticalAlignment::Center);
-    Border mark;
-    mark.Width(24.0);
-    mark.Height(24.0);
-    mark.CornerRadius(CornerRadius{6.0, 6.0, 6.0, 6.0});
-    if (const auto accent = Application::Current().Resources().TryLookup(
-            box_value(hstring{L"AccentFillColorDefaultBrush"})).try_as<Brush>()) {
-      mark.Background(accent);
-    }
-    auto slash = Text(L"/", 15.0, true);
-    slash.HorizontalAlignment(HorizontalAlignment::Center);
-    slash.VerticalAlignment(VerticalAlignment::Center);
-    if (const auto foreground = Application::Current().Resources().TryLookup(
-            box_value(hstring{L"TextOnAccentFillColorPrimaryBrush"}))
-                                    .try_as<Brush>()) {
-      slash.Foreground(foreground);
-    }
-    mark.Child(slash);
-    title_content.Children().Append(mark);
-    title_content.Children().Append(Text(L"Forward Slash Windows", 12.0, true));
-    title_bar.Children().Append(title_content);
+    TitleBar title_bar;
+    title_bar.Title(L"Forward Slash Windows");
+    title_bar.IsPaneToggleButtonVisible(false);
+    ImageIconSource title_icon;
+    BitmapImage title_bitmap;
+    title_bitmap.UriSource(
+        Windows::Foundation::Uri{L"ms-appx:///Assets/fwdslash-titlebar.png"});
+    title_icon.ImageSource(title_bitmap);
+    title_bar.IconSource(title_icon);
     window_root.Children().Append(title_bar);
 
     navigation_ = NavigationView{};

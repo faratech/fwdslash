@@ -83,6 +83,10 @@
   <ItemGroup>
     <Manifest Include="app.manifest" />
     <ResourceCompile Include="..\..\assets\fwdslash.rc" />
+    <Content Include="..\..\assets\fwdslash-titlebar.png">
+      <Link>Assets\fwdslash-titlebar.png</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
   <ItemGroup>
     <ApplicationDefinition Include="App.xaml" />
