@@ -4,6 +4,10 @@ Forward Slash Windows makes short WSL paths useful in native Windows
 navigation surfaces while preserving a clear boundary around Windows path
 semantics.
 
+![Forward Slash Windows in the Run dialog, the File Explorer address bar,
+Windows Search, a classic Open dialog, Command Prompt, PowerShell, and the
+settings app](docs/readme-demo.gif)
+
 ```text
 /                         -> \\wsl.localhost            (or \\wsl.localhost\Ubuntu, see below)
 /Ubuntu                   -> \\wsl.localhost\Ubuntu
@@ -12,11 +16,23 @@ semantics.
 
 Bare `/` opens the WSL distribution list by default; it never silently selects a
 distribution. If you prefer a default installation root, enable it in the
-settings app or with `fswctl bare-slash default`: bare `/` then resolves to
+settings app or with `fwdslash bare-slash default`: bare `/` then resolves to
 your default WSL distribution — following `wsl --set-default`, or a
-distribution you pin in Forward Slash Windows (for example `fswctl bare-slash
+distribution you pin in Forward Slash Windows (for example `fwdslash bare-slash
 default Ubuntu`). When no usable default exists, bare `/` is blocked with an
 explanation. The tray's **Open WSL root** always opens the distribution list.
+
+That default-distribution mode also covers paths that name a directory rather
+than a distribution, so ordinary Linux paths work unprefixed:
+
+```text
+/etc/apt                  -> \\wsl.localhost\Ubuntu\etc\apt
+/tmp/build/log.txt        -> \\wsl.localhost\Ubuntu\tmp\build\log.txt
+```
+
+A registered distribution always wins over a same-named directory, so
+`/Ubuntu/home` keeps naming the distribution. In the default distribution-list
+mode, a leading segment that is not a registered distribution stays an error.
 
 ## Current implementation
 
@@ -71,11 +87,11 @@ Windows command interpreters parse input before filesystem APIs see it:
 Use the safe terminal commands instead:
 
 ```powershell
-fswctl list /
-fswctl list /Ubuntu/etc
-fswctl open /
-fswctl open /Ubuntu/home
-fswctl resolve /Ubuntu/etc
+fwdslash list /
+fwdslash list /Ubuntu/etc
+fwdslash open /
+fwdslash open /Ubuntu/home
+fwdslash resolve /Ubuntu/etc
 ```
 
 ### Optional Command Prompt adapter
@@ -83,11 +99,11 @@ fswctl resolve /Ubuntu/etc
 The opt-in adapter makes the simple interactive forms `dir /`, `ls /`,
 `dir /Ubuntu/path`, and `ls /Ubuntu/path` work in newly opened Command Prompt
 windows. Ordinary single-argument switches such as `dir /a` keep their native
-meaning. Multi-argument slash aliases should use `fswctl list` in version
+meaning. Multi-argument slash aliases should use `fwdslash list` in version
 `0.0.1`.
 
 ```powershell
-.\tools\Install-CmdAdapter.ps1 -ControllerPath .\out\user\arm64\Release\fswctl.exe
+.\tools\Install-CmdAdapter.ps1 -ControllerPath .\out\user\arm64\Release\fwdslash.exe
 .\tools\Uninstall-CmdAdapter.ps1
 ```
 
@@ -104,10 +120,10 @@ Windows PowerShell 5.1 and PowerShell 7 can be enabled separately in Settings,
 or managed directly:
 
 ```powershell
-fswctl integration windows-powershell enable
-fswctl integration powershell enable
-fswctl integration windows-powershell disable
-fswctl integration powershell disable
+fwdslash integration windows-powershell enable
+fwdslash integration powershell enable
+fwdslash integration windows-powershell disable
+fwdslash integration powershell disable
 ```
 
 Each adapter adds a transaction-marked import to that edition's current-user
@@ -136,7 +152,7 @@ On ARM64 Windows:
 ```powershell
 .\tools\Build-UserMode.ps1 -Architecture ARM64 -Configuration Release
 .\out\user\arm64\Release\fswcore_tests.exe
-.\out\user\arm64\Release\fswctl.exe install
+.\out\user\arm64\Release\fwdslash.exe install
 ```
 
 On x64 or 32-bit Windows, replace `ARM64` with `x64` or `x86`. The build uses
@@ -146,27 +162,27 @@ DLL.
 Useful controller commands:
 
 ```text
-fswctl status [--json]
-fswctl bare-slash
-fswctl bare-slash list | default [Distro]
-fswctl resolve /Distro/path
-fswctl doctor /Distro/path | --all
-fswctl open /Distro/path
-fswctl list /Distro/path
-fswctl settings
-fswctl settings windows|cmd|windows-powershell|powershell|about
-fswctl integrations [--json]
-fswctl integration <windows|cmd|windows-powershell|powershell> enable|disable
-fswctl pause | resume
-fswctl driver status
-fswctl start | stop
-fswctl install | uninstall
+fwdslash status [--json]
+fwdslash bare-slash
+fwdslash bare-slash list | default [Distro]
+fwdslash resolve /Distro/path
+fwdslash doctor /Distro/path | --all
+fwdslash open /Distro/path
+fwdslash list /Distro/path
+fwdslash settings
+fwdslash settings windows|cmd|windows-powershell|powershell|about
+fwdslash integrations [--json]
+fwdslash integration <windows|cmd|windows-powershell|powershell> enable|disable
+fwdslash pause | resume
+fwdslash driver status
+fwdslash start | stop
+fwdslash install | uninstall
 ```
 
 The driver-free install is per-user and reversible:
 
 ```powershell
-.\fswctl.exe uninstall
+.\fwdslash.exe uninstall
 ```
 
 That stops the broker and removes its HKCU startup registration. No Explorer
