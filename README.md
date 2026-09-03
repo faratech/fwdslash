@@ -1,237 +1,167 @@
-# Forward Slash Windows
+# fwdslash
 
-Forward Slash Windows makes short WSL paths useful in native Windows
-navigation surfaces while preserving a clear boundary around Windows path
-semantics.
+**Type Linux paths in Windows.** `/etc/apt` in the File Explorer address bar opens `\\wsl.localhost\Ubuntu\etc\apt`.
 
-![Forward Slash Windows in the Run dialog, the File Explorer address bar,
-Windows Search, a classic Open dialog, Command Prompt, PowerShell, and the
-settings app](docs/readme-demo.gif)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D6?style=flat-square&logo=windows)
+![C++](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square&logo=cplusplus)
+![WSL](https://img.shields.io/badge/WSL-2-E95420?style=flat-square&logo=linux&logoColor=white)
+[![GitHub stars](https://img.shields.io/github/stars/faratech/fwdslash?style=flat-square)](https://github.com/faratech/fwdslash/stargazers)
+
+<p align="center">
+  <img src="docs/readme-demo.gif" alt="fwdslash in the Run dialog, File Explorer, Windows Search, an Open dialog, Command Prompt, PowerShell, and the settings app" width="100%">
+</p>
+
+---
+
+## Why fwdslash?
+
+You already know where the file is. You just can't type it.
+
+WSL files live at `\\wsl.localhost\Ubuntu\...` — fine in a script, miserable to type into an address bar. So type the path you were already thinking of:
+
+- **Works where you already navigate** — File Explorer, Win+R, Windows Search, Open/Save dialogs
+- **No driver, no admin** — per-user, reversible, and no Explorer restart
+- **Terminals too, if you want** — `dir` and `ls` keep working in Command Prompt and PowerShell
+- **Fails safely** — a typo is blocked with an explanation instead of turning into a web search
+- **Stays out of the way** — pause it from the tray without uninstalling anything
+- **No network, no telemetry, no account**
+
+---
+
+## Where it works
+
+| Surface | Type this |
+|---------|-----------|
+| File Explorer address bar | `/etc/apt` |
+| Run (Win+R) | `/usr/share` |
+| Windows Search | `/etc` |
+| Open / Save dialogs | `/home/alice` |
+| Command Prompt&nbsp;* | `dir /etc/apt` |
+| PowerShell 5.1 / 7&nbsp;* | `ls /usr` |
+
+<sub>* optional adapters, off by default</sub>
+
+---
+
+## Paths
 
 ```text
-/                         -> \\wsl.localhost            (or \\wsl.localhost\Ubuntu, see below)
-/Ubuntu                   -> \\wsl.localhost\Ubuntu
-/Ubuntu/home/alice        -> \\wsl.localhost\Ubuntu\home\alice
+/Ubuntu                 →  \\wsl.localhost\Ubuntu
+/Ubuntu/home/alice      →  \\wsl.localhost\Ubuntu\home\alice
 ```
 
-Bare `/` opens the WSL distribution list by default; it never silently selects a
-distribution. If you prefer a default installation root, enable it in the
-settings app or with `fwdslash bare-slash default`: bare `/` then resolves to
-your default WSL distribution — following `wsl --set-default`, or a
-distribution you pin in Forward Slash Windows (for example `fwdslash bare-slash
-default Ubuntu`). When no usable default exists, bare `/` is blocked with an
-explanation. The tray's **Open WSL root** always opens the distribution list.
+Bare `/` lists your distributions — it never silently picks one. Prefer a default? Turn on default-distribution mode and plain Linux paths work unprefixed:
 
-That default-distribution mode also covers paths that name a directory rather
-than a distribution, so ordinary Linux paths work unprefixed:
+```powershell
+fwdslash bare-slash default          # follow `wsl --set-default`
+fwdslash bare-slash default Ubuntu   # or pin one
+```
 
 ```text
-/etc/apt                  -> \\wsl.localhost\Ubuntu\etc\apt
-/tmp/build/log.txt        -> \\wsl.localhost\Ubuntu\tmp\build\log.txt
+/etc/apt                →  \\wsl.localhost\Ubuntu\etc\apt
+/tmp/build/log.txt      →  \\wsl.localhost\Ubuntu\tmp\build\log.txt
 ```
 
-A registered distribution always wins over a same-named directory, so
-`/Ubuntu/home` keeps naming the distribution. In the default distribution-list
-mode, a leading segment that is not a registered distribution stays an error.
+A registered distribution always wins over a same-named folder, so `/Ubuntu/home` keeps meaning the distribution.
 
-## Current implementation
+---
 
-The per-user C++ broker supports these driver-free surfaces:
+## Install
 
-- File Explorer address bar, in the current window/tab.
-- Win+R.
-- Windows Search path navigation.
-- Classic Open/Save dialogs that expose a standard editable path control.
-
-The broker rewrites a recognized edit control to the validated native UNC path
-and lets that surface complete its normal Enter action. Windows Search is
-handled as direct path navigation. Unknown distributions and malformed slash
-paths are blocked with an explanation, so they cannot fall through to Edge or
-a web search.
-
-The optional filesystem minifilter is still production-gated. Once installed
-and connected, it reserves registered distro names at every drive root for the
-signed-in user. A normalized `C:\Ubuntu\etc` open is then reparsed to
-`\\wsl.localhost\Ubuntu\etc`. This enables explicit `/Ubuntu/...` paths in
-PowerShell, .NET, Python, and other desktop applications that reach Windows
-filesystem APIs.
-
-## Settings app
-
-`fswsettings.exe` is an unpackaged WinUI 3 desktop app. It uses the Windows 11
-Mica backdrop, the Windows App SDK `TitleBar` control with the branded app icon
-and native caption buttons, and a compact NavigationView. Every integration is
-independent: turning one off runs its reversible uninstall transaction, while
-the General **Disable** switch pauses resolution without forgetting the
-selected integrations.
-
-The tray menu opens the app directly at General, Windows, Command Prompt,
-Windows PowerShell, or PowerShell 7 through the registered
-`fwdslash://settings/...` protocol. Double-clicking the tray icon opens General.
-
-The settings app requires the Microsoft Windows App Runtime 1.8 for the target
-architecture. Build output contains the bootstrap DLL used to locate that
-runtime; it does not install or service the runtime itself.
-
-## Terminal behavior
-
-Windows command interpreters parse input before filesystem APIs see it:
-
-- `cmd.exe` treats `/` as an option prefix, so its built-in `dir /` fails before
-  a driver could inspect a file open.
-- Bare `/` passed to a filesystem API means the current drive root. Redirecting
-  it globally would break Windows, so generic bare-root interception is not
-  provided.
-- Some third-party `ls.cmd` wrappers parse POSIX syntax themselves.
-
-Use the safe terminal commands instead:
-
-```powershell
-fwdslash list /
-fwdslash list /Ubuntu/etc
-fwdslash open /
-fwdslash open /Ubuntu/home
-fwdslash resolve /Ubuntu/etc
-```
-
-### Optional Command Prompt adapter
-
-The opt-in adapter makes the simple interactive forms `dir /`, `ls /`,
-`dir /Ubuntu/path`, and `ls /Ubuntu/path` work in newly opened Command Prompt
-windows. Ordinary single-argument switches such as `dir /a` keep their native
-meaning. Multi-argument slash aliases should use `fwdslash list` in version
-`0.0.1`.
-
-```powershell
-.\tools\Install-CmdAdapter.ps1 -ControllerPath .\out\user\arm64\Release\fwdslash.exe
-.\tools\Uninstall-CmdAdapter.ps1
-```
-
-Installation stages a private copy under `%LOCALAPPDATA%`, preserves the exact
-prior `HKCU\Software\Microsoft\Command Processor\AutoRun` value and registry
-type, and records a recovery state before activation. Uninstall restores that
-value only when it still matches the installed transaction; if another program
-changed it, uninstall refuses to overwrite the change. Already-open Command
-Prompt windows retain their in-memory DOSKEY macros until closed.
-
-### Optional PowerShell adapters
-
-Windows PowerShell 5.1 and PowerShell 7 can be enabled separately in Settings,
-or managed directly:
-
-```powershell
-fwdslash integration windows-powershell enable
-fwdslash integration powershell enable
-fwdslash integration windows-powershell disable
-fwdslash integration powershell disable
-```
-
-Each adapter adds a transaction-marked import to that edition's current-user
-all-hosts profile. `dir /` and `ls /` list WSL distributions, while explicit
-paths such as `dir /Ubuntu/etc` resolve to their `\\wsl.localhost` location.
-All other `Get-ChildItem` behavior is delegated to PowerShell's real command.
-Install verifies the result in a fresh process of the selected edition before
-reporting success. Existing terminal processes cannot reload a changed profile,
-so close and reopen the affected shell after changing its toggle.
-
-Profile writes are atomic and uninstall removes only the exact block recorded
-by the install transaction. Controlled Folder Access or another security tool
-may deny a profile write. That is a supported failure: the toggle returns to
-off, partial state is cleaned up, and the app does not disable or weaken the
-security control.
-
-With the production-signed filter installed, explicit aliases such as
-`Get-ChildItem /Ubuntu/etc` work when the caller passes the normalized path to
-the filesystem. Programs that consume the argument as a switch remain outside
-the compatibility guarantee.
-
-## Build and run
-
-On ARM64 Windows:
+**Requires** Windows 11 and WSL with at least one distribution installed. With no distribution registered there is nothing for a slash path to open.
 
 ```powershell
 .\tools\Build-UserMode.ps1 -Architecture ARM64 -Configuration Release
-.\out\user\arm64\Release\fswcore_tests.exe
 .\out\user\arm64\Release\fwdslash.exe install
 ```
 
-On x64 or 32-bit Windows, replace `ARM64` with `x64` or `x86`. The build uses
-static C++ runtime linking for the broker/controller and produces no injected
-DLL.
+Replace `ARM64` with `x64` or `x86` as needed. Uninstalling is one command and leaves nothing behind:
 
-Useful controller commands:
+```powershell
+fwdslash uninstall
+```
+
+---
+
+## Terminals
+
+Command interpreters parse `/` before the filesystem ever sees it — `cmd.exe` reads it as a switch, and to a filesystem API a bare `/` means the current drive root. So terminal support is an opt-in adapter rather than a global hook.
+
+```powershell
+fwdslash integration cmd enable
+fwdslash integration windows-powershell enable
+fwdslash integration powershell enable
+```
+
+Each adapter records exactly what it replaced and restores it byte-for-byte when you turn it off, and refuses to overwrite anything another program changed in the meantime. Open a **new** shell afterwards — running ones can't reload their profile.
+
+Prefer not to touch your shell? These always work:
+
+```powershell
+fwdslash list /Ubuntu/etc
+fwdslash open /Ubuntu/home
+fwdslash resolve /etc/apt
+```
+
+---
+
+## Commands
 
 ```text
-fwdslash status [--json]
-fwdslash bare-slash
-fwdslash bare-slash list | default [Distro]
-fwdslash resolve /Distro/path
-fwdslash doctor /Distro/path | --all
-fwdslash open /Distro/path
-fwdslash list /Distro/path
-fwdslash settings
-fwdslash settings windows|cmd|windows-powershell|powershell|about
+fwdslash status [--json]          Broker, distributions, and driver state
+fwdslash resolve /Distro/path     Print the resolved UNC path
+fwdslash open|list /Distro/path   Open in Explorer, or list to stdout
+fwdslash doctor /path | --all     Diagnose a path
+fwdslash bare-slash [list|default [Distro]]
 fwdslash integrations [--json]
-fwdslash integration <windows|cmd|windows-powershell|powershell> enable|disable
-fwdslash pause | resume
-fwdslash driver status
-fwdslash start | stop
-fwdslash install | uninstall
+fwdslash integration <name> enable|disable
+fwdslash pause | resume           Pause resolution, keep integrations
+fwdslash settings [section]       Open the settings app
+fwdslash start | stop | install | uninstall
 ```
 
-The driver-free install is per-user and reversible:
+---
 
-```powershell
-.\fwdslash.exe uninstall
-```
+## Settings
 
-That stops the broker and removes its HKCU startup registration. No Explorer
-restart is required.
+A WinUI 3 app with a tray icon. Every integration is independent, and turning one off runs its reversible uninstall. The General **Disable** switch pauses resolution without forgetting what you installed.
 
-## Driver development gate
+Needs the [Windows App Runtime 1.8](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) for your architecture.
 
-The `driver/` directory contains the minifilter and `test/hyperv/` contains the
-VM-only install/remove workflow. The filter:
-
-- accepts authenticated mappings per user SID and interactive session;
-- supports standard and elevated interactive desktop callers;
-- excludes services, session zero, AppContainers, low-integrity callers,
-  paging files, volume opens, and file-ID opens;
-- fails open on internal errors and clears mappings on broker disconnect;
-- never implements generic bare `/` redirection.
-
-Registered distro names are intentionally reserved at drive roots while the
-filter is enabled. For example, a real `C:\Ubuntu` conflicts with the WSL alias.
-Production installation must detect and require confirmation for such
-collisions.
-
-Do not load the unsigned/test-signed driver on a physical workstation. Build
-and test it only in a checkpointed Hyper-V guest:
-
-```powershell
-.\tools\Build-Driver.ps1 -Architecture ARM64 -Configuration Debug
-```
-
-Public generic-filesystem support requires Microsoft signing and the complete
-Driver Verifier/HLK release gates described in
-[`docs/compatibility.md`](docs/compatibility.md).
+---
 
 ## Tests
 
-- `fswcore_tests.exe`: resolver and invalid-path contract.
-- `fsw_address_bar_integration.exe Ubuntu /usr/share`: literal Explorer input
-  with same-window navigation verification.
-- `fsw_address_bar_integration.exe Ubuntu --root`: bare `/` to the WSL list.
-- `fsw_filesystem_integration.exe Ubuntu /etc/hosts`: alias-versus-UNC
-  `CreateFileW` verification, run only in the driver VM.
-- `tools/Test-Sandbox.ps1`: driver-free lifecycle and package smoke test.
+```powershell
+.\out\user\arm64\Release\fswcore_tests.exe                        # resolver contract
+.\out\user\arm64\Release\fsw_address_bar_integration.exe Ubuntu /usr/share
+.\tools\Test-Sandbox.ps1                                          # lifecycle smoke test
+```
 
-See [`docs/architecture.md`](docs/architecture.md) for trust boundaries and
-[`docs/compatibility.md`](docs/compatibility.md) for the evidence matrix.
+---
 
-## Project
+## Filesystem driver
 
-Forward Slash Windows is open-source software by Mike Fara,
-Fara Technologies LLC, New York, United States. Source is available at
-[github.com/faratech/fwdslash](https://github.com/faratech/fwdslash) under the
-[MIT License](LICENSE).
+`driver/` holds an optional minifilter that would extend explicit `/Ubuntu/...` paths to PowerShell, .NET, Python and anything else reaching Windows filesystem APIs. It is **production-gated and not part of any release.**
+
+> **Do not load the unsigned driver on a physical machine.** Build and test it only in a checkpointed Hyper-V guest. See [`SECURITY.md`](SECURITY.md) and [`docs/compatibility.md`](docs/compatibility.md).
+
+---
+
+## Docs
+
+- [`docs/architecture.md`](docs/architecture.md) — trust boundaries and design
+- [`docs/compatibility.md`](docs/compatibility.md) — what's verified, and what isn't
+- [`PRIVACY.md`](PRIVACY.md) — no data collected, no network calls
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE). By Mike Fara, Fara Technologies LLC, New York.
+
+<p align="center">
+  <b>Star this repo if you find it useful!</b><br>
+  <a href="https://github.com/faratech/fwdslash">https://github.com/faratech/fwdslash</a>
+</p>
