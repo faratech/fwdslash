@@ -96,10 +96,12 @@ here but resembles a keylogger to an automated scan, so state plainly:
 
 ## 5. Known gaps at first submission
 
-- **Startup task is `Enabled="true"`.** A Store user therefore reaches the same
-  end state as an unpackaged user who runs `fwdslash install`. The broker does
-  not start until the next logon, so testing right after install needs
-  `fwdslash start`.
+- **Startup task is `Enabled="true"`**, but it only fires at *logon* and MSIX
+  runs nothing at install time. Opening the app therefore starts the broker if
+  it is not already running (`EnsureBrokerRunning` in `src/settings/main.cpp`).
+  A reviewer who installs and immediately tests a slash path without opening the
+  app first will see nothing happen, so the certification notes tell them to
+  open the app or run `fwdslash start`.
 - **Same-version reinstall is blocked** (`0x80073CFB`). Iterating locally needs
   `Remove-AppxPackage` first, or a version bump.
 - **Uninstall leaves the adapters behind.** MSIX has no uninstall hook, so

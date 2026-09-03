@@ -137,6 +137,35 @@ std::wstring Quote(const std::wstring_view value) {
   return L"\"" + std::wstring(value) + L"\"";
 }
 
+// Launches the broker if it is not already running.
+//
+// A packaged build has no install-time hook, and its windows.startupTask only
+// fires at logon, so opening the app is the first moment the broker can be
+// armed. Unpackaged installs arrange this through "fwdslash install" instead.
+void EnsureBrokerRunning() {
+  if (!fsw::HasPackageIdentity()) return;
+  if (FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr) != nullptr) return;
+
+  const std::wstring directory = ExecutableDirectory();
+  const std::wstring broker = directory + L"\\fswbroker.exe";
+  std::wstring command = Quote(broker);
+  STARTUPINFOW startup{sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  if (!CreateProcessW(broker.c_str(), command.data(), nullptr, nullptr, FALSE,
+                      CREATE_NEW_PROCESS_GROUP, nullptr, directory.c_str(),
+                      &startup, &process)) {
+    return;
+  }
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  // The broker registers its message window a moment after launch; give it long
+  // enough that the state this window is about to read is accurate.
+  for (int attempt = 0; attempt < 40; ++attempt) {
+    if (FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr) != nullptr) return;
+    Sleep(50);
+  }
+}
+
 bool RunController(const std::wstring_view arguments) {
   const std::wstring directory = ExecutableDirectory();
   const std::wstring controller = directory + L"\\fwdslash.exe";
@@ -416,6 +445,7 @@ class SettingsWindow {
       RefreshState();
     });
 
+    EnsureBrokerRunning();
     RefreshState();
     ShowSection(InitialSection());
     loading_ = false;
