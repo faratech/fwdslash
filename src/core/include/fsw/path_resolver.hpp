@@ -55,10 +55,12 @@ using DistributionPredicate =
     const DistributionPredicate& is_registered);
 
 // Resolves like ResolveSlashPath and then applies the user's bare-"/" mode.
-// In default_distribution mode a bare "/" resolves to the preferred
-// distribution when it is registered, otherwise to the WSL default
-// distribution when that one is registered, and otherwise fails with
-// ResolveError::no_default_distribution. Explicit /Distro paths are unaffected.
+// In default_distribution mode a bare "/", and any path whose leading segment
+// is not a registered distribution such as "/tmp/log", resolve inside the
+// preferred distribution when it is registered, otherwise inside the WSL
+// default distribution when that one is registered, and otherwise fail with
+// ResolveError::no_default_distribution. Explicit /Distro paths are unaffected,
+// so a registered distribution always wins over a same-named directory.
 [[nodiscard]] ResolveResult ResolveSlashPathWithBareSlashMode(
     std::wstring_view input,
     const DistributionPredicate& is_registered,

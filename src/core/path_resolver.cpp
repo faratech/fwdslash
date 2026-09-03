@@ -134,9 +134,18 @@ ResolveResult ResolveSlashPathWithBareSlashMode(
     const std::wstring_view preferred_distribution,
     const std::wstring_view wsl_default_distribution) {
   ResolveResult result = ResolveSlashPath(input, is_registered);
-  if (!result.is_wsl_root() || mode == BareSlashMode::distribution_list) {
+  if (mode == BareSlashMode::distribution_list) {
     return result;
   }
+
+  // Two inputs belong to the default distribution: a bare "/", and any path
+  // whose leading segment is not a registered distribution, such as /tmp/log.
+  // An explicit /Distro/path always keeps naming its own distribution.
+  if (!result.is_wsl_root() &&
+      result.error != ResolveError::unregistered_distribution) {
+    return result;
+  }
+
   std::wstring_view target;
   if (!preferred_distribution.empty() &&
       is_registered(preferred_distribution)) {
@@ -150,13 +159,15 @@ ResolveResult ResolveSlashPathWithBareSlashMode(
     result.distribution.clear();
     return result;
   }
-  result.target = ResolveTarget::distribution;
-  result.distribution.assign(target);
-  result.linux_path = L"/";
-  result.unc_path = L"\\\\wsl.localhost\\";
-  result.unc_path.append(target);
-  result.had_trailing_separator = true;
-  return result;
+
+  // Resolving the rewritten "/Distro" + input gives normalization, traversal
+  // limits and trailing separators identical to an explicit distribution path.
+  std::wstring rewritten;
+  rewritten.reserve(1 + target.size() + input.size());
+  rewritten.push_back(L'/');
+  rewritten.append(target);
+  rewritten.append(input);
+  return ResolveSlashPath(rewritten, is_registered);
 }
 
 std::wstring ResolveErrorMessage(

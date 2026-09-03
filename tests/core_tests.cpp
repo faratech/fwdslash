@@ -143,6 +143,68 @@ int wmain() {
     Require(result.unc_path == L"\\\\wsl.localhost\\Ubuntu\\home",
             "default mode should not change explicit distribution paths");
   }
+  {
+    const auto result = ResolveWithMode(
+        L"/tmp/build/log.txt", fsw::BareSlashMode::default_distribution, L"",
+        L"Ubuntu");
+    Require(result.matched(), "default mode should resolve a non-distro path");
+    Require(result.distribution == L"Ubuntu",
+            "a non-distro path should land in the default distribution");
+    Require(result.linux_path == L"/tmp/build/log.txt",
+            "a non-distro path should keep every segment");
+    Require(result.unc_path == L"\\\\wsl.localhost\\Ubuntu\\tmp\\build\\log.txt",
+            "a non-distro path should build the distribution UNC");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/tmp", fsw::BareSlashMode::default_distribution, L"Dev Distro",
+        L"Ubuntu");
+    Require(result.distribution == L"Dev Distro",
+            "a non-distro path should honour the pinned preference");
+    Require(result.unc_path == L"\\\\wsl.localhost\\Dev Distro\\tmp",
+            "a pinned preference should build its own UNC");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/tmp/", fsw::BareSlashMode::default_distribution, L"", L"Ubuntu");
+    Require(result.had_trailing_separator,
+            "a non-distro path should keep its trailing separator");
+    Require(result.unc_path == L"\\\\wsl.localhost\\Ubuntu\\tmp\\",
+            "a trailing separator should survive the rewrite");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/tmp/nested/../sibling", fsw::BareSlashMode::default_distribution,
+        L"", L"Ubuntu");
+    Require(result.linux_path == L"/tmp/sibling",
+            "a non-distro path should normalize traversal");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/../escape", fsw::BareSlashMode::default_distribution, L"",
+        L"Ubuntu");
+    Require(result.error == fsw::ResolveError::traversal_above_root,
+            "a non-distro path must not escape the distribution root");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/tmp", fsw::BareSlashMode::distribution_list, L"", L"Ubuntu");
+    Require(result.error == fsw::ResolveError::unregistered_distribution,
+            "list mode should still reject an unregistered distribution");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/tmp", fsw::BareSlashMode::default_distribution, L"Debian", L"");
+    Require(result.error == fsw::ResolveError::no_default_distribution,
+            "no usable default should block a non-distro path");
+  }
+  {
+    const auto result = ResolveWithMode(
+        L"/Dev Distro/home", fsw::BareSlashMode::default_distribution,
+        L"Ubuntu", L"Ubuntu");
+    Require(result.distribution == L"Dev Distro",
+            "a registered distribution should win over the default");
+  }
 
   std::wcout << L"All resolver tests passed.\n";
   return EXIT_SUCCESS;
