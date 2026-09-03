@@ -2,10 +2,17 @@ name: build
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   user-mode:
@@ -29,6 +36,10 @@ jobs:
         run: ctest --preset x64-debug
 
   driver-compile:
+    # Hosted Windows images ship no WDK (stampinf.exe is missing), so this job
+    # cannot pass on a hosted runner — build driver packages locally or on a
+    # self-hosted runner via workflow_dispatch.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
