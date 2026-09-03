@@ -292,6 +292,7 @@ class SettingsWindow {
   RadioButton default_mode_radio_{nullptr};
   ComboBox default_distribution_{nullptr};
   StackPanel default_distribution_row_{nullptr};
+  TextBlock bare_target_{nullptr};
   ToggleSwitch windows_toggle_{nullptr};
   ToggleSwitch cmd_toggle_{nullptr};
   ToggleSwitch windows_powershell_toggle_{nullptr};
@@ -513,6 +514,9 @@ class SettingsWindow {
     picker_row.Children().Append(default_distribution_);
     default_distribution_row_ = picker_row;
     bare_content.Children().Append(picker_row);
+    bare_target_ = Text(L"");
+    bare_target_.Opacity(0.70);
+    bare_content.Children().Append(bare_target_);
     bare_card.Child(bare_content);
     stack.Children().Append(bare_card);
 
@@ -742,9 +746,8 @@ class SettingsWindow {
     default_mode_radio_.IsChecked(
         winrt::box_value(!list_mode).as<IReference<bool>>());
     default_distribution_.Items().Clear();
-    default_distribution_.Items().Append(box_value(wsl_default.has_value()
-        ? winrt::hstring(L"Windows default (/" + *wsl_default + L")")
-        : winrt::hstring(L"Windows default")));
+    default_distribution_.Items().Append(box_value(winrt::hstring(
+        L"Follow the Windows default")));
     int32_t selected_distribution = 0;
     for (size_t index = 0; index < bare_distributions.size(); ++index) {
       default_distribution_.Items().Append(
@@ -755,10 +758,22 @@ class SettingsWindow {
       }
     }
     default_distribution_.SelectedIndex(selected_distribution);
-    default_distribution_row_.Visibility(
+    std::wstring bare_effective;
+    if (selected_distribution > 0) {
+      bare_effective =
+          bare_distributions[static_cast<size_t>(selected_distribution) - 1];
+    } else if (wsl_default.has_value()) {
+      bare_effective = *wsl_default;
+    }
+    bare_target_.Text(bare_effective.empty()
+        ? winrt::hstring(L"No WSL distribution is available for / yet.")
+        : winrt::hstring(L"/ opens \\\\wsl.localhost\\" + bare_effective));
+    const Visibility bare_picker_visibility =
         bare_mode == fsw::BareSlashMode::default_distribution
             ? Visibility::Visible
-            : Visibility::Collapsed);
+            : Visibility::Collapsed;
+    default_distribution_row_.Visibility(bare_picker_visibility);
+    bare_target_.Visibility(bare_picker_visibility);
 
     const HWND broker_window = FindWindowW(FSW_BROKER_WINDOW_CLASS, nullptr);
     const FSW_BROKER_STATE broker = [broker_window] {
