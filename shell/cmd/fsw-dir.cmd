@@ -7,7 +7,7 @@ if "%~1"=="" goto native
 if not "%~2"=="" goto native
 set "fsw_alias=%~1"
 if not "%fsw_alias:~0,1%"=="/" goto native
-"%~dp0fswctl.exe" cmd-list "%fsw_alias%"
+"%~dp0fwdslash.exe" cmd-list "%fsw_alias%"
 if errorlevel 3 goto native
 exit /b %errorlevel%
 

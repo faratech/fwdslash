@@ -409,7 +409,7 @@ int SetScriptIntegration(const std::wstring_view id, const bool enabled) {
         (enabled ? L"Install-CmdAdapter.ps1" : L"Uninstall-CmdAdapter.ps1");
     std::vector<std::wstring> arguments;
     if (enabled) {
-      arguments = {L"-ControllerPath", (directory / L"fswctl.exe").wstring()};
+      arguments = {L"-ControllerPath", (directory / L"fwdslash.exe").wstring()};
     }
     return RunPowerShellScript(script, arguments);
   }
@@ -436,7 +436,7 @@ int SetScriptIntegration(const std::wstring_view id, const bool enabled) {
   std::vector<std::wstring> arguments = {L"-Edition", edition};
   if (enabled) {
     arguments.emplace_back(L"-ControllerPath");
-    arguments.emplace_back((directory / L"fswctl.exe").wstring());
+    arguments.emplace_back((directory / L"fwdslash.exe").wstring());
   }
   return RunPowerShellScript(script, arguments);
 }
@@ -820,22 +820,22 @@ int CmdList(const std::wstring_view path) {
 void Usage() {
   std::wcout <<
       L"Forward Slash Windows controller\n\n"
-      L"  fswctl status [--json]\n"
-      L"  fswctl resolve /Distro/path\n"
-      L"  fswctl open /Distro/path\n"
-      L"  fswctl list /Distro/path\n"
-      L"  fswctl doctor /Distro/path | --all\n"
-      L"  fswctl settings [general|windows|cmd|windows-powershell|powershell]\n"
-      L"  fswctl integrations [--json]\n"
-      L"  fswctl integration <name> enable|disable\n"
-      L"  fswctl bare-slash\n"
-      L"  fswctl bare-slash list | default [Distro]\n"
-      L"  fswctl disable | enable\n"
-      L"  fswctl pause | resume       Aliases for disable and enable\n"
-      L"  fswctl driver status\n"
-      L"  fswctl start | stop\n"
-      L"  fswctl install       Register and start the per-user broker\n"
-      L"  fswctl uninstall     Stop and unregister the per-user broker\n\n"
+      L"  fwdslash status [--json]\n"
+      L"  fwdslash resolve /Distro/path\n"
+      L"  fwdslash open /Distro/path\n"
+      L"  fwdslash list /Distro/path\n"
+      L"  fwdslash doctor /Distro/path | --all\n"
+      L"  fwdslash settings [general|windows|cmd|windows-powershell|powershell]\n"
+      L"  fwdslash integrations [--json]\n"
+      L"  fwdslash integration <name> enable|disable\n"
+      L"  fwdslash bare-slash\n"
+      L"  fwdslash bare-slash list | default [Distro]\n"
+      L"  fwdslash disable | enable\n"
+      L"  fwdslash pause | resume       Aliases for disable and enable\n"
+      L"  fwdslash driver status\n"
+      L"  fwdslash start | stop\n"
+      L"  fwdslash install       Register and start the per-user broker\n"
+      L"  fwdslash uninstall     Stop and unregister the per-user broker\n\n"
       L"The optional filesystem driver is production-gated and is never "
       L"installed by these per-user commands.\n";
 }

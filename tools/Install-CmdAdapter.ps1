@@ -14,8 +14,8 @@ $sourceShell = if (Test-Path -LiteralPath $packagedShell -PathType Container) {
     Join-Path $repo 'shell\cmd'
 }
 if (-not $ControllerPath) {
-    $packagedController = Join-Path $PSScriptRoot 'fswctl.exe'
-    $developmentController = Join-Path $repo 'out\user\arm64\Release\fswctl.exe'
+    $packagedController = Join-Path $PSScriptRoot 'fwdslash.exe'
+    $developmentController = Join-Path $repo 'out\user\arm64\Release\fwdslash.exe'
     $ControllerPath = if (Test-Path -LiteralPath $packagedController) {
         $packagedController
     } else {
@@ -24,7 +24,7 @@ if (-not $ControllerPath) {
 }
 $ControllerPath = [IO.Path]::GetFullPath($ControllerPath)
 if (-not (Test-Path -LiteralPath $ControllerPath -PathType Leaf)) {
-    throw "fswctl.exe was not found: $ControllerPath"
+    throw "fwdslash.exe was not found: $ControllerPath"
 }
 
 $installRoot = Join-Path $env:LOCALAPPDATA 'ForwardSlashWindows\cmd'
@@ -49,7 +49,7 @@ try {
     New-Item -ItemType Directory -Path $staging | Out-Null
     Copy-Item -LiteralPath (Join-Path $sourceShell 'fsw-autorun.cmd') -Destination $staging
     Copy-Item -LiteralPath (Join-Path $sourceShell 'fsw-dir.cmd') -Destination $staging
-    Copy-Item -LiteralPath $ControllerPath -Destination (Join-Path $staging 'fswctl.exe')
+    Copy-Item -LiteralPath $ControllerPath -Destination (Join-Path $staging 'fwdslash.exe')
 
     $stateKey = $currentUser.OpenSubKey($statePath, $true)
     if ($stateKey) {

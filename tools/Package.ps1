@@ -27,7 +27,7 @@ if (Test-Path -LiteralPath $resolvedStage) {
     Remove-Item -LiteralPath $resolvedStage -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $resolvedStage | Out-Null
-$files = 'fswctl.exe', 'fswbroker.exe', 'fswsettings.exe'
+$files = 'fwdslash.exe', 'fswbroker.exe', 'fswsettings.exe'
 foreach ($file in $files) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination $stage
 }

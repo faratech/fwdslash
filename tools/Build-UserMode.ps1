@@ -116,7 +116,7 @@ $appResource = Join-Path $objects 'fwdslash.res'
 Invoke-Checked -FilePath $rc -Arguments @(
     '/nologo', "/i$sdkInclude\um", "/i$sdkInclude\shared",
     "/fo$appResource", (Join-Path $repo 'assets\fwdslash.rc'))
-Link-Target 'fswctl' @($controllerObject, $pathObject, $registryObject, $appResource) 'console' @('shell32.lib', 'user32.lib', 'advapi32.lib', 'FltLib.lib')
+Link-Target 'fwdslash' @($controllerObject, $pathObject, $registryObject, $appResource) 'console' @('shell32.lib', 'user32.lib', 'advapi32.lib', 'FltLib.lib')
 Link-Target 'fswbroker' @($brokerObject, $pathObject, $registryObject, $appResource) 'windows' @('shell32.lib', 'user32.lib', 'gdi32.lib', 'advapi32.lib', 'ole32.lib', 'oleaut32.lib', 'uiautomationcore.lib', 'FltLib.lib', 'uuid.lib')
 Link-Target 'fswcore_tests' @($testObject, $pathObject) 'console' @('advapi32.lib')
 Link-Target 'fsw_address_bar_integration' @($addressBarTestObject) 'console' @('shell32.lib', 'ole32.lib', 'oleaut32.lib', 'user32.lib')

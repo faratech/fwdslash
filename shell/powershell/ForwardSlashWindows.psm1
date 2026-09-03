@@ -1,6 +1,6 @@
 Set-StrictMode -Version 2.0
 
-$script:FswController = Join-Path $PSScriptRoot 'fswctl.exe'
+$script:FswController = Join-Path $PSScriptRoot 'fwdslash.exe'
 $script:FswSettingsKey = 'HKCU:\Software\ForwardSlashWindows\Settings'
 
 function Test-ForwardSlashWindowsDisabled {
@@ -111,7 +111,7 @@ function Invoke-ForwardSlashWindowsChildItem {
 
     if ($hasBareRoot) {
         if ($pathIndexes.Count -ne 1) {
-            throw "Bare '/' cannot be combined with other Get-ChildItem arguments. Use 'fswctl list /' for advanced root queries."
+            throw "Bare '/' cannot be combined with other Get-ChildItem arguments. Use 'fwdslash list /' for advanced root queries."
         }
         Get-ForwardSlashWindowsRoots
         return

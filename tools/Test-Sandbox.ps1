@@ -38,7 +38,7 @@ if (Test-Path -LiteralPath $resultFile) {
     Remove-Item -LiteralPath $resultFile
 }
 Copy-Item -LiteralPath (Join-Path $build 'fswcore_tests.exe') -Destination $artifacts -Force
-Copy-Item -LiteralPath (Join-Path $build 'fswctl.exe') -Destination $artifacts -Force
+Copy-Item -LiteralPath (Join-Path $build 'fwdslash.exe') -Destination $artifacts -Force
 Copy-Item -LiteralPath (Join-Path $build 'fswbroker.exe') -Destination $artifacts -Force
 Copy-Item -LiteralPath (Join-Path $repo 'test\sandbox\bootstrap.ps1') -Destination (Join-Path $artifacts 'sandbox-bootstrap.ps1') -Force
 

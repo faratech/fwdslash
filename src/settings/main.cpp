@@ -138,7 +138,7 @@ std::wstring Quote(const std::wstring_view value) {
 
 bool RunController(const std::wstring_view arguments) {
   const std::wstring directory = ExecutableDirectory();
-  const std::wstring controller = directory + L"\\fswctl.exe";
+  const std::wstring controller = directory + L"\\fwdslash.exe";
   std::wstring command = Quote(controller) + L" " + std::wstring(arguments);
   STARTUPINFOW startup{sizeof(startup)};
   PROCESS_INFORMATION process{};

@@ -89,13 +89,13 @@ $sourceShell = if (Test-Path -LiteralPath $packagedShell -PathType Container) {
     Join-Path $repo 'shell\powershell'
 }
 if (-not $ControllerPath) {
-    $packagedController = Join-Path $PSScriptRoot 'fswctl.exe'
-    $developmentController = Join-Path $repo 'out\user\arm64\Release\fswctl.exe'
+    $packagedController = Join-Path $PSScriptRoot 'fwdslash.exe'
+    $developmentController = Join-Path $repo 'out\user\arm64\Release\fwdslash.exe'
     $ControllerPath = if (Test-Path -LiteralPath $packagedController) { $packagedController } else { $developmentController }
 }
 $ControllerPath = [IO.Path]::GetFullPath($ControllerPath)
 if (-not (Test-Path -LiteralPath $ControllerPath -PathType Leaf)) {
-    throw "fswctl.exe was not found: $ControllerPath"
+    throw "fwdslash.exe was not found: $ControllerPath"
 }
 
 $documents = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
@@ -135,7 +135,7 @@ try {
     if (-not (Test-Path -LiteralPath $moduleRoot -PathType Container)) {
         New-Item -ItemType Directory -Path $moduleStaging | Out-Null
         Copy-Item -LiteralPath (Join-Path $sourceShell 'ForwardSlashWindows.psm1') -Destination $moduleStaging
-        Copy-Item -LiteralPath $ControllerPath -Destination (Join-Path $moduleStaging 'fswctl.exe')
+        Copy-Item -LiteralPath $ControllerPath -Destination (Join-Path $moduleStaging 'fwdslash.exe')
         Move-Item -LiteralPath $moduleStaging -Destination $moduleRoot
         $moduleDeployed = $true
     }

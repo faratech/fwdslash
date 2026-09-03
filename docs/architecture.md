@@ -40,7 +40,7 @@ paths are not logged.
 ## Settings and optional shell adapters
 
 The settings process is an unpackaged WinUI 3 desktop app. It delegates every
-state change to `fswctl`; it never edits profiles or registry integration state
+state change to `fwdslash`; it never edits profiles or registry integration state
 itself. The app uses a Mica system backdrop and the Windows App SDK `TitleBar`
 control with an `ImageIconSource`, while retaining the system caption buttons.
 Tray commands deep-link to sections through the per-user `fwdslash` URI

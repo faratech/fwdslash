@@ -20,17 +20,17 @@ Invoke-FswTest 'resolver-unit-tests' {
 }
 
 Invoke-FswTest 'controller-status' {
-    & (Join-Path $artifacts 'fswctl.exe') status
+    & (Join-Path $artifacts 'fwdslash.exe') status
     if ($LASTEXITCODE -ne 0) { throw "Controller status exited with $LASTEXITCODE" }
 }
 
 Invoke-FswTest 'broker-lifecycle' {
-    & (Join-Path $artifacts 'fswctl.exe') start
+    & (Join-Path $artifacts 'fwdslash.exe') start
     if ($LASTEXITCODE -ne 0) { throw "Broker start exited with $LASTEXITCODE" }
     Start-Sleep -Milliseconds 500
     $broker = Get-Process -Name fswbroker -ErrorAction SilentlyContinue
     if (-not $broker) { throw 'Broker did not remain running' }
-    & (Join-Path $artifacts 'fswctl.exe') stop
+    & (Join-Path $artifacts 'fwdslash.exe') stop
     if ($LASTEXITCODE -ne 0) { throw "Broker stop exited with $LASTEXITCODE" }
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Process -Name fswbroker -ErrorAction SilentlyContinue) -and
