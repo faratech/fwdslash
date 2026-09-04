@@ -35,7 +35,7 @@
     <Logo>Assets\StoreLogo.png</Logo>
     <Description>Type Linux-style WSL paths in File Explorer, Run, Windows Search and Open dialogs.</Description>
 
-    <!-- TEST REMOVAL: virtualization exclusions and unvirtualizedResources
+    <!--
       Only HKCU and %USERPROFILE%\AppData are virtualized by MSIX. These three
       locations must be visible to processes outside the package:
 
@@ -51,8 +51,19 @@
       These targeted exclusions are honoured on Windows 11 and later, which is
       why TargetDeviceFamily below starts at 10.0.22000.0. They require the
       unvirtualizedResources restricted capability declared further down.
-      [TEST: exclusion elements + capability temporarily removed]
     -->
+    <virtualization:RegistryWriteVirtualization>
+      <virtualization:ExcludedKeys>
+        <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\Microsoft\Command Processor</virtualization:ExcludedKey>
+        <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\ForwardSlashWindows</virtualization:ExcludedKey>
+      </virtualization:ExcludedKeys>
+    </virtualization:RegistryWriteVirtualization>
+
+    <virtualization:FileSystemWriteVirtualization>
+      <virtualization:ExcludedDirectories>
+        <virtualization:ExcludedDirectory>$(KnownFolder:LocalAppData)\ForwardSlashWindows</virtualization:ExcludedDirectory>
+      </virtualization:ExcludedDirectories>
+    </virtualization:FileSystemWriteVirtualization>
   </Properties>
 
   <Dependencies>
@@ -71,12 +82,13 @@
 
   <Capabilities>
     <rescap:Capability Name="runFullTrust" />
-    <!-- [TEST: unvirtualizedResources temporarily removed]
+    <!--
       Required by the virtualization exclusions above. This capability needs
       Microsoft approval before the package can be published to the Store, and
       App Installer refuses packages that declare it, so local installs must use
       Add-AppxPackage.
     -->
+    <rescap:Capability Name="unvirtualizedResources" />
   </Capabilities>
 
   <Applications>
