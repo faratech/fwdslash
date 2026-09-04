@@ -179,6 +179,9 @@ pub enum Resolved<'r> {
     WslRoot,
     /// A path inside one distribution.
     Distribution(DistributionPath<'r>),
+    /// A path under the user's custom bare-slash root (Rust-layer feature; the
+    /// C++ resolver has no counterpart — see docs/divergences.md).
+    Folder(FolderPath<'r>),
 }
 
 impl<'r> Resolved<'r> {
@@ -186,35 +189,51 @@ impl<'r> Resolved<'r> {
     /// and `Navigate2`, and printed by `fwdslash resolve`.
     ///
     /// This is a wire contract: `ForwardSlashWindows.psm1` compares the output of
-    /// `fwdslash resolve /` against the literal `\\wsl.localhost`.
+    /// `fwdslash resolve /` against the literal `\\wsl.localhost` (and its
+    /// trailing-separator spelling). A custom root resolves to a longer UNC or
+    /// to a drive path — never to those literals.
     #[must_use]
     pub const fn unc_display(&self) -> &'r str {
         match self {
             Self::WslRoot => WSL_ROOT_UNC,
             Self::Distribution(path) => path.unc_display,
+            Self::Folder(path) => path.display,
         }
     }
 
     /// The Linux path the user meant, normalized.
+    ///
+    /// For [`Resolved::Folder`] this is the path *under* the chosen root
+    /// (`/` when the input is bare), since a Win32 root has no Linux path.
     #[must_use]
     pub const fn linux_path(&self) -> &'r str {
         match self {
             Self::WslRoot => "/",
             Self::Distribution(path) => path.linux_path,
+            Self::Folder(path) => path.under_root,
         }
     }
 
-    /// The distribution this resolved into, or `None` for the provider root.
+    /// The distribution this resolved into, or `None` for the provider root
+    /// or a folder root.
     #[must_use]
     pub const fn distribution(&self) -> Option<&'r str> {
         match self {
-            Self::WslRoot => None,
+            Self::WslRoot | Self::Folder(_) => None,
             Self::Distribution(path) => Some(path.distribution),
         }
     }
 
     #[must_use]
     pub const fn is_wsl_root(&self) -> bool {
+        matches!(self, Self::WslRoot)
+    }
+
+    /// True only for the provider root that lists distributions. Tests and the
+    /// broker key on this rather than `distribution().is_none()`, because a
+    /// folder root also has no distribution.
+    #[must_use]
+    pub const fn is_provider_root(&self) -> bool {
         matches!(self, Self::WslRoot)
     }
 }
@@ -261,6 +280,165 @@ impl<'r> DistributionPath<'r> {
             .split('/')
             .any(|component| component.ends_with('.') || component.ends_with(' '))
     }
+}
+
+/// A path under the user's custom bare-slash root — any Win32 location, a
+/// drive path (`C:\code`) or a UNC (`\\wsl.localhost\Ubuntu\home\mike`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderPath<'r> {
+    display: &'r str,
+    under_root: &'r str,
+    had_trailing_separator: bool,
+}
+
+impl<'r> FolderPath<'r> {
+    /// The Win32 path to open: the string handed to `ShellExecuteEx` and
+    /// written into the address bar.
+    #[must_use]
+    pub const fn display(&self) -> &'r str {
+        self.display
+    }
+
+    /// The `/`-separated path below the chosen root — `/` when the input is
+    /// bare. A Win32 root has no Linux path, so this is the *relative* tail.
+    #[must_use]
+    pub const fn under_root(&self) -> &'r str {
+        self.under_root
+    }
+
+    #[must_use]
+    pub const fn had_trailing_separator(&self) -> bool {
+        self.had_trailing_separator
+    }
+}
+
+/// Resolve an input against a user-chosen folder root: `/` is the root and
+/// everything below it joins onto it lexically, exactly the way `render`
+/// joins components onto a distribution. Pure string work — no filesystem
+/// access, no canonicalization — matching the resolver's contract.
+///
+/// The input shape rules R1-R4 apply unchanged, including `..` clamping:
+/// traversal past the root is [`ResolveError::TraversalAboveRoot`], because
+/// the root is the folder the user chose, not a suggestion.
+pub fn resolve_under_root<'r>(
+    input: &str,
+    root: &str,
+    buf: &'r mut RenderBuf,
+) -> Result<Resolved<'r>, ResolveError> {
+    if input.is_empty() || !input.starts_with('/') {
+        return Err(ResolveError::NotASlashPath);
+    }
+    if input.as_bytes().get(1) == Some(&b'/') {
+        return Err(ResolveError::DoubleLeadingSlash);
+    }
+    if input.contains('\0') {
+        return Err(ResolveError::EmbeddedNul);
+    }
+    if input.contains('\\') {
+        return Err(ResolveError::BackslashNotAllowed);
+    }
+
+    let RenderBuf { unc, linux } = buf;
+    unc.clear();
+    linux.clear();
+
+    // The root without trailing separators. A bare drive keeps exactly one:
+    // `C:` alone is a drive-relative path in Win32, not a folder.
+    unc.push_str(root);
+    while unc.ends_with('\\') {
+        unc.pop();
+    }
+    if !unc.contains('\\') {
+        unc.push('\\');
+    }
+    let base_end = unc.len();
+
+    let had_trailing_separator = input.ends_with('/');
+    for component in input[1..].split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            if unc.len() == base_end {
+                return Err(ResolveError::TraversalAboveRoot);
+            }
+            let cut = unc
+                .get(base_end..)
+                .and_then(|rest| rest.rfind('\\'))
+                .unwrap_or(0);
+            unc.truncate(base_end + cut);
+            continue;
+        }
+        // A drive-root base (`C:\`) already ends in the separator; appending
+        // another would produce `C:\\tmp`, which Win32 reads as an UNC-style
+        // path prefix. Every other base needs one added.
+        if !unc.ends_with('\\') {
+            unc.push('\\');
+        }
+        unc.push_str(component);
+    }
+
+    let has_components = unc.len() > base_end;
+    if had_trailing_separator && has_components {
+        unc.push('\\');
+    }
+
+    if has_components {
+        // Mirror the UNC tail below the root, with `/` separators. When the
+        // base is a drive root the tail does not start with a separator (it
+        // is already part of the base), so the leading `/` is explicit.
+        let tail = unc[base_end..].strip_prefix('\\').unwrap_or(&unc[base_end..]);
+        linux.push('/');
+        for (index, part) in tail.split('\\').enumerate() {
+            if index > 0 {
+                linux.push('/');
+            }
+            linux.push_str(part);
+        }
+    } else {
+        linux.push('/');
+    }
+
+    Ok(Resolved::Folder(FolderPath {
+        display: unc.as_str(),
+        under_root: linux.as_str(),
+        had_trailing_separator,
+    }))
+}
+
+/// Whether `root` is a usable custom-root value: an absolute drive path
+/// (`C:`, `C:\Users\me`) or UNC (`\\server\share`, `\\wsl.localhost\Ubuntu\…`).
+/// Existence is deliberately not checked — a `\\wsl.localhost` root may be
+/// offline at set time.
+#[must_use]
+pub fn is_valid_windows_root(root: &str) -> bool {
+    if root.is_empty() || root.contains('/') || root.contains('\0') {
+        return false;
+    }
+    // Device and NT namespaces are kernel paths, not user folders.
+    for namespace in [r"\\.\", r"\\?\", r"\??\"] {
+        if root.starts_with(namespace) {
+            return false;
+        }
+    }
+    let forbidden = |byte: u8| matches!(byte, b'"' | b'<' | b'>' | b'|' | 0..=0x1F);
+
+    let bytes = root.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        // Drive form; a second `:` (`C:\a:b`) would be a stream, not a folder.
+        return root[2..].bytes().all(|byte| byte != b':' && !forbidden(byte));
+    }
+    if let Some(rest) = root.strip_prefix(r"\\") {
+        // UNC form: `\\server\share[\dir …]` — a bare `\\server` is not a
+        // folder, and UNC paths never carry a colon.
+        return match rest.find('\\') {
+            Some(share_start) if share_start > 0 => {
+                rest.bytes().all(|byte| byte != b':' && !forbidden(byte))
+            }
+            _ => false,
+        };
+    }
+    false
 }
 
 /// Resolve an explicit `/Distro/path` input. Mirrors the C++ `ResolveSlashPath`.

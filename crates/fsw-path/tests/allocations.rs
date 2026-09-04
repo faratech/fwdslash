@@ -85,3 +85,30 @@ fn steady_state_resolution_allocates_nothing() {
         "hot-path resolution allocated across 10,000 resolves"
     );
 }
+
+#[test]
+fn folder_root_resolution_allocates_nothing() {
+    let mut buf = RenderBuf::with_capacity(512);
+
+    let roots: [&str; 3] = [r"C:\code", r"C:\", r"\\wsl.localhost\Ubuntu\home\mike"];
+    let inputs: [&str; 5] = ["/", "/tmp/x", "/./a//b/../c/", "/..", "/deep/a/b/c/d/e"];
+
+    // Warm-up pass.
+    for root in roots {
+        for input in inputs {
+            let _ = std::hint::black_box(fsw_path::resolve_under_root(input, root, &mut buf));
+        }
+    }
+
+    ALLOCATIONS.store(0, Relaxed);
+    for root in roots {
+        for input in inputs {
+            let _ = std::hint::black_box(fsw_path::resolve_under_root(input, root, &mut buf));
+        }
+    }
+    assert_eq!(
+        ALLOCATIONS.load(Relaxed),
+        0,
+        "folder-root resolution allocated; the broker's Enter path regressed"
+    );
+}

@@ -415,3 +415,101 @@ fn case_folding_matches_the_win32_simple_uppercase_table() {
     assert!(eq_ignore_case("\u{fc}nicode", "\u{dc}NICODE"));
     assert!(eq_ignore_case("\u{e9}t\u{e9}", "\u{c9}T\u{c9}"));
 }
+
+// ---------------------------------------------------------------------------
+// The custom bare-slash root (`resolve_under_root`) — a Rust-layer feature
+// with no C++ counterpart; docs/divergences.md, resolver entry 6.
+// ---------------------------------------------------------------------------
+
+/// Resolves `input` under `root` and asserts both rendered forms.
+fn folder(input: &str, root: &str, want_display: &str, want_under: &str) {
+    let mut buf = RenderBuf::new();
+    match fsw_path::resolve_under_root(input, root, &mut buf) {
+        Ok(Resolved::Folder(path)) => {
+            assert_eq!(path.display(), want_display, "display for {input:?} under {root:?}");
+            assert_eq!(path.under_root(), want_under, "under-root for {input:?} under {root:?}");
+        }
+        other => panic!("for {input:?} under {root:?}: got {other:?}"),
+    }
+}
+
+#[test]
+fn folder_root_bare_slash_returns_the_root() {
+    folder("/", r"C:\code", r"C:\code", "/");
+    folder("/", r"\\wsl.localhost\Ubuntu\home\mike", r"\\wsl.localhost\Ubuntu\home\mike", "/");
+}
+
+#[test]
+fn folder_root_joins_components() {
+    folder("/tmp/x", r"C:\code", r"C:\code\tmp\x", "/tmp/x");
+    folder("/proj/build", r"\\wsl.localhost\Ubuntu\home\mike", r"\\wsl.localhost\Ubuntu\home\mike\proj\build", "/proj/build");
+}
+
+#[test]
+fn folder_root_preserves_trailing_separator() {
+    folder("/tmp/x/", r"C:\code", r"C:\code\tmp\x\", "/tmp/x/");
+    // Bare `/` never gains one: the root itself is the destination.
+    folder("/", r"C:\code", r"C:\code", "/");
+}
+
+#[test]
+fn folder_root_normalizes_dot_segments() {
+    folder("/./a//b/../c", r"C:\code", r"C:\code\a\c", "/a/c");
+    folder("/a/..", r"C:\code", r"C:\code", "/");
+}
+
+#[test]
+fn folder_root_clamps_traversal_at_the_root() {
+    let mut buf = RenderBuf::new();
+    for input in ["/..", "/../..", "/x/../.."] {
+        let got = fsw_path::resolve_under_root(input, r"C:\code", &mut buf);
+        assert_eq!(got, Err(ResolveError::TraversalAboveRoot), "for {input:?}");
+    }
+}
+
+#[test]
+fn folder_root_accepts_a_unc_root() {
+    folder("/docs", r"\\server\share", r"\\server\share\docs", "/docs");
+}
+
+#[test]
+fn folder_root_accepts_a_drive_root_without_doubling_the_separator() {
+    folder("/tmp", r"C:\", r"C:\tmp", "/tmp");
+    folder("/tmp", "C:", r"C:\tmp", "/tmp");
+}
+
+#[test]
+fn folder_root_strips_trailing_separators_from_the_root() {
+    folder("/", r"C:\code\\\", r"C:\code", "/");
+    folder("/x", r"C:\code\", r"C:\code\x", "/x");
+}
+
+#[test]
+fn folder_root_still_rejects_backslash_and_double_slash() {
+    let mut buf = RenderBuf::new();
+    assert_eq!(
+        fsw_path::resolve_under_root(r"/a\b", r"C:\code", &mut buf),
+        Err(ResolveError::BackslashNotAllowed)
+    );
+    assert_eq!(
+        fsw_path::resolve_under_root("//x", r"C:\code", &mut buf),
+        Err(ResolveError::DoubleLeadingSlash)
+    );
+    assert_eq!(
+        fsw_path::resolve_under_root("tmp", r"C:\code", &mut buf),
+        Err(ResolveError::NotASlashPath)
+    );
+}
+
+#[test]
+fn windows_root_validation_table() {
+    // Accepted.
+    for root in [r"C:", r"C:\", r"C:\code", r"C:\Users\me\stuff", r"\\server\share", r"\\wsl.localhost\Ubuntu"] {
+        assert!(fsw_path::is_valid_windows_root(root), "{root:?} should be valid");
+    }
+    // Rejected: relative, empty, separators of the other kind, device
+    // namespaces, streams, junk.
+    for root in ["", "code", r"relative\path", r"\\.\pipe\x", r"\\?\C:\x", r"\??\x", r"C:\a:b", r"\\server", "C:/code", "/tmp"] {
+        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+    }
+}
