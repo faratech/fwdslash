@@ -44,10 +44,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW,
     GetWindowThreadProcessId, HHOOK, IDC_ARROW, KBDLLHOOKSTRUCT, KillTimer,
     LLKHF_UP, LoadCursorW, LoadIconW, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SW_SHOWNORMAL, SetForegroundWindow, SetTimer,
-    SetWindowsHookExW, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SW_SHOWNORMAL,
+    SetForegroundWindow, SetTimer, SetWindowsHookExW, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_KEYUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
+    WM_QUERYENDSESSION, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 const MUTEX_NAME: &str = "Local\\ForwardSlashWindows.Broker";
@@ -514,7 +515,10 @@ fn install_hook() -> bool {
                     *guard = Some(auto);
                     true
                 }
-                Err(_) => false,
+                Err(err) => {
+                    log_diagnostic(&format!("event=debug_uia_failed code={}", err.code().0));
+                    false
+                }
             }
         } else {
             true
@@ -533,6 +537,12 @@ fn install_hook() -> bool {
         )
     };
     KEYBOARD_HOOK.store(hook as isize, Ordering::Relaxed);
+    if hook.is_null() {
+        log_diagnostic(&format!(
+            "event=debug_hook_failed error={}",
+            unsafe { GetLastError() }
+        ));
+    }
     !hook.is_null()
 }
 
@@ -650,6 +660,16 @@ fn publish_filter_mappings(force: bool) {
     }
 }
 
+/// Distinct from the settings app's `"fwdslash settings"` so the two tray
+/// icons are identifiable at a glance; both used to read identically.
+fn tray_tip() -> &'static str {
+    if PAUSED.load(Ordering::Relaxed) {
+        "fwdslash broker (paused)"
+    } else {
+        "fwdslash broker"
+    }
+}
+
 fn set_tray_icon(window: HWND, add: bool) {
     unsafe {
         let mut icon: NOTIFYICONDATAW = std::mem::zeroed();
@@ -660,7 +680,7 @@ fn set_tray_icon(window: HWND, add: bool) {
         icon.uCallbackMessage = TRAY_MESSAGE;
         icon.hIcon = LoadIconW(GetModuleHandleW(std::ptr::null()), IDI_FSW_APP as *const u16);
 
-        let tip = to_u16_vec("Forward Slash Windows");
+        let tip = to_u16_vec(tray_tip());
         let tip_len = tip.len().min(icon.szTip.len() - 1);
         icon.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);
 
@@ -672,6 +692,32 @@ fn set_tray_icon(window: HWND, add: bool) {
     }
 }
 
+/// Re-announces the tooltip (NIM_MODIFY) without touching the icon itself.
+fn update_tray_tooltip(window: HWND) {
+    unsafe {
+        let mut icon: NOTIFYICONDATAW = std::mem::zeroed();
+        icon.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        icon.hWnd = window;
+        icon.uID = TRAY_ID as u32;
+        icon.uFlags = NIF_TIP;
+        let tip = to_u16_vec(tray_tip());
+        let tip_len = tip.len().min(icon.szTip.len() - 1);
+        icon.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);
+        Shell_NotifyIconW(NIM_MODIFY, &icon);
+    }
+}
+
+/// `TaskbarCreated` is broadcast when the shell restarts; broadcasts never
+/// reach a message-only window, which is why the broker window is a real
+/// (never-shown) top-level window. Without the re-add, an explorer.exe
+/// restart would leave the resident broker with no tray icon at all.
+fn taskbar_created_message() -> u32 {
+    static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TASKBAR_CREATED.get_or_init(|| unsafe {
+        RegisterWindowMessageW(to_u16_vec("TaskbarCreated").as_ptr())
+    })
+}
+
 fn set_paused(paused: bool) {
     PAUSED.store(paused, Ordering::Relaxed);
     let _ = persist_disabled(paused);
@@ -679,6 +725,10 @@ fn set_paused(paused: bool) {
         remove_hook();
     } else {
         install_hook();
+    }
+    let window = BROKER_WINDOW.load(Ordering::Relaxed);
+    if window != 0 {
+        update_tray_tooltip(window as HWND);
     }
     publish_filter_mappings(true);
 }
@@ -823,6 +873,17 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        message if message == taskbar_created_message() => {
+            set_tray_icon(window, true);
+            0
+        }
+        // Session end: Windows destroys the window without WM_DESTROY running
+        // our cleanup, so remove the icon now or it lingers as a ghost.
+        WM_QUERYENDSESSION => 1,
+        WM_ENDSESSION if wparam != 0 => {
+            set_tray_icon(window, false);
+            0
+        }
         WM_COMMAND => {
             let id = (wparam & 0xFFFF) as u32;
             match id {
@@ -923,8 +984,13 @@ fn main() {
         }
 
         let title = to_u16_vec("Forward Slash Windows");
+        // A top-level never-shown tool window, not a message-only one:
+        // message-only windows are skipped by HWND_BROADCAST, so
+        // TaskbarCreated and WM_ENDSESSION would never reach the icon
+        // lifecycle below. Divergence from the C++ broker (HWND_MESSAGE);
+        // discovery via FindWindowW on the class is unaffected.
         let broker_wnd = CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW,
             class_name.as_ptr(),
             title.as_ptr(),
             WS_OVERLAPPED,
@@ -932,7 +998,7 @@ fn main() {
             0,
             0,
             0,
-            windows_sys::Win32::UI::WindowsAndMessaging::HWND_MESSAGE,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance,
             std::ptr::null_mut(),
@@ -945,8 +1011,9 @@ fn main() {
         }
 
         BROKER_WINDOW.store(broker_wnd as isize, Ordering::Relaxed);
-        set_tray_icon(broker_wnd, true);
+        // Paused state first: the tray tooltip reflects it at NIM_ADD time.
         PAUSED.store(is_disabled(), Ordering::Relaxed);
+        set_tray_icon(broker_wnd, true);
         let hook_installed = PAUSED.load(Ordering::Relaxed) || install_hook();
         publish_filter_mappings(true);
         SetTimer(broker_wnd, HEALTH_TIMER, 5000, None);

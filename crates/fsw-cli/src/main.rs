@@ -63,6 +63,34 @@ fn is_driver_available() -> bool {
     }
 }
 
+/// Asks the running broker to unpause (`FSW_WM_SET_PAUSED` with 0). True only
+/// when the broker accepted the message.
+#[cfg(windows)]
+fn send_resume() -> bool {
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+        };
+
+        let class = to_u16_vec(FSW_BROKER_WINDOW_CLASS);
+        let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut result: usize = 0;
+        let sent = SendMessageTimeoutW(
+            hwnd,
+            FSW_WM_SET_PAUSED,
+            0,
+            0,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            2000,
+            &mut result,
+        );
+        sent != 0 && result != 0
+    }
+}
+
 fn start_broker() -> i32 {
     #[cfg(windows)]
     unsafe {
@@ -73,7 +101,7 @@ fn start_broker() -> i32 {
             WaitForSingleObject,
         };
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            FindWindowW, PostMessageW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW, WM_CLOSE,
+            FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
         };
 
         if broker_window_exists() {
@@ -83,20 +111,7 @@ fn start_broker() -> i32 {
                 return 0;
             }
             if state == BrokerState::Paused {
-                let class = to_u16_vec(FSW_BROKER_WINDOW_CLASS);
-                let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
-                let mut result: usize = 0;
-                if SendMessageTimeoutW(
-                    hwnd,
-                    FSW_WM_SET_PAUSED,
-                    0,
-                    0,
-                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
-                    2000,
-                    &mut result,
-                ) != 0
-                    && result != 0
-                {
+                if send_resume() {
                     if broker_state(1000) == BrokerState::Active {
                         println!("Forward Slash Windows broker resumed and is active.");
                         return 0;
@@ -142,11 +157,21 @@ fn start_broker() -> i32 {
 
         CloseHandle(process.hThread);
         let deadline = GetTickCount64() + 5000;
+        let mut resume_attempted = false;
         loop {
-            if broker_state(1000) == BrokerState::Active {
-                CloseHandle(process.hProcess);
-                println!("Forward Slash Windows broker started and is active.");
-                return 0;
+            match broker_state(1000) {
+                BrokerState::Active => {
+                    CloseHandle(process.hProcess);
+                    println!("Forward Slash Windows broker started and is active.");
+                    return 0;
+                }
+                BrokerState::Paused if !resume_attempted => {
+                    // A fresh spawn comes up paused when Disabled=1; resume it
+                    // the same way the already-running branch does.
+                    resume_attempted = true;
+                    send_resume();
+                }
+                _ => {}
             }
             if WaitForSingleObject(process.hProcess, 0) == WAIT_OBJECT_0 {
                 break;
@@ -157,12 +182,27 @@ fn start_broker() -> i32 {
             }
         }
 
+        // The probe failed. Something with the broker class exists, but it is
+        // not necessarily the process we spawned -- a losing spawn exits at
+        // the mutex and the class window belongs to some other instance. Only
+        // ever close the window our own process owns.
+        let state = broker_state(1000);
+        if state == BrokerState::Paused {
+            // A paused broker (ours or not) is healthy; surface the pause.
+            CloseHandle(process.hProcess);
+            eprintln!("Resolution is paused; run \"fwdslash enable\" to activate.");
+            return 1;
+        }
         let class = to_u16_vec(FSW_BROKER_WINDOW_CLASS);
         let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
         if !hwnd.is_null() {
-            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut owner);
+            if owner == process.dwProcessId {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                WaitForSingleObject(process.hProcess, 2000);
+            }
         }
-        WaitForSingleObject(process.hProcess, 2000);
         CloseHandle(process.hProcess);
         eprintln!("Broker started but its keyboard hook is unavailable.");
         1

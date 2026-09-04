@@ -21,6 +21,7 @@ fsw-core = { path = "../fsw-core" }
 fsw-path = { path = "../fsw-path" }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_Shell",
@@ -28,7 +29,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [build-dependencies]
-embed-resource = "3.0.11"
+embed-resource = { workspace = true }
 
 [lints]
 workspace = true

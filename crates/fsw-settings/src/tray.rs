@@ -14,7 +14,7 @@
 //! - `TaskbarCreated` (shell restart) re-adds the icon so the window can never
 //!   end up hidden with no way back.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Shell::{
@@ -23,10 +23,11 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetSystemMetrics,
-    GetWindowThreadProcessId, LoadImageW, MF_STRING, RegisterWindowMessageW,
-    SetForegroundWindow, ShowWindow, SIZE_MINIMIZED, SM_CXSMICON, SM_CYSMICON, SW_HIDE,
-    SW_RESTORE, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenu, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_NCDESTROY, WM_SIZE, DestroyWindow,
+    GetWindowThreadProcessId, LoadImageW, MF_STRING, PostMessageW, PostQuitMessage,
+    RegisterWindowMessageW, SetForegroundWindow, ShowWindow, SIZE_MINIMIZED, SM_CXSMICON,
+    SM_CYSMICON, SW_HIDE, SW_RESTORE, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TrackPopupMenu, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_ENDSESSION, WM_NCDESTROY,
+    WM_SIZE,
 };
 
 use crate::{IDI_FSW_APP, WINDOW_TITLE};
@@ -38,6 +39,11 @@ const SUBCLASS_ID: usize = 1;
 
 const MENU_SHOW: i32 = 1;
 const MENU_EXIT: i32 = 2;
+
+/// Tray tooltip, distinct from the broker's so the two icons are
+/// identifiable at a glance. The window title itself stays `"Forward Slash
+/// Windows"` for C++ parity.
+pub const TRAY_TIP: &str = "fwdslash settings";
 
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_RBUTTONUP: u32 = 0x0205;
@@ -100,18 +106,24 @@ pub fn discover_window() -> isize {
 }
 
 /// Subclasses the window and adds the tray icon. Must run on the window's own
-/// thread; the bool guard in the caller makes repeat calls a no-op. The
+/// thread; a static guard makes repeat calls a no-op and a *changed* handle
+/// (a reactor-recreated HWND) reinstall rather than double-subclass. The
 /// returned string is the Win32 error the failure mapped to, for the crash log.
 pub fn install(window: isize) -> Result<(), u32> {
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Foundation::GetLastError;
+        static INSTALLED_HWND: AtomicIsize = AtomicIsize::new(0);
+        if INSTALLED_HWND.load(Ordering::SeqCst) == window {
+            return Ok(());
+        }
         if SetWindowSubclass(window as _, Some(tray_proc), SUBCLASS_ID, 0) == 0 {
             return Err(GetLastError());
         }
         if !add_tray_icon(window as _) {
             return Err(GetLastError());
         }
+        INSTALLED_HWND.store(window, Ordering::SeqCst);
         Ok(())
     }
     #[cfg(not(windows))]
@@ -150,7 +162,7 @@ fn add_tray_icon(window: windows_sys::Win32::Foundation::HWND) -> bool {
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = TRAY_MESSAGE;
     data.hIcon = tray_icon();
-    let tip = crate::to_wide(WINDOW_TITLE);
+    let tip = crate::to_wide(TRAY_TIP);
     let tip_len = tip.len().min(data.szTip.len() - 1);
     data.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);
     unsafe { Shell_NotifyIconW(NIM_ADD, &data) != 0 }
@@ -192,6 +204,18 @@ fn hide(window: windows_sys::Win32::Foundation::HWND) {
     }
 }
 
+/// Real exit: arms `FORCE_CLOSE`, then posts `WM_CLOSE` instead of calling
+/// `DestroyWindow` directly. The reactor's process exit lives behind WinUI's
+/// `Window.Closed` event, which only the close pipeline raises -- a direct
+/// `DestroyWindow` skips it and leaves a windowless process holding the
+/// single-instance mutex (the "won't start again" zombie). The subclass
+/// removes the icon on the resulting `WM_CLOSE`; `WM_DESTROY` posts the quit.
+#[cfg(windows)]
+fn exit_via_close(window: windows_sys::Win32::Foundation::HWND) {
+    FORCE_CLOSE.store(true, Ordering::SeqCst);
+    unsafe { PostMessageW(window, WM_CLOSE, 0, 0) };
+}
+
 #[cfg(windows)]
 fn show_tray_menu(window: windows_sys::Win32::Foundation::HWND) {
     unsafe {
@@ -216,11 +240,7 @@ fn show_tray_menu(window: windows_sys::Win32::Foundation::HWND) {
         DestroyMenu(menu);
         match command {
             MENU_SHOW => restore(window),
-            MENU_EXIT => {
-                FORCE_CLOSE.store(true, Ordering::SeqCst);
-                remove_tray_icon(window);
-                DestroyWindow(window);
-            }
+            MENU_EXIT => exit_via_close(window),
             _ => {}
         }
     }
@@ -255,18 +275,27 @@ unsafe extern "system" fn tray_proc(
         WM_COMMAND => {
             match (wparam & 0xFFFF) as i32 {
                 MENU_SHOW => restore(window),
-                MENU_EXIT => {
-                    FORCE_CLOSE.store(true, Ordering::SeqCst);
-                    remove_tray_icon(window);
-                    unsafe { DestroyWindow(window) };
-                }
+                MENU_EXIT => exit_via_close(window),
                 _ => {}
             }
             return 0;
         }
+        // Belt and braces: the reactor's only exit path is WinUI's
+        // `Window.Closed` event, and any destroy that skips the close
+        // pipeline would otherwise leave the process running with no
+        // window (the settings-app "won't start again" zombie).
+        WM_DESTROY => {
+            crate::watchdog::note_exit_requested();
+            unsafe { PostQuitMessage(0) };
+        }
         WM_NCDESTROY => {
             remove_tray_icon(window);
             unsafe { RemoveWindowSubclass(window, Some(tray_proc), SUBCLASS_ID) };
+        }
+        // Session end destroys the window without the close pipeline; make
+        // sure the icon does not outlive the session as a ghost.
+        WM_ENDSESSION if wparam != 0 => {
+            remove_tray_icon(window);
         }
         message if message == taskbar_created_message() => {
             remove_tray_icon(window);

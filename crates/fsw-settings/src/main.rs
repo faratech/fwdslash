@@ -23,6 +23,7 @@ use std::process::Command;
 use windows_reactor::*;
 
 mod tray;
+mod watchdog;
 
 /// The WSL provider root. Bare `/` may resolve elsewhere depending on bare-slash mode,
 /// so "Open WSL root" targets this literally, as `src/settings/main.cpp:562` does.
@@ -427,9 +428,23 @@ impl Component for SettingsModel {
             Msg::WindowHookReady(window) => {
                 // Subclassing requires the window's own thread; `update` runs
                 // on it. A 0 payload means discovery timed out -- tray and
-                // close-to-tray silently degrade to default behavior.
-                if window != 0 && let Err(code) = tray::install(window) {
-                    log_crash(&format!("tray subclass installation failed: Win32 error {code}"));
+                // close-to-tray would silently degrade to default behavior,
+                // leaving an unquittable window; exit loudly instead.
+                if window == 0 {
+                    log_crash("settings window discovery failed; exiting");
+                    show_startup_error(
+                        "Forward Slash Windows could not attach to its own window \
+                         and will now exit.",
+                    );
+                    watchdog::note_exit_requested();
+                    watchdog::quit_ui_thread();
+                } else {
+                    watchdog::note_window(window);
+                    if let Err(code) = tray::install(window) {
+                        log_crash(&format!(
+                            "tray subclass installation failed: Win32 error {code}"
+                        ));
+                    }
                 }
             }
         }
@@ -948,6 +963,17 @@ fn log_crash(message: &str) {
 
 fn main() {
     std::panic::set_hook(Box::new(|info| log_crash(&format!("panic: {info}"))));
+    #[cfg(windows)]
+    if std::env::var_os("FSW_SIMULATE_WINDOWLESS").is_some() {
+        // Test hook for the takeover path in `activate_existing_instance`:
+        // hold the single-instance mutex forever with no window, exactly the
+        // state a direct `DestroyWindow` (or a session end) can leave behind.
+        // See docs/divergences.md. Set the variable to any value to enable.
+        simulate_windowless();
+        return;
+    }
+    watchdog::note_ui_thread();
+    watchdog::spawn();
     if activate_existing_instance() {
         return;
     }
@@ -969,6 +995,12 @@ fn to_wide(value: &str) -> Vec<u16> {
 /// `Local\ForwardSlashWindows.Broker` convention), and a second launch raises
 /// the existing window instead of opening a duplicate.
 ///
+/// A prior instance can outlive its own window (a direct `DestroyWindow` or a
+/// session end skips the reactor's `Window.Closed` exit path), leaving a
+/// process that holds the mutex but has nothing to raise -- every future
+/// launch would then be a silent no-op. That zombie is terminated and the
+/// launching instance takes over.
+///
 /// The mutex handle is intentionally leaked so it lives until process exit;
 /// the kernel releases it when the owning process terminates.
 fn activate_existing_instance() -> bool {
@@ -977,35 +1009,272 @@ fn activate_existing_instance() -> bool {
         use std::thread::sleep;
         use std::time::Duration;
         use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-        use windows_sys::Win32::System::Threading::CreateMutexW;
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
         };
 
         let name = to_wide(SETTINGS_MUTEX_NAME);
         let mutex = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        if mutex.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
-            // Either we own the mutex (first instance) or the check failed and
-            // the safe default is to run normally.
+        if mutex.is_null() {
+            // Fail closed: an error here means ownership cannot be decided,
+            // and silently running a second instance is exactly the
+            // duplicate-tray-icon failure this guard exists to prevent.
+            let code = GetLastError();
+            log_crash(&format!("single-instance mutex creation failed: Win32 error {code}"));
+            show_startup_error(&format!(
+                "Forward Slash Windows could not verify that it is not already running \
+                 (Win32 error {code})."
+            ));
+            std::process::exit(2);
+        }
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            // We own the mutex: first instance.
             return false;
         }
         // Another instance owns the mutex. Its window may still be materializing
-        // (the WinUI activation path takes a beat), so poll briefly before giving
-        // up on the raise -- but never start a second window either way.
+        // (the WinUI activation path takes a beat), so poll before concluding
+        // anything -- 10 s, not 2 s.
         let title = to_wide(WINDOW_TITLE);
-        for _ in 0..40 {
+        for _ in 0..200 {
             let window = FindWindowW(std::ptr::null(), title.as_ptr());
             if !window.is_null() {
                 ShowWindow(window, SW_RESTORE);
                 SetForegroundWindow(window);
-                break;
+                return true;
             }
             sleep(Duration::from_millis(50));
         }
+        // No window anywhere. Take over from a windowless holder, if one is
+        // there to take over from.
+        if terminate_windowless_holder() {
+            // WAIT_ABANDONED is success: the holder died holding the mutex.
+            let wait = WaitForSingleObject(mutex, 5000);
+            if wait == 0 || wait == 0x0000_0080 {
+                return false;
+            }
+        }
+        show_startup_error(
+            "Forward Slash Windows is already running, but its window could not be \
+             restored. Quit it from the notification area (or Task Manager) and try \
+             again.",
+        );
         true
     }
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+/// Kills an `fswsettings.exe` peer that holds the single-instance mutex but
+/// owns no window: the windowless zombie. Only a same-identity peer older than
+/// 15 s qualifies, and the kill is skipped whenever anything is ambiguous -- a
+/// killed healthy instance is worse than a failed launch.
+#[cfg(windows)]
+unsafe fn terminate_windowless_holder() -> bool {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, TerminateProcess, GetCurrentProcessId,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    // 15 s in 100 ns units. A younger peer is a legitimate concurrent launch
+    // still materializing its window.
+    const MINIMUM_AGE_100NS: u64 = 15 * 10_000_000;
+    // FILETIME epoch offset: 100 ns intervals between 1601-01-01 and 1970-01-01.
+    const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() {
+        return false;
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+        unsafe { CloseHandle(snapshot) };
+        return false;
+    }
+    let mine = unsafe { GetCurrentProcessId() };
+    let now = UNIX_EPOCH_FILETIME
+        + u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() / 100)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+    let mut killed = false;
+    loop {
+        if entry.th32ProcessID != mine && eq_wide(&entry.szExeFile, "fswsettings.exe") {
+            let handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                    0,
+                    entry.th32ProcessID,
+                )
+            };
+            if !handle.is_null() {
+                let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+                let mut exit_time: FILETIME = unsafe { std::mem::zeroed() };
+                let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+                let mut user: FILETIME = unsafe { std::mem::zeroed() };
+                if unsafe {
+                    GetProcessTimes(handle, &mut creation, &mut exit_time, &mut kernel, &mut user)
+                } != 0 {
+                    let created = (creation.dwLowDateTime as u64)
+                        | ((creation.dwHighDateTime as u64) << 32);
+                    let qualifies = now.saturating_sub(created) >= MINIMUM_AGE_100NS
+                        && unsafe {
+                            same_package_identity(entry.th32ProcessID)
+                                && !window_exists(entry.th32ProcessID)
+                        };
+                    if qualifies {
+                        unsafe { TerminateProcess(handle, 1) };
+                        killed = true;
+                    }
+                }
+                unsafe { CloseHandle(handle) };
+            }
+        }
+        if killed || unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+            break;
+        }
+    }
+    unsafe { CloseHandle(snapshot) };
+    killed
+}
+
+/// True only when the peer lives in the same packaging context as us: two
+/// unpackaged builds, or the same MSIX package family. A packaged instance and
+/// an unpackaged dev build use different named-object namespaces and must
+/// never kill each other.
+#[cfg(windows)]
+unsafe fn same_package_identity(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let Ok(mine) = env::current_exe() else {
+        return false;
+    };
+    let handle = unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+    };
+    if handle.is_null() {
+        return false;
+    }
+    let mut image = [0u16; 1024];
+    let mut length = image.len() as u32;
+    let queried = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, image.as_mut_ptr(), &mut length)
+    };
+    unsafe { CloseHandle(handle) };
+    if queried == 0 {
+        return false;
+    }
+    let theirs = String::from_utf16_lossy(&image[..length as usize]).to_ascii_lowercase();
+    let mine = mine.to_string_lossy().to_ascii_lowercase();
+    const WINDOWS_APPS: &str = r"\windowsapps\";
+    let mine_packaged = mine.contains(WINDOWS_APPS);
+    let theirs_packaged = theirs.contains(WINDOWS_APPS);
+    if mine_packaged != theirs_packaged {
+        return false;
+    }
+    if !mine_packaged {
+        return true;
+    }
+    // Same package family: the segment right after windowsapps\ is
+    // <family>_<version>_<arch>_<publisherhash>; compare up to the first '_'.
+    let family = |path: &str| {
+        path.split(WINDOWS_APPS)
+            .nth(1)
+            .unwrap_or("")
+            .split('_')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    family(&mine) == family(&theirs)
+}
+
+/// Whether `pid` owns any top-level window at all. The zombie is defined by
+/// owning none; any window disqualifies the kill, whatever its title.
+#[cfg(windows)]
+unsafe fn window_exists(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
+
+    struct Match {
+        pid: u32,
+        found: bool,
+    }
+    unsafe extern "system" fn on_window(window: HWND, lparam: isize) -> i32 {
+        unsafe {
+            let state = &mut *(lparam as *mut Match);
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(window, &mut owner);
+            if owner == state.pid {
+                state.found = true;
+                return 0;
+            }
+            1
+        }
+    }
+    let mut state = Match { pid, found: false };
+    unsafe { EnumWindows(Some(on_window), &mut state as *mut Match as isize) };
+    state.found
+}
+
+/// Wide-string comparison against a NUL-terminated fixed buffer.
+#[cfg(windows)]
+fn eq_wide(buffer: &[u16], value: &str) -> bool {
+    let expected: Vec<u16> = value.encode_utf16().collect();
+    buffer.len() >= expected.len()
+        && buffer[..expected.len()] == expected[..]
+        && buffer.iter().nth(expected.len()) == Some(&0)
+}
+
+/// Modal error shown when startup cannot proceed. Category text only.
+#[cfg(windows)]
+fn show_startup_error(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
+    };
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            to_wide(message).as_ptr(),
+            to_wide(WINDOW_TITLE).as_ptr(),
+            MB_ICONERROR | MB_OK | MB_SETFOREGROUND,
+        );
+    }
+}
+
+/// Holds the single-instance mutex forever with no window, for testing the
+/// takeover path. Enabled by setting `FSW_SIMULATE_WINDOWLESS`.
+#[cfg(windows)]
+fn simulate_windowless() {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let name = to_wide(SETTINGS_MUTEX_NAME);
+    let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if mutex.is_null() || unsafe { GetLastError() } == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
+        eprintln!("another instance already holds the mutex");
+        return;
+    }
+    // The handle must outlive everything this process does; the loop below
+    // keeps it alive, and the kernel reaps it at process exit.
+    let _ = mutex;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
     }
 }
