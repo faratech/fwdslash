@@ -420,6 +420,9 @@ impl Component for SettingsModel {
                     return;
                 }
                 self.folder_selected = true;
+                // Deterministic re-render: every other view-input change ends
+                // in a refresh, so this one must too (divergences #5 flow).
+                self.refresh();
                 return;
             }
             Msg::RootTextChanged(text) => {
@@ -450,10 +453,11 @@ impl Component for SettingsModel {
             Msg::ApplyRoot => {
                 // Echo guard: re-pressing Apply with an unchanged draft must
                 // not re-invoke the controller (divergences #5).
-                if Some(self.root_draft.as_str()) == self.state.root.as_deref() {
+                let candidate = self.root_draft.trim();
+                if Some(candidate) == self.state.root.as_deref() {
                     return;
                 }
-                if !is_valid_windows_root(&self.root_draft) {
+                if !is_valid_windows_root(candidate) {
                     self.notice = Some((
                         InfoBarSeverity::Error,
                         "Could not set the folder root",
@@ -462,7 +466,7 @@ impl Component for SettingsModel {
                     ));
                     return;
                 }
-                let succeeded = run_controller(["bare-slash", "root", &self.root_draft]);
+                let succeeded = run_controller(["bare-slash", "root", candidate]);
                 if succeeded {
                     self.folder_selected = false;
                 }
