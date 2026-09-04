@@ -170,9 +170,20 @@ function Measure-CliColdStart {
 
     $times = New-Object System.Collections.Generic.List[double]
     for ($run = 1; $run -le $Count; $run++) {
+        # .NET Process, not Start-Process -Wait: Start-Process -Wait carries
+        # ~1,045 ms of PowerShell overhead regardless of the child (measured
+        # 1,044 ms vs 17 ms for the same exe), which once made this row
+        # report the harness instead of the CLI.
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = Join-Path $Directory 'fwdslash.exe'
+        $psi.Arguments = 'status'
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.CreateNoWindow = $true
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        $proc = Start-Process -FilePath (Join-Path $Directory 'fwdslash.exe') `
-            -ArgumentList 'status' -PassThru -NoNewWindow -Wait
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $null = $proc.StandardOutput.ReadToEnd()   # drain so a full pipe cannot block exit
+        $proc.WaitForExit()
         $clock.Stop()
         if ($proc.ExitCode -eq 0) { $times.Add($clock.Elapsed.TotalMilliseconds) }
     }

@@ -125,12 +125,12 @@ delta across a 10 s window with nothing happening, as a percentage of one core.
 
 | Metric | C++ | Rust |
 |---|---:|---:|
-| Broker startup to window (median, 10 runs) | n/a (a) | 32.25 ms |
-| Broker idle working set (5 s settle) | 16.42 MB | 16.98 MB |
-| Broker idle private bytes | 2.81 MB | 2.86 MB |
-| Broker idle CPU (10 s window, % of one core) | 0.00 % | 0.16 % |
-| CLI cold start `fwdslash status` (median, 20 runs) | 1,013.50 ms | 1,016.14 ms |
-| Settings launch to window (median, 5 runs) | n/a (b) | 141.31 ms |
+| Broker startup to window (median, 10 runs) | n/a (a) | 32.09 ms |
+| Broker idle working set (5 s settle) | 16.43 MB | 16.97 MB |
+| Broker idle private bytes | 2.83 MB | 2.85 MB |
+| Broker idle CPU (10 s window, % of one core) | 0.00 % | 0.00 % |
+| CLI cold start `fwdslash status` (median, 20 runs) | 22.26 ms | 21.01 ms |
+| Settings launch to window (median, 5 runs) | n/a (b) | 141.38 ms |
 
 (a) The C++ broker's window is message-only (`HWND_MESSAGE`), which no
 enumeration route from this host can observe — `FindWindow`/`FindWindowEx`
@@ -144,8 +144,12 @@ The Rust broker's window is a top-level tool window (docs/divergences.md,
 configuration); build it via `-Configuration Release` after the MSIX staging
 is no longer needed to measure that side.
 
-The ~1 s CLI cold start on both sides is dominated by the WSL default-distro
-query that `status` performs, not by language startup; the two are at parity
-to within noise. Resolver hot-path cost is pinned separately by
+An earlier draft of this table reported `fwdslash status` at ~1,014 ms on both
+sides. That was the harness measuring itself: `Start-Process -Wait` carries
+~1,045 ms of PowerShell overhead regardless of the child (measured 1,044 ms vs
+17 ms for the same executable). `Measure-CliColdStart` now launches through
+`System.Diagnostics.Process` and reports the real numbers above — the two
+implementations are at parity to within noise, and there is no slow "WSL
+query" to optimize. Resolver hot-path cost is pinned separately by
 `crates/fsw-path/tests/allocations.rs` (zero steady-state allocations) and
 `tests/perf.rs` (~54 ns/resolve in release, opt-in).

@@ -17,6 +17,15 @@ pub const FSW_DISABLED_VALUE: &str = "Disabled";
 pub const FSW_BARE_SLASH_MODE_VALUE: &str = "BareSlashMode";
 pub const FSW_BARE_SLASH_DISTRIBUTION_VALUE: &str = "BareSlashDistribution";
 
+/// The three values below are hand copies of `include/fsw_filter_protocol.h` —
+/// the only contract the broker shares with the minifilter, which Rust cannot
+/// `#include`. The driver validates all of them (`fswfilter.c` message
+/// dispatch): a wrong port, version, size or a non-zero Reserved silently
+/// fails the publish, so if you touch the header, touch these.
+pub const FSW_FILTER_PORT_NAME: &str = "\\FswFilterPort";
+pub const FSW_FILTER_PROTOCOL_VERSION: u32 = 2;
+pub const FSW_FILTER_MAX_DISTRIBUTIONS: usize = 32;
+
 pub const LXSS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub const RUN_VALUE: &str = "ForwardSlashWindows";
@@ -433,8 +442,10 @@ pub fn broker_window_exists() -> bool {
 
 /// Asks the broker for its state, giving up after `timeout_ms`.
 ///
-/// The settings window uses 750 ms (`src/settings/main.cpp:827`) so a wedged
-/// broker cannot stall a refresh; the CLI uses 1000 ms.
+/// A stopped broker costs one `FindWindowW` regardless of the timeout (the
+/// send is skipped when the window is absent). The settings window uses
+/// 750 ms (`src/settings/main.cpp:827`) so a wedged broker cannot stall a
+/// refresh; the CLI uses 200 ms for the same reason.
 pub fn broker_state(timeout_ms: u32) -> BrokerState {
     #[cfg(windows)]
     unsafe {

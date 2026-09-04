@@ -18,7 +18,6 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-const FSW_FILTER_PORT_NAME: &str = "\\ForwardSlashWindowsPort";
 const SYNCHRONIZE: u32 = 0x0010_0000;
 /// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND); what `remove_value` reports for an
 /// absent value, which is the desired end state rather than a failure.
@@ -665,11 +664,12 @@ fn json_escape(s: &str) -> String {
 
 fn cmd_status(json: bool) -> i32 {
     let snap = Snapshot::current();
-    let state = broker_state(1000);
+    // Window check first: a stopped broker costs one FindWindowW, and a
+    // wedged one only waits the short informational timeout.
     let broker_status = if !broker_window_exists() {
         "stopped"
     } else {
-        match state {
+        match broker_state(200) {
             BrokerState::Active => "running (active)",
             BrokerState::Paused => "running (paused)",
             BrokerState::Unavailable => "running (hook unavailable)",

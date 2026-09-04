@@ -70,10 +70,9 @@ const MENU_POWERSHELL: u32 = 1008;
 /// Icon resource id, kept in step with `include/fsw_resources.h`.
 const IDI_FSW_APP: u16 = 101;
 
-const FSW_FILTER_PORT_NAME: &str = "\\ForwardSlashWindowsPort";
-const FSW_PROTOCOL_VERSION: u32 = 1;
+// Port, protocol version and distribution capacity come from `fsw_core`
+// (hand copies of `include/fsw_filter_protocol.h`).
 const FSW_OPERATION_REPLACE_MAPPINGS: u32 = 1;
-const FSW_MAX_DISTRIBUTIONS: usize = 64;
 const FSW_MAX_DISTRIBUTION_NAME: usize = 128;
 
 #[repr(C)]
@@ -81,9 +80,10 @@ struct FswMappingMessage {
     version: u32,
     size: u32,
     operation: u32,
+    reserved: u32,
     generation: u64,
     distribution_count: u32,
-    distributions: [[u16; FSW_MAX_DISTRIBUTION_NAME]; FSW_MAX_DISTRIBUTIONS],
+    distributions: [[u16; FSW_MAX_DISTRIBUTION_NAME]; FSW_FILTER_MAX_DISTRIBUTIONS],
 }
 
 #[cfg(windows)]
@@ -120,6 +120,32 @@ enum SurfaceKind {
 static PAUSED: AtomicBool = AtomicBool::new(false);
 static ENTER_DOWN: AtomicBool = AtomicBool::new(false);
 static SUPPRESS_ENTER_UP: AtomicBool = AtomicBool::new(false);
+
+/// Registry state re-read on the Enter hot path, cached briefly: five registry
+/// opens per keystroke buy nothing when a settings change is visible within a
+/// quarter second anyway. The broker-local cache lives here (not in
+/// `fsw-core`) so the funnel stays a pure pass-through.
+static SNAPSHOT_CACHE: Mutex<Option<(u64, fsw_core::Snapshot)>> = Mutex::new(None);
+const SNAPSHOT_CACHE_TTL_MS: u64 = 250;
+
+/// Returns the current registry snapshot, serving repeats within the TTL from
+/// the cache. Falls back to a fresh read whenever the mutex is poisoned —
+/// a cache must never block resolution.
+fn current_snapshot() -> fsw_core::Snapshot {
+    if let Ok(guard) = SNAPSHOT_CACHE.lock() {
+        if let Some((stamp, snapshot)) = guard.as_ref() {
+            if stamp.wrapping_add(SNAPSHOT_CACHE_TTL_MS) > unsafe { GetTickCount64() } {
+                return snapshot.clone();
+            }
+        }
+    }
+    let snapshot = Snapshot::current();
+    if let Ok(mut guard) = SNAPSHOT_CACHE.lock() {
+        let now = unsafe { GetTickCount64() };
+        *guard = Some((now, snapshot.clone()));
+    }
+    snapshot
+}
 
 static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static BROKER_WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -410,7 +436,7 @@ fn process_enter_request(foreground: HWND) {
         return;
     }
 
-    let snap = Snapshot::current();
+    let snap = current_snapshot();
     let mut buf = RenderBuf::new();
     let resolved = match resolve_user_slash_path(&input, &snap, &mut buf) {
         Ok(r) => r,
@@ -627,11 +653,12 @@ fn publish_filter_mappings(force: bool) {
 
     unsafe {
         let mut msg: FswMappingMessage = std::mem::zeroed();
-        msg.version = FSW_PROTOCOL_VERSION;
+        msg.version = FSW_FILTER_PROTOCOL_VERSION;
         msg.size = std::mem::size_of::<FswMappingMessage>() as u32;
         msg.operation = FSW_OPERATION_REPLACE_MAPPINGS;
+        msg.reserved = 0; // the driver requires zero; explicit, not padding luck
         msg.generation = GetTickCount64();
-        let count = distributions.len().min(FSW_MAX_DISTRIBUTIONS);
+        let count = distributions.len().min(FSW_FILTER_MAX_DISTRIBUTIONS);
         msg.distribution_count = count as u32;
 
         for (i, d) in distributions[..count].iter().enumerate() {
