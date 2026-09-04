@@ -390,25 +390,17 @@ bool ExecutableAvailable(const wchar_t* name) {
   return length > 0 && length < path.size();
 }
 
-int RunPowerShellScript(const std::filesystem::path& script,
-                        const std::vector<std::wstring>& arguments) {
-  if (!std::filesystem::exists(script)) {
-    std::wcerr << L"Integration script was not found: " << script.wstring()
-               << L"\n";
-    return 1;
-  }
-  std::wstring command = L"powershell.exe -NoLogo -NoProfile -NonInteractive "
-                         L"-ExecutionPolicy Bypass -File " +
-                         Quote(script);
-  for (const std::wstring& argument : arguments) {
-    command.push_back(L' ');
-    command.append(Quote(argument));
-  }
+int SetScriptIntegration(const std::wstring_view id, const bool enabled) {
+  // The adapter installers are native Rust in fwdslash.exe (crates/fsw-cli
+  // src/adapters); the C++ controller delegates to the same implementation.
+  const std::filesystem::path directory = ExecutableDirectory();
+  std::wstring command = Quote((directory / L"fwdslash.exe").wstring()) +
+                         L" integration " + std::wstring(id) +
+                         (enabled ? L" enable" : L" disable");
   STARTUPINFOW startup{sizeof(startup)};
   PROCESS_INFORMATION process{};
   if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, 0,
-                      nullptr, ExecutableDirectory().c_str(), &startup,
-                      &process)) {
+                      nullptr, directory.c_str(), &startup, &process)) {
     std::wcerr << L"Unable to start the integration transaction. Win32 error "
                << GetLastError() << L".\n";
     return 1;
@@ -419,48 +411,6 @@ int RunPowerShellScript(const std::filesystem::path& script,
   GetExitCodeProcess(process.hProcess, &exit_code);
   CloseHandle(process.hProcess);
   return static_cast<int>(exit_code);
-}
-
-int SetScriptIntegration(const std::wstring_view id, const bool enabled) {
-  const std::filesystem::path directory = ExecutableDirectory();
-  if (id == L"cmd") {
-    if (RegistryStateInstalled(kCmdAdapterKey) == enabled) {
-      return 0;
-    }
-    const auto script = directory /
-        (enabled ? L"Install-CmdAdapter.ps1" : L"Uninstall-CmdAdapter.ps1");
-    std::vector<std::wstring> arguments;
-    if (enabled) {
-      arguments = {L"-ControllerPath", (directory / L"fwdslash.exe").wstring()};
-    }
-    return RunPowerShellScript(script, arguments);
-  }
-
-  std::wstring edition;
-  if (id == L"windows-powershell") {
-    edition = L"WindowsPowerShell";
-  } else if (id == L"powershell") {
-    edition = L"PowerShell";
-    if (enabled && !ExecutableAvailable(L"pwsh.exe")) {
-      std::wcerr << L"PowerShell 7 is not installed.\n";
-      return 1;
-    }
-  } else {
-    return 2;
-  }
-  const std::wstring state_key = std::wstring(kPowerShellAdapterRoot) + edition;
-  if (RegistryStateInstalled(state_key) == enabled) {
-    return 0;
-  }
-  const auto script = directory /
-      (enabled ? L"Install-PowerShellAdapter.ps1"
-               : L"Uninstall-PowerShellAdapter.ps1");
-  std::vector<std::wstring> arguments = {L"-Edition", edition};
-  if (enabled) {
-    arguments.emplace_back(L"-ControllerPath");
-    arguments.emplace_back((directory / L"fwdslash.exe").wstring());
-  }
-  return RunPowerShellScript(script, arguments);
 }
 
 std::wstring JsonEscape(const std::wstring_view input) {

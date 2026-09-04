@@ -57,18 +57,7 @@ def main():
             shutil.copy2(src, dst)
             print(f"  Staged {exe} ({os.path.getsize(dst)} bytes)")
 
-        # Scripts and License
-        for script in [
-            "Install-CmdAdapter.ps1",
-            "Uninstall-CmdAdapter.ps1",
-            "Install-PowerShellAdapter.ps1",
-            "Uninstall-PowerShellAdapter.ps1",
-        ]:
-            src = os.path.join(REPO, "out", "user", arch, "Release", script)
-            if not os.path.exists(src):
-                src = os.path.join(REPO, "out", "user", "arm64", "Release", script)
-            shutil.copy2(src, os.path.join(stage, script))
-
+        # License
         shutil.copy2(os.path.join(REPO, "LICENSE"), os.path.join(stage, "LICENSE"))
 
         # Shell directories

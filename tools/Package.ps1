@@ -49,11 +49,6 @@ Copy-Item -LiteralPath (Join-Path $repo 'shell\cmd\fsw-autorun.cmd') -Destinatio
 Copy-Item -LiteralPath (Join-Path $repo 'shell\cmd\fsw-dir.cmd') -Destination (Join-Path $stage 'shell\cmd')
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'shell\powershell') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo 'shell\powershell\ForwardSlashWindows.psm1') -Destination (Join-Path $stage 'shell\powershell')
-foreach ($script in 'Install-CmdAdapter.ps1', 'Uninstall-CmdAdapter.ps1',
-                    'Install-PowerShellAdapter.ps1', 'Uninstall-PowerShellAdapter.ps1') {
-    Copy-Item -LiteralPath (Join-Path $repo "tools\$script") -Destination $stage
-}
-
 if (Test-Path -LiteralPath $archive) {
     Remove-Item -LiteralPath $archive
 }

@@ -1,9 +1,11 @@
+mod adapters;
+
 use fsw_core::*;
 use fsw_path::{BareSlashMode, RenderBuf, ResolveError, is_valid_windows_root};
 use std::env;
 use std::ffi::OsStr;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[cfg(windows)]
 #[link(name = "fltlib", kind = "raw-dylib")]
@@ -445,132 +447,6 @@ fn set_settings_protocol(enabled: bool) -> i32 {
         let _ = enabled;
         0
     }
-}
-
-fn run_powershell_script(script: &Path, args: &[&str]) -> i32 {
-    if !script.exists() {
-        eprintln!("Integration script was not found: {}", script.display());
-        return 1;
-    }
-    #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
-        use windows_sys::Win32::System::Threading::{
-            CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
-            WaitForSingleObject,
-        };
-
-        let mut cmd_line = format!(
-            "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
-            script.display()
-        );
-        for a in args {
-            cmd_line.push(' ');
-            cmd_line.push('"');
-            cmd_line.push_str(a);
-            cmd_line.push('"');
-        }
-
-        let mut wide_cmd = to_u16_vec(&cmd_line);
-        let dir = executable_directory().unwrap_or_else(|_| PathBuf::from("."));
-        let wide_dir = to_u16_vec(&dir.to_string_lossy());
-
-        let mut startup: STARTUPINFOW = std::mem::zeroed();
-        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        let mut process: PROCESS_INFORMATION = std::mem::zeroed();
-
-        // Inherit handles and take no creation flags, matching
-        // `src/controller/main.cpp:409-411`. The adapter scripts report progress and
-        // rollback reasons on stdout/stderr; CREATE_NO_WINDOW would discard all of it
-        // and leave the user with nothing but an exit code.
-        let ok = CreateProcessW(
-            std::ptr::null(),
-            wide_cmd.as_mut_ptr(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            1,
-            0,
-            std::ptr::null(),
-            wide_dir.as_ptr(),
-            &startup,
-            &mut process,
-        );
-
-        if ok == 0 {
-            eprintln!(
-                "Unable to start the integration transaction. Win32 error {}.",
-                GetLastError()
-            );
-            return 1;
-        }
-
-        CloseHandle(process.hThread);
-        WaitForSingleObject(process.hProcess, INFINITE);
-        let mut exit_code: u32 = 1;
-        GetExitCodeProcess(process.hProcess, &mut exit_code);
-        CloseHandle(process.hProcess);
-        exit_code as i32
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (script, args);
-        1
-    }
-}
-
-fn set_script_integration(id: &str, enabled: bool) -> i32 {
-    let dir = match executable_directory() {
-        Ok(d) => d,
-        Err(_) => PathBuf::from("."),
-    };
-    if id == "cmd" {
-        if adapter_installed(CMD_ADAPTER_KEY) == enabled {
-            return 0;
-        }
-        let script = dir.join(if enabled {
-            "Install-CmdAdapter.ps1"
-        } else {
-            "Uninstall-CmdAdapter.ps1"
-        });
-        let ctrl_path = dir.join("fwdslash.exe");
-        let ctrl_str = ctrl_path.to_string_lossy();
-        let args = if enabled {
-            vec!["-ControllerPath", ctrl_str.as_ref()]
-        } else {
-            vec![]
-        };
-        return run_powershell_script(&script, &args);
-    }
-
-    let edition = if id == "windows-powershell" {
-        "WindowsPowerShell"
-    } else if id == "powershell" {
-        if enabled && !executable_available("pwsh.exe") {
-            eprintln!("PowerShell 7 is not installed.");
-            return 1;
-        }
-        "PowerShell"
-    } else {
-        return 2;
-    };
-
-    let state_key = format!("{}{}", POWERSHELL_ADAPTER_ROOT, edition);
-    if adapter_installed(&state_key) == enabled {
-        return 0;
-    }
-    let script = dir.join(if enabled {
-        "Install-PowerShellAdapter.ps1"
-    } else {
-        "Uninstall-PowerShellAdapter.ps1"
-    });
-    let ctrl_path = dir.join("fwdslash.exe");
-    let ctrl_str = ctrl_path.to_string_lossy();
-    let mut args = vec!["-Edition", edition];
-    if enabled {
-        args.push("-ControllerPath");
-        args.push(ctrl_str.as_ref());
-    }
-    run_powershell_script(&script, &args)
 }
 
 fn set_windows_integration(enabled: bool) -> i32 {
@@ -1185,7 +1061,7 @@ fn main() {
                 if name == "windows" {
                     set_windows_integration(enabled)
                 } else {
-                    let result = set_script_integration(name, enabled);
+                    let result = adapters::set_integration(name, enabled);
                     if result == 2 {
                         usage();
                     }
@@ -1204,9 +1080,12 @@ fn main() {
         "stop" => stop_broker(),
         "install" => set_windows_integration(true),
         "uninstall" => {
+            // Sweep the shell adapters first so their helper state (payload,
+            // markers, profile blocks) goes with the rest of the product.
+            let sweep = adapters::sweep_uninstall();
             let win = set_windows_integration(false);
             let proto = set_settings_protocol(false);
-            if win != 0 { win } else { proto }
+            if win != 0 { win } else if proto != 0 { proto } else { sweep }
         }
         _ => {
             usage();

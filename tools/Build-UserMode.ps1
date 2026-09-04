@@ -184,9 +184,4 @@ foreach ($payload in $payloadDirectories) {
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
     Copy-Item -Path (Join-Path $repo ($payload.Source + '\*')) -Destination $destination -Force
 }
-foreach ($script in 'Install-CmdAdapter.ps1', 'Uninstall-CmdAdapter.ps1',
-                    'Install-PowerShellAdapter.ps1', 'Uninstall-PowerShellAdapter.ps1') {
-    Copy-Item -LiteralPath (Join-Path $repo "tools\$script") -Destination $output -Force
-}
-
 Write-Host "User-mode $Architecture artifacts built at $output."

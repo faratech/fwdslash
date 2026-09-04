@@ -57,21 +57,30 @@ Blank or pending entries are unverified and must not be advertised as working.
 
 The driver is not included in normal packages until all driver gates pass.
 
-## MSIX virtualization (verified 2026-09-04, one ARM64 host, Windows 11 26200)
+## MSIX virtualization and the shell adapters (verified 2026-09-04, one ARM64
+## host, Windows 11 26200; re-verify on new Windows builds)
 
-Clean-room packaged test with `unvirtualizedResources` **absent**: the packaged
-CLI's own write to `HKCU\Software\ForwardSlashWindows\Settings\Disabled`
-(`fwdslash disable`, exit 0) landed in the package's private registry hive —
-the real-hive value stayed `0`, so the unpackaged PowerShell module and CLI
-never saw the disable. File writes by the adapter helper scripts landed real
-only because those scripts run as unpackaged `powershell.exe` children.
+Clean-room findings that shaped the design:
 
-With the exclusions and the capability restored (the committed manifest), a
-from-scratch packaged install verified correct: real `Command Processor`
-AutoRun, real `%LOCALAPPDATA%` payload, real `Documents` profile imports for
-Windows PowerShell 5.1 and PowerShell 7 (OneDrive-redirected Documents), and
-cross-context `Disabled` visibility.
+- A packaged process's **registry** writes to `HKCU\Software\...` land in the
+  package's private hive — invisible to unpackaged shells. Proven: packaged
+  `fwdslash disable` (exit 0) left the real `Settings\Disabled` value at `0`.
+- A packaged process's **file** writes to `%LOCALAPPDATA%\ForwardSlashWindows`
+  and `Documents` land in the real file system (those paths are not
+  redirected for this package).
+- A `powershell.exe` child spawned by the packaged app also writes real —
+  which is why the retired PowerShell helper scripts appeared to work.
 
-Conclusion: the virtualization exclusions and the restricted capability are
-**required**, and the Microsoft-approval requirement for the Store submission
-stands. Re-verify on each new Windows build before Store submission.
+The adapters are therefore installed natively (`crates/fsw-cli/src/adapters/`)
+with every registry write routed through `reg.exe` — a System32 child without
+package identity, so its writes land in the real hive. Reads use the merged
+view and are always correct. With this design the manifest needs **no**
+virtualization exclusions and **no** `unvirtualizedResources` capability;
+both were removed, removing the Microsoft-approval requirement for the Store
+submission.
+
+Verify on every new Windows build before a Store submission: packaged
+`fwdslash disable` must flip the real `HKCU\...\Settings\Disabled` value
+(read it from an unpackaged PowerShell), and a fresh packaged
+`fwdslash integration cmd enable` must produce a real `Command Processor
+AutoRun` value.

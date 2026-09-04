@@ -262,18 +262,44 @@ pub fn is_disabled() -> bool {
 }
 
 /// Sets the disabled state in HKCU\Software\ForwardSlashWindows\Settings.
+/// Persists the global pause flag.
+///
+/// The write goes through `reg.exe` (a System32 child, i.e. a process without
+/// package identity) because a packaged process's own registry writes are
+/// virtualized into the package's private hive — and the PowerShell module
+/// reads this flag from an unpackaged shell, where virtualized writes are
+/// invisible (verified 2026-09-04; see docs/compatibility.md). The BareSlash*
+/// settings are deliberately NOT routed this way: they are only ever read
+/// back by packaged components, so their virtualized writes are
+/// self-consistent.
 pub fn persist_disabled(disabled: bool) -> Result<(), u32> {
     #[cfg(windows)]
     {
-        use windows_registry::CURRENT_USER;
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
 
-        let key = CURRENT_USER
-            .create(FSW_SETTINGS_KEY)
-            .map_err(|e| e.code().0 as u32)?;
-        let val = if disabled { 1u32 } else { 0u32 };
-        key.set_u32(FSW_DISABLED_VALUE, val)
-            .map_err(|e| e.code().0 as u32)?;
-        Ok(())
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let value = if disabled { "1" } else { "0" };
+        let status = Command::new("reg.exe")
+            .args([
+                "add",
+                &format!("HKCU\\{FSW_SETTINGS_KEY}"),
+                "/v",
+                FSW_DISABLED_VALUE,
+                "/t",
+                "REG_DWORD",
+                "/d",
+                value,
+                "/f",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| e.raw_os_error().unwrap_or(u32::MAX as i32) as u32)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(status.code().unwrap_or(u32::MAX as i32) as u32)
+        }
     }
     #[cfg(not(windows))]
     {

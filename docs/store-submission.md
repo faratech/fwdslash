@@ -31,33 +31,16 @@ Add-AppxPackage out\msix\fwdslash-<version>.msixbundle
 Upload `out\msix\fwdslash-<version>.msixbundle` **unsigned**. The Store re-signs
 it; a self-signature would be discarded.
 
-## 2. Restricted capability (blocking, long lead time)
+## 2. Capabilities (resolved — none beyond runFullTrust)
 
-The package declares `unvirtualizedResources`. This needs Microsoft approval
-before the product can be published, and approval takes days to weeks, so
-request it as early as possible.
-
-Justification to submit:
-
-> fwdslash makes Linux-style WSL paths work in Windows navigation surfaces. Two
-> optional, user-initiated integrations extend that to Command Prompt and
-> PowerShell. They require writes that unpackaged shells must be able to read:
->
-> - `HKEY_CURRENT_USER\Software\Microsoft\Command Processor` — `cmd.exe` reads
->   `AutoRun` to load the `dir`/`ls` adapter.
-> - `HKEY_CURRENT_USER\Software\ForwardSlashWindows` — the PowerShell module
->   reads the enabled/disabled state on every `dir`/`ls`.
-> - `%LOCALAPPDATA%\ForwardSlashWindows` — holds the adapter payload that
->   `cmd.exe` and `powershell.exe` execute by absolute path.
->
-> Virtualized writes are invisible to those processes, which defeats the feature
-> entirely. The manifest uses targeted exclusions rather than disabling
-> virtualization wholesale: three specific locations, no blanket
-> `RegistryWriteVirtualization`/`FileSystemWriteVirtualization` opt-out. Every
-> write is opt-in, per-user, transactional, and reversible from the app.
-
-Note App Installer refuses packages declaring this capability, so sideload
-testing must use `Add-AppxPackage`.
+The package previously declared the restricted `unvirtualizedResources`
+capability for targeted virtualization exclusions, which required Microsoft
+approval. Clean-room testing (2026-09-04, docs/compatibility.md) showed the
+exclusions were solving the wrong problem: the shell-facing registry state the
+adapters depend on is now written through `reg.exe` — a System32 child process
+without package identity — so it lands in the real hive regardless of MSIX
+virtualization. The manifest declares only `runFullTrust`, which needs no
+approval, and App Installer can sideload the package without restriction.
 
 ## 3. Notes for certification
 

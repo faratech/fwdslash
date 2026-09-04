@@ -23,6 +23,16 @@ param(
     [string]$CertificatePath,
     [string]$CertificatePassword,
 
+    # Where the staged binaries come from. Cpp (default) = the MSVC build in
+    # out\user\<arch>\<Configuration>, built here unless -SkipBuild. Rust =
+    # the cargo release build in target\<rust-triple>\release, built by the
+    # caller (e.g. the release workflow). The Rust payload omits App.xbf and
+    # fswsettings.pri — the Rust settings app needs neither — and takes the
+    # adapter scripts and shell payload straight from the repo instead of the
+    # C++ build output.
+    [ValidateSet('Cpp', 'Rust')]
+    [string]$BinarySource = 'Cpp',
+
     [switch]$SkipBuild
 )
 
@@ -98,11 +108,7 @@ function Invoke-Tool {
 $payloadFiles = @(
     'fwdslash.exe',
     'fswbroker.exe',
-    'fswsettings.exe',
-    'Install-CmdAdapter.ps1',
-    'Uninstall-CmdAdapter.ps1',
-    'Install-PowerShellAdapter.ps1',
-    'Uninstall-PowerShellAdapter.ps1'
+    'fswsettings.exe'
 )
 # Inside a package the Windows App SDK is reached through the manifest
 # PackageDependency, and -Packaged stops the bootstrap initializer being
@@ -117,36 +123,56 @@ $produced = @()
 
 foreach ($target in $Architecture) {
     Write-Host "== $target =="
-    if (-not $SkipBuild) {
-        & (Join-Path $PSScriptRoot 'Build-UserMode.ps1') -Architecture $target -Configuration $Configuration `
-            -Packaged -PackageIdentityName $IdentityName
-        if ($LASTEXITCODE -ne 0) { throw "Build-UserMode.ps1 failed for $target." }
-    }
+    if ($BinarySource -eq 'Cpp') {
+        if (-not $SkipBuild) {
+            & (Join-Path $PSScriptRoot 'Build-UserMode.ps1') -Architecture $target -Configuration $Configuration `
+                -Packaged -PackageIdentityName $IdentityName
+            if ($LASTEXITCODE -ne 0) { throw "Build-UserMode.ps1 failed for $target." }
+        }
 
-    $binaries = Join-Path $repo ('out\user\{0}\{1}' -f $target.ToLowerInvariant(), $Configuration)
-    if (-not (Test-Path -LiteralPath $binaries -PathType Container)) {
-        throw "Build output does not exist: $binaries"
+        $binaries = Join-Path $repo ('out\user\{0}\{1}' -f $target.ToLowerInvariant(), $Configuration)
+        if (-not (Test-Path -LiteralPath $binaries -PathType Container)) {
+            throw "Build output does not exist: $binaries"
+        }
+    } else {
+        $rustTriple = if ($target -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+        $binaries = Join-Path $repo ("target\$rustTriple\release")
+        if (-not (Test-Path -LiteralPath $binaries -PathType Container)) {
+            throw "Rust build output does not exist: $binaries. Run cargo build --release --target $rustTriple --workspace first."
+        }
     }
 
     $stage = Join-Path $outputRoot ('stage-{0}' -f $target.ToLowerInvariant())
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-    foreach ($file in $payloadFiles) {
+    # The three executables always come from the binary source; the adapter
+    # scripts and shell payload come from the C++ build output for Cpp (which
+    # stages them) and straight from the repo for Rust.
+    $exes = @('fwdslash.exe', 'fswbroker.exe', 'fswsettings.exe')
+    $sideFiles = if ($BinarySource -eq 'Cpp') {
+        $payloadFiles + $optionalPayloadFiles
+    } else {
+        @()
+    }
+    $shellBase = if ($BinarySource -eq 'Cpp') { $binaries } else { $repo }
+
+    foreach ($file in $exes) {
         $source = Join-Path $binaries $file
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             throw "Required payload file is missing from the build: $source"
         }
         Copy-Item -LiteralPath $source -Destination $stage
     }
-    foreach ($file in $optionalPayloadFiles) {
+    foreach ($file in $sideFiles) {
         $source = Join-Path $binaries $file
-        if (Test-Path -LiteralPath $source -PathType Leaf) {
-            Copy-Item -LiteralPath $source -Destination $stage
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Required payload file is missing: $source"
         }
+        Copy-Item -LiteralPath $source -Destination $stage
     }
     foreach ($directory in 'shell\cmd', 'shell\powershell') {
-        $source = Join-Path $binaries $directory
+        $source = Join-Path $shellBase $directory
         if (Test-Path -LiteralPath $source -PathType Container) {
             $targetDirectory = Join-Path $stage $directory
             New-Item -ItemType Directory -Force -Path $targetDirectory | Out-Null
@@ -160,7 +186,11 @@ foreach ($target in $Architecture) {
     $stageAssets = Join-Path $stage 'Assets'
     New-Item -ItemType Directory -Force -Path $stageAssets | Out-Null
     Copy-Item -Path (Join-Path $assetSource '*') -Destination $stageAssets -Recurse -Force
-    $titleBar = Join-Path $binaries 'Assets\fwdslash-titlebar.png'
+    $titleBar = if ($BinarySource -eq 'Cpp') {
+        Join-Path $binaries 'Assets\fwdslash-titlebar.png'
+    } else {
+        Join-Path $repo 'assets\fwdslash-titlebar.png'
+    }
     if (Test-Path -LiteralPath $titleBar -PathType Leaf) {
         Copy-Item -LiteralPath $titleBar -Destination $stageAssets -Force
     }

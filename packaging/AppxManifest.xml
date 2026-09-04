@@ -20,8 +20,7 @@
   xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  xmlns:virtualization="http://schemas.microsoft.com/appx/manifest/virtualization/windows10"
-  IgnorableNamespaces="uap uap5 desktop desktop4 rescap virtualization">
+  IgnorableNamespaces="uap uap5 desktop desktop4 rescap">
 
   <Identity
     Name="{{IDENTITY_NAME}}"
@@ -36,38 +35,20 @@
     <Description>Type Linux-style WSL paths in File Explorer, Run, Windows Search and Open dialogs.</Description>
 
     <!--
-      Only HKCU and %USERPROFILE%\AppData are virtualized by MSIX. These three
-      locations must be visible to processes outside the package:
-
-        Command Processor    cmd.exe reads AutoRun to load the dir/ls adapter.
-        ForwardSlashWindows  the PowerShell module reads Disabled on every
-                             dir/ls from an unpackaged shell.
-        LocalAppData\...     holds the adapter payload that cmd.exe and
-                             powershell.exe execute by absolute path.
-
-      The user's PowerShell profile lives under Documents, which MSIX does not
-      virtualize, so it needs no exclusion.
-
-      These targeted exclusions are honoured on Windows 11 and later, which is
-      why TargetDeviceFamily below starts at 10.0.22000.0. They require the
-      unvirtualizedResources restricted capability declared further down.
+      No virtualization exclusions and no unvirtualizedResources capability:
+      the adapters are now installed by `fwdslash` itself, whose shell-facing
+      registry state (Command Processor AutoRun, the ForwardSlashWindows
+      settings) is written through reg.exe — a System32 child without package
+      identity, so its writes land in the real hive despite MSIX
+      virtualization. File payloads under %LOCALAPPDATA%\ForwardSlashWindows
+      are written the same way; Documents is not virtualized. Reads use the
+      merged view and are always correct. Verified 2026-09-04 (see
+      docs/compatibility.md); drop-in exclusions are the fallback if a future
+      Windows build ever redirects these writes.
     -->
-    <virtualization:RegistryWriteVirtualization>
-      <virtualization:ExcludedKeys>
-        <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\Microsoft\Command Processor</virtualization:ExcludedKey>
-        <virtualization:ExcludedKey>HKEY_CURRENT_USER\Software\ForwardSlashWindows</virtualization:ExcludedKey>
-      </virtualization:ExcludedKeys>
-    </virtualization:RegistryWriteVirtualization>
-
-    <virtualization:FileSystemWriteVirtualization>
-      <virtualization:ExcludedDirectories>
-        <virtualization:ExcludedDirectory>$(KnownFolder:LocalAppData)\ForwardSlashWindows</virtualization:ExcludedDirectory>
-      </virtualization:ExcludedDirectories>
-    </virtualization:FileSystemWriteVirtualization>
   </Properties>
 
   <Dependencies>
-    <!-- Windows 11: targeted virtualization exclusions are not honoured before it. -->
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26200.0" />
     <!-- Broad Windows App Runtime 2.x compatibility -->
     <PackageDependency
@@ -82,14 +63,7 @@
 
   <Capabilities>
     <rescap:Capability Name="runFullTrust" />
-    <!--
-      Required by the virtualization exclusions above. This capability needs
-      Microsoft approval before the package can be published to the Store, and
-      App Installer refuses packages that declare it, so local installs must use
-      Add-AppxPackage.
-    -->
-    <rescap:Capability Name="unvirtualizedResources" />
-  </Capabilities>
+</Capabilities>
 
   <Applications>
     <!-- SupportsMultipleInstances is required by the console-subsystem alias below,

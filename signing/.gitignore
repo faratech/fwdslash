@@ -1,0 +1,3 @@
+lib/
+.env.codesigning
+signing-test.exe

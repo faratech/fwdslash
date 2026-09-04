@@ -255,10 +255,12 @@ workspace-aware dependency updater and enforces the island pins listed in its `I
 
 ### Shell adapters
 
-`cmd` and PowerShell support are optional adapters installed by `fwdslash` shelling out to
-`tools/Install-*.ps1`. They are **transactional**: the previous `AutoRun` value and the original
-PowerShell profile bytes are snapshotted before modification and restored byte-exact on removal,
-and uninstall refuses to touch anything a third party has since changed. Preserve that property.
+`cmd` and PowerShell support are optional adapters installed natively by `fwdslash`
+(`crates/fsw-cli/src/adapters/`; the retired `tools/Install-*.ps1` helpers are gone). They are
+**transactional**: the previous `AutoRun` value and the original PowerShell profile bytes are
+snapshotted before modification and restored byte-exact on removal, and uninstall refuses to touch
+anything a third party has since changed. Preserve that property. `fwdslash uninstall` sweeps all
+installed adapters before removing the Run key and protocol.
 
 The cmd adapter works by `doskey` macros, so **it only takes effect in interactive consoles** —
 `cmd /c "dir /etc"` will always fail with "Invalid switch". Test it in a real console window.
