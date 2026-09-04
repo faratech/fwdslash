@@ -56,3 +56,22 @@ Blank or pending entries are unverified and must not be advertised as working.
   collision warnings for every registered distro name on every mounted drive.
 
 The driver is not included in normal packages until all driver gates pass.
+
+## MSIX virtualization (verified 2026-09-04, one ARM64 host, Windows 11 26200)
+
+Clean-room packaged test with `unvirtualizedResources` **absent**: the packaged
+CLI's own write to `HKCU\Software\ForwardSlashWindows\Settings\Disabled`
+(`fwdslash disable`, exit 0) landed in the package's private registry hive —
+the real-hive value stayed `0`, so the unpackaged PowerShell module and CLI
+never saw the disable. File writes by the adapter helper scripts landed real
+only because those scripts run as unpackaged `powershell.exe` children.
+
+With the exclusions and the capability restored (the committed manifest), a
+from-scratch packaged install verified correct: real `Command Processor`
+AutoRun, real `%LOCALAPPDATA%` payload, real `Documents` profile imports for
+Windows PowerShell 5.1 and PowerShell 7 (OneDrive-redirected Documents), and
+cross-context `Disabled` visibility.
+
+Conclusion: the virtualization exclusions and the restricted capability are
+**required**, and the Microsoft-approval requirement for the Store submission
+stands. Re-verify on each new Windows build before Store submission.
