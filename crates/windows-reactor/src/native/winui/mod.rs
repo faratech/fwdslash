@@ -319,6 +319,7 @@ struct WindowVisualChanges {
     client_size: bool,
     constraints: bool,
     icon: bool,
+    icon_resource: bool,
     theme: bool,
 }
 
@@ -512,6 +513,8 @@ fn window_visual_changes(
         client_size: previous.is_none_or(|previous| previous.client_size != next.client_size),
         constraints: previous.is_none_or(|previous| previous.constraints != next.constraints),
         icon: next.icon.is_some() && previous.is_none_or(|previous| previous.icon != next.icon),
+        icon_resource: next.icon_resource.is_some()
+            && previous.is_none_or(|previous| previous.icon_resource != next.icon_resource),
         theme: previous.is_none_or(|previous| previous.theme != next.theme),
     }
 }
@@ -833,6 +836,42 @@ impl WinUiRuntime {
                 .AppWindow()
                 .and_then(|window| window.SetIcon(path))
                 .map_err(native_error)?;
+        }
+
+        if changes.icon_resource
+            && let Some(id) = visuals.icon_resource
+        {
+            // Mirrors what a classic window class gets for free via `WNDCLASS.hIcon`:
+            // the shell sizes the taskbar/Alt-Tab entry from the small icon, so send
+            // both. Like `SetIcon` above, a failed load is a hard error rather than a
+            // silently generic window.
+            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+            let load = |width: i32, height: i32| {
+                unsafe {
+                    LoadImageW(
+                        instance,
+                        id as *const u16,
+                        IMAGE_ICON,
+                        width,
+                        height,
+                        LR_DEFAULTCOLOR,
+                    )
+                }
+            };
+            let metrics = |index: i32| unsafe { GetSystemMetrics(index) };
+            let large = load(metrics(SM_CXICON), metrics(SM_CYICON));
+            if large.is_null() {
+                let code = unsafe { GetLastError() };
+                return Err(RuntimeError::Native((code | 0x8007_0000) as i32));
+            }
+            let small = load(metrics(SM_CXSMICON), metrics(SM_CYSMICON));
+            let hwnd = window_handle()?;
+            unsafe {
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, large as isize);
+                if !small.is_null() {
+                    SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
+                }
+            }
         }
 
         if changes.constraints {

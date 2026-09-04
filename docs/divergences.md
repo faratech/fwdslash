@@ -118,12 +118,42 @@ under the unpackaged Windows App SDK. The `TitleBar` `Content` slot is not a
 substitute either: it centres its child, so the icon lands mid-bar instead of at
 the leading edge.
 
-The caption is therefore drawn by `TitleBar` itself, which puts it in exactly the
-C++ position. The product icon still reaches the taskbar, Alt-Tab and Explorer
-through the `IDI_FSW_APP` resource in `crates/fsw-settings/app.rc`. Closing this
-needs an upstream `TitleBar.IconSource` in `windows-reactor`.
+The caption is therefore drawn by `TitleBar` itself, and the leading-edge icon
+goes in the TitleBar's `LeftHeader` slot (added to `windows-reactor` for this):
+same position the C++ `IconSource` occupies, automatic drag regions, and
+`ImageIcon` + `EncodedImage::from_static` over `assets/fwdslash-titlebar.png`
+decodes in place via `BitmapImage.SetSourceAsync`, never constructing the
+fail-fasting `ImageIconSource`. The taskbar/Alt-Tab icon is not part of this
+divergence either: `WindowVisuals::icon_resource(IDI_FSW_APP)` loads the
+`app.rc` resource and applies it with `WM_SETICON`, the same thing
+`src/settings/main.cpp:354-366` does against the raw HWND. (An `.rc` icon alone
+only becomes the exe's file icon — it never reaches the taskbar on its own.)
+The only remaining caption gap versus the C++ is that the PNG sits in
+`LeftHeader` rather than `IconSource` — functionally equivalent at the leading
+edge.
+
+### 1b. The settings window has tray + close/minimize-to-tray behavior the C++ lacks
+
+`crates/fsw-settings/src/tray.rs` subclasses the window (`SetWindowSubclass`)
+and adds a notification-area icon: minimizing or closing hides the window to
+the tray, left click restores, right click offers Show/Exit, and
+`TaskbarCreated` re-adds the icon after a shell restart. The C++ settings app
+has no tray surface at all. This is the wfdiag `reactor-spike/window_support.rs`
+solution ported onto `windows-sys`; it also pairs with the single-instance
+mutex in `activate_existing_instance` — a second launch raises the existing
+window instead of starting a duplicate, which the C++ app does not guard
+against either.
 
 ### 2. The navigation pane pushes content instead of overlaying it
+
+Also against the Fluent audit (2026-09): the Rust app deviates from the C++
+*product* on purpose in three places to match the published WinUI guidance —
+`OpenPaneLength` at the documented 320 default (the C++ pins a custom value),
+24px content padding (the C++ uses 32/24/32/28), and secondary text drawn with
+`TextFillColorSecondaryBrush` via `ThemeBrush::TextSecondary` instead of the
+C++'s `Opacity(0.7x)` dimming, which does not survive high-contrast themes.
+These are Fluent-conformance fixes, not porting drift; the C++ app was left as
+shipped.
 
 `src/settings/main.cpp:396` sets `PaneDisplayMode = LeftCompact`. That pins WinUI's
 `DisplayMode` to `Compact`, which hosts the pane in a `SplitView` set to

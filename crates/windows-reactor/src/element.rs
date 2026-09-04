@@ -162,6 +162,7 @@ pub enum ThemeBrush {
     Accent,
     AccentText,
     PrimaryText,
+    TextSecondary,
     SolidBackground,
     CardBackground,
     CardStroke,
@@ -227,6 +228,7 @@ impl ThemeBrush {
             Self::Accent => "AccentFillColorDefaultBrush",
             Self::AccentText => "AccentTextFillColorPrimaryBrush",
             Self::PrimaryText => "TextFillColorPrimaryBrush",
+            Self::TextSecondary => "TextFillColorSecondaryBrush",
             Self::SolidBackground => "SolidBackgroundFillColorBaseBrush",
             Self::CardBackground => "CardBackgroundFillColorDefaultBrush",
             Self::CardStroke => "CardStrokeColorDefaultBrush",
@@ -1739,6 +1741,7 @@ pub struct WindowVisuals {
     pub(crate) client_size: Option<(f64, f64)>,
     pub(crate) constraints: Option<WindowConstraints>,
     pub(crate) icon: Option<&'static str>,
+    pub(crate) icon_resource: Option<u16>,
     pub(crate) theme: WindowTheme,
 }
 
@@ -1774,6 +1777,16 @@ impl WindowVisuals {
     pub fn icon(mut self, path: &'static str) -> Self {
         assert!(!path.is_empty(), "window icon path must not be empty");
         self.icon = Some(path);
+        self
+    }
+
+    /// Sets the window icon from a Win32 resource in the running executable.
+    ///
+    /// This is the resource-based counterpart to [`Self::icon`]: it loads
+    /// `MAKEINTRESOURCE(id)` from the module and applies it with `WM_SETICON`,
+    /// so no icon file needs to ship next to the binary.
+    pub fn icon_resource(mut self, id: u16) -> Self {
+        self.icon_resource = Some(id);
         self
     }
 

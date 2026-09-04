@@ -94,6 +94,19 @@ See `docs/store-submission.md` for identity values and Store constraints.
 leaving WSL for native PowerShell. It is part of the Rust-port work (see below) and currently
 hardcodes its own `VERSION` constant rather than reading the workspace version.
 
+**Local MSIX test loop (Rust binaries):** `cargo build --release --target <rust-triple>
+--workspace` on the Windows side (both `aarch64-pc-windows-msvc` and `x86_64-pc-windows-msvc`
+are installed), then `python3 tools/package_msix.py` from WSL — it stages the three Rust exes
+from `target/<triple>/release`, so the MSIX is the *Rust* product even though nothing else
+consumes it yet. Sign with the publisher-matching self-sign cert
+(`C:\code\wfdiag-selfsign.pfx`, password recorded in the wfdiag repo's `build-cross.py`; the
+cert must also be in the machine's trusted root — it already is on the dev host). Same-version
+reinstall is blocked with 0x80073CFB: `Get-AppxPackage 32827MikeFara.fwdslash | Remove-AppxPackage`
+before each `Add-AppxPackage`, or bump `VERSION` in `package_msix.py`. Launch the packaged
+app with `explorer.exe 'shell:AppsFolder\32827MikeFara.fwdslash!App'`, and remember the
+running-process rule above applies to the packaged copy too — a running settings window
+(often the leftover unpackaged dev build in `target\release`) blocks relinking.
+
 ## Architecture
 
 Three user-mode binaries share one static core and cooperate at runtime:
@@ -200,11 +213,29 @@ is exactly one line, and a PR that needs to add a dependency there must justify 
 `docs/dependencies.md` first. `crates/windows-reactor/` is Microsoft's own crate (MIT/Apache-2.0,
 from microsoft/windows-rs), vendored and pulled in via `[patch.crates-io]` in the root
 `Cargo.toml` so it can be patched locally — treat it as a dependency to patch, not code owned by
-this project.
+this project. It has already absorbed local patches this way: `WindowVisuals::icon_resource`
+(WM_SETICON from the exe's `.rc` resource — the taskbar icon the `.rc` file alone never
+provides), `ThemeBrush::TextSecondary` (`TextFillColorSecondaryBrush`), and the
+`TitleBar.LeftHeader` slot (binding + slot plumbing; the caption icon goes there because
+`ImageIconSource` fail-fasts under the unpackaged SDK — see `docs/divergences.md` §1). When a
+WinRT API slot is missing, the vtable in `native/winui/bindings.rs` usually reserves its
+position as a `usize` placeholder — implement the fn pointer + wrapper method, then wire the
+slot/property through `generated.rs` and `native/winui/generated.rs`.
+
+`crates/fsw-settings/src/tray.rs` is the wfdiag `reactor-spike/window_support.rs` solution
+ported onto `windows-sys`: the window is subclassed with `SetWindowSubclass` and that one file
+owns tray icon, minimize/close-to-tray, and the Show/Exit menu. Window discovery enumerates
+**current-process** windows only — a bare `FindWindowW(NULL, title)` matches another
+instance's window and `SetWindowSubclass` fails cross-process. The app is also
+single-instance (`activate_existing_instance` + `Local\ForwardSlashWindows.Settings` mutex):
+a second launch raises the existing window. The C++ settings app has neither guard.
 
 `docs/divergences.md` pins every place the Rust resolver is deliberately not byte-identical to
 the C++ one (case-folding table, error-shape tightening, an unreachable error variant, malformed
-distribution names, and the structural vs. textual bare-slash rewrite), each backed by a named
+distribution names, and the structural vs. textual bare-slash rewrite) — and, further down,
+every settings-app divergence (caption icon route, pane display mode, Fluent-conformance
+departures from the C++ such as 24px padding / 320 pane length / semantic secondary-text
+brush, tray + single-instance behavior the C++ lacks), each backed by a named
 test in `crates/fsw-path/tests/resolver.rs`. A difference not listed there is a bug, not a
 feature. `docs/size-baseline.md` records the measured C++ binary sizes (e.g. `fswbroker.exe`
 ~161–173 KB of code) as the budget the Rust binaries have to clear, and the codegen policy

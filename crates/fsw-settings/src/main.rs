@@ -22,9 +22,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use windows_reactor::*;
 
+mod tray;
+
 /// The WSL provider root. Bare `/` may resolve elsewhere depending on bare-slash mode,
 /// so "Open WSL root" targets this literally, as `src/settings/main.cpp:562` does.
 const WSL_ROOT: &str = r"\\wsl.localhost";
+
+/// Icon resource id from app.rc, kept in step with `include/fsw_resources.h`.
+const IDI_FSW_APP: u16 = 101;
 
 // ---------------------------------------------------------------------------
 // Sections
@@ -243,6 +248,9 @@ enum Msg {
     OpenWslRoot,
     RefreshStatus,
     DismissNotice,
+    /// The settings HWND exists; install the tray/lifecycle subclass on the UI
+    /// thread. The payload is the window discovered by the background poll.
+    WindowHookReady(isize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -288,11 +296,24 @@ impl Component for SettingsModel {
     type Input = Section;
     type Message = Msg;
 
-    fn create(input: &Self::Input, _context: &ComponentContext<Self>) -> Self {
+    fn create(input: &Self::Input, context: &ComponentContext<Self>) -> Self {
         // A packaged build runs nothing at install time and its startup task only
         // fires at logon, so opening this window is the first chance to arm the
         // broker. Without this a Store install does nothing at all.
         ensure_broker_running();
+        // Reactor materializes the HWND after `create` returns, so discovery
+        // runs off-thread with bounded polling; `WindowHookReady` hands the
+        // window back for the (UI-thread-only) subclass installation.
+        context.spawn_background(|_| {
+            for _ in 0..100 {
+                let window = tray::discover_window();
+                if window != 0 {
+                    return Msg::WindowHookReady(window);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Msg::WindowHookReady(0)
+        });
         Self {
             section: *input,
             pane_open: false,
@@ -403,6 +424,14 @@ impl Component for SettingsModel {
                 self.show_result(true, "Status refreshed", false);
             }
             Msg::DismissNotice => self.notice = None,
+            Msg::WindowHookReady(window) => {
+                // Subclassing requires the window's own thread; `update` runs
+                // on it. A 0 payload means discovery timed out -- tray and
+                // close-to-tray silently degrade to default behavior.
+                if window != 0 && let Err(code) = tray::install(window) {
+                    log_crash(&format!("tray subclass installation failed: Win32 error {code}"));
+                }
+            }
         }
     }
 
@@ -411,6 +440,7 @@ impl Component for SettingsModel {
         context.window_visuals(
             WindowVisuals::new()
                 .backdrop(WindowBackdrop::Mica)
+                .icon_resource(IDI_FSW_APP)
                 .theme(match self.color_scheme {
                     ColorScheme::Dark => WindowTheme::Dark,
                     ColorScheme::Light => WindowTheme::Light,
@@ -418,31 +448,43 @@ impl Component for SettingsModel {
         );
         context.on_color_scheme(context.callback(Msg::ColorSchemeChanged));
 
-        // The C++ sets TitleBar.IconSource (main.cpp:387-392). reactor models no
-        // IconSource type at all, and hand-activating ImageIconSource fail-fasts under
-        // the unpackaged Windows App SDK, so the caption is drawn by TitleBar itself --
-        // which puts it in exactly the C++ position. The TitleBar's Content region
-        // centres its child, so it is not a usable substitute. The product icon still
-        // reaches the taskbar and Alt-Tab through the IDI_FSW_APP resource in app.rc.
-        // Tracked in docs/divergences.md.
+        // The C++ sets TitleBar.IconSource (main.cpp:387-392). ImageIconSource
+        // fail-fasts under the unpackaged Windows App SDK, so the icon goes in the
+        // TitleBar's LeftHeader slot instead: same leading-edge position (the
+        // control draws it ahead of the title), automatic drag regions because it
+        // is non-interactive content inside the TitleBar, and ImageIcon decodes
+        // embedded PNG bytes in place -- the one route that never constructs the
+        // fail-fasting ImageIconSource. The window icon proper (taskbar and
+        // Alt-Tab) is applied from the IDI_FSW_APP resource in app.rc via
+        // WM_SETICON, as src/settings/main.cpp does against the HWND.
         let title_bar = TitleBar::new()
             .title("Forward Slash Windows")
             // On the TitleBar, not the NavigationView (main.cpp:386).
             .is_pane_toggle_button_visible(false)
-            .grid_row(0);
+            .grid_row(0)
+            .slot(
+                TitleBarSlot::LeftHeader,
+                ImageIcon::new()
+                    .source_data(EncodedImage::from_static(include_bytes!(
+                        "../../../assets/fwdslash-titlebar.png"
+                    )))
+                    .height(16.0)
+                    .margin(Thickness::new(16.0, 0.0, 12.0, 0.0)),
+            );
 
         let navigation = NavigationView::new()
             // The C++ pins LeftCompact (main.cpp:396), which forces WinUI's DisplayMode
             // to Compact and therefore SplitView CompactOverlay: opening the pane draws
             // it *over* the page and clips the text mid-word. `Left` forces DisplayMode
-            // Expanded / SplitView CompactInline instead, which keeps the same 48px icon
-            // rail while closed but pushes the content aside when opened. Deliberate
-            // divergence, recorded in docs/divergences.md.
+            // Expanded / SplitView CompactInline instead: same 48px icon rail while
+            // closed, content pushed aside when open. Deliberate divergence, recorded
+            // in docs/divergences.md.
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
             .is_back_button_visible(NavigationViewBackButtonVisible::Collapsed)
             .is_settings_visible(false)
             .is_pane_open(self.pane_open)
-            .open_pane_length(190.0)
+            // The documented default (NavigationView page: "don't override").
+            .open_pane_length(320.0)
             .grid_row(1)
             .on_is_pane_open_changed(context.callback(Msg::PaneOpenChanged))
             .on_selected_tag_changed(context.callback(Msg::Navigate))
@@ -513,7 +555,7 @@ impl SettingsModel {
         };
 
         Border::new()
-            .padding(Thickness::new(32.0, 24.0, 32.0, 28.0))
+            .padding(Thickness::uniform(24.0))
             .content(
                 Grid::new()
                     .rows([GridLength::Auto, GridLength::Star(1.0)])
@@ -549,7 +591,7 @@ impl SettingsModel {
                                     context.callback(Msg::SelectDistribution),
                                 ),
                         )),
-                    body(state.bare_target_caption()).opacity(0.70),
+                    body(state.bare_target_caption()).foreground(ThemeBrush::TextSecondary),
                 ))
         };
 
@@ -581,7 +623,7 @@ impl SettingsModel {
                 ),
                 card(StackPanel::new().spacing(8.0).children((
                     strong("Bare slash ( / ) behavior"),
-                    body("Choose what typing only / means on enabled surfaces.").opacity(0.70),
+                    body("Choose what typing only / means on enabled surfaces.").foreground(ThemeBrush::TextSecondary),
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Show all distributions")
@@ -607,7 +649,7 @@ impl SettingsModel {
                             .on_click(context.message(Msg::RefreshStatus))
                             .content("Refresh status"),
                     )),
-                body(state.status_text()).opacity(0.78),
+                body(state.status_text()).foreground(ThemeBrush::TextSecondary),
             ))
     }
 
@@ -617,7 +659,7 @@ impl SettingsModel {
         // nothing to write; point at where the user can actually change it.
         let managed: View = if state.packaged {
             body("Installed with the app. Turn startup on or off under Settings > Apps > Startup.")
-                .opacity(0.72)
+                .foreground(ThemeBrush::TextSecondary)
                 .into()
         } else {
             View::empty()
@@ -640,7 +682,7 @@ impl SettingsModel {
                 body(
                     "Invalid slash paths are blocked instead of being sent to Edge or web search.",
                 )
-                .opacity(0.72),
+                .foreground(ThemeBrush::TextSecondary),
                 managed,
             ))
     }
@@ -680,7 +722,7 @@ impl SettingsModel {
                     "Profile and AutoRun changes apply to newly opened terminal sessions. \
                      Existing sessions retain what they already loaded.",
                 )
-                .opacity(0.72)
+                .foreground(ThemeBrush::TextSecondary)
                 .margin(Thickness::new(0.0, 4.0, 0.0, 0.0)),
             ))
     }
@@ -698,7 +740,7 @@ impl SettingsModel {
                     "The filesystem minifilter remains production-gated and is not installed by \
                      this app.",
                 )
-                .opacity(0.76),
+                .foreground(ThemeBrush::TextSecondary),
                 Border::new()
                     .padding(Thickness::new(18.0, 16.0, 18.0, 16.0))
                     .corner_radius(CornerRadius::uniform(8.0))
@@ -712,7 +754,7 @@ impl SettingsModel {
                             .font_weight(FontWeight::SEMI_BOLD)
                             .text_wrapping(TextWrapping::Wrap),
                         body("Fara Technologies LLC"),
-                        body("New York, United States").opacity(0.72),
+                        body("New York, United States").foreground(ThemeBrush::TextSecondary),
                     ))),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
@@ -729,7 +771,7 @@ impl SettingsModel {
                             .expect("static URI")
                             .content("MIT License"),
                     )),
-                body("Open-source software licensed under the MIT License.").opacity(0.72),
+                body("Open-source software licensed under the MIT License.").foreground(ThemeBrush::TextSecondary),
             ))
     }
 }
@@ -763,7 +805,7 @@ fn page_header(title: &'static str, subtitle: &'static str) -> View {
             .font_size(28.0)
             .font_weight(FontWeight::SEMI_BOLD)
             .text_wrapping(TextWrapping::Wrap),
-        body(subtitle).opacity(0.72),
+        body(subtitle).foreground(ThemeBrush::TextSecondary),
     ))
 }
 
@@ -787,7 +829,7 @@ fn toggle_card(title: &'static str, description: &'static str, toggle: impl Into
                     .grid_column(0)
                     .spacing(3.0)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .children((strong(title), body(description).opacity(0.70))),
+                    .children((strong(title), body(description).foreground(ThemeBrush::TextSecondary))),
                 toggle,
             )),
     )
@@ -906,7 +948,64 @@ fn log_crash(message: &str) {
 
 fn main() {
     std::panic::set_hook(Box::new(|info| log_crash(&format!("panic: {info}"))));
+    if activate_existing_instance() {
+        return;
+    }
     if let Err(error) = App::run_component::<SettingsModel>(initial_section()) {
         log_crash(&format!("App::run_component error: {error:?}"));
+    }
+}
+
+const SETTINGS_MUTEX_NAME: &str = "Local\\ForwardSlashWindows.Settings";
+const WINDOW_TITLE: &str = "Forward Slash Windows";
+
+fn to_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Keeps the settings window single-instance, the way the broker is kept
+/// single-instance by its well-known window class: a named mutex decides
+/// ownership (`Local\ForwardSlashWindows.Settings`, following the
+/// `Local\ForwardSlashWindows.Broker` convention), and a second launch raises
+/// the existing window instead of opening a duplicate.
+///
+/// The mutex handle is intentionally leaked so it lives until process exit;
+/// the kernel releases it when the owning process terminates.
+fn activate_existing_instance() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use std::thread::sleep;
+        use std::time::Duration;
+        use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+
+        let name = to_wide(SETTINGS_MUTEX_NAME);
+        let mutex = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if mutex.is_null() || GetLastError() != ERROR_ALREADY_EXISTS {
+            // Either we own the mutex (first instance) or the check failed and
+            // the safe default is to run normally.
+            return false;
+        }
+        // Another instance owns the mutex. Its window may still be materializing
+        // (the WinUI activation path takes a beat), so poll briefly before giving
+        // up on the raise -- but never start a second window either way.
+        let title = to_wide(WINDOW_TITLE);
+        for _ in 0..40 {
+            let window = FindWindowW(std::ptr::null(), title.as_ptr());
+            if !window.is_null() {
+                ShowWindow(window, SW_RESTORE);
+                SetForegroundWindow(window);
+                break;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
