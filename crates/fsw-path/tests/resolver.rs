@@ -11,8 +11,9 @@ use fsw_path::{
     resolve, resolve_strict,
 };
 
-/// Mirrors the C++ `Registered` predicate, including the non-ASCII entry.
-const REGISTERED: &[&str] = &["Ubuntu", "Dev Distro", "\u{65e5}\u{672c}\u{8a9e}"];
+mod common;
+
+use common::{REGISTERED, snapshot};
 
 #[derive(Debug)]
 enum Expect {
@@ -299,118 +300,29 @@ fn render_buffer_is_reusable_and_results_are_independent() {
 // The rewrite optimization, validated against the C++ algorithm
 // ---------------------------------------------------------------------------
 
-/// A faithful transcription of the C++ `ResolveSlashPathWithBareSlashMode`:
-/// build `"/" + target + input` and re-parse. Kept only as the oracle.
-fn reference_rewrite(
-    input: &str,
-    mode: fsw_path::BareSlashMode,
-    preferred: Option<&str>,
-    wsl_default: Option<&str>,
-    buf: &mut RenderBuf,
-) -> Result<(String, String, String), ResolveError> {
-    let mut probe = RenderBuf::new();
-    let direct = resolve_strict(input, &REGISTERED, &mut probe);
-    if mode == DistributionList {
-        return direct.map(snapshot);
-    }
-    let passes_through = match &direct {
-        Ok(resolved) => !resolved.is_wsl_root(),
-        Err(error) => *error != ResolveError::UnregisteredDistribution,
-    };
-    if passes_through {
-        return direct.map(snapshot);
-    }
-
-    let target = preferred
-        .filter(|name| !name.is_empty() && REGISTERED.is_registered_for_test(name))
-        .or_else(|| {
-            wsl_default.filter(|name| !name.is_empty() && REGISTERED.is_registered_for_test(name))
-        })
-        .ok_or(ResolveError::NoDefaultDistribution)?;
-
-    let mut rewritten = String::with_capacity(1 + target.len() + input.len());
-    rewritten.push('/');
-    rewritten.push_str(target);
-    rewritten.push_str(input);
-    resolve_strict(&rewritten, &REGISTERED, buf).map(snapshot)
-}
-
-fn snapshot(resolved: Resolved<'_>) -> (String, String, String) {
-    (
-        resolved.distribution().unwrap_or_default().to_owned(),
-        resolved.unc_display().to_owned(),
-        resolved.linux_path().to_owned(),
-    )
-}
-
-trait TestRegistry {
-    fn is_registered_for_test(&self, name: &str) -> bool;
-}
-impl TestRegistry for &[&str] {
-    fn is_registered_for_test(&self, name: &str) -> bool {
-        self.iter().any(|candidate| eq_ignore_case(candidate, name))
-    }
-}
-
 #[test]
 fn rewrite_equivalence() {
     // The direct path passes the distribution out-of-band instead of
     // concatenating and re-parsing. Prove the two agree over a corpus rather
     // than resting on the argument in the source comment.
-    let leading = [
-        "",
-        "/",
-        "/tmp",
-        "/tmp/",
-        "/Ubuntu",
-        "/Ubuntu/",
-        "/ubuntu",
-        "/Debian",
-        "/..",
-        "/../..",
-        "/.",
-        "/./tmp",
-        "/tmp/nested/../sibling",
-        "/tmp//double",
-        "/Dev Distro/x",
-        "/a:b",
-        "/deep/a/b/c/d/e",
-        "/trailing/dot.",
-        "/trailing/space ",
-    ];
-    let pins = [
-        None,
-        Some("Ubuntu"),
-        Some("Dev Distro"),
-        Some("dev distro"),
-        Some("Debian"),
-        Some(""),
-    ];
-    let defaults = [None, Some("Ubuntu"), Some("Dev Distro"), Some("")];
-
     let mut checked = 0_u32;
-    for input in leading {
-        for pref in pins {
-            for def in defaults {
-                for mode in [DistributionList, DefaultDistribution] {
-                    let mut direct_buf = RenderBuf::new();
-                    let mut ref_buf = RenderBuf::new();
-                    let ctx = Context {
-                        registry: REGISTERED,
-                        mode,
-                        preferred: pref,
-                        wsl_default: def,
-                    };
-                    let direct = resolve(input, &ctx, &mut direct_buf).map(snapshot);
-                    let reference = reference_rewrite(input, mode, pref, def, &mut ref_buf);
-                    assert_eq!(
-                        direct, reference,
-                        "divergence for input={input:?} mode={mode:?} pin={pref:?} default={def:?}"
-                    );
-                    checked += 1;
-                }
-            }
-        }
+    for (input, ctx) in common::contexts() {
+        let mut direct_buf = RenderBuf::new();
+        let mut ref_buf = RenderBuf::new();
+        let direct = resolve(input, &ctx, &mut direct_buf).map(snapshot);
+        let reference = common::reference_rewrite(
+            input,
+            ctx.mode,
+            ctx.preferred,
+            ctx.wsl_default,
+            &mut ref_buf,
+        );
+        assert_eq!(
+            direct, reference,
+            "divergence for input={input:?} mode={:?} pin={:?} default={:?}",
+            ctx.mode, ctx.preferred, ctx.wsl_default
+        );
+        checked += 1;
     }
     assert!(checked > 500, "corpus shrank unexpectedly: {checked}");
 }

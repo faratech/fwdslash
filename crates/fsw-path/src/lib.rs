@@ -381,9 +381,13 @@ fn render<'r>(
             if unc.len() == distro_end {
                 return Err(ResolveError::TraversalAboveRoot);
             }
-            let cut = unc[distro_end..]
-                .rfind('\\')
-                .expect("every component is pushed behind a separator");
+            // The `==` check above guarantees a separator exists behind the
+            // distro root; the fallback keeps the resolver total (a panic
+            // under panic = "abort" would take down the resident broker).
+            let cut = unc
+                .get(distro_end..)
+                .and_then(|rest| rest.rfind('\\'))
+                .unwrap_or(0);
             unc.truncate(distro_end + cut);
             continue;
         }
