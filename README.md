@@ -65,6 +65,20 @@ fwdslash bare-slash default Ubuntu   # or pin one
 
 A registered distribution always wins over a same-named folder, so `/Ubuntu/home` keeps meaning the distribution.
 
+Want `/` to open something else entirely? Point it at any folder on your machine — a real directory or one inside a distro:
+
+```powershell
+fwdslash bare-slash root C:\code                            # / becomes C:\code
+fwdslash bare-slash root \\wsl.localhost\Ubuntu\home\me   # or a folder inside a distro
+fwdslash bare-slash root                                    # clear it
+```
+
+```text
+/                →  C:\code
+/proj/build      →  C:\code\proj\build
+/Ubuntu/home     →  still the distribution — distro paths always win
+```
+
 ---
 
 ## Install
@@ -114,6 +128,7 @@ fwdslash resolve /Distro/path     Print the resolved UNC path
 fwdslash open|list /Distro/path   Open in Explorer, or list to stdout
 fwdslash doctor /path | --all     Diagnose a path
 fwdslash bare-slash [list|default [Distro]]
+fwdslash bare-slash root <WindowsPath>
 fwdslash integrations [--json]
 fwdslash integration <name> enable|disable
 fwdslash pause | resume           Pause resolution, keep integrations

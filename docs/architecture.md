@@ -31,7 +31,9 @@ native behavior and the active Explorer tab. Bare `/` is special-cased by the
 shared resolver: by default it targets the WSL provider root (with an Explorer
 COM navigation fallback for provider-root builds that open UNC roots in a new
 window), or, when the per-user bare-slash mode opts in, the default
-distribution root. Search opens the validated path directly and dismisses its
+distribution root. A user-configured custom root (`BareSlashRoot`, a
+Rust-layer feature — docs/divergences.md resolver 6) takes any non-distribution
+input instead, so `/` opens an arbitrary folder and `/name` resolves inside it. Search opens the validated path directly and dismisses its
 flyout.
 
 Diagnostics record event and error categories only. User-entered and resolved

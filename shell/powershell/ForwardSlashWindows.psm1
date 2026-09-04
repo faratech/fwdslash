@@ -81,8 +81,11 @@ function Invoke-ForwardSlashWindowsChildItem {
                 Microsoft.PowerShell.Management\Get-ChildItem @forward
                 return
             }
-            if ($resolved -eq '\\wsl.localhost') {
+            if ($resolved -eq '\\wsl.localhost' -or $resolved -eq '\\wsl.localhost\\') {
                 # Bare "/" resolved to the provider root: list distributions.
+                # Exact literals only — a custom bare-slash root may itself
+                # live under \\wsl.localhost, and a prefix match would
+                # misread it as the provider root.
                 $hasBareRoot = $true
             }
             $forward[$index] = $resolved
@@ -97,7 +100,7 @@ function Invoke-ForwardSlashWindowsChildItem {
                         Microsoft.PowerShell.Management\Get-ChildItem @forward
                         return
                     }
-                    if ($resolved -eq '\\wsl.localhost') {
+                    if ($resolved -eq '\\wsl.localhost' -or $resolved -eq '\\wsl.localhost\\') {
                         $hasBareRoot = $true
                     }
                     $replacement += $resolved

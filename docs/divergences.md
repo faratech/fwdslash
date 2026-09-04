@@ -94,6 +94,44 @@ it from the input. Rule R12 discards it either way because no component survives
 so `unc_display` and `linux_path` are unaffected. Pinned by
 `bare_slash_in_default_mode_reports_a_trailing_separator`.
 
+### 6. The custom bare-slash root is a Rust-layer feature
+
+`fwdslash bare-slash root <path>` stores an absolute Windows path (`C:\code`,
+`\\wsl.localhost\Ubuntu\home\mike`) in a new `BareSlashRoot` REG_SZ under the
+settings key, and the funnel in `fsw-core::resolve_user_slash_path` then routes
+every input whose first segment is not a registered distribution to
+`fsw_path::resolve_under_root`: a bare `/` opens the root, `/foo` resolves to
+root\foo, `..` clamps at the root (`TraversalAboveRoot`), in **either**
+bare-slash mode. Registered-distribution inputs keep WSL semantics — that is
+the escape hatch back to `\\wsl.localhost`. No new `ResolveError` variant
+exists, so the C++ wire contract is untouched.
+
+Deliberate details:
+- `BareSlashRoot` is **not** a third `BareSlashMode` value. Both resolvers read
+  any nonzero `BareSlashMode` DWORD as "default distribution"
+  (`fsw-core/src/lib.rs`, `src/core/wsl_registry.cpp`), so a mode value would
+  make a stale C++ build disagree about what `/` means. With a separate value a
+  stale C++ build ignores it and keeps today's behavior — the same thing that
+  happens when the value is corrupt, because the funnel re-validates it on
+  every resolve (`is_valid_windows_root`).
+- `Resolved::Folder` and `Resolved::is_provider_root()` exist only in Rust; the
+  broker's `event=route_folder` diagnostic category is new (category-only, per
+  PRIVACY.md).
+- The Explorer message-only special case keys on `is_provider_root()`, so a
+  folder `/` goes through the ordinary set-focused-value path.
+- `ResolveError::message()` for `TraversalAboveRoot` still says "distribution
+  root", which reads slightly wrong under a folder root. Generalizing the
+  sentence is a cross-tree wire-text change; accepted for now.
+- `ForwardSlashWindows.psm1` keeps an **exact** provider-root comparison
+  (against both `\\wsl.localhost` and `\\wsl.localhost\`) — a prefix match
+  would misread a custom root that itself lives under `\\wsl.localhost` as the
+  provider root and list distributions instead of the folder.
+
+Named tests: `folder_root_*` and `windows_root_validation_table`
+(`crates/fsw-path/tests/resolver.rs`), `folder_root_resolution_allocates_nothing`
+(`tests/allocations.rs`), and the `bare_slash_root_*` funnel suite
+(`crates/fsw-core/tests/bare_slash_root.rs`).
+
 ## Settings window (`fsw-settings`)
 
 The Rust settings app is built on `windows-reactor` rather than WinUI 3 XAML

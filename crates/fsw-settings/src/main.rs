@@ -277,6 +277,9 @@ struct SettingsModel {
     state: State,
     /// The TextBox draft for the custom root; committed only by Apply.
     root_draft: String,
+    /// The folder radio is selected but not yet committed (no root stored).
+    /// UI intent only — the stored root is what survives a restart.
+    folder_selected: bool,
     notice: Option<(InfoBarSeverity, &'static str, String)>,
 }
 
@@ -338,6 +341,7 @@ impl Component for SettingsModel {
             color_scheme: ColorScheme::Dark,
             state: State::read(),
             root_draft: String::new(),
+            folder_selected: false,
             notice: None,
         }
     }
@@ -385,39 +389,36 @@ impl Component for SettingsModel {
                 // A folder root can coexist with either underlying mode, so
                 // the echo guard must account for it: picking this radio
                 // while a root is live is a real change, not an echo.
-                if !checked || (self.state.is_list_mode() && self.state.root.is_none()) {
+                if !checked
+                    || (self.state.is_list_mode() && self.state.root.is_none() && !self.folder_selected)
+                {
                     return;
                 }
+                self.folder_selected = false;
                 let succeeded = run_controller(["bare-slash", "list"]);
                 self.show_result(succeeded, "Bare slash shows all distributions", false);
                 self.refresh();
             }
             Msg::BareSlashDefaultChecked(checked) => {
-                if !checked || (!self.state.is_list_mode() && self.state.root.is_none()) {
+                if !checked
+                    || (!self.state.is_list_mode() && self.state.root.is_none() && !self.folder_selected)
+                {
                     return;
                 }
+                self.folder_selected = false;
                 let succeeded = run_controller(["bare-slash", "default"]);
                 self.show_result(succeeded, "Bare slash opens the default distribution", false);
                 self.refresh();
             }
             Msg::FolderRadioChecked(checked) => {
-                // Checking the folder radio adopts the draft as the root;
-                // unchecking is a WinUI echo of another radio winning.
-                if !checked || self.state.root.is_some() {
+                // Selecting the radio only reveals the folder controls; the
+                // Apply button validates and commits. Unchecking is the WinUI
+                // echo of another radio winning.
+                if !checked || self.folder_selected || self.state.root.is_some() {
                     return;
                 }
-                if !is_valid_windows_root(&self.root_draft) {
-                    self.show_result(
-                        false,
-                        "That is not a usable folder root (try C:\\code)",
-                        false,
-                    );
-                    self.refresh();
-                    return;
-                }
-                let succeeded = run_controller(["bare-slash", "root", &self.root_draft]);
-                self.show_result(succeeded, "Bare slash opens the chosen folder", false);
-                self.refresh();
+                self.folder_selected = true;
+                return;
             }
             Msg::RootTextChanged(text) => {
                 if self.root_draft == text {
@@ -432,14 +433,18 @@ impl Component for SettingsModel {
                     return;
                 }
                 if !is_valid_windows_root(&self.root_draft) {
-                    self.show_result(
-                        false,
-                        "That is not a usable folder root (try C:\\code)",
-                        false,
-                    );
+                    self.notice = Some((
+                        InfoBarSeverity::Error,
+                        "Could not set the folder root",
+                        "Use an absolute path like C:\\code or \\\\wsl.localhost\\Ubuntu\\home\\me."
+                            .to_string(),
+                    ));
                     return;
                 }
                 let succeeded = run_controller(["bare-slash", "root", &self.root_draft]);
+                if succeeded {
+                    self.folder_selected = false;
+                }
                 self.show_result(succeeded, "Bare slash opens the chosen folder", false);
                 self.refresh();
             }
@@ -653,7 +658,7 @@ impl SettingsModel {
         // The folder choice: the app's first free-form input. Reactor's
         // TextBox has no submit-on-enter, so an explicit Apply button commits
         // the draft; validation failure keeps the previous root.
-        let folder_picker: View = if !state.is_folder_mode() {
+        let folder_picker: View = if !state.is_folder_mode() && !self.folder_selected {
             View::empty()
         } else {
             StackPanel::new()
@@ -733,19 +738,19 @@ impl SettingsModel {
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Show all distributions")
-                        .is_checked(state.is_list_mode() && state.root.is_none())
+                        .is_checked(state.is_list_mode() && state.root.is_none() && !self.folder_selected)
                         .on_checked(context.callback(Msg::BareSlashListChecked))
                         .content("Show all distributions"),
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Open my default distribution")
-                        .is_checked(!state.is_list_mode() && state.root.is_none())
+                        .is_checked(!state.is_list_mode() && state.root.is_none() && !self.folder_selected)
                         .on_checked(context.callback(Msg::BareSlashDefaultChecked))
                         .content("Open my default distribution"),
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Open a folder I choose")
-                        .is_checked(state.is_folder_mode())
+                        .is_checked(state.is_folder_mode() || self.folder_selected)
                         .on_checked(context.callback(Msg::FolderRadioChecked))
                         .content("Open a folder I choose"),
                     picker,
@@ -840,6 +845,9 @@ impl SettingsModel {
             ))
     }
 
+    // The only `expect`s in the crate: `navigate_uri` on a compile-time
+    // constant string is infallible by construction.
+    #[allow(clippy::expect_used)]
     fn view_about() -> View {
         page_stack(16.0)
             .children((
