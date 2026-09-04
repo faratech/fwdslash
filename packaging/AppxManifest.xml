@@ -69,14 +69,10 @@
   <Dependencies>
     <!-- Windows 11: targeted virtualization exclusions are not honoured before it. -->
     <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22000.0" MaxVersionTested="10.0.26200.0" />
-    <!--
-      Version comes from the SDK's own MicrosoftWindowsAppSDKFoundationAppXVersion
-      for the Microsoft.WindowsAppSDK 1.8.260804001 package reference, not from
-      whatever runtime happens to be installed on the build machine.
-    -->
+    <!-- Broad Windows App Runtime 2.x compatibility -->
     <PackageDependency
-      Name="Microsoft.WindowsAppRuntime.1.8"
-      MinVersion="8000.946.1701.0"
+      Name="Microsoft.WindowsAppRuntime.2"
+      MinVersion="2.0.0.0"
       Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
   </Dependencies>
 

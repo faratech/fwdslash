@@ -36,6 +36,24 @@ loaded image. Before rebuilding:
 Get-Process fswsettings -ErrorAction SilentlyContinue | Stop-Process
 ```
 
+### Rust port (parallel, not yet wired into the build)
+
+A full Rust rewrite lives in `crates/` (workspace root `Cargo.toml`). It is committed as of
+v0.0.1, but it is **not wired into the build or release pipeline** — `build.yml`,
+`Build-UserMode.ps1`, `Package.ps1` and the README all still describe only the C++ product
+above, and nothing in CI compiles or tests the Rust tree yet. See [Rust port](#rust-port) under Architecture for the crate map and the
+version-island rule before touching any crate. From WSL/Linux, only the two library crates
+build without an MSVC linker:
+
+```bash
+cargo test -p fsw-path                                    # runs directly, no target needed
+cargo check --target x86_64-pc-windows-msvc -p fsw-core   # type-checks only, no linker
+```
+
+The three `[[bin]]` crates (`fsw-cli`, `fsw-broker`, `fsw-settings`) link against `windows`-crate
+COM/UI Automation surfaces and require `link.exe` — Windows only, and subject to the same
+running-process-blocks-the-linker rule as the C++ binaries above.
+
 ## Test
 
 ```powershell
@@ -54,6 +72,11 @@ any suite:
 .\fsw_filesystem_integration.exe <distribution> /path
 ```
 
+`cargo test -p fsw-path` is the Rust resolver's equivalent of `fswcore_tests.exe` (47 cases) and
+runs directly on Linux/WSL with no target flag — it's the fastest way to validate a resolver
+change before touching the C++ side. It is currently the only crate in the Rust workspace with
+tests.
+
 `tools/Test-Sandbox.ps1` drives a Windows Sandbox install/start/pause/uninstall cycle;
 `tools/Test-Prerequisites.ps1 [-RequireWdk]` checks the toolchain.
 
@@ -65,6 +88,11 @@ any suite:
 ```
 
 See `docs/store-submission.md` for identity values and Store constraints.
+
+`tools/package_msix.py` is a WSL-runnable equivalent to `Package-Msix.ps1`: it shells out to
+`makeappx.exe`/`makepri.exe` under `packages/` via `wslpath`, so MSIX packaging doesn't require
+leaving WSL for native PowerShell. It is part of the Rust-port work (see below) and currently
+hardcodes its own `VERSION` constant rather than reading the workspace version.
 
 ## Architecture
 
@@ -138,6 +166,52 @@ compiles in a bootstrap initializer that calls `exit()` when it finds package id
 `WindowsPackageType=MSIX` is *not* usable — it makes the SDK demand an `AppxManifest` item on
 the vcxproj; the gate is `WindowsAppSdkBootstrapInitialize=false`.
 
+### Rust port
+
+`crates/` holds a full Rust rewrite of the entire product, developed in parallel with the C++
+tree described above and shipped alongside it since v0.0.1. Five crates map onto the three C++ binaries plus
+the shared core:
+
+| Crate | Binary / role | Mirrors |
+|---|---|---|
+| `fsw-path` | library, zero dependencies | `src/core/path_resolver.cpp` |
+| `fsw-core` | library, registry reads + settings persistence + broker probes | `src/core/wsl_registry.cpp` + broker settings glue |
+| `fsw-cli` | `fwdslash.exe` | `src/controller/` |
+| `fsw-broker` | `fswbroker.exe` | `src/broker/main.cpp` |
+| `fsw-settings` | `fswsettings.exe`, built on the vendored `windows-reactor` crate in `crates/windows-reactor/` | `src/settings/` (WinUI 3) |
+
+`fsw-core` is `#[cfg(windows)]`-gated with non-Windows fallbacks (registry reads return empty,
+writes no-op), which is why it type-checks on Linux even though it ultimately reads/writes HKCU.
+
+**`fsw-settings` depends on `fsw-core`**, so the settings window reads state in-process the
+way `RefreshState()` in `src/settings/main.cpp` does rather than parsing `fwdslash --json`.
+That is sound across the version islands because `fsw-core`'s dependency closure contains no
+`windows-core` at all — `windows-registry` 0.6 and `windows-sys` 0.61 both stop at
+`windows-link`. The argument and the CI gate are in `docs/dependencies.md`; do not add a
+crate to `fsw-core` that pulls `windows-core`.
+
+**The version-island rule** (full detail in `docs/dependencies.md`) is the load-bearing
+constraint on this workspace: `windows-reactor` requires `windows-core` 0.100, while everything
+else uses the `windows`/`windows-sys` 0.62/0.61 generation, and the two `windows-core` majors are
+incompatible COM/WinRT type systems that must never appear in the same binary. `fsw-path` and
+`fsw-core` are therefore the only crates shared across both islands, which is only sound because
+`fsw-path`'s `[dependencies]` table is intentionally empty — CI asserts `cargo tree -p fsw-path`
+is exactly one line, and a PR that needs to add a dependency there must justify it in
+`docs/dependencies.md` first. `crates/windows-reactor/` is Microsoft's own crate (MIT/Apache-2.0,
+from microsoft/windows-rs), vendored and pulled in via `[patch.crates-io]` in the root
+`Cargo.toml` so it can be patched locally — treat it as a dependency to patch, not code owned by
+this project.
+
+`docs/divergences.md` pins every place the Rust resolver is deliberately not byte-identical to
+the C++ one (case-folding table, error-shape tightening, an unreachable error variant, malformed
+distribution names, and the structural vs. textual bare-slash rewrite), each backed by a named
+test in `crates/fsw-path/tests/resolver.rs`. A difference not listed there is a bug, not a
+feature. `docs/size-baseline.md` records the measured C++ binary sizes (e.g. `fswbroker.exe`
+~161–173 KB of code) as the budget the Rust binaries have to clear, and the codegen policy
+(`crt-static`, fat LTO, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`) that makes a
+comparable size plausible — `panic = "abort"` in particular is not negotiable, since unwinding
+out of a `WH_KEYBOARD_LL` callback or a COM vtable is undefined behavior.
+
 ### Shell adapters
 
 `cmd` and PowerShell support are optional adapters installed by `fwdslash` shelling out to
@@ -167,7 +241,16 @@ change) whether or not the driver is actually loaded.
   requires elevation. Keep it that way.
 - Version `0.0.1` is hardcoded in `assets/fwdslash.rc`, `src/settings/app.manifest`,
   `CMakeLists.txt`, `tools/Package.ps1` and the adapter payload directory name. Changing it
-  means changing all of them.
+  means changing all of them. The Rust port adds its own set of copies: root `Cargo.toml`
+  (`workspace.package.version`, inherited by every crate), `crates/fsw-settings/app.manifest`,
+  `crates/fsw-settings/app.rc`, `crates/fsw-broker/app.rc`, and `tools/package_msix.py`'s
+  hardcoded `VERSION` constant.
+- The icon resource id `IDI_FSW_APP = 101` also has copies: `include/fsw_resources.h`
+  for the C++ tree, and `crates/fsw-broker/app.rc` plus a `const` in
+  `crates/fsw-broker/src/main.rs` for the Rust broker. Each Rust binary links a
+  different icon on purpose — none for the CLI, a 16-48px `assets/fwdslash-tray.ico`
+  for the broker, the full `assets/fwdslash.ico` for the settings app. See
+  `docs/size-baseline.md`.
 - `docs/compatibility.md` lists release gates; blank entries mean unverified and must not be
   advertised as working.
 - **Never log a path.** `Diagnostic()` in `src/broker/main.cpp` (opt-in only, via the

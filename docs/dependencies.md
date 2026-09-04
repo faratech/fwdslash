@@ -40,7 +40,7 @@ them, so they do not have to agree.
 | `fsw-core` | `windows-registry` 0.6 + `windows-sys` 0.61 |
 | `fwdslash.exe` | `fsw-core` + `windows-sys` 0.61 |
 | `fswbroker.exe` | `windows` 0.62.2 |
-| `fswsettings.exe` | `windows-reactor` 0.100 |
+| `fswsettings.exe` | `windows-reactor` 0.100 + `fsw-core` |
 
 `fswbroker` stays on 0.62.2 for v1 because 0.100 dropped the three things its UI
 Automation path depends on: all 351 `UIA_*PropertyId`/`UIA_*PatternId` constants,
@@ -48,7 +48,53 @@ Automation path depends on: all 351 `UIA_*PropertyId`/`UIA_*PatternId` constants
 returns on COM methods without `[retval]`. Migrating it to `windows-bindgen` 0.100
 is the phase-2 size lever, after parity — a real port, not a version bump.
 
-### `fsw-path` is the only crate shared across islands
+### `fsw-core` is shared too, and that is sound
+
+`fswsettings.exe` depends on `fsw-core` so the settings window can read HKCU and
+the broker window **in-process**, exactly as `src/settings/main.cpp:754-841`
+does. The alternative — parsing `fwdslash status --json` / `integrations --json`
+— was tried and removed: one field-name drift (`windowsPowerShell` against
+serde's `windowsPowershell`) silently failed the whole parse and left every
+toggle reading `false`, which is a failure mode a text contract between two
+binaries will keep reproducing.
+
+This does not breach the rule, because **`fsw-core`'s dependency closure contains
+no `windows-core` at all**:
+
+```
+$ cargo tree -p fsw-core --locked --offline
+fsw-core v0.0.1
+├── fsw-path v0.0.1
+├── windows-registry v0.6.1
+│   ├── windows-link v0.2.1
+│   ├── windows-result v0.4.1 └── windows-link v0.2.1
+│   └── windows-strings v0.5.1 └── windows-link v0.2.1
+└── windows-sys v0.61.2 └── windows-link v0.2.1
+```
+
+So `fswsettings.exe` still contains exactly one `windows-core`, at 0.100.0, via
+`windows-reactor`. What is duplicated is leaf crates — `windows-link`,
+`windows-result`, `windows-strings` at both 0.2/0.4/0.5 and 0.100 — and each is
+safe here:
+
+- `windows-link` is macro-only: it expands `#[link]` blocks in the consuming
+  crate and emits no symbols. The doc already blesses this duplication for
+  `windows-sys`.
+- `windows-strings` owns its `HSTRING` allocations, so two copies are safe as
+  long as an `HSTRING` from one is never freed by the other. `fsw-core`'s public
+  API returns only `String`, `Vec<String>`, `bool`, `Option<String>`, `Snapshot`,
+  `BrokerState` and `Result<(), u32>` — no WinRT type crosses the boundary.
+- `windows-result`'s `Error` can hold an `IErrorInfo`. `fsw-core` never returns
+  one: every fallible path maps to `u32` via `e.code().0 as u32`.
+
+The gate to keep this honest, alongside the `fsw-path` one:
+
+```sh
+cargo tree -p fswsettings -e normal --target aarch64-pc-windows-msvc \
+  | grep -o 'windows-core v[0-9.]*' | sort -u   # must print only windows-core v0.100.0
+```
+
+### `fsw-path` is the only crate shared across *both* islands
 
 That is only sound while it depends on nothing. A crate resolves to exactly one
 version of `windows-registry`, and 0.6.1 pulls `windows-result ^0.4.1` /
@@ -62,8 +108,9 @@ asserts:
 test "$(cargo tree -p fsw-path | wc -l)" -eq 1
 ```
 
-The registry adapter is **not** shared. Each binary owns a thin `registry.rs` on
-its own island, all producing the same plain types defined in `fsw-path`.
+The registry adapter **is** shared, through `fsw-core` — see the section above
+for why that is sound. `fsw-path` stays dependency-free regardless, because it is
+the only crate that would otherwise be free to pull in either generation.
 
 ## Adding a dependency
 

@@ -1,0 +1,32 @@
+[package]
+name = "fswsettings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Native WinUI 3 settings application for Forward Slash Windows."
+
+[[bin]]
+name = "fswsettings"
+path = "src/main.rs"
+
+[dependencies]
+windows-reactor = "0.100.0"
+# Reads HKCU in-process the way the C++ settings app does. Sound across the
+# version islands because `fsw-core`'s closure contains no `windows-core` at all
+# -- see docs/dependencies.md.
+fsw-core = { path = "../fsw-core" }
+fsw-path = { path = "../fsw-path" }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "3.0.11"
+
+[lints]
+workspace = true

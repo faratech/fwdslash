@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/fsw-path"]
+members = [
+    "crates/fsw-path",
+    "crates/fsw-core",
+    "crates/fsw-cli",
+    "crates/fsw-broker",
+    "crates/fsw-settings",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -18,14 +24,14 @@ authors = ["Mike Fara", "Fara Technologies LLC"]
 [workspace.dependencies]
 windows-registry = "0.6.1"
 windows-sys = "0.61.2"
+windows = "0.62.2"
 
 [profile.release]
 opt-level = "s"      # rustc docs: "z" often produces LARGER binaries than "s". Measure per binary.
-lto = "fat"
-codegen-units = 1
-panic = "abort"      # unwinding out of a WH_KEYBOARD_LL callback or a COM vtable is UB
-strip = "symbols"
-debug = 0
+lto = "fat"          # Maximum cross-crate optimization and dead code elimination.
+codegen-units = 1    # Enables full LTO optimization across all compilation units.
+panic = "abort"      # Drops unwinding tables and landing pads entirely.
+strip = "symbols"    # Strips symbol tables; keep .pdb files if debugging is needed.
 incremental = false
 overflow-checks = false
 
@@ -44,3 +50,6 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[patch.crates-io]
+windows-reactor = { path = "crates/windows-reactor" }

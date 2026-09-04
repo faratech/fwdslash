@@ -1,0 +1,41 @@
+#include <winver.h>
+
+1 24 "app.manifest"
+
+// Kept in step with include/fsw_resources.h. The settings window is the one binary
+// the shell shows at large sizes, so it links the full icon.
+#define IDI_FSW_APP 101
+IDI_FSW_APP ICON "../../assets/fwdslash.ico"
+
+1 VERSIONINFO
+ FILEVERSION 0,0,1,0
+ PRODUCTVERSION 0,0,1,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Fara Technologies LLC\0"
+            VALUE "FileDescription", "Forward Slash Windows Settings\0"
+            VALUE "FileVersion", "0.0.1\0"
+            VALUE "InternalName", "Forward Slash Windows Settings\0"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Mike Fara, Fara Technologies LLC\0"
+            VALUE "OriginalFilename", "fswsettings.exe\0"
+            VALUE "ProductName", "Forward Slash Windows\0"
+            VALUE "ProductVersion", "0.0.1\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

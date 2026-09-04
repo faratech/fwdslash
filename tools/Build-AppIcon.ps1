@@ -6,7 +6,14 @@ param(
 
     # MSIX requires its own logo set at several scales. Generated from the same
     # master so the Store tiles, the taskbar and the .ico never drift apart.
-    [string]$MsixAssetDirectory
+    [string]$MsixAssetDirectory,
+
+    # The resident broker only ever needs tray and window-class sizes, so it links a
+    # reduced icon. Generating it from the same master keeps the two in step.
+    [int[]]$Sizes,
+
+    # Skip the title-bar PNG and the MSIX logo set when only the .ico is wanted.
+    [switch]$IconOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,11 +27,11 @@ if (-not $Destination) { $Destination = Join-Path $repo 'assets\fwdslash.ico' }
 if (-not $TitleBarDestination) { $TitleBarDestination = Join-Path $repo 'assets\fwdslash-titlebar.png' }
 if (-not $MsixAssetDirectory) { $MsixAssetDirectory = Join-Path $repo 'packaging\Assets' }
 
-$sizes = 16, 20, 24, 32, 40, 48, 64, 128, 256
+$iconSizes = if ($Sizes) { @($Sizes) } else { @(16, 20, 24, 32, 40, 48, 64, 128, 256) }
 $sourceImage = [Drawing.Bitmap]::FromFile([IO.Path]::GetFullPath($Source))
 $images = [Collections.Generic.List[byte[]]]::new()
 try {
-    foreach ($size in $sizes) {
+    foreach ($size in $iconSizes) {
         $bitmap = [Drawing.Bitmap]::new($size, $size, [Drawing.Imaging.PixelFormat]::Format32bppArgb)
         try {
             $bitmap.SetResolution(96, 96)
@@ -97,7 +104,9 @@ try {
     }
 }
 
-Write-Host "Generated $destinationPath with $($sizes.Count) PNG-backed icon sizes."
+Write-Host "Generated $destinationPath with $($iconSizes.Count) PNG-backed icon sizes."
+
+if ($IconOnly) { return }
 
 $titleBarPath = [IO.Path]::GetFullPath($TitleBarDestination)
 $titleBarDirectory = Split-Path -Parent $titleBarPath

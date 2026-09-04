@@ -94,6 +94,80 @@ it from the input. Rule R12 discards it either way because no component survives
 so `unc_display` and `linux_path` are unaffected. Pinned by
 `bare_slash_in_default_mode_reports_a_trailing_separator`.
 
+## Settings window (`fsw-settings`)
+
+The Rust settings app is built on `windows-reactor` rather than WinUI 3 XAML
+interop, so a few things the C++ gets from the framework have no direct
+equivalent. State reads are *not* on this list: `fsw-settings` reads HKCU and the
+broker window in-process exactly as `RefreshState()` does, so every value shown
+comes from the same source as the C++.
+
+### 1. No icon in the title bar
+
+`src/settings/main.cpp:387-392` sets `TitleBar.IconSource` to an
+`ImageIconSource` over `ms-appx:///Assets/fwdslash-titlebar.png`. reactor models
+no `IconSource` type at all — `PropertyId::ImageIconSource` is the *source*
+property of the `ImageIcon` **element**, which is an `IconElement` and not
+assignable to `IconSource`.
+
+Binding `Microsoft.UI.Xaml.Controls.ImageIconSource` by hand was tried and
+rejected: the IID and vtable layout match the SDK headers, `ITitleBar`'s
+`SetIconSource` slot is in the right position, and everything up to the
+activation succeeds — but `ImageIconSource::new()` fail-fasts (`0xC0000409`)
+under the unpackaged Windows App SDK. The `TitleBar` `Content` slot is not a
+substitute either: it centres its child, so the icon lands mid-bar instead of at
+the leading edge.
+
+The caption is therefore drawn by `TitleBar` itself, which puts it in exactly the
+C++ position. The product icon still reaches the taskbar, Alt-Tab and Explorer
+through the `IDI_FSW_APP` resource in `crates/fsw-settings/app.rc`. Closing this
+needs an upstream `TitleBar.IconSource` in `windows-reactor`.
+
+### 2. The navigation pane pushes content instead of overlaying it
+
+`src/settings/main.cpp:396` sets `PaneDisplayMode = LeftCompact`. That pins WinUI's
+`DisplayMode` to `Compact`, which hosts the pane in a `SplitView` set to
+`CompactOverlay` — so opening the pane draws it *on top of* the page. The content
+does not reflow, and the headings and body text are clipped mid-word behind it.
+This is reproducible in the shipped C++ build (`out/package/.../fswsettings.exe`),
+so it is a defect the port inherited rather than one it introduced.
+
+The Rust app sets `PaneDisplayMode = Left`, which forces `DisplayMode = Expanded`
+and therefore `SplitView CompactInline`. Closed, that renders the identical 48px
+icon rail — the collapsed window is pixel-identical to the C++ one. Opened, the
+pane expands inline to `OpenPaneLength` and the content shifts aside instead of
+being covered.
+
+Reverting to strict parity is a one-word change back to `LeftCompact`.
+
+### 3. No refresh when the window is activated
+
+The C++ hooks `window_.Activated` (`main.cpp:443-446`) so a change made by
+`fwdslash` in a terminal shows up on alt-tab. reactor exposes no activation
+observation — `HostEvent` carries only `WindowSize`, `ColorScheme` and errors.
+The Rust app refreshes on every mutation, on navigation, and on the explicit
+"Refresh status" button, which covers everything except an external change made
+while the window is already open and untouched.
+
+### 4. Deep links select the page but do not focus the control
+
+`ShowSection` (`main.cpp:855-871`) calls `Focus(FocusState::Programmatic)` on the
+toggle named by `fwdslash://settings/cmd` and friends. reactor exposes no
+programmatic focus API, so the Rust app selects the right page and stops there.
+
+### 5. Guards replace the `loading_` flag
+
+The C++ suppresses handler re-entry with a `loading_` flag around the imperative
+`RefreshState()` (`main.cpp:330`, `755`, `840`). A declarative view re-applies
+every value on each mount, and the mount echo for `RadioButtons`/`ComboBox`
+arrives *after* reactor's synchronous feedback-suppression window closes, so a
+time-window flag cannot work. Every handler instead compares the requested value
+against current state and returns early when they agree — see
+`SettingsModel::update`. This is why the bare-slash controls are two
+`RadioButton`s sharing a `GroupName`, matching `main.cpp:490-517`, rather than
+the items-source `RadioButtons` control: `RadioButton.IsChecked` echoes
+synchronously and is suppressed by the framework.
+
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 
 These are planned, not yet implemented. Each needs its own entry with a test

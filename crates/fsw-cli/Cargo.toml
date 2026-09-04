@@ -1,0 +1,32 @@
+[package]
+name = "fwdslash"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command-line interface and controller for Forward Slash Windows."
+
+[[bin]]
+name = "fwdslash"
+path = "src/main.rs"
+
+[dependencies]
+fsw-path = { path = "../fsw-path" }
+fsw-core = { path = "../fsw-core" }
+windows-registry = { workspace = true }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true
