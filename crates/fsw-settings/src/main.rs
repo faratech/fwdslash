@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use windows_reactor::*;
 
+mod folder_picker;
 mod tray;
 mod watchdog;
 
@@ -259,6 +260,7 @@ enum Msg {
     FolderRadioChecked(bool),
     RootTextChanged(String),
     ApplyRoot,
+    BrowseRoot,
     SelectDistribution(Option<usize>),
     ToggleIntegration(Integration, bool),
     OpenWslRoot,
@@ -425,6 +427,25 @@ impl Component for SettingsModel {
                     return;
                 }
                 self.root_draft = text;
+            }
+            Msg::BrowseRoot => {
+                // Modal picker on the UI thread; it pumps its own messages.
+                let parent = crate::tray::discover_window();
+                let Some(path) = folder_picker::pick_folder(parent as _) else {
+                    return; // cancelled
+                };
+                self.root_draft = path.clone();
+                self.folder_selected = true;
+                if !is_valid_windows_root(&path) || Some(path.as_str()) == self.state.root.as_deref()
+                {
+                    return;
+                }
+                let succeeded = run_controller(["bare-slash", "root", &path]);
+                if succeeded {
+                    self.folder_selected = false;
+                }
+                self.show_result(succeeded, "Bare slash opens the chosen folder", false);
+                self.refresh();
             }
             Msg::ApplyRoot => {
                 // Echo guard: re-pressing Apply with an unchanged draft must
@@ -673,6 +694,9 @@ impl SettingsModel {
                                 .placeholder_text(r"C:\code or \\wsl.localhost\Ubuntu\home")
                                 .text(self.root_draft.clone())
                                 .on_text_changed(context.callback(Msg::RootTextChanged)),
+                            Button::new()
+                                .on_click(context.message(Msg::BrowseRoot))
+                                .content("Browse\\u{2026}"),
                             Button::new()
                                 .on_click(context.message(Msg::ApplyRoot))
                                 .content("Apply folder"),
