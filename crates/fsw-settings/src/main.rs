@@ -696,7 +696,7 @@ impl SettingsModel {
                                 .on_text_changed(context.callback(Msg::RootTextChanged)),
                             Button::new()
                                 .on_click(context.message(Msg::BrowseRoot))
-                                .content("Browse\\u{2026}"),
+                                .content("Browse\u{2026}"),
                             Button::new()
                                 .on_click(context.message(Msg::ApplyRoot))
                                 .content("Apply folder"),
@@ -706,7 +706,8 @@ impl SettingsModel {
                 ))
         };
 
-        let picker: View = if state.is_list_mode() {
+        let picker: View = if state.is_list_mode() || state.is_folder_mode() || self.folder_selected
+        {
             View::empty()
         } else {
             StackPanel::new()
