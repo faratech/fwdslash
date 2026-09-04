@@ -132,6 +132,20 @@ Named tests: `folder_root_*` and `windows_root_validation_table`
 (`tests/allocations.rs`), and the `bare_slash_root_*` funnel suite
 (`crates/fsw-core/tests/bare_slash_root.rs`).
 
+## Product behaviour (Rust-only): dual-track distribution + self-update
+
+The GitHub-distributed build (Trusted Signing publisher, different package
+family from the Store listing) checks `api.github.com/releases/latest` at most
+daily and can atomically install its own signed MSIX bundle
+(`crates/fsw-core/src/update.rs`). Gated at runtime to
+`packaged && !is_store_flavor() && AutoUpdate` — the Store build never
+performs the check, and an `AutoUpdate` settings value (default on) can switch
+it off. The settings app surfaces a found update as an Informational InfoBar
+plus a tray balloon, and shows an "Automatic updates" toggle only in the
+GitHub flavor. The C++ tree has no counterpart; documented for certification
+in docs/store-submission.md (the Store package performs no network
+connections).
+
 ## Settings window (`fsw-settings`)
 
 The Rust settings app is built on `windows-reactor` rather than WinUI 3 XAML

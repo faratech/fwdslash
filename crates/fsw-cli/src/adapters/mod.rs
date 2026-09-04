@@ -34,9 +34,9 @@ pub use state::Edition;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The adapter payload directory version. One of the product's `0.0.1`
+/// The adapter payload directory version. One of the product's `0.0.2`
 /// copies — bump it together with the other version strings (CLAUDE.md).
-pub const PAYLOAD_VERSION: &str = "0.0.1";
+pub const PAYLOAD_VERSION: &str = "0.0.2";
 
 /// A user-facing adapter failure. The message is shown verbatim.
 #[derive(Debug, Clone)]

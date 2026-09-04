@@ -26,12 +26,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Fara Technologies LLC\0"
             VALUE "FileDescription", "Forward Slash Windows Broker\0"
-            VALUE "FileVersion", "0.0.1\0"
+            VALUE "FileVersion", "0.0.2\0"
             VALUE "InternalName", "Forward Slash Windows Broker\0"
             VALUE "LegalCopyright", "Copyright (c) 2026 Mike Fara, Fara Technologies LLC\0"
             VALUE "OriginalFilename", "fswbroker.exe\0"
             VALUE "ProductName", "Forward Slash Windows\0"
-            VALUE "ProductVersion", "0.0.1\0"
+            VALUE "ProductVersion", "0.0.2\0"
         END
     END
     BLOCK "VarFileInfo"

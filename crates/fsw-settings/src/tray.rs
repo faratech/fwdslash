@@ -52,6 +52,9 @@ const WM_RBUTTONUP: u32 = 0x0205;
 /// `WM_CLOSE` closes instead of hiding.
 static FORCE_CLOSE: AtomicBool = AtomicBool::new(false);
 
+/// The window the tray icon is registered on.
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+
 /// Discovers this process's settings window. Enumerates top-level windows of
 /// the current process only and matches the title exactly: a bare
 /// `FindWindowW(NULL, title)` can return *another* instance's window (the
@@ -124,6 +127,7 @@ pub fn install(window: isize) -> Result<(), u32> {
             return Err(GetLastError());
         }
         INSTALLED_HWND.store(window, Ordering::SeqCst);
+        TRAY_HWND.store(window, Ordering::SeqCst);
         Ok(())
     }
     #[cfg(not(windows))]
@@ -131,6 +135,33 @@ pub fn install(window: isize) -> Result<(), u32> {
         let _ = window;
         Err(0)
     }
+}
+
+/// Shows a balloon above the settings tray icon. The icon must already be
+/// installed (`install`); used for the GitHub-flavor update notice.
+#[cfg(windows)]
+pub fn show_notification(message: &str) -> bool {
+    use windows_sys::Win32::UI::Shell::{NIF_INFO, NIM_MODIFY, NOTIFYICONDATAW};
+
+    let Some(window) = installed_window() else {
+        return false;
+    };
+    let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    data.hWnd = window;
+    data.uID = TRAY_ID;
+    data.uFlags = NIF_INFO;
+    let text = crate::to_wide(message);
+    let text_len = text.len().min(data.szInfo.len() - 1);
+    data.szInfo[..text_len].copy_from_slice(&text[..text_len]);
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) != 0 }
+}
+
+/// The window the tray icon is registered on, if installed.
+#[cfg(windows)]
+fn installed_window() -> Option<windows_sys::Win32::Foundation::HWND> {
+    let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 { Some(hwnd as _) } else { None }
 }
 
 #[cfg(windows)]

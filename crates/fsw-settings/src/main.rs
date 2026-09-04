@@ -14,9 +14,10 @@ use fsw_core::{
     BrokerState, CMD_ADAPTER_KEY, POWERSHELL_ADAPTER_ROOT, adapter_installed, broker_state,
     broker_window_exists, ensure_broker_running, executable_available, executable_directory,
     get_bare_slash_mode, get_bare_slash_override, get_bare_slash_root, get_default_distribution,
-    has_package_identity, is_disabled, list_registered_distributions,
-    windows_integration_installed,
+    has_package_identity, is_disabled, is_store_flavor, list_registered_distributions,
+    package_architecture, package_version, update, windows_integration_installed, FSW_VERSION,
 };
+use fsw_core::update::UpdateOutcome;
 use fsw_path::{BareSlashMode, eq_ignore_case, is_valid_windows_root};
 use std::env;
 use std::path::PathBuf;
@@ -143,6 +144,9 @@ struct State {
     bare_mode: BareSlashMode,
     pinned: String,
     root: Option<String>,
+    store_flavor: bool,
+    auto_update: bool,
+    update_tag: Option<String>,
     distributions: Vec<String>,
     wsl_default: Option<String>,
     broker: BrokerState,
@@ -166,6 +170,9 @@ impl State {
             bare_mode: get_bare_slash_mode(),
             pinned: get_bare_slash_override(),
             root: get_bare_slash_root(),
+            store_flavor: is_store_flavor(),
+            auto_update: update::read_auto_update_enabled(),
+            update_tag: update::cached_update_tag(),
             distributions,
             wsl_default,
             // 750 ms so a wedged broker cannot stall a refresh (main.cpp:827).
@@ -261,6 +268,9 @@ enum Msg {
     RootTextChanged(String),
     ApplyRoot,
     BrowseRoot,
+    UpdateCheckFinished(update::UpdateOutcome),
+    DismissUpdateNotice,
+    SetAutoUpdate(bool),
     SelectDistribution(Option<usize>),
     ToggleIntegration(Integration, bool),
     OpenWslRoot,
@@ -282,6 +292,9 @@ struct SettingsModel {
     /// The folder radio is selected but not yet committed (no root stored).
     /// UI intent only — the stored root is what survives a restart.
     folder_selected: bool,
+    /// The current notice is the update-available notice: dismissing it must
+    /// also clear the persisted AvailableUpdate value.
+    notice_is_update: bool,
     notice: Option<(InfoBarSeverity, &'static str, String)>,
 }
 
@@ -327,6 +340,17 @@ impl Component for SettingsModel {
         // Reactor materializes the HWND after `create` returns, so discovery
         // runs off-thread with bounded polling; `WindowHookReady` hands the
         // window back for the (UI-thread-only) subclass installation.
+        // Daily GitHub update check (GitHub flavor only; the gate inside
+        // `run_update_check` no-ops for the Store flavor and unpackaged
+        // builds). Off the UI thread so the curl timeouts cannot stall the
+        // window.
+        if update::update_check_allowed(
+            has_package_identity(),
+            is_store_flavor(),
+            update::read_auto_update_enabled(),
+        ) {
+            context.spawn_background(|_| Msg::UpdateCheckFinished(update::run_update_check()));
+        }
         context.spawn_background(|_| {
             for _ in 0..100 {
                 let window = tray::discover_window();
@@ -344,6 +368,7 @@ impl Component for SettingsModel {
             state: State::read(),
             root_draft: String::new(),
             folder_selected: false,
+            notice_is_update: false,
             notice: None,
         }
     }
@@ -518,7 +543,53 @@ impl Component for SettingsModel {
                 self.refresh();
                 self.show_result(true, "Status refreshed", false);
             }
-            Msg::DismissNotice => self.notice = None,
+            Msg::UpdateCheckFinished(outcome) => {
+                let UpdateOutcome::Ready(tag) = outcome else {
+                    return;
+                };
+                let short = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+                self.notice = Some((
+                    InfoBarSeverity::Informational,
+                    "Update available",
+                    format!(
+                        "Version {short} was downloaded and applies the next time \
+                         Forward Slash Windows starts."
+                    ),
+                ));
+                self.notice_is_update = true;
+                tray::show_notification(&format!(
+                    "Forward Slash Windows {short} will apply on next launch."
+                ));
+            }
+            Msg::DismissUpdateNotice => {
+                let _ = update::dismiss_update();
+                self.notice = None;
+                self.notice_is_update = false;
+            }
+            Msg::SetAutoUpdate(enabled) => {
+                if enabled == update::read_auto_update_enabled() {
+                    return;
+                }
+                let succeeded = update::set_auto_update_enabled(enabled).is_ok();
+                self.show_result(
+                    succeeded,
+                    if enabled {
+                        "Automatic updates enabled"
+                    } else {
+                        "Automatic updates disabled"
+                    },
+                    false,
+                );
+            }
+            Msg::DismissNotice => {
+                if self.notice_is_update {
+                    // An update notice is persisted until a newer check
+                    // replaces it; dismissal clears that too.
+                    let _ = update::dismiss_update();
+                    self.notice_is_update = false;
+                }
+                self.notice = None;
+            }
             Msg::WindowHookReady(window) => {
                 // Subclassing requires the window's own thread; `update` runs
                 // on it. A 0 payload means discovery timed out -- tray and
@@ -660,7 +731,7 @@ impl SettingsModel {
             Section::General => self.view_general(context),
             Section::Windows => self.view_windows(context),
             Section::Terminals => self.view_terminals(context),
-            Section::About => Self::view_about(),
+            Section::About => self.view_about(),
         };
 
         Border::new()
@@ -785,6 +856,22 @@ impl SettingsModel {
                     picker,
                     folder_picker,
                 ))),
+                // Automatic updates: GitHub flavor only. The Store build
+                // updates through the Store; its updater never runs.
+                if state.packaged && !state.store_flavor {
+                    toggle_card(
+                        "Automatic updates",
+                        "Check GitHub daily and install new versions automatically.",
+                        ToggleSwitch::new()
+                            .is_on(state.auto_update)
+                            .automation_name("Automatic updates")
+                            .on_toggled(context.callback(Msg::SetAutoUpdate))
+                            .grid_column(1)
+                            .vertical_alignment(VerticalAlignment::Center),
+                    )
+                } else {
+                    View::empty()
+                },
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
                     .spacing(12.0)
@@ -877,10 +964,28 @@ impl SettingsModel {
     // The only `expect`s in the crate: `navigate_uri` on a compile-time
     // constant string is infallible by construction.
     #[allow(clippy::expect_used)]
-    fn view_about() -> View {
+    fn view_about(&self) -> View {
+        // Dynamic subtitle: the running package version (the MSIX identity
+        // when packaged, the crate version otherwise) and the package
+        // architecture.
+        let subtitle = format!(
+            "Forward Slash Windows {} ({})",
+            package_version().as_deref().unwrap_or(fsw_core::FSW_VERSION),
+            package_architecture().unwrap_or_else(|| {
+                std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default()
+            }),
+        );
         page_stack(16.0)
             .children((
-                page_header("About", "Forward Slash Windows 0.0.1"),
+                // page_header demands &'static str; the subtitle is dynamic.
+                StackPanel::new().spacing(4.0).children((
+                    TextBlock::new()
+                        .text("About")
+                        .font_size(28.0)
+                        .font_weight(FontWeight::SEMI_BOLD)
+                        .text_wrapping(TextWrapping::Wrap),
+                    body(&subtitle).foreground(ThemeBrush::TextSecondary),
+                )),
                 body(
                     "Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to either the \
                      WSL distribution list or your default distribution, on supported Windows \

@@ -7,6 +7,8 @@ use fsw_path::{
     BareSlashMode, Context, RenderBuf, ResolveError, Resolved, eq_ignore_case,
     is_valid_distribution_name, is_valid_windows_root, resolve, resolve_under_root,
 };
+pub mod update;
+
 use std::fmt;
 use std::path::PathBuf;
 
@@ -42,6 +44,16 @@ pub const RUN_VALUE: &str = "ForwardSlashWindows";
 pub const PROTOCOL_KEY: &str = r"Software\Classes\fwdslash";
 pub const CMD_ADAPTER_KEY: &str = r"Software\ForwardSlashWindows\CmdAdapter";
 pub const POWERSHELL_ADAPTER_ROOT: &str = r"Software\ForwardSlashWindows\PowerShellAdapter\";
+
+/// The running crate version, embedded at compile time.
+pub const FSW_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Dual-track identity values (docs/store-submission.md). Both packages share
+/// the Identity Name; the Store flavor is discriminated by its assigned
+/// GUID publisher at runtime — see `is_store_flavor`.
+pub const STORE_IDENTITY_NAME: &str = "32827MikeFara.fwdslash";
+pub const STORE_PUBLISHER: &str = "CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4";
+pub const STORE_PACKAGE_FAMILY: &str = "32827MikeFara.fwdslash_t6j5qexy2jpp2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(isize)]
@@ -105,6 +117,119 @@ impl Snapshot {
             wsl_default: self.default_distribution.as_deref(),
         }
     }
+}
+
+/// The current package full name
+/// (`Name_Version_Arch[_ResourceId]__PublisherHash`), or `None` without
+/// package identity.
+pub fn package_full_name() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+        use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+
+        static FULL_NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        FULL_NAME
+            .get_or_init(|| unsafe {
+                let mut length = 0u32;
+                let first = GetCurrentPackageFullName(&mut length, std::ptr::null_mut());
+                if first != ERROR_INSUFFICIENT_BUFFER || length == 0 {
+                    return None;
+                }
+                let mut buffer = vec![0u16; length as usize];
+                let second = GetCurrentPackageFullName(&mut length, buffer.as_mut_ptr());
+                if second != 0 {
+                    return None;
+                }
+                // length includes the terminating NUL.
+                Some(String::from_utf16_lossy(&buffer[..length as usize - 1]))
+            })
+            .clone()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn is_four_part_version(text: &str) -> bool {
+    let mut groups = text.split('.');
+    groups.clone().count() == 4
+        && groups.all(|group| !group.is_empty() && group.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The package family from a full name. Full names are
+/// `Name_Version_Arch[_ResourceId]__PublisherHash`; our manifest declares no
+/// ResourceId, so the shipped form contains an empty group (a double
+/// underscore): `32827MikeFara.fwdslash_0.0.2.0_x64__hash`. Parse from the
+/// right, skipping empty groups — the identity name itself may contain
+/// underscores.
+pub fn package_family_from_full_name(full: &str) -> Option<String> {
+    let (name, hash) = split_full_name_tail(full)?;
+    Some(format!("{name}_{hash}"))
+}
+
+/// The four-part package version from a full name.
+pub fn package_version_from_full_name(full: &str) -> Option<String> {
+    let fields: Vec<&str> = full.split('_').filter(|field| !field.is_empty()).collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    let version = fields[fields.len() - 3];
+    is_four_part_version(version).then(|| version.to_string())
+}
+
+/// Splits a full name into `(identity name, publisher hash)`. From the right:
+/// hash, arch, version, then the name — which may itself contain underscores.
+fn split_full_name_tail(full: &str) -> Option<(String, String)> {
+    let fields: Vec<&str> = full.split('_').filter(|field| !field.is_empty()).collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    let version = fields[fields.len() - 3];
+    if !is_four_part_version(version) {
+        return None;
+    }
+    let hash = fields[fields.len() - 1];
+    let name = fields[..fields.len() - 3].join("_");
+    Some((name, hash.to_string()))
+}
+
+/// The package family (`Name_PublisherHash`) of the running process.
+pub fn package_family() -> Option<String> {
+    static FAMILY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FAMILY
+        .get_or_init(|| package_family_from_full_name(&package_full_name()?))
+        .clone()
+}
+
+/// The package architecture (`x64`, `arm64`, …) of the running process.
+pub fn package_architecture() -> Option<String> {
+    static ARCH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ARCH.get_or_init(|| {
+        let full_name = package_full_name()?;
+        let fields: Vec<&str> = full_name
+            .split('_')
+            .filter(|field| !field.is_empty())
+            .collect();
+        fields.get(fields.len() - 2).map(|arch| (*arch).to_string())
+    })
+    .clone()
+}
+
+/// The four-part package version of the running process.
+pub fn package_version() -> Option<String> {
+    static VERSION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VERSION
+        .get_or_init(|| package_version_from_full_name(&package_full_name()?))
+        .clone()
+}
+
+/// True when this packaged build came from the Microsoft Store track: the
+/// package family matches the Partner Center identity. The GitHub-distributed
+/// build carries the Trusted Signing publisher, whose hash differs.
+pub fn is_store_flavor() -> bool {
+    package_family().as_deref() == Some(STORE_PACKAGE_FAMILY)
 }
 
 /// Checks whether the running process has MSIX package identity.

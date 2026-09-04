@@ -55,8 +55,10 @@ here but resembles a keylogger to an automated scan, so state plainly:
 > In every other case the keystroke is replayed unmodified.
 >
 > No keystroke content is recorded, stored, or transmitted. Diagnostics log event
-> categories only, never user-entered or resolved paths. The product makes no
-> network connections.
+> categories only, never user-entered or resolved paths. The Store package makes
+> no network connections: its self-update code path is gated to the
+> GitHub-distributed flavor at runtime (package-family comparison) and cannot
+> execute in the Store package.
 >
 > UI Automation is used to read and rewrite the focused address/filename control
 > in those same four surfaces — this is how a typed `/etc/apt` becomes

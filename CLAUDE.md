@@ -253,6 +253,20 @@ into `out\user\<arch>\ReleaseCpp` (`Build-UserMode.ps1 -Configuration ReleaseCpp
 clobbers the Rust exes the MSIX loop stages into `...Release`; `tools/update-deps.py` is the
 workspace-aware dependency updater and enforces the island pins listed in its `ISLAND_PINNED`.
 
+### Dual-track distribution
+
+Two package flavors ship from the same tree: the **Store** build (Identity
+publisher `CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4`, family
+`32827MikeFara.fwdslash_t6j5qexy2jpp2`, updated by the Store) and the
+**GitHub** build (publisher `CN=Mike Fara, O=Mike Fara, …`, Trusted
+Signing-signed by `.github/workflows/release.yml`, self-updating via
+`crates/fsw-core/src/update.rs` — daily GitHub check, `Add-AppxPackage` of the
+downloaded bundle, gated by `packaged && !is_store_flavor() && AutoUpdate`).
+Flavor is always detected at runtime by package family (`is_store_flavor`),
+never at build time. `signing/` holds the Azure Trusted Signing kit
+(credentials live in GitHub Secrets); `tools/Install-fwdslash.ps1` refuses to
+install the GitHub build over a Store install unless `-Force`.
+
 ### Shell adapters
 
 `cmd` and PowerShell support are optional adapters installed natively by `fwdslash`

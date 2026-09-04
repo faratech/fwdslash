@@ -236,19 +236,19 @@ fn encode_round_trips_through_utf16() {
 #[test]
 fn block_text_matches_the_script_layout() {
     let block = profile::block_text(
-        "0.0.1",
+        "0.0.2",
         "cafe",
-        r"C:\Users\me\AppData\Local\ForwardSlashWindows\PowerShell\0.0.1\ForwardSlashWindows.psm1",
+        r"C:\Users\me\AppData\Local\ForwardSlashWindows\PowerShell\0.0.2\ForwardSlashWindows.psm1",
         false,
     );
-    assert!(block.starts_with("# >>> Forward Slash Windows 0.0.1 cafe >>>\r\n"));
-    assert!(block.contains("Import-Module -Name 'C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\PowerShell\\0.0.1\\ForwardSlashWindows.psm1' -Global -Force\r\n"));
-    assert!(block.ends_with("# <<< Forward Slash Windows 0.0.1 cafe <<<\r\n"));
+    assert!(block.starts_with("# >>> Forward Slash Windows 0.0.2 cafe >>>\r\n"));
+    assert!(block.contains("Import-Module -Name 'C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\PowerShell\\0.0.2\\ForwardSlashWindows.psm1' -Global -Force\r\n"));
+    assert!(block.ends_with("# <<< Forward Slash Windows 0.0.2 cafe <<<\r\n"));
 }
 
 #[test]
 fn block_text_escapes_quotes_and_prefixes_nonempty_originals() {
-    let block = profile::block_text("0.0.1", "t", "C:\\it's", true);
+    let block = profile::block_text("0.0.2", "t", "C:\\it's", true);
     assert!(block.starts_with("\r\n"));
     assert!(block.contains("'C:\\it''s'"));
 }

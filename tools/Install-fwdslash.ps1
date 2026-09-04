@@ -8,11 +8,26 @@
 [CmdletBinding()]
 param(
     # Release tag to install; 'latest' picks the newest non-prerelease.
-    [string]$Version = 'latest'
+    [string]$Version = 'latest',
+
+    # Install the GitHub build even when the Microsoft Store version is
+    # already present (the two coexist side-by-side; the 'fwdslash' alias and
+    # protocol route to whichever registered last).
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = 'faratech/fwdslash'
+$storePublisher = 'CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4'
+
+$storeInstall = Get-AppxPackage -Name '32827MikeFara.fwdslash' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Publisher -eq $storePublisher }
+if ($storeInstall -and -not $Force) {
+    Write-Host 'You already have the Microsoft Store version of Forward Slash Windows.'
+    Write-Host 'Update it from the Store (Library > Get updates); it updates itself there.'
+    Write-Host 'To install the GitHub build side-by-side anyway, rerun with -Force.'
+    exit 1
+}
 
 if ($Version -eq 'latest') {
     $release = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
