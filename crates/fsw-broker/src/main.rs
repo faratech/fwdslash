@@ -448,8 +448,10 @@ fn process_enter_request(foreground: HWND) {
         }
     };
 
-    log_diagnostic(if resolved.distribution().is_none() {
+    log_diagnostic(if resolved.is_provider_root() {
         "event=route_wsl_root"
+    } else if resolved.distribution().is_none() {
+        "event=route_folder"
     } else {
         "event=route_distribution"
     });
@@ -458,14 +460,14 @@ fn process_enter_request(foreground: HWND) {
 
     if surface == SurfaceKind::Search {
         if !open_resolved_path(unc_path) {
-            show_notification("Windows could not open the WSL location.", NIIF_ERROR);
+            show_notification("Windows could not open the location.", NIIF_ERROR);
         }
         send_virtual_key(VK_ESCAPE);
         return;
     }
 
     if surface == SurfaceKind::Explorer
-        && resolved.distribution().is_none()
+        && resolved.is_provider_root()
         && navigate_explorer_window(foreground, unc_path)
     {
         return;
@@ -477,7 +479,7 @@ fn process_enter_request(foreground: HWND) {
     }
 
     if !open_resolved_path(unc_path) {
-        show_notification("Windows could not open the WSL location.", NIIF_ERROR);
+        show_notification("Windows could not open the location.", NIIF_ERROR);
     }
 }
 

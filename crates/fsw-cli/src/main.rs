@@ -1,5 +1,5 @@
 use fsw_core::*;
-use fsw_path::{BareSlashMode, RenderBuf, ResolveError};
+use fsw_path::{BareSlashMode, RenderBuf, ResolveError, is_valid_windows_root};
 use std::env;
 use std::ffi::OsStr;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -601,6 +601,10 @@ fn show_bare_slash_state() -> i32 {
     };
     println!("bare slash mode: {}", mode_str);
 
+    match &snap.bare_slash_root {
+        Some(root) => println!("custom root: {}", root),
+        None => println!("custom root: none"),
+    }
     if let Some(pinned) = &snap.bare_slash_pinned {
         println!("pinned distribution: /{}", pinned);
     }
@@ -619,12 +623,23 @@ fn show_bare_slash_state() -> i32 {
     0
 }
 
-fn set_bare_slash(default_mode: bool, pinned: &str) -> i32 {
+fn set_bare_slash(default_mode: bool, pinned: &str, root: Option<&str>) -> i32 {
     if default_mode && !pinned.is_empty() && !is_registered_distribution(pinned) {
         eprintln!("That WSL distribution is not registered.");
         return 1;
     }
-    if write_bare_slash_settings(default_mode, pinned).is_err() {
+    if let Some(path) = root {
+        if !is_valid_windows_root(path) {
+            eprintln!(
+                "That is not a usable folder root. Use an absolute path like \
+                 C:\\code or \\\\wsl.localhost\\Ubuntu\\home\\me."
+            );
+            return 1;
+        }
+    }
+    // The dispatcher passes root=None for every non-root mutation, so the
+    // radios and a configured folder can never disagree about what `/` means.
+    if write_bare_slash_settings(default_mode, pinned, root).is_err() {
         return 1;
     }
     show_bare_slash_state()
@@ -695,12 +710,17 @@ fn cmd_status(json: bool) -> i32 {
             .collect();
 
         println!(
-            "{{\"broker\":\"{}\",\"driverConnected\":{},\"disabled\":{},\"bareSlashMode\":\"{}\",\"bareSlashTarget\":{},\"wslRoot\":\"\\\\\\\\wsl.localhost\",\"distributions\":[{}]}}",
+            "{{\"broker\":\"{}\",\"driverConnected\":{},\"disabled\":{},\"bareSlashMode\":\"{}\",\"bareSlashTarget\":{},\"bareSlashRoot\":{},\"wslRoot\":\"\\\\\\\\wsl.localhost\",\"distributions\":[{}]}}",
             broker_status,
             driver_conn,
             snap.disabled,
             mode_str,
             bare_target,
+            snap
+                .bare_slash_root
+                .as_deref()
+                .map(|root| format!("\"{}\"", json_escape(root)))
+                .unwrap_or_else(|| "null".to_string()),
             distro_list.join(",")
         );
         return 0;
@@ -724,8 +744,10 @@ fn cmd_status(json: bool) -> i32 {
     let mut buf = RenderBuf::new();
     match resolve_user_slash_path("/", &snap, &mut buf) {
         Ok(resolved) => {
-            let note = if resolved.distribution().is_none() {
+            let note = if resolved.is_provider_root() {
                 " (distribution list)"
+            } else if resolved.distribution().is_none() {
+                " (custom folder root)"
             } else {
                 " (default distribution)"
             };
@@ -814,7 +836,7 @@ fn cmd_list(path: &str) -> i32 {
         }
     };
 
-    if resolved.distribution().is_none() {
+    if resolved.is_provider_root() {
         for d in &snap.distributions {
             println!("[distro] /{}", d);
         }
@@ -898,7 +920,7 @@ fn cmd_doctor_single(path: &str, snap: &Snapshot) -> i32 {
         }
     };
 
-    let is_root = resolved.distribution().is_none();
+    let is_root = resolved.is_provider_root();
     println!(
         "target kind: {}",
         if is_root {
@@ -1068,6 +1090,7 @@ fn usage() {
          \x20 fwdslash integration <name> enable|disable\n\
          \x20 fwdslash bare-slash\n\
          \x20 fwdslash bare-slash list | default [Distro]\n\
+         \x20 fwdslash bare-slash root <WindowsPath>\n\
          \x20 fwdslash disable | enable\n\
          \x20 fwdslash pause | resume       Aliases for disable and enable\n\
          \x20 fwdslash driver status\n\
@@ -1127,11 +1150,24 @@ fn main() {
             } else {
                 let op = args[2].as_str();
                 if args.len() == 3 && op == "list" {
-                    set_bare_slash(false, "")
+                    set_bare_slash(false, "", None)
                 } else if args.len() == 3 && op == "default" {
-                    set_bare_slash(true, "")
+                    set_bare_slash(true, "", None)
                 } else if args.len() == 4 && op == "default" {
-                    set_bare_slash(true, &args[3])
+                    set_bare_slash(true, &args[3], None)
+                } else if args.len() == 3 && op == "root" {
+                    // Root set/clear is orthogonal to the mode and the pin:
+                    // preserve both, the way every other mutation preserves
+                    // the root.
+                    let snap = Snapshot::current();
+                    let default_mode = snap.bare_slash_mode == BareSlashMode::DefaultDistribution;
+                    let pinned = snap.bare_slash_pinned.as_deref().unwrap_or("");
+                    set_bare_slash(default_mode, pinned, None)
+                } else if args.len() == 4 && op == "root" {
+                    let snap = Snapshot::current();
+                    let default_mode = snap.bare_slash_mode == BareSlashMode::DefaultDistribution;
+                    let pinned = snap.bare_slash_pinned.as_deref().unwrap_or("");
+                    set_bare_slash(default_mode, pinned, Some(&args[3]))
                 } else {
                     usage();
                     2

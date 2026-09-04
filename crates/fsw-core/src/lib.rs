@@ -1,8 +1,11 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+// The two validators are only reachable under `cfg(windows)`; on Linux the
+// registry paths compile out and the import would be flagged unused.
+#[cfg_attr(not(windows), allow(unused_imports))]
 use fsw_path::{
     BareSlashMode, Context, RenderBuf, ResolveError, Resolved, eq_ignore_case,
-    is_valid_distribution_name, resolve,
+    is_valid_distribution_name, is_valid_windows_root, resolve, resolve_under_root,
 };
 use std::fmt;
 use std::path::PathBuf;
@@ -16,6 +19,13 @@ pub const FSW_SETTINGS_KEY: &str = r"Software\ForwardSlashWindows\Settings";
 pub const FSW_DISABLED_VALUE: &str = "Disabled";
 pub const FSW_BARE_SLASH_MODE_VALUE: &str = "BareSlashMode";
 pub const FSW_BARE_SLASH_DISTRIBUTION_VALUE: &str = "BareSlashDistribution";
+/// Custom bare-slash root: an absolute Windows path (`C:\code`, a UNC) that
+/// `/` opens and everything non-distro resolves under. Deliberately a separate
+/// value, not a third `BareSlashMode`: both resolvers read any nonzero
+/// BareSlashMode DWORD as "default distribution" (docs/divergences.md,
+/// resolver 6), so a stale C++ build ignores this value and falls back to
+/// today's behavior instead of disagreeing about what `/` means.
+pub const FSW_BARE_SLASH_ROOT_VALUE: &str = "BareSlashRoot";
 
 /// The three values below are hand copies of `include/fsw_filter_protocol.h` —
 /// the only contract the broker shares with the minifilter, which Rust cannot
@@ -58,6 +68,8 @@ pub struct Snapshot {
     pub default_distribution: Option<String>,
     pub bare_slash_mode: BareSlashMode,
     pub bare_slash_pinned: Option<String>,
+    /// The custom bare-slash root, when one is configured and well-formed.
+    pub bare_slash_root: Option<String>,
     pub disabled: bool,
 }
 
@@ -72,6 +84,7 @@ impl Snapshot {
         } else {
             Some(bare_slash_override)
         };
+        let bare_slash_root = get_bare_slash_root();
         let disabled = is_disabled();
 
         Self {
@@ -79,6 +92,7 @@ impl Snapshot {
             default_distribution,
             bare_slash_mode,
             bare_slash_pinned,
+            bare_slash_root,
             disabled,
         }
     }
@@ -213,6 +227,25 @@ pub fn get_bare_slash_override() -> String {
     String::new()
 }
 
+/// Reads the custom bare-slash root. An absent, empty, or malformed value is
+/// no root at all — a bad stored value must degrade to today's behavior, not
+/// poison every resolve.
+pub fn get_bare_slash_root() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows_registry::CURRENT_USER;
+
+        if let Ok(key) = CURRENT_USER.open(FSW_SETTINGS_KEY) {
+            if let Ok(val) = key.get_string(FSW_BARE_SLASH_ROOT_VALUE) {
+                if is_valid_windows_root(&val) {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Returns whether forward-slash path resolution is globally paused/disabled.
 pub fn is_disabled() -> bool {
     #[cfg(windows)]
@@ -250,7 +283,11 @@ pub fn persist_disabled(disabled: bool) -> Result<(), u32> {
 }
 
 /// Updates bare slash settings in HKCU.
-pub fn write_bare_slash_settings(default_mode: bool, pinned_distribution: &str) -> Result<(), u32> {
+pub fn write_bare_slash_settings(
+    default_mode: bool,
+    pinned_distribution: &str,
+    root: Option<&str>,
+) -> Result<(), u32> {
     #[cfg(windows)]
     {
         use windows_registry::CURRENT_USER;
@@ -268,21 +305,60 @@ pub fn write_bare_slash_settings(default_mode: bool, pinned_distribution: &str) 
         } else {
             let _ = key.remove_value(FSW_BARE_SLASH_DISTRIBUTION_VALUE);
         }
+
+        match root {
+            Some(path) if !path.is_empty() => {
+                key.set_string(FSW_BARE_SLASH_ROOT_VALUE, path)
+                    .map_err(|e| e.code().0 as u32)?;
+            }
+            _ => {
+                let _ = key.remove_value(FSW_BARE_SLASH_ROOT_VALUE);
+            }
+        }
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        let _ = (default_mode, pinned_distribution);
+        let _ = (default_mode, pinned_distribution, root);
         Ok(())
     }
 }
 
 /// Resolves a forward-slash path against the live user registry configuration.
+///
+/// When a custom bare-slash root is configured (`BareSlashRoot`) and the
+/// input's first segment is not a registered distribution, the root owns the
+/// input entirely: a bare `/` opens the root and `/foo` resolves to
+/// root\foo — in either bare-slash mode. Only registered-distribution inputs
+/// keep WSL semantics, which is the escape hatch to `\\wsl.localhost` the
+/// README advertises. A root that is absent or malformed changes nothing, so
+/// a stale C++ install (which never reads the value) behaves identically to
+/// a corrupt one (docs/divergences.md, resolver 6).
 pub fn resolve_user_slash_path<'b>(
     input: &str,
     snapshot: &'b Snapshot,
     render_buf: &'b mut RenderBuf,
 ) -> Result<Resolved<'b>, ResolveError> {
+    // Validation happens here, not only at set time: the funnel runs on every
+    // platform and a hand-built snapshot must not bypass it.
+    let configured_root = snapshot
+        .bare_slash_root
+        .as_deref()
+        .filter(|root| is_valid_windows_root(root));
+
+    let first_segment = input[1..].split('/').next().unwrap_or_default();
+    let explicit_distro = !first_segment.is_empty()
+        && snapshot
+            .distributions
+            .iter()
+            .any(|distro| eq_ignore_case(distro, first_segment));
+
+    if let (false, Some(root)) = (explicit_distro, configured_root) {
+        // Owns the input's shape checks too: the same R1-R4 errors come back
+        // with the same variants, and `..` clamps at the root.
+        return resolve_under_root(input, root, render_buf);
+    }
+
     let refs: Vec<&str> = snapshot.distributions.iter().map(|s| s.as_str()).collect();
     let ctx = snapshot.context(&refs);
     resolve(input, &ctx, render_buf)
@@ -296,6 +372,7 @@ pub enum DiagEvent {
     RouteDistribution,
     RouteDefault,
     RouteList,
+    RouteFolder,
     ResolveFailure,
     EnterPassThrough,
     EnterReplayed,
@@ -312,6 +389,7 @@ impl fmt::Display for DiagEvent {
             Self::RouteDistribution => "event=route_distribution",
             Self::RouteDefault => "event=route_default",
             Self::RouteList => "event=route_list",
+            Self::RouteFolder => "event=route_folder",
             Self::ResolveFailure => "event=resolve_failure",
             Self::EnterPassThrough => "event=enter_passthrough",
             Self::EnterReplayed => "event=enter_replayed",
