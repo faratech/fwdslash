@@ -198,6 +198,63 @@ against current state and returns early when they agree — see
 the items-source `RadioButtons` control: `RadioButton.IsChecked` echoes
 synchronously and is suppressed by the framework.
 
+### 6. Instance lifecycle: takeover, watchdog, fail-closed guard
+
+The C++ settings app has no single-instance guard and no tray, so it has no
+zombie failure mode. The Rust app's guard (added with the tray) initially had
+three holes, all now closed; the fixes are behavior the C++ does not have:
+
+- **Fail closed.** Any `CreateMutexW` error other than "already exists" shows a
+  message box and exits — it never falls through to "I'm the first instance",
+  which is how a duplicate tray icon could appear.
+- **Zombie takeover.** A prior instance can outlive its own window (a direct
+  `DestroyWindow` or a session end skips the reactor's only exit path, the
+  `Window.Closed` event), leaving a process that holds the single-instance mutex
+  with nothing to raise; every later launch would then be a silent no-op. When a
+  relaunch finds no window for 10 s, it terminates a *qualifying* peer and takes
+  over. Qualifying means: `fswsettings.exe`, same packaging context (same MSIX
+  package family, or both unpackaged — a packaged and an unpackaged instance
+  never kill each other), older than 15 s (a young peer is a concurrent launch
+  still materializing), and owning no window at all. Anything ambiguous shows an
+  error box instead of killing.
+- **Watchdog.** `watchdog.rs` posts `WM_QUIT` to the UI thread (and exits the
+  process as a last resort) if the window the discovery poller found ever
+  disappears without an exit having been requested. `WM_DESTROY` in the tray
+  subclass posts the quit directly as the first line of defense.
+- **Exit routes through the close pipeline.** The tray Exit item posts
+  `WM_CLOSE` with `FORCE_CLOSE` armed rather than calling `DestroyWindow`
+  directly, so the reactor's `Window.Closed` exit path actually runs.
+- **`FSW_SIMULATE_WINDOWLESS`** (any value) makes the process hold the mutex
+  forever with no window — the test fixture for the takeover path.
+- **Tray tooltips are distinct**: the broker reads `"fwdslash broker"` (plus
+  `" (paused)"` while resolution is disabled) and the settings app reads
+  `"fwdslash settings"`. Both used to read `"Forward Slash Windows"`, making the
+  two icons indistinguishable.
+
+## Broker (fsw-broker)
+
+### 1. The window is a never-shown top-level tool window, not message-only
+
+The C++ broker creates its window with the `HWND_MESSAGE` parent
+(`src/broker/main.cpp:712`). Message-only windows are skipped by `HWND_BROADCAST`,
+so `TaskbarCreated` (explorer.exe restart) and `WM_QUERYENDSESSION`/`WM_ENDSESSION`
+(session end) can never reach the tray-icon lifecycle. The Rust broker creates a
+real top-level window with `WS_EX_TOOLWINDOW` that is never shown: same
+`FindWindowW`-by-class discovery for the CLI and settings app, but the icon is
+re-added after a shell restart and removed before a session-end ghost can appear.
+
+## CLI (fwdslash)
+
+### 1. `fwdslash start` only ever closes the broker it spawned
+
+On probe failure the C++ controller finds whichever window carries the broker
+class and closes it — including a pre-existing healthy instance the spawn did not
+create (the spawn may have lost the mutex race and exited already). The Rust CLI
+compares the window's PID against the spawned `dwProcessId` before posting
+`WM_CLOSE`, and reports `Resolution is paused; run "fwdslash enable" to activate.`
+when the probed broker is merely paused instead of the misleading "keyboard hook
+is unavailable".
+
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 
 These are planned, not yet implemented. Each needs its own entry with a test

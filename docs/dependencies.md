@@ -17,9 +17,18 @@ So the ecosystem is split, and the split is load-bearing:
 
 | Crate | Requires | Published |
 |---|---|---|
-| `windows` | `windows-core ^0.62.2` | 0.62.2, 2025-10-06 |
-| `windows-sys` | `windows-link` only | 0.61.2, 2025-10-06 |
-| `windows-reactor` | `windows-core ^0.100.0` | 0.100.0, 2026-09-03 |
+| `windows` | `windows-core ^0.62.2` | 0.62.2, 2025-10-06 (still latest as of 2026-09-04) |
+| `windows-sys` | `windows-link` only | 0.61.2, 2025-10-06 (still latest as of 2026-09-04) |
+| `windows-reactor` | `windows-core ^0.100.0` | 0.100.0, 2026-09-03 (latest) |
+| `windows-registry` | 0.6.x: `windows-link` only; **0.100.0: `windows-core ^0.100.0`** | 0.100.0, 2026-09-03 (latest) |
+
+**`windows-registry` is island-pinned at 0.6.** Its 0.100.0 release exists but
+drags `windows-core` 0.100 into the closure of `fsw-core`, which is shared with
+the 0.62 island — exactly the collision the rule forbids. `tools/update-deps.py`
+enforces this via its `ISLAND_PINNED` list; do not bump it by hand. Unification
+of the whole workspace onto the 0.100 line becomes possible only when
+`windows`/`windows-sys` publish there **and** `fswbroker` is ported off the UIA
+constants/VARIANT surface (see below) — until then the split stands.
 
 Two `windows-core` majors are two incompatible `IUnknown`/`IInspectable`/`Interface`
 type systems. **COM objects cannot cross that boundary**, so the two generations

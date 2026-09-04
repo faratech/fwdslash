@@ -241,7 +241,17 @@ feature. `docs/size-baseline.md` records the measured C++ binary sizes (e.g. `fs
 ~161–173 KB of code) as the budget the Rust binaries have to clear, and the codegen policy
 (`crt-static`, fat LTO, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`) that makes a
 comparable size plausible — `panic = "abort"` in particular is not negotiable, since unwinding
-out of a `WH_KEYBOARD_LL` callback or a COM vtable is undefined behavior.
+out of a `WH_KEYBOARD_LL` callback or a COM vtable is undefined behavior. The flags live in
+`.cargo/config.toml` (per-target `rustflags`; never `[build] rustflags`) and the toolchain is
+pinned by `rust-toolchain.toml` — install the pinned version on **both** the Windows host and
+WSL, and re-measure `docs/size-baseline.md` whenever either changes. `cargo tree -p fsw-path`
+counts dev-dependencies too, so `fsw-path` may not gain even a dev-dep: the shared test corpus
+is `crates/fsw-path/tests/common/mod.rs`, the zero-allocation contract is `tests/allocations.rs`
+(always on), and the timing smoke is `tests/perf.rs` (`--release -- --ignored`). Runtime
+comparison against the C++ binaries is `tools/Measure-Runtime.ps1`, which builds the C++ side
+into `out\user\<arch>\ReleaseCpp` (`Build-UserMode.ps1 -Configuration ReleaseCpp`) so it never
+clobbers the Rust exes the MSIX loop stages into `...Release`; `tools/update-deps.py` is the
+workspace-aware dependency updater and enforces the island pins listed in its `ISLAND_PINNED`.
 
 ### Shell adapters
 

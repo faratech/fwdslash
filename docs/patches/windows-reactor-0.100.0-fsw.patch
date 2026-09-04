@@ -1,0 +1,277 @@
+# windows-reactor 0.100.0 — Forward Slash Windows local patches
+#
+# The complete diff between the vendored crates/windows-reactor/ and the
+# pristine windows-reactor 0.100.0 crate source (cargo registry), excluding
+# Cargo.lock/Cargo.toml.orig/.cargo-* metadata (identical to upstream) and the
+# readme. Contents: WindowVisuals::icon_resource (WM_SETICON from the .rc),
+# ThemeBrush::TextSecondary, the TitleBar.LeftHeader slot plumbing, and the
+# WINDOWSAPPSDK_RUNTIME_VERSION_UINT64 compatibility pin.
+#
+# Re-vendoring recipe (docs/dependencies.md): extract the NEW version's crate
+# source over crates/windows-reactor/, then:
+#   git apply -3 docs/patches/windows-reactor-<new>-fsw.patch
+# re-deriving any vtable slot positions from the new upstream layout — never
+# reuse an offset from this file blindly. If upstream ships a real
+# TitleBar.LeftHeader or icon_resource, drop the corresponding hunk.
+# Update the windows-reactor requirement in crates/fsw-settings/Cargo.toml to
+# the new version; [patch.crates-io] keeps its path entry.
+
+--- a/src/element.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/element.rs	2026-09-04 02:29:29.152265600 -0400
+@@ -162,6 +162,7 @@
+     Accent,
+     AccentText,
+     PrimaryText,
++    TextSecondary,
+     SolidBackground,
+     CardBackground,
+     CardStroke,
+@@ -227,6 +228,7 @@
+             Self::Accent => "AccentFillColorDefaultBrush",
+             Self::AccentText => "AccentTextFillColorPrimaryBrush",
+             Self::PrimaryText => "TextFillColorPrimaryBrush",
++            Self::TextSecondary => "TextFillColorSecondaryBrush",
+             Self::SolidBackground => "SolidBackgroundFillColorBaseBrush",
+             Self::CardBackground => "CardBackgroundFillColorDefaultBrush",
+             Self::CardStroke => "CardStrokeColorDefaultBrush",
+@@ -1739,6 +1741,7 @@
+     pub(crate) client_size: Option<(f64, f64)>,
+     pub(crate) constraints: Option<WindowConstraints>,
+     pub(crate) icon: Option<&'static str>,
++    pub(crate) icon_resource: Option<u16>,
+     pub(crate) theme: WindowTheme,
+ }
+ 
+@@ -1777,6 +1780,16 @@
+         self
+     }
+ 
++    /// Sets the window icon from a Win32 resource in the running executable.
++    ///
++    /// This is the resource-based counterpart to [`Self::icon`]: it loads
++    /// `MAKEINTRESOURCE(id)` from the module and applies it with `WM_SETICON`,
++    /// so no icon file needs to ship next to the binary.
++    pub fn icon_resource(mut self, id: u16) -> Self {
++        self.icon_resource = Some(id);
++        self
++    }
++
+     /// Sets client-size constraints in DIPs.
+     ///
+     /// # Panics
+diff -ru '--exclude=Cargo.lock' '--exclude=Cargo.toml.orig' '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=readme.md' a/src/generated.rs b/src/generated.rs
+--- a/src/generated.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/generated.rs	2026-09-04 02:29:43.158804500 -0400
+@@ -1829,6 +1829,7 @@
+     pub enum TitleBarSlot {
+         Content,
+         RightHeader,
++        LeftHeader,
+     }
+     impl sealed::SlotIndex<TitleBarSlot> for TitleBar {
+         fn slot_index(slot: TitleBarSlot) -> u8 {
+@@ -12318,6 +12319,7 @@
+     SliderHeader,
+     TitleBarContent,
+     TitleBarRightHeader,
++    TitleBarLeftHeader,
+     NavigationViewContent,
+     NavigationViewHeader,
+     NavigationViewPaneCustomContent,
+@@ -12378,6 +12380,7 @@
+         MountedKind::TitleBar => match index {
+             0u8 => Some(SlotId::TitleBarContent),
+             1u8 => Some(SlotId::TitleBarRightHeader),
++            2u8 => Some(SlotId::TitleBarLeftHeader),
+             _ => None,
+         },
+         MountedKind::NavigationView => match index {
+@@ -12502,7 +12505,11 @@
+         MountedKind::PasswordBox => &[SlotId::PasswordBoxHeader],
+         MountedKind::NumberBox => &[SlotId::NumberBoxHeader],
+         MountedKind::Slider => &[SlotId::SliderHeader],
+-        MountedKind::TitleBar => &[SlotId::TitleBarContent, SlotId::TitleBarRightHeader],
++        MountedKind::TitleBar => &[
++            SlotId::TitleBarContent,
++            SlotId::TitleBarRightHeader,
++            SlotId::TitleBarLeftHeader,
++        ],
+         MountedKind::NavigationView => &[
+             SlotId::NavigationViewContent,
+             SlotId::NavigationViewHeader,
+@@ -15742,6 +15749,13 @@
+         interface: "Microsoft.UI.Xaml.Controls.ITitleBar",
+         target: "ui_element",
+         collection: false,
++    },
++    SlotDescriptor {
++        id: SlotId::TitleBarLeftHeader,
++        name: "LeftHeader",
++        interface: "Microsoft.UI.Xaml.Controls.ITitleBar",
++        target: "ui_element",
++        collection: false,
+     },
+ ];
+ const NAVIGATION_VIEW_PROPERTIES: &[PropertyDescriptor] = &[
+diff -ru '--exclude=Cargo.lock' '--exclude=Cargo.toml.orig' '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=readme.md' a/src/native/winui/bindings.rs b/src/native/winui/bindings.rs
+--- a/src/native/winui/bindings.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/native/winui/bindings.rs	2026-09-04 02:29:32.344230200 -0400
+@@ -1,7 +1,12 @@
+ windows_core::link!("api-ms-win-appmodel-runtime-l1-1-5.dll" "system" fn AddPackageDependency(packagedependencyid : windows_core::PCWSTR, rank : i32, options : AddPackageDependencyOptions, packagedependencycontext : *mut PACKAGEDEPENDENCY_CONTEXT, packagefullname : *mut windows_core::PWSTR) -> windows_core::HRESULT);
+ windows_core::link!("ole32.dll" "system" fn CoInitializeEx(pvreserved : *const core::ffi::c_void, dwcoinit : u32) -> windows_core::HRESULT);
+ windows_core::link!("kernel32.dll" "system" fn GetCurrentPackageFullName(packagefullnamelength : *mut u32, packagefullname : windows_core::PWSTR) -> i32);
++windows_core::link!("kernel32.dll" "system" fn GetLastError() -> u32);
++windows_core::link!("kernel32.dll" "system" fn GetModuleHandleW(lpnmodulename : windows_core::PCWSTR) -> HMODULE);
+ windows_core::link!("user32.dll" "system" fn GetDpiForWindow(hwnd : HWND) -> u32);
++windows_core::link!("user32.dll" "system" fn GetSystemMetrics(nindex : i32) -> i32);
++windows_core::link!("user32.dll" "system" fn LoadImageW(hinst : HINSTANCE, lpname : *const u16, utype : u32, cxdesired : i32, cydesired : i32, fuload : u32) -> HANDLE);
++windows_core::link!("user32.dll" "system" fn SendMessageW(hwnd : HWND, msg : u32, wparam : WPARAM, lparam : LPARAM) -> LRESULT);
+ windows_core::link!("kernel32.dll" "system" fn GetProcessHeap() -> HANDLE);
+ windows_core::link!("kernel32.dll" "system" fn HeapFree(hheap : HANDLE, dwflags : u32, lpmem : *mut core::ffi::c_void) -> windows_core::BOOL);
+ windows_core::link!("user32.dll" "system" fn MessageBoxW(hwnd : HWND, lptext : windows_core::PCWSTR, lpcaption : windows_core::PCWSTR, utype : u32) -> i32);
+@@ -10,6 +15,15 @@
+ windows_core::link!("shell32.dll" "system" fn ShellExecuteW(hwnd : HWND, lpoperation : windows_core::PCWSTR, lpfile : windows_core::PCWSTR, lpparameters : windows_core::PCWSTR, lpdirectory : windows_core::PCWSTR, nshowcmd : i32) -> HINSTANCE);
+ windows_core::link!("api-ms-win-appmodel-runtime-l1-1-5.dll" "system" fn TryCreatePackageDependency(user : PSID, packagefamilyname : windows_core::PCWSTR, minversion : PACKAGE_VERSION, packagedependencyprocessorarchitectures : PackageDependencyProcessorArchitectures, lifetimekind : PackageDependencyLifetimeKind, lifetimeartifact : windows_core::PCWSTR, options : CreatePackageDependencyOptions, packagedependencyid : *mut windows_core::PWSTR) -> windows_core::HRESULT);
+ pub const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
++pub const ICON_BIG: u32 = 1;
++pub const ICON_SMALL: u32 = 0;
++pub const IMAGE_ICON: u32 = 1;
++pub const LR_DEFAULTCOLOR: u32 = 0;
++pub const SM_CXICON: i32 = 11;
++pub const SM_CXSMICON: i32 = 49;
++pub const SM_CYICON: i32 = 12;
++pub const SM_CYSMICON: i32 = 50;
++pub const WM_SETICON: u32 = 0x80;
+ pub type AddPackageDependencyOptions = u32;
+ #[repr(transparent)]
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -4495,6 +4509,10 @@
+ unsafe impl Sync for GridViewItem {}
+ pub type HANDLE = *mut core::ffi::c_void;
+ pub type HINSTANCE = *mut core::ffi::c_void;
++pub type HMODULE = HINSTANCE;
++pub type LPARAM = isize;
++pub type LRESULT = isize;
++pub type WPARAM = usize;
+ pub type HWND = *mut core::ffi::c_void;
+ #[repr(transparent)]
+ #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+@@ -18228,6 +18246,18 @@
+             .ok()
+         }
+     }
++    pub(crate) fn SetLeftHeader<P0>(&self, value: P0) -> windows_core::Result<()>
++    where
++        P0: windows_core::Param<UIElement>,
++    {
++        unsafe {
++            (windows_core::Interface::vtable(self).SetLeftHeader)(
++                windows_core::Interface::as_raw(self),
++                value.param().abi(),
++            )
++            .ok()
++        }
++    }
+     pub(crate) fn SetRightHeader<P0>(&self, value: P0) -> windows_core::Result<()>
+     where
+         P0: windows_core::Param<UIElement>,
+@@ -18348,7 +18378,10 @@
+     IconSource: usize,
+     SetIconSource: usize,
+     LeftHeader: usize,
+-    SetLeftHeader: usize,
++    pub SetLeftHeader: unsafe extern "system" fn(
++        *mut core::ffi::c_void,
++        *mut core::ffi::c_void,
++    ) -> windows_core::HRESULT,
+     Content: usize,
+     pub SetContent: unsafe extern "system" fn(
+         *mut core::ffi::c_void,
+@@ -29212,7 +29245,7 @@
+ pub const WINDOWSAPPSDK_RUNTIME_VERSION_MAJOR: u32 = 2;
+ pub const WINDOWSAPPSDK_RUNTIME_VERSION_MINOR: u32 = 4;
+ pub const WINDOWSAPPSDK_RUNTIME_VERSION_REVISION: u32 = 0;
+-pub const WINDOWSAPPSDK_RUNTIME_VERSION_UINT64: u64 = 562967133290496;
++pub const WINDOWSAPPSDK_RUNTIME_VERSION_UINT64: u64 = 562949953421312; // 2.0.0.0 for broad compatibility
+ #[repr(transparent)]
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ pub struct WebView2(windows_core::IUnknown);
+diff -ru '--exclude=Cargo.lock' '--exclude=Cargo.toml.orig' '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=readme.md' a/src/native/winui/generated.rs b/src/native/winui/generated.rs
+--- a/src/native/winui/generated.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/native/winui/generated.rs	2026-09-04 02:29:45.770584600 -0400
+@@ -3834,6 +3834,12 @@
+                 .SetRightHeader(None::<&UIElement>)
+                 .map_err(native_error),
+         },
++        (Handle::TitleBar(control), SlotId::TitleBarLeftHeader) => match child {
++            Some(child) => control.SetLeftHeader(child).map_err(native_error),
++            None => control
++                .SetLeftHeader(None::<&UIElement>)
++                .map_err(native_error),
++        },
+         (Handle::NavigationView(control), SlotId::NavigationViewContent) => {
+             let control = control.cast::<IContentControl>().map_err(native_error)?;
+             match child {
+diff -ru '--exclude=Cargo.lock' '--exclude=Cargo.toml.orig' '--exclude=.cargo-ok' '--exclude=.cargo_vcs_info.json' '--exclude=readme.md' a/src/native/winui/mod.rs b/src/native/winui/mod.rs
+--- a/src/native/winui/mod.rs	2006-07-23 21:21:28.000000000 -0400
++++ b/src/native/winui/mod.rs	2026-09-04 01:50:08.249610600 -0400
+@@ -319,6 +319,7 @@
+     client_size: bool,
+     constraints: bool,
+     icon: bool,
++    icon_resource: bool,
+     theme: bool,
+ }
+ 
+@@ -512,6 +513,8 @@
+         client_size: previous.is_none_or(|previous| previous.client_size != next.client_size),
+         constraints: previous.is_none_or(|previous| previous.constraints != next.constraints),
+         icon: next.icon.is_some() && previous.is_none_or(|previous| previous.icon != next.icon),
++        icon_resource: next.icon_resource.is_some()
++            && previous.is_none_or(|previous| previous.icon_resource != next.icon_resource),
+         theme: previous.is_none_or(|previous| previous.theme != next.theme),
+     }
+ }
+@@ -835,6 +838,42 @@
+                 .map_err(native_error)?;
+         }
+ 
++        if changes.icon_resource
++            && let Some(id) = visuals.icon_resource
++        {
++            // Mirrors what a classic window class gets for free via `WNDCLASS.hIcon`:
++            // the shell sizes the taskbar/Alt-Tab entry from the small icon, so send
++            // both. Like `SetIcon` above, a failed load is a hard error rather than a
++            // silently generic window.
++            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
++            let load = |width: i32, height: i32| {
++                unsafe {
++                    LoadImageW(
++                        instance,
++                        id as *const u16,
++                        IMAGE_ICON,
++                        width,
++                        height,
++                        LR_DEFAULTCOLOR,
++                    )
++                }
++            };
++            let metrics = |index: i32| unsafe { GetSystemMetrics(index) };
++            let large = load(metrics(SM_CXICON), metrics(SM_CYICON));
++            if large.is_null() {
++                let code = unsafe { GetLastError() };
++                return Err(RuntimeError::Native((code | 0x8007_0000) as i32));
++            }
++            let small = load(metrics(SM_CXSMICON), metrics(SM_CYSMICON));
++            let hwnd = window_handle()?;
++            unsafe {
++                SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, large as isize);
++                if !small.is_null() {
++                    SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
++                }
++            }
++        }
++
+         if changes.constraints {
+             let app_window = window_2.AppWindow().map_err(native_error)?;
+             let presenter = app_window
