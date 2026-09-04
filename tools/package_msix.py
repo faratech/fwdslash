@@ -14,7 +14,7 @@ OUTPUT_ROOT = os.path.join(REPO, "out", "msix")
 IDENTITY_NAME = "32827MikeFara.fwdslash"
 PUBLISHER = "CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4"
 PUBLISHER_DISPLAY_NAME = "WindowsForum.com"
-VERSION = "0.0.1.0"
+VERSION = "0.0.2.0"  # instance-guard + watchdog + takeover fixes
 
 MAKEAPPX = os.path.join(REPO, "packages/Microsoft.Windows.SDK.CPP.10.0.28000.2526/c/bin/10.0.28000.0/arm64/makeappx.exe")
 MAKEPRI = os.path.join(REPO, "packages/Microsoft.Windows.SDK.CPP.10.0.28000.2526/c/bin/10.0.28000.0/arm64/makepri.exe")

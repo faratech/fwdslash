@@ -1,0 +1,11 @@
+# Pinned exact, not to the "stable" channel: binary-size and codegen numbers
+# in docs/size-baseline.md are toolchain-sensitive (inlining and LTO
+# thresholds move between releases), and a floating channel would silently
+# invalidate every recorded measurement. Bumping this file is therefore a
+# deliberate act that ends with re-measuring that table.
+# Install on BOTH build hosts (Windows and the WSL dev box):
+#   rustup toolchain install 1.98.1
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

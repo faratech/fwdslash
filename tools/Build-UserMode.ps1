@@ -2,7 +2,10 @@
 param(
     [ValidateSet('x86', 'x64', 'ARM64')]
     [string]$Architecture = $(if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'ARM64' } else { 'x64' }),
-    [ValidateSet('Debug', 'Release')]
+    # ReleaseCpp exists only for tools/Measure-Runtime.ps1: C++ binaries built
+    # into out\user\<arch>\ReleaseCpp so runtime comparisons never clobber the
+    # Rust exes that tools/package_msix.py stages into ...Release.
+    [ValidateSet('Debug', 'Release', 'ReleaseCpp')]
     [string]$Configuration = 'Debug',
 
     # Build the settings app for life inside an MSIX. Unpackaged, the Windows App
@@ -164,7 +167,13 @@ if ($Packaged) {
         "/p:ProjectPriIndexName=$PackageIdentityName"
     )
 }
-Invoke-Checked -FilePath $msbuild -Arguments $settingsArguments
+# ReleaseCpp has no vcxproj configuration (the comparison harness measures the
+# cl-built exes; the Rust settings app stands in for the settings surface).
+if ('Debug', 'Release' -contains $Configuration) {
+    Invoke-Checked -FilePath $msbuild -Arguments $settingsArguments
+} else {
+    Write-Host "Skipping the WinUI 3 settings app: '$Configuration' has no vcxproj configuration."
+}
 
 $payloadDirectories = @(
     @{ Source = 'shell\cmd'; Destination = 'shell\cmd' },

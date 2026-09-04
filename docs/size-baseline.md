@@ -58,16 +58,23 @@ large.
 
 ## Rust side, measured
 
-Built 2026-09-03 with `cargo build --release --target aarch64-pc-windows-msvc`
+Built 2026-09-04 with `cargo build --release --target aarch64-pc-windows-msvc`
 from an ARM64 VS 18 developer shell, at the size-tuned release profile in the
 root `Cargo.toml` (`opt-level = "s"`, fat LTO, `codegen-units = 1`,
-`panic = "abort"`, `strip = "symbols"`).
+`panic = "abort"`, `strip = "symbols"`) **plus the committed
+`.cargo/config.toml` target flags** (`crt-static`, the `/NODEFAULTLIB` /MT
+link recipe, `control-flow-guard`, `windows_slim_errors`). The previous table
+(2026-09-03) was measured without those flags; the static CRT costs ~28 KB
+per native binary, which is the /MT parity price the C++ product also pays.
+
+x64, same flags: `fwdslash.exe` 200,192 / `fswbroker.exe` 200,704 /
+`fswsettings.exe` 1,680,896.
 
 | Artifact | ARM64 Rust | C++ ARM64 code | Verdict |
 |---|---:|---:|---|
-| `fwdslash.exe` | 168,960 | ~336 KB | about half the C++ |
-| `fswbroker.exe` | 170,496 | ~161 KB | within ~6% of the C++ |
-| `fswsettings.exe` | 1,676,288 | ~295 KB | ~5.7x, but see below |
+| `fwdslash.exe` | 196,608 | ~336 KB | about half the C++ |
+| `fswbroker.exe` | 198,656 | ~161 KB | larger than the C++ code, well under the whole C++ binary (261,632) |
+| `fswsettings.exe` | 1,736,704 | ~295 KB | ~5.9x, but see below |
 
 `fswsettings.exe` also **deletes** the 392 KB `Microsoft.WindowsAppRuntime.Bootstrap.dll`,
 `App.xbf` and the PRI files from the payload, so the shipped delta is smaller
@@ -108,3 +115,37 @@ so the WSL loop works for everything up to the first `[[bin]]`.
 
 Stop the broker and settings window first — `link.exe` cannot overwrite a loaded
 image.
+
+## Runtime baseline, measured
+
+Produced 2026-09-04 by `tools\Measure-Runtime.ps1 -Architecture ARM64`
+(C++ side from `out\user\arm64\ReleaseCpp`, Rust side from
+`target\aarch64-pc-windows-msvc\release`). Idle CPU is the broker's total-processor-time
+delta across a 10 s window with nothing happening, as a percentage of one core.
+
+| Metric | C++ | Rust |
+|---|---:|---:|
+| Broker startup to window (median, 10 runs) | n/a (a) | 32.25 ms |
+| Broker idle working set (5 s settle) | 16.42 MB | 16.98 MB |
+| Broker idle private bytes | 2.81 MB | 2.86 MB |
+| Broker idle CPU (10 s window, % of one core) | 0.00 % | 0.16 % |
+| CLI cold start `fwdslash status` (median, 20 runs) | 1,013.50 ms | 1,016.14 ms |
+| Settings launch to window (median, 5 runs) | n/a (b) | 141.31 ms |
+
+(a) The C++ broker's window is message-only (`HWND_MESSAGE`), which no
+enumeration route from this host can observe — `FindWindow`/`FindWindowEx`
+from an interop PowerShell and `EnumChildWindows` from `HWND_MESSAGE` were all
+tried; the C++ broker's own CLI finds it, but only at 1 s call granularity.
+`WaitForInputIdle` never fires for a hidden-window process on either side.
+The Rust broker's window is a top-level tool window (docs/divergences.md,
+"Broker 1"), which is why its startup is measurable at all.
+
+(b) `ReleaseCpp` deliberately skips the WinUI 3 settings app (no vcxproj
+configuration); build it via `-Configuration Release` after the MSIX staging
+is no longer needed to measure that side.
+
+The ~1 s CLI cold start on both sides is dominated by the WSL default-distro
+query that `status` performs, not by language startup; the two are at parity
+to within noise. Resolver hot-path cost is pinned separately by
+`crates/fsw-path/tests/allocations.rs` (zero steady-state allocations) and
+`tests/perf.rs` (~54 ns/resolve in release, opt-in).

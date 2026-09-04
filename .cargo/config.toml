@@ -1,0 +1,32 @@
+# Shippable-binary flags for the MSVC targets, per docs/dependencies.md
+# ("Build-flag policy"). These belong under [target.<triple>], never
+# [build] rustflags -- the two sources are mutually exclusive and per-target
+# entries under [build] are silently dropped.
+#
+#   crt-static              /MT parity for the native binaries
+#   /DEFAULTLIB:/NODEFAULTLIB set   the /MT link recipe used by
+#                           microsoft/edit, microsoft/sudo and
+#                           microsoft/coreutils
+#   control-flow-guard      /guard:cf parity with tools/Build-UserMode.ps1
+#   windows_slim_errors     windows-core's slimmer Error layout; the vendored
+#                           windows-reactor declares this cfg in its
+#                           unexpected_cfgs check-cfg list
+#
+# There is deliberately no entry for the Linux host triple, so
+# `cargo test -p fsw-path` keeps working from WSL untouched.
+
+[target.aarch64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-args=/DEFAULTLIB:ucrt.lib /NODEFAULTLIB:vcruntime.lib /NODEFAULTLIB:msvcrt.lib /NODEFAULTLIB:libucrt.lib",
+    "-C", "control-flow-guard",
+    "--cfg", "windows_slim_errors",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-args=/DEFAULTLIB:ucrt.lib /NODEFAULTLIB:vcruntime.lib /NODEFAULTLIB:msvcrt.lib /NODEFAULTLIB:libucrt.lib",
+    "-C", "control-flow-guard",
+    "--cfg", "windows_slim_errors",
+]

@@ -25,6 +25,10 @@ authors = ["Mike Fara", "Fara Technologies LLC"]
 windows-registry = "0.6.1"
 windows-sys = "0.61.2"
 windows = "0.62.2"
+# Pinned once here; two [build-dependencies] copies drifted as literals before.
+# windows-registry is island-pinned at 0.6 -- see docs/dependencies.md and
+# tools/update-deps.py's ISLAND_PINNED list.
+embed-resource = "3.0.11"
 
 [profile.release]
 opt-level = "s"      # rustc docs: "z" often produces LARGER binaries than "s". Measure per binary.
@@ -50,6 +54,15 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# panic = "abort" makes any of these in a window proc or COM callback an
+# instant process death that skips WM_DESTROY -- a ghost tray icon and, for
+# the broker, a dead keyboard hook with no notification. Deny the explicit
+# forms; indexing stays a warning (the resolver slices deliberately, under
+# test).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "warn"
 
 [patch.crates-io]
 windows-reactor = { path = "crates/windows-reactor" }

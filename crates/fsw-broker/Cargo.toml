@@ -40,7 +40,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [build-dependencies]
-embed-resource = "3.0.11"
+embed-resource = { workspace = true }
 
 [lints]
 workspace = true
