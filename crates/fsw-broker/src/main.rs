@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::System::Com::{
@@ -118,7 +118,7 @@ const UPDATE_CONSIDER_INTERVAL_MS: u64 = 6 * 60 * 60 * 1_000;
 const UPDATE_FIRST_DELAY_MS: u64 = 5 * 60 * 1_000;
 /// Ceiling on `fwdslash update check`. A Store round trip on a bad network,
 /// or `curl.exe` against GitHub, both answer or give up well inside this.
-const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 /// Ceiling on `fwdslash update install`. The child only *starts* the install —
 /// the Store's own download runs in the Store's service, and the relaunch is a
 /// scheduled task — so this bounds a handful of WinRT calls, not a download.
@@ -243,6 +243,10 @@ static WORKER_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static WORKER_THREAD: AtomicU32 = AtomicU32::new(0);
 static WORKER_STOPPED: AtomicBool = AtomicBool::new(false);
 static WORKER_JOIN: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// One FIFO writer prevents rapid pause/resume toggles from completing their
+/// registry writes out of order. The sender is intentionally unbounded: a
+/// tray command must never wait for a slow `reg.exe` child.
+static PERSIST_QUEUE: Mutex<Option<mpsc::Sender<bool>>> = Mutex::new(None);
 
 /// Whether `Shell_NotifyIconW(NIM_ADD)` has actually succeeded. It fails with
 /// `ERROR_TIMEOUT` when the shell is busy — precisely the logon moment the
@@ -496,13 +500,19 @@ fn editable_value_pattern(focused: &IUIAutomationElement) -> Option<IUIAutomatio
         if control_type != UIA_EditControlTypeId && control_type != UIA_ComboBoxControlTypeId {
             return None;
         }
-        if focused.CurrentIsPassword().is_ok_and(BOOL::as_bool) {
+        let Ok(password) = focused.CurrentIsPassword() else {
+            return None;
+        };
+        if password.as_bool() {
             return None;
         }
         let pattern = focused
             .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
             .ok()?;
-        if pattern.CurrentIsReadOnly().is_ok_and(BOOL::as_bool) {
+        let Ok(read_only) = pattern.CurrentIsReadOnly() else {
+            return None;
+        };
+        if read_only.as_bool() {
             return None;
         }
         Some(pattern)
@@ -550,14 +560,24 @@ fn request_open_path(path: String) {
         // The worker owns the allocation now and frees it in `worker_proc`.
         return;
     }
-    // No worker to hand it to: reclaim the allocation and open inline.
-    let path = unsafe { Box::from_raw(owned) };
-    if !open_resolved_path(&path) {
-        show_notification("Windows could not open the location.", NIIF_ERROR);
-    }
+    // Never run ShellExecuteEx on the broker (hook-owning) thread. A null
+    // worker HWND can make PostMessageW target this thread's queue, and a WSL
+    // path can block while its distribution starts, so dropping is safer than
+    // a late inline fallback. Reclaim the ownership we could not hand over.
+    drop(unsafe { Box::from_raw(owned) });
+    log_diagnostic("event=worker_open_path_dropped");
+    show_notification("The location could not be opened right now.", NIIF_ERROR);
 }
 
-fn navigate_explorer_window(foreground: HWND, path: &str) -> bool {
+fn navigate_explorer_window(
+    automation: &IUIAutomation,
+    focused: &IUIAutomationElement,
+    foreground: HWND,
+    path: &str,
+) -> bool {
+    if !request_control_is_current(automation, focused, foreground) {
+        return false;
+    }
     unsafe {
         let Ok(shell_windows) =
             CoCreateInstance::<_, IShellWindows>(&ShellWindows, None, CLSCTX_LOCAL_SERVER)
@@ -574,6 +594,12 @@ fn navigate_explorer_window(foreground: HWND, path: &str) -> bool {
                 if let Ok(browser) = disp.cast::<IWebBrowser2>() {
                     if let Ok(hwnd_num) = browser.HWND() {
                         if hwnd_num.0 == foreground as isize {
+                            // Every call above can cross into Explorer's COM
+                            // apartment. Do not navigate a window whose focus
+                            // or foreground changed while it was answering.
+                            if !request_control_is_current(automation, focused, foreground) {
+                                return false;
+                            }
                             let target_var = VARIANT::from(path);
                             let empty = VARIANT::default();
                             let res = browser.Navigate2(
@@ -626,48 +652,125 @@ fn show_notification(message: &str, flags: u32) {
 /// Runs on the worker thread. Everything here can block for seconds — UIA
 /// cross-process calls, a WSL bind, a shell navigation — which is why the
 /// hook thread only classifies and posts.
-fn process_enter_request(surface: SurfaceKind, foreground: HWND) {
-    if PAUSED.load(Ordering::Relaxed) {
-        replay_enter();
-        return;
-    }
-
-    if foreground != unsafe { GetForegroundWindow() } {
+fn request_window_is_current(foreground: HWND) -> bool {
+    if !request_target_is_current(foreground, unsafe { GetForegroundWindow() }) {
         // The user moved on while this request was queued. Replaying Enter now
         // would inject it into whatever they switched to — a half-written chat
         // message sent, a half-typed command run. Drop it instead.
         log_diagnostic("event=enter_dropped_foreground_changed");
+        return false;
+    }
+    true
+}
+
+#[must_use]
+fn request_target_is_current(expected: HWND, current: HWND) -> bool {
+    expected == current
+}
+
+#[must_use]
+fn should_swallow_enter(worker_present: bool, post_succeeded: bool) -> bool {
+    worker_present && post_succeeded
+}
+
+/// UIA calls can block while the target application is busy. Do not let the
+/// request resume against a new focused field when they return: both the
+/// captured foreground window and the exact focused element must still match.
+fn request_control_is_current(
+    automation: &IUIAutomation,
+    focused: &IUIAutomationElement,
+    foreground: HWND,
+) -> bool {
+    if !request_window_is_current(foreground) {
+        return false;
+    }
+    let Ok(current) = (unsafe { automation.GetFocusedElement() }) else {
+        log_diagnostic("event=enter_dropped_control_changed");
+        return false;
+    };
+    if !unsafe { automation.CompareElements(focused, &current) }.is_ok_and(BOOL::as_bool) {
+        log_diagnostic("event=enter_dropped_control_changed");
+        return false;
+    }
+    // GetFocusedElement and CompareElements are cross-process operations too;
+    // check the owning window once more immediately before touching the field.
+    request_window_is_current(foreground)
+}
+
+fn replay_enter_if_current(
+    automation: &IUIAutomation,
+    focused: &IUIAutomationElement,
+    foreground: HWND,
+) {
+    if request_control_is_current(automation, focused, foreground) {
+        replay_enter();
+    }
+}
+
+fn process_enter_request(surface: SurfaceKind, foreground: HWND) {
+    // This check deliberately precedes the paused branch: a request queued
+    // while active must not replay Enter into a window the user selected while
+    // the worker was busy.
+    if !request_window_is_current(foreground) {
+        return;
+    }
+
+    if PAUSED.load(Ordering::Relaxed) {
+        // There is no captured UIA control in this branch, but foreground must
+        // still be current immediately before injecting Enter.
+        if request_window_is_current(foreground) {
+            replay_enter();
+        }
         return;
     }
 
     if surface == SurfaceKind::Unknown {
-        replay_enter();
+        if request_window_is_current(foreground) {
+            replay_enter();
+        }
         return;
     }
 
     let Some(automation) = AUTOMATION.with_borrow(Option::clone) else {
-        replay_enter();
+        if request_window_is_current(foreground) {
+            replay_enter();
+        }
         return;
     };
 
     let Ok(focused) = (unsafe { automation.GetFocusedElement() }) else {
-        replay_enter();
+        if request_window_is_current(foreground) {
+            replay_enter();
+        }
         return;
     };
+
+    if !request_control_is_current(&automation, &focused, foreground) {
+        return;
+    }
 
     let Some(value_pattern) = editable_value_pattern(&focused) else {
         log_diagnostic("event=surface_rejected");
-        replay_enter();
+        replay_enter_if_current(&automation, &focused, foreground);
         return;
     };
 
+    // The value read is private input. Revalidate before reading and again
+    // after the potentially blocking UIA property calls complete.
+    if !request_control_is_current(&automation, &focused, foreground) {
+        return;
+    }
     let Some(input) = read_focused_value(&focused) else {
-        replay_enter();
+        replay_enter_if_current(&automation, &focused, foreground);
         return;
     };
+
+    if !request_control_is_current(&automation, &focused, foreground) {
+        return;
+    }
 
     if !input.starts_with('/') {
-        replay_enter();
+        replay_enter_if_current(&automation, &focused, foreground);
         return;
     }
 
@@ -706,25 +809,36 @@ fn process_enter_request(surface: SurfaceKind, foreground: HWND) {
         };
 
     if surface == SurfaceKind::Search {
+        if !request_control_is_current(&automation, &focused, foreground) {
+            return;
+        }
         if !open_resolved_path(unc_path) {
             show_notification("Windows could not open the location.", NIIF_ERROR);
         }
-        send_virtual_key(VK_ESCAPE);
+        if request_control_is_current(&automation, &focused, foreground) {
+            send_virtual_key(VK_ESCAPE);
+        }
         return;
     }
 
     if surface == SurfaceKind::Explorer
         && resolved.is_provider_root()
-        && navigate_explorer_window(foreground, unc_path)
+        && request_control_is_current(&automation, &focused, foreground)
+        && navigate_explorer_window(&automation, &focused, foreground, unc_path)
     {
         return;
     }
 
-    if set_pattern_value(&value_pattern, unc_path) {
-        replay_enter();
+    if request_control_is_current(&automation, &focused, foreground)
+        && set_pattern_value(&value_pattern, unc_path)
+    {
+        replay_enter_if_current(&automation, &focused, foreground);
         return;
     }
 
+    if !request_control_is_current(&automation, &focused, foreground) {
+        return;
+    }
     if !open_resolved_path(unc_path) {
         show_notification("Windows could not open the location.", NIIF_ERROR);
     }
@@ -777,7 +891,12 @@ unsafe extern "system" fn low_level_keyboard_proc(
     // hook that takes longer than LowLevelHooksTimeout is removed by Windows
     // without notice, and the removal is invisible to us.
     let worker = WORKER_WINDOW.load(Ordering::Relaxed) as HWND;
-    if unsafe { PostMessageW(worker, PROCESS_ENTER, surface as usize, foreground as LPARAM) } == 0 {
+    // PostMessageW(NULL, ...) targets this thread's message queue and succeeds,
+    // so it is not evidence that a worker will process the request. Pass both
+    // edges through natively until a real worker window exists.
+    let posted = !worker.is_null()
+        && unsafe { PostMessageW(worker, PROCESS_ENTER, surface as usize, foreground as LPARAM) } != 0;
+    if !should_swallow_enter(!worker.is_null(), posted) {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
@@ -1031,8 +1150,10 @@ fn publish_filter_mappings(force: bool) {
 fn tray_tip() -> &'static str {
     if PAUSED.load(Ordering::Relaxed) {
         "Forward Slash Windows \u{2014} paused"
-    } else if (KEYBOARD_HOOK.load(Ordering::Relaxed) as HHOOK).is_null() {
-        "Forward Slash Windows \u{2014} hook unavailable"
+    } else if (KEYBOARD_HOOK.load(Ordering::Relaxed) as HHOOK).is_null()
+        || (WORKER_WINDOW.load(Ordering::Acquire) as HWND).is_null()
+    {
+        "Forward Slash Windows \u{2014} processing unavailable"
     } else {
         "Forward Slash Windows \u{2014} active"
     }
@@ -1121,7 +1242,7 @@ fn taskbar_created_message() -> u32 {
     })
 }
 
-/// Writes the pause flag from a thread of its own.
+/// Drains pause writes in submission order on one background thread.
 ///
 /// `persist_disabled` shells out to `reg.exe` (see its doc comment for why a
 /// child process and not a direct write). That is a process creation plus a
@@ -1131,34 +1252,64 @@ fn taskbar_created_message() -> u32 {
 /// persistence is reported asynchronously: `FSW_WM_SET_PAUSED` replies from
 /// in-memory state plus the hook result, and a failed write surfaces later as
 /// a balloon plus `event=persist_disabled_failed`.
-fn request_persist_disabled(disabled: bool) {
-    // Raised before the write starts and dropped when it ends, on whichever of
-    // the two paths below runs it.
-    PERSIST_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-    let spawned = std::thread::Builder::new()
-        .name("fsw-persist".to_owned())
-        .spawn(move || {
-            let failed = persist_disabled(disabled).is_err();
-            PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
-            if failed {
-                log_diagnostic("event=persist_disabled_failed");
-                let window = BROKER_WINDOW.load(Ordering::Relaxed) as HWND;
-                if !window.is_null() {
-                    unsafe {
-                        PostMessageW(window, PERSIST_FAILED, 0, 0);
-                    }
-                }
-            }
-        });
-    if spawned.is_err() {
-        // Out of threads: the write is the whole point of the setting, so do
-        // it inline rather than silently skip it.
+fn report_persist_failure() {
+    log_diagnostic("event=persist_disabled_failed");
+    let window = BROKER_WINDOW.load(Ordering::Relaxed) as HWND;
+    if !window.is_null() {
+        unsafe {
+            PostMessageW(window, PERSIST_FAILED, 0, 0);
+        }
+    }
+}
+
+fn drain_persist_queue<F>(receiver: mpsc::Receiver<bool>, mut persist: F)
+where
+    F: FnMut(bool),
+{
+    while let Ok(disabled) = receiver.recv() {
+        persist(disabled);
+    }
+}
+
+fn persist_worker_main(receiver: mpsc::Receiver<bool>) {
+    drain_persist_queue(receiver, |disabled| {
         let failed = persist_disabled(disabled).is_err();
         PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
         if failed {
-            log_diagnostic("event=persist_disabled_failed");
-            show_notification("The pause setting could not be saved.", NIIF_ERROR);
+            report_persist_failure();
         }
+    });
+}
+
+fn request_persist_disabled(disabled: bool) {
+    PERSIST_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    let Ok(mut queue) = PERSIST_QUEUE.lock() else {
+        PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        log_diagnostic("event=persist_queue_unavailable");
+        report_persist_failure();
+        return;
+    };
+    if queue.is_none() {
+        let (sender, receiver) = mpsc::channel();
+        match std::thread::Builder::new()
+            .name("fsw-persist".to_owned())
+            .spawn(move || persist_worker_main(receiver))
+        {
+            Ok(_) => *queue = Some(sender),
+            Err(_) => {
+                PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+                log_diagnostic("event=persist_queue_start_failed");
+                report_persist_failure();
+                return;
+            }
+        }
+    }
+    let Some(sender) = queue.as_ref() else { return };
+    if sender.send(disabled).is_err() {
+        *queue = None;
+        PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        log_diagnostic("event=persist_queue_unavailable");
+        report_persist_failure();
     }
 }
 
@@ -2072,7 +2223,9 @@ unsafe extern "system" fn window_proc(
         FSW_WM_QUERY_STATE => {
             if PAUSED.load(Ordering::Relaxed) {
                 BrokerState::Paused as isize
-            } else if (KEYBOARD_HOOK.load(Ordering::Relaxed) as HHOOK).is_null() {
+            } else if (KEYBOARD_HOOK.load(Ordering::Relaxed) as HHOOK).is_null()
+                || (WORKER_WINDOW.load(Ordering::Acquire) as HWND).is_null()
+            {
                 BrokerState::Unavailable as isize
             } else {
                 BrokerState::Active as isize
@@ -2397,8 +2550,8 @@ fn main() {
 mod tests {
     use super::{
         AdapterOutcome, UPDATE_CONSIDER_INTERVAL_MS, UPDATE_FIRST_DELAY_MS, adapter_outcome,
-        should_balloon_install_failure, should_balloon_update, update_cycle_age_ms,
-        update_cycle_due,
+        drain_persist_queue, request_target_is_current, should_balloon_install_failure,
+        should_balloon_update, should_swallow_enter, update_cycle_age_ms, update_cycle_due,
     };
 
     // -- the cycle gate ----------------------------------------------------
@@ -2524,5 +2677,38 @@ mod tests {
     fn a_second_refusal_is_the_one_the_user_must_see() {
         assert_eq!(adapter_outcome(Some(1), Some(1)), AdapterOutcome::NeedsUser);
         assert_eq!(adapter_outcome(None, Some(2)), AdapterOutcome::NeedsUser);
+    }
+
+    // -- #65: pause persistence ordering ----------------------------------
+
+    #[test]
+    fn persistence_queue_keeps_rapid_toggles_in_order() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(true).unwrap();
+        sender.send(false).unwrap();
+        sender.send(true).unwrap();
+        drop(sender);
+
+        let mut persisted = Vec::new();
+        drain_persist_queue(receiver, |disabled| persisted.push(disabled));
+        assert_eq!(persisted, [true, false, true]);
+    }
+
+    // -- #7/#64: hook admission and stale replay --------------------------
+
+    #[test]
+    fn null_worker_never_admits_an_enter_for_suppression() {
+        // PostMessageW(NULL, ...) may report success, but it is not a worker.
+        assert!(!should_swallow_enter(false, true));
+        assert!(!should_swallow_enter(false, false));
+        assert!(!should_swallow_enter(true, false));
+        assert!(should_swallow_enter(true, true));
+    }
+
+    #[test]
+    fn stale_request_never_replays_into_a_new_foreground_window() {
+        let original = 101isize as HWND;
+        assert!(request_target_is_current(original, original));
+        assert!(!request_target_is_current(original, 202isize as HWND));
     }
 }
