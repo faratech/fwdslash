@@ -62,26 +62,29 @@ that produces its evidence. `docs/driver-lab.md` is the operator runbook.
 | Gate | Harness step | Evidence |
 |---|---|---|
 | Unsigned/test-signed installation only in a checkpointed Hyper-V guest | a | ARM64 guest, Win 26200.9278, FakeShare, Verifier `0x93B`, 2026-09-05: PASS |
-| Alias-versus-UNC parity for create, read, write, enumerate, metadata, rename, delete, long and Unicode paths | c | VM gate pending (blocked by issue #39) |
-| Standard and elevated callers redirected; AppContainer and SYSTEM not | d | VM gate pending (blocked by issue #39) |
+| Alias-versus-UNC parity for create, read, write, enumerate, metadata, long and Unicode paths | c | ARM64 guest, FakeShare, Verifier `0x93B`, 2026-09-05 (post-#39 fix, reproduced across two clean runs): PASS for create, read, write, enumerate, metadata, long paths (up to 276/289 characters), Unicode names, trailing-dot/trailing-space names, and PowerShell/.NET/Win32/cmd access — alias and UNC agree in every case |
+| Rename and delete through the alias | c | **FAIL, by design — issue #40.** `Rename-Item`/`Remove-Item` through `C:\Ubuntu` throw `DirectoryNotFoundException`; `New-Item` and every other mutation work. Root cause in `driver/fswfilter/fswfilter.c` (`FswPreCreate` fail-open list, item 2): the driver deliberately does not redirect `SL_OPEN_TARGET_DIRECTORY` opens (what a rename's target-directory lookup uses) "the caller wants the parent directory back, and reparsing it would retarget the rename". Since the alias root has no real parent on disk, that lookup fails. Reproduced identically on two consecutive runs. Use the UNC path for rename/delete until #40 is triaged; not a harness defect |
+| Standard and elevated callers redirected; AppContainer and SYSTEM not | d | ARM64 guest, FakeShare, 2026-09-05: PASS for elevated, standard-integrity and SYSTEM (all three correctly redirected/not-redirected, each via a nested nested `schtasks` probe). AppContainer still pending: `Invoke-CommandInDesktopPackage` times out after 20 s when the harness itself runs inside the interactive `FswGate` scheduled task (nested-task-inside-a-task; a harness/launch-path limitation, not evidence about the driver) — re-run this one case from a plain elevated console to clear the cell |
 | ARM64 native, x64 emulated and x86 emulated callers; native x64 in an x64 VM | c (re-run per lab) | VM gate pending; x64 lab not stood up |
 | Two concurrent users and sessions with different WSL registrations | not automated | VM gate pending |
-| Broker disconnect, crash, restart and mapping refresh | e | VM gate pending (blocked by issue #39) |
+| Broker disconnect, crash, restart and mapping refresh | e | ARM64 guest, FakeShare, 2026-09-05: PASS — `fwdslash stop`/`start` round-trips the mapping, a killed broker clears its slot (disconnect, not a graceful clear), and the 17th sequential connection still succeeds (no slot leak) |
 | Logoff, WSL shutdown/restart | not automated | VM gate pending |
-| Malformed messages rejected without a bugcheck; slot accounting | e | VM gate pending — the set ran but every message was `[SKIPPED]`, the port having refused the harness (issue #39); the machine did survive it |
+| Malformed messages rejected without a bugcheck; slot accounting | e | ARM64 guest, FakeShare, Verifier `0x93B`, 2026-09-05: PASS — wrong input length, wrong protocol version, non-zero `Reserved`, `DistributionCount > 32`, and a backslash in a name are each rejected; the machine survives the whole set |
 | Allocation failures | not automated (fail-open by design; see the Verifier note) | VM gate pending |
 | Sleep/resume | manual, reported `[SKIPPED]` by step f | VM gate pending |
 | Unload under load, then reload | f | ARM64 guest, Win 26200.9278, Verifier `0x93B`, 2026-09-05: PASS (unload during a create loop, no bugcheck, filter reloads) |
 | Driver Verifier: Special Pool, pool tracking, force IRQL checking, I/O verification, deadlock detection, security checks, miscellaneous checks (mask `0x93B`) | a asserts it is active for the whole run | ARM64 guest, Win 26200.9278, 2026-09-05: PASS — active for a full run that reached teardown with no bugcheck |
-| Create-rate cost on non-matching paths | g (informational, no threshold) | ARM64 guest, 2026-09-05, 20 000 iterations: loaded 67 015 opens/s vs unloaded 71 890 opens/s, −6.78 % |
+| Create-rate cost on non-matching paths | g (informational, no threshold) | ARM64 guest, 2026-09-05, 20 000 iterations, latest clean run: loaded 65,548 opens/s vs unloaded 66,791 opens/s, −1.86 % (noisy on this guest across five runs so far, from −7.5 % to +16 %; informational only, no threshold) |
 | Transactional install, unload and driver-store removal | a and h | ARM64 guest, Win 26200.9278, Verifier `0x93B`, 2026-09-05: PASS (`pnputil /add-driver /install`, `fltmc unload`, `pnputil /delete-driver oem1.inf /uninstall /force`) |
 | Collision warning for every registered distro name on every mounted drive | not automated | VM gate pending |
 | Applicable HLK filter/filesystem playlists and Microsoft production signing | out of scope of the lab | Deferred (Tier 3: altitude allocation, Partner Center, attestation signing) |
 
 **Driver gate status 2026-09-05 (ARM64 guest, Win 26200.9278, FakeShare,
-Driver Verifier `0x93B`).** Three runs, two kernel faults found and both fixed.
-The guest no longer bugchecks, and the harness now runs the whole matrix
-through teardown: `28 passed / 28 failed / 13 skipped`.
+Driver Verifier `0x93B`).** Six runs total, two kernel faults found and fixed,
+one lab-plumbing defect found and fixed, one architectural driver limitation
+newly surfaced. The harness now runs the whole matrix through teardown twice
+in a row with the port actually connected: `63 passed / 2 failed / 4 skipped`,
+identical on both runs.
 
 - **Fixed (issue #36).** The guest bugchecked `0x0000003B`
   `SYSTEM_SERVICE_EXCEPTION` (param 1 `0xC0000005`) on the broker's first
@@ -109,20 +112,39 @@ through teardown: `28 passed / 28 failed / 13 skipped`.
   `LastBootUpTime` jump, `[PASS] h. no unexpected-shutdown (Kernel-Power 41)
   event during the run`.
 
-- **Open (issue #39) — not a driver fault.** Every one of the 28 remaining
-  failures has one cause: PowerShell Direct's `Invoke-Command -VMName` lands
-  in the guest's **session 0**, so the detached `Test-Driver.ps1`, the CLI and
-  `fswbroker.exe` all run there (`out/lab/step11-probe.log`: `remote PID 8436
-  runs in SESSION 0`, `fswbroker pid=3188 session=0`, while an interactive
-  `console` session 1 is Active). `FswPortConnect` refuses session 0 by
-  design, so no mapping is ever published and steps b, c, d and the malformed
-  message set in e cannot run. The harness needs to start in session 1, and
-  should assert a non-zero session id at preflight rather than producing a
-  28-failure run that reads like a driver regression.
+- **Fixed (issue #39) — was never a driver fault.** The prior 28-failure run
+  had one cause: PowerShell Direct's `Invoke-Command -VMName` lands in the
+  guest's **session 0**, so the detached `Test-Driver.ps1`, the CLI and
+  `fswbroker.exe` all ran there, and `FswPortConnect` refuses session 0 by
+  design — no mapping was ever published. Two independent fixes, both in the
+  harness: (1) `tools/Test-Driver.ps1` now asserts its own session id is
+  non-zero at preflight and fails fast with an explanation instead of
+  producing a mass of failures that read like a driver regression; (2) the
+  gate's in-guest launch now registers an **interactive scheduled task**
+  (`schtasks /it /rl HIGHEST`, run as the console user) instead of a bare
+  `Start-Process` from the PowerShell Direct session — verified session id 1
+  and an elevated token before committing to the full run. A second,
+  independent defect surfaced once the port actually connected:
+  `-FakeShare` provisions the SMB share and shadow directory but never seeds
+  `HKCU\...\Lxss`, so the broker had nothing to publish even with the launch
+  fixed. `Test-Driver.ps1`'s `-FakeShare` preflight now seeds a synthetic
+  Lxss registration (`DistributionName` = the distro, tagged with a private
+  `FswLabFakeDistribution` marker) and removes it again in step h. A third,
+  harness-only defect (a nested `schtasks /run` from inside the outer
+  interactive task blocking indefinitely instead of returning) was found
+  live and fixed: every native call in the identity-rules step now goes
+  through a bounded (job + `Wait-Job -Timeout`) wrapper, and the `/st` value
+  is computed in the future instead of a fixed `00:00`.
 
-Rows covered by steps that do not need a published mapping — a, f, g, h — are
-recorded above from the 2026-09-05 post-#38 run. Everything downstream of the
-port connect stays pending on #39.
+- **New (issue #40) — a driver behavior, not touched.** `Rename-Item` and
+  `Remove-Item` through the alias fail with `DirectoryNotFoundException`,
+  reproduced identically across two clean runs. The driver's own source
+  comment explains this is deliberate (see the table row above and #40) —
+  logged for review rather than patched blind.
+
+Rows covered by steps that do not need a published mapping — a, f, g, h — were
+already recorded from the 2026-09-05 post-#38 run and are unchanged. Steps b
+through e now have real evidence for the first time.
 
 Verifier runs with mask `0x93B` and deliberately **without** low-resource
 simulation (`0x0004`): the filter is fail-open on every allocation failure by

@@ -328,6 +328,13 @@ if ($FakeShare) {
     Write-Host '   metadata, case-sensitive directories, symlinks or Linux permissions.'
     Write-Host '   A green -FakeShare run is necessary, not sufficient: the gate rows in'
     Write-Host '   docs/compatibility.md stay pending until a real WSL distribution passes.'
+    Write-Host ''
+    Write-Host '   NOTE: this provisions the SMB share only, not a distribution the broker'
+    Write-Host '   can see - the broker publishes what HKCU\...\Lxss lists, and nothing here'
+    Write-Host '   writes to it. Test-Driver.ps1 -FakeShare seeds a synthetic Lxss'
+    Write-Host '   registration itself (and removes it in step h), because this script only'
+    Write-Host '   runs once at checkpoint-creation time, while Test-Driver.ps1 is re-pushed'
+    Write-Host '   and re-run against the restored checkpoint on every gate run (issue #39).'
 } else {
     Write-Section 'Fake share'
     Write-Step 'skipped (-FakeShare not given); a real WSL distribution must serve \\wsl.localhost'
