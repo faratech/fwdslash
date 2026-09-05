@@ -43,12 +43,85 @@ struct AttemptLock {
     owner: String,
 }
 
+/// A cross-session, per-user serialization gate for decisions about the lock
+/// file. The file survives the updater process so tasks can own an attempt;
+/// the mutex deliberately does not. Its only job is making create/reclaim and
+/// compare/delete decisions indivisible.
+#[cfg(windows)]
+struct AttemptMutex(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl AttemptMutex {
+    fn acquire(directory: &std::path::Path) -> Option<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+        let normalized = directory
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase();
+        let hash = normalized
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        let name = format!("Global\\ForwardSlashWindows.UpdateAttemptLock.{hash:016x}");
+        let mut wide: Vec<u16> = std::ffi::OsStr::new(&name).encode_wide().collect();
+        wide.push(0);
+        // SAFETY: the null security attributes request the current user's
+        // default ACL; the nul-terminated name is local to this call.
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+        if handle.is_null() {
+            return None;
+        }
+        // SAFETY: `handle` was returned by CreateMutexW and is valid here.
+        let result = unsafe { WaitForSingleObject(handle, 5_000) };
+        if result == WAIT_OBJECT_0 || result == WAIT_ABANDONED {
+            // WAIT_ABANDONED grants this decision mutex, but is not evidence
+            // that a fresh file-backed task owner is stale.
+            Some(Self(handle))
+        } else {
+            // SAFETY: this branch owns no mutex acquisition but still owns the
+            // kernel handle returned above.
+            unsafe { CloseHandle(handle) };
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AttemptMutex {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+
+        // SAFETY: AttemptMutex exists only after WaitForSingleObject granted
+        // ownership. Both calls consume no Rust references and are best effort
+        // during error unwinding.
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 impl AttemptLock {
     fn acquire(owner: &str) -> Option<Self> {
-        use std::io::Write;
-        use std::time::Duration;
         let directory = fsw_core::update::update_directory_path()?;
-        std::fs::create_dir_all(&directory).ok()?;
+        Self::acquire_in(&directory, owner, std::time::Duration::from_secs(65 * 60))
+    }
+
+    fn acquire_in(
+        directory: &std::path::Path,
+        owner: &str,
+        stale_after: std::time::Duration,
+    ) -> Option<Self> {
+        use std::io::Write;
+
+        let _decision = AttemptMutex::acquire(directory)?;
+        std::fs::create_dir_all(directory).ok()?;
         let path = directory.join("update-attempt.lock");
         for _ in 0..2 {
             match std::fs::OpenOptions::new()
@@ -64,14 +137,14 @@ impl AttemptLock {
                     });
                 }
                 Err(_) => {
-                    // The XML limits every task to an hour. A lock older than
-                    // that plus a small clock/filesystem margin is abandoned
-                    // state after a crash, not a live updater.
+                    // The XML limits every task to an hour. This mutex keeps
+                    // the stale observation, removal and replacement together
+                    // so a second contender cannot delete our fresh token.
                     let stale = std::fs::metadata(&path)
                         .ok()
                         .and_then(|metadata| metadata.modified().ok())
                         .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > Duration::from_secs(65 * 60));
+                        .is_some_and(|age| age > stale_after);
                     if !stale {
                         return None;
                     }
@@ -83,10 +156,28 @@ impl AttemptLock {
     }
 
     fn release(self) {
+        let Some(directory) = self.path.parent() else {
+            return;
+        };
+        let Some(_decision) = AttemptMutex::acquire(directory) else {
+            return;
+        };
         if std::fs::read_to_string(&self.path).ok().as_deref() == Some(self.owner.as_str()) {
             let _ = std::fs::remove_file(self.path);
         }
     }
+}
+
+/// Holds the same short decision mutex through uninstall's task inventory and
+/// storage sweep, preventing a fresh updater from acquiring a token between
+/// those destructive steps.
+#[cfg(windows)]
+pub struct UninstallUpdateGuard(AttemptMutex);
+
+#[cfg(windows)]
+pub fn lock_update_storage_for_uninstall() -> Option<UninstallUpdateGuard> {
+    let directory = fsw_core::update::update_directory_path()?;
+    AttemptMutex::acquire(&directory).map(UninstallUpdateGuard)
 }
 
 /// The relaunch ceiling, in minutes, for the watchdog's poll loop.
@@ -428,5 +519,115 @@ pub fn schedule_apply(command: &str, mode: RelaunchMode, previous_version: &str)
     } else {
         lock.release();
         false
+    }
+}
+
+#[cfg(all(test, windows))]
+mod attempt_lock_tests {
+    use super::AttemptLock;
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn directory(name: &str) -> TestDirectory {
+        let path = std::env::temp_dir().join(format!(
+            "fsw-attempt-lock-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("test directory");
+        TestDirectory(path)
+    }
+
+    fn make_genuinely_old(path: &std::path::Path) {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::Storage::FileSystem::SetFileTime;
+        use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("stale lock file");
+        let mut now = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        // SAFETY: GetSystemTimeAsFileTime initializes the provided FILETIME.
+        unsafe { GetSystemTimeAsFileTime(&mut now) };
+        let ticks = (u64::from(now.dwHighDateTime) << 32) | u64::from(now.dwLowDateTime);
+        let old = ticks - 2 * 60 * 60 * 10_000_000;
+        let old = FILETIME {
+            dwLowDateTime: old as u32,
+            dwHighDateTime: (old >> 32) as u32,
+        };
+        // SAFETY: the file handle is live for this call and the FILETIME points
+        // to initialized memory.
+        assert_ne!(
+            unsafe {
+                SetFileTime(
+                    file.as_raw_handle(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &old,
+                )
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn two_contenders_cannot_replace_a_fresh_reclaimed_owner() {
+        let directory = directory("contention");
+        let path = directory.0.join("update-attempt.lock");
+        std::fs::write(&path, "dead-owner").expect("seed lock");
+        make_genuinely_old(&path);
+        let barrier = Arc::new(Barrier::new(2));
+        let stale_after = Duration::from_secs(60 * 60);
+        let contenders = ["owner-a", "owner-b"].map(|owner| {
+            let barrier = Arc::clone(&barrier);
+            let directory = directory.0.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                AttemptLock::acquire_in(&directory, owner, stale_after)
+            })
+        });
+        let [first, second] = contenders;
+        let first = first.join().expect("first contender");
+        let second = second.join().expect("second contender");
+        assert_eq!(
+            usize::from(first.is_some()) + usize::from(second.is_some()),
+            1
+        );
+        let winner = first.or(second).expect("one winner");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("winner token"),
+            winner.owner
+        );
+        winner.release();
+    }
+
+    #[test]
+    fn release_never_deletes_a_foreign_owner_token() {
+        let directory = directory("foreign-owner");
+        let owner = AttemptLock::acquire_in(&directory.0, "owner-a", Duration::from_secs(60))
+            .expect("first owner");
+        std::fs::write(&owner.path, "owner-b").expect("replace token for test");
+        owner.release();
+        assert_eq!(
+            std::fs::read_to_string(directory.0.join("update-attempt.lock"))
+                .expect("foreign token"),
+            "owner-b"
+        );
     }
 }

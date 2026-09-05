@@ -1106,9 +1106,14 @@ fn owned_update_task_inventory(csv: &str) -> Vec<String> {
         .collect()
 }
 
-fn cleanup_update_tasks_for_uninstall() {
+fn cleanup_update_tasks_for_uninstall() -> bool {
     use std::process::{Command, Stdio};
 
+    // Do not sweep a freshly acquired attempt token from another session. The
+    // guard is intentionally held only across this bounded uninstall cleanup.
+    let Some(_guard) = update::relaunch::lock_update_storage_for_uninstall() else {
+        return false;
+    };
     let mut names = Command::new("schtasks.exe")
         .args(["/query", "/fo", "csv", "/nh"])
         .stdin(Stdio::null())
@@ -1148,6 +1153,7 @@ fn cleanup_update_tasks_for_uninstall() {
             }
         }
     }
+    fsw_core::update::sweep_update_directory().is_ok()
 }
 
 fn cmd_doctor_all() -> i32 {
@@ -1540,14 +1546,15 @@ fn main() {
             // uninstall. The relaunch watchdog is a scheduled task rather than
             // a file, so it needs its own sweep -- an update task that fired
             // after an uninstall would relaunch a product that is gone.
-            cleanup_update_tasks_for_uninstall();
-            let _ = fsw_core::update::sweep_update_directory();
+            let updates_cleaned = cleanup_update_tasks_for_uninstall();
             let win = set_windows_integration(false);
             let proto = set_settings_protocol(false);
             if win != 0 {
                 win
             } else if proto != 0 {
                 proto
+            } else if !updates_cleaned {
+                1
             } else {
                 sweep
             }
