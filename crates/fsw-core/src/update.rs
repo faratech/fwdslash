@@ -16,8 +16,9 @@
 //! -DeferRegistrationWhenPackagesAreInUse`. MSIX deployment is transactional:
 //! the running version keeps running and the next launch is the new one.
 //!
-//! The download directory holds at most one bundle: a new download prunes any
-//! other `*.msixbundle` first, and `sweep_update_directory` (called by
+//! The download directory holds at most one bundle: a successful new download
+//! prunes other `*.msixbundle` only after atomic promotion, and
+//! `sweep_update_directory` (called by
 //! `fwdslash uninstall`) removes the directory outright. A registered bundle
 //! is deliberately KEPT — deferred registration only applies at the next
 //! launch, and [`pending_bundle_path`] is the apply-now path for it: the CLI's
@@ -52,6 +53,60 @@ pub const UPDATE_ROUTE_VALUE: &str = "UpdateRoute";
 /// one — so it writes one of `completed`, `paused` or `error:0x…` here and the
 /// next packaged `update check`/`update status` folds that into the registry.
 pub const UPDATE_RESULT_FILE: &str = "last-result.txt";
+
+#[cfg(any(windows, test))]
+const BUNDLE_DOWNLOAD_CONNECT_TIMEOUT_SECS: &str = "5";
+#[cfg(any(windows, test))]
+const BUNDLE_DOWNLOAD_MAX_TIME_SECS: &str = "120";
+
+#[cfg(any(windows, test))]
+fn bundle_download_curl_args() -> [&'static str; 6] {
+    [
+        "-fsSL",
+        "--connect-timeout",
+        BUNDLE_DOWNLOAD_CONNECT_TIMEOUT_SECS,
+        "--max-time",
+        BUNDLE_DOWNLOAD_MAX_TIME_SECS,
+        "-o",
+    ]
+}
+
+/// Transfers to a uniquely named sidecar and only then atomically promotes it
+/// into the path consumers treat as installable. Kept platform-neutral so the
+/// failure and cleanup invariant can be tested without a Windows curl child.
+#[cfg(any(windows, test))]
+fn download_bundle_with<F>(directory: &std::path::Path, bundle_name: &str, transfer: F) -> Option<std::path::PathBuf>
+where
+    F: FnOnce(&std::path::Path) -> bool,
+{
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    std::fs::create_dir_all(directory).ok()?;
+    let destination = directory.join(bundle_name);
+    let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!(
+        ".{bundle_name}.{}.{}.part",
+        std::process::id(),
+        sequence
+    ));
+    if !transfer(&temporary) || !temporary.is_file() {
+        let _ = std::fs::remove_file(&temporary);
+        return None;
+    }
+    match std::fs::rename(&temporary, &destination) {
+        Ok(()) => Some(destination),
+        Err(_) => {
+            let _ = std::fs::remove_file(&temporary);
+            None
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn powershell_single_quoted(value: &str) -> String {
+    value.replace('\'', "''")
+}
 
 /// A semantic `(major, minor, patch)` triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -264,7 +319,8 @@ pub enum UpdateOutcome {
 #[cfg(windows)]
 pub mod windows_impl {
     use super::{
-        extract_bundle_url, extract_tag_name, is_newer_version, update_check_allowed, UpdateOutcome,
+        bundle_download_curl_args, download_bundle_with, extract_bundle_url, extract_tag_name,
+        is_newer_version, powershell_single_quoted, update_check_allowed, UpdateOutcome,
         AUTO_UPDATE_VALUE, AVAILABLE_UPDATE_VALUE, LAST_UPDATE_CHECK_VALUE, RELEASES_LATEST_URL,
     };
     use crate::{FSW_SETTINGS_KEY, is_store_flavor, package_version};
@@ -414,22 +470,20 @@ pub mod windows_impl {
 
     fn download_bundle(url: &str, tag: &str) -> Option<PathBuf> {
         let update_dir = update_directory_path()?;
-        std::fs::create_dir_all(&update_dir).ok()?;
-        let destination = update_dir.join(bundle_name(tag));
-        // Whatever an earlier release left here is dead weight.
+        let bundle = bundle_name(tag);
+        let destination = download_bundle_with(&update_dir, &bundle, |temporary| {
+            Command::new("curl.exe")
+                .args(bundle_download_curl_args())
+                .arg(temporary)
+                .arg(url)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .is_ok_and(|status| status.status.success())
+        })?;
+        // Only a complete bundle has replaced the old one, so a failed
+        // transfer cannot erase the last known-good deferred registration.
         prune_bundles(&update_dir, destination.file_name());
-        let status = Command::new("curl.exe")
-            .args(["-fsSL", "-o"])
-            .arg(&destination)
-            .arg(url)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .ok()?;
-        if status.status.success() && destination.is_file() {
-            Some(destination)
-        } else {
-            None
-        }
+        Some(destination)
     }
 
     fn register_bundle(path: &Path) -> bool {
@@ -437,7 +491,7 @@ pub mod windows_impl {
         // package being updated; registration defers to the next launch.
         let command = format!(
             "Add-AppxPackage -Path '{}' -DeferRegistrationWhenPackagesAreInUse",
-            path.display()
+            powershell_single_quoted(&path.to_string_lossy())
         );
         Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &command])
@@ -555,4 +609,71 @@ pub fn update_directory_path() -> Option<std::path::PathBuf> {
 #[must_use]
 pub fn last_update_check() -> Option<u64> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BUNDLE_DOWNLOAD_CONNECT_TIMEOUT_SECS, BUNDLE_DOWNLOAD_MAX_TIME_SECS, bundle_download_curl_args,
+        download_bundle_with, powershell_single_quoted,
+    };
+
+    fn temporary_directory(label: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "fsw-core-update-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("create test directory");
+        directory
+    }
+
+    #[test]
+    fn failed_transfer_cleans_the_partial_and_preserves_the_previous_bundle() {
+        let directory = temporary_directory("failed-transfer");
+        let bundle = "fwdslash-v1.msixbundle";
+        let previous = directory.join(bundle);
+        std::fs::write(&previous, b"known-good").expect("write previous bundle");
+
+        let result = download_bundle_with(&directory, bundle, |temporary| {
+            std::fs::write(temporary, b"partial").expect("write partial transfer");
+            false
+        });
+
+        assert_eq!(result, None);
+        assert_eq!(std::fs::read(&previous).expect("read previous bundle"), b"known-good");
+        assert!(
+            std::fs::read_dir(&directory)
+                .expect("read update directory")
+                .flatten()
+                .all(|entry| entry.path().extension().is_none_or(|extension| extension != "part"))
+        );
+        std::fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn download_curl_has_bounded_connect_and_transfer_time() {
+        assert_eq!(
+            bundle_download_curl_args(),
+            [
+                "-fsSL",
+                "--connect-timeout",
+                BUNDLE_DOWNLOAD_CONNECT_TIMEOUT_SECS,
+                "--max-time",
+                BUNDLE_DOWNLOAD_MAX_TIME_SECS,
+                "-o",
+            ]
+        );
+    }
+
+    #[test]
+    fn powershell_single_quoted_literal_preserves_special_path_characters() {
+        assert_eq!(
+            powershell_single_quoted(r"C:\Users\O'Brien\Forward Slash $stable`\bundle.msixbundle"),
+            r"C:\Users\O''Brien\Forward Slash $stable`\bundle.msixbundle"
+        );
+    }
 }
