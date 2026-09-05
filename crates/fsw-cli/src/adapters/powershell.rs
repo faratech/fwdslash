@@ -170,11 +170,13 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     let module_path = transaction.module_root.join("ForwardSlashWindows.psm1");
     let controller_path = transaction.module_root.join("fwdslash.exe");
     let probe_path = super::product_probe_path(&running);
+    let alias_path = super::app_execution_alias().unwrap_or_default();
     let block = profile::block_text(&profile::BlockParams {
         version: super::PAYLOAD_VERSION,
         transaction_id: &transaction.transaction_id,
         module_path: &module_path.display().to_string(),
         probe_path: &probe_path.display().to_string(),
+        alias_path: &alias_path.display().to_string(),
         controller_path: &controller_path.display().to_string(),
         original_non_empty: true_original_present,
     });

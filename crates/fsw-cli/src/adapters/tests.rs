@@ -358,7 +358,8 @@ fn ps_block(version: &str, id: &str, module: &str, original_non_empty: bool) -> 
         version,
         transaction_id: id,
         module_path: module,
-        probe_path: "C:\\probe\\fwdslash.exe",
+        probe_path: "C:\\Local\\Packages\\Fam_abc",
+        alias_path: "C:\\Local\\Microsoft\\WindowsApps\\fwdslash.exe",
         controller_path: "C:\\ctl\\fwdslash.exe",
         original_non_empty,
     })
@@ -378,10 +379,17 @@ fn block_text_renders_the_guarded_form() {
         "# >>> Forward Slash Windows {version} cafe >>>\r\n"
     )));
     assert!(block.contains(&format!("$m = '{module}'\r\n")));
-    // The import is guarded by Test-Path, never a bare Import-Module (#37), and
-    // the self-clean is launched detached so a shell never blocks on it.
+    // The import is guarded by Test-Path, never a bare Import-Module (#37); the
+    // product counts as present when EITHER the probe folder or the
+    // app-execution alias is there, so switching the alias off in Settings
+    // cannot look like an uninstall; and the self-clean is launched detached so
+    // a shell never blocks on it.
+    assert!(block.contains("$p = 'C:\\Local\\Packages\\Fam_abc'\r\n"));
+    assert!(block.contains("$a = 'C:\\Local\\Microsoft\\WindowsApps\\fwdslash.exe'\r\n"));
+    // `$a -and` guards the alias: an unresolvable %LOCALAPPDATA% renders it
+    // empty, and a bare `Test-Path -LiteralPath ''` throws on every shell start.
     assert!(block.contains(
-        "if (Test-Path -LiteralPath $p) { if (Test-Path -LiteralPath $m) { Import-Module -Name $m -Global -Force } } elseif (Test-Path -LiteralPath $c) { Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }\r\n"
+        "if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) { if (Test-Path -LiteralPath $m) { Import-Module -Name $m -Global -Force } } elseif (Test-Path -LiteralPath $c) { Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }\r\n"
     ));
     assert!(
         !block.contains("Import-Module -Name 'C:"),
@@ -565,6 +573,32 @@ fn strip_fwdslash_autorun_recovers_the_true_third_party_value() {
         "echo a & echo b"
     );
     assert_eq!(state::strip_fwdslash_autorun("echo hi"), "echo hi");
+}
+
+#[test]
+fn a_refused_uninstall_still_strips_only_our_own_autorun_segment() {
+    // The bug this closes (#37): the transactional uninstall REFUSES when a
+    // third party edited AutoRun after we installed, which used to leave our
+    // `call "…fsw-autorun.cmd"` pointing at a script the self-clean then
+    // deleted — a "system cannot find the path specified" on every cmd start.
+    let hook =
+        "call \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
+    let original = "echo hi";
+    let installed = state::installed_autorun(original, hook);
+    let tampered = format!("{installed} & echo later");
+
+    // The refusal still stands...
+    assert_eq!(
+        state::judge_autorun(true, &tampered, &installed, original),
+        state::AutorunVerdict::Changed
+    );
+    // ...but stripping removes only our segment and keeps both third-party
+    // parts byte-for-byte, leaving nothing that references the deleted script.
+    let stripped = state::strip_fwdslash_autorun(&tampered);
+    assert_eq!(stripped, "echo hi & echo later");
+    assert!(!state::autorun_references_fwdslash(&stripped));
+    // Idempotent: stripping an already-clean value changes nothing.
+    assert_eq!(state::strip_fwdslash_autorun(&stripped), stripped);
 }
 
 #[test]

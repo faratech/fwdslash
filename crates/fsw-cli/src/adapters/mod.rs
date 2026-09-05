@@ -379,19 +379,31 @@ pub fn cleanup_orphaned() -> i32 {
 
         // Product confirmed gone. Restore the profiles / AutoRun byte-exact
         // through the transactional sweep (cmd still refuses if a third party
-        // changed AutoRun), then belt-and-braces strip any block a refused or
+        // changed AutoRun), then belt-and-braces strip anything a refused or
         // missing-recovery uninstall could have left behind.
         let _ = sweep_uninstall();
         strip_all_ps_profiles();
+        // The cmd analogue: a refused uninstall leaves our `call` in AutoRun,
+        // and deleting the payload under it would break every console start.
+        let _ = cmd::strip_autorun_hook();
 
         // Wipe the settings hive + adapter markers, and the unpackaged-only Run
-        // value and protocol registration (a packaged orphan has neither).
+        // value (a packaged orphan has neither).
         let _ = reg::delete_tree("Software\\ForwardSlashWindows");
         let _ = reg::delete_value(fsw_core::RUN_KEY, fsw_core::RUN_VALUE);
-        let _ = reg::delete_tree(fsw_core::PROTOCOL_KEY);
+        // The protocol registration goes only if it is still ours — the normal
+        // uninstall refuses to remove another application's handler, and so
+        // does this.
+        if protocol_is_ours() {
+            let _ = reg::delete_tree(fsw_core::PROTOCOL_KEY);
+        }
 
         // Delete the payload tree, scheduling the running directory's own
-        // removal for after this process exits.
+        // removal for after this process exits — but never while AutoRun still
+        // calls into it.
+        if cmd::autorun_still_hooked() {
+            return 0;
+        }
         schedule_payload_delete();
         0
     }
@@ -399,6 +411,28 @@ pub fn cleanup_orphaned() -> i32 {
     {
         1
     }
+}
+
+/// Whether `HKCU\Software\Classes\fwdslash` still names *our* handler.
+///
+/// `set_settings_protocol` writes `"<dir>\fswsettings.exe" "%1"` and refuses to
+/// remove the key when another application has since taken the scheme; the
+/// orphan self-clean keeps that promise rather than deleting a handler that is
+/// no longer ours.
+#[cfg(windows)]
+fn protocol_is_ours() -> bool {
+    use windows_registry::CURRENT_USER;
+
+    let command_key = format!(r"{}\shell\open\command", fsw_core::PROTOCOL_KEY);
+    let Ok(key) = CURRENT_USER.open(&command_key) else {
+        // No handler registered at all: nothing of ours to remove.
+        return false;
+    };
+    let Ok(command) = key.get_string("") else {
+        return false;
+    };
+    let command = command.to_ascii_lowercase();
+    command.contains("fswsettings.exe") || command.contains("fwdslash.exe")
 }
 
 /// Belt-and-braces removal of any fwdslash block left in either edition's
@@ -495,17 +529,30 @@ pub fn app_execution_alias() -> Option<PathBuf> {
 }
 
 /// The product-presence probe recorded in an adapter's marker at install time.
-/// Packaged: the app-execution alias. Unpackaged: the directory the real
-/// controller runs from. Its absence arms the shell hook's self-clean.
+/// Its absence arms the shell hook's self-clean.
+///
+/// Packaged: the package's own app-data folder,
+/// `%LOCALAPPDATA%\Packages\<package family>`, resolved from the *actual*
+/// family at install time so either flavor works. It exists while the package
+/// is registered, survives updates (closing the in-flight-update race), and is
+/// removed by an MSIX uninstall. Deliberately **not** the app-execution alias:
+/// a user can turn that off under Settings > Apps > App execution aliases,
+/// which would silently disable the integration and spawn a self-clean on
+/// every shell start.
+///
+/// Unpackaged: the directory the real controller runs from.
 #[cfg(windows)]
 pub fn product_probe_path(controller: &Path) -> PathBuf {
     if fsw_core::has_package_identity() {
+        if let (Some(family), Ok(local_app_data)) = (fsw_core::package_family(), local_app_data()) {
+            return local_app_data.join("Packages").join(family);
+        }
         if let Some(alias) = app_execution_alias() {
             return alias;
         }
     }
-    // Unpackaged (or, defensively, a packaged build with no %LOCALAPPDATA%):
-    // the real controller's own directory proves the product is present.
+    // Unpackaged (or, defensively, a packaged build we could not resolve a
+    // family for): the real controller's own directory proves it is present.
     controller
         .parent()
         .map_or_else(|| controller.to_path_buf(), Path::to_path_buf)
@@ -518,14 +565,16 @@ pub fn product_probe_path(controller: &Path) -> PathBuf {
 /// transient failure never destroys a live install.
 #[cfg(windows)]
 pub fn product_present(recorded_probes: &[String]) -> bool {
-    // Cheap: the app-execution alias. Slow — only paid when the alias is
-    // absent: a recorded install directory, then, last, an appx query.
-    let cheap_probe_present = app_execution_alias().is_some_and(|path| path.is_file());
-    let slow_confirm_present = !cheap_probe_present
-        && (recorded_probes
-            .iter()
-            .any(|probe| !probe.is_empty() && Path::new(probe).exists())
-            || appx_registered(fsw_core::STORE_IDENTITY_NAME));
+    // Cheap: the recorded probes (the package app-data folder, or the
+    // unpackaged install directory) and the app-execution alias — plain file
+    // system checks. Slow, and only paid when every cheap check has failed:
+    // an appx registration query.
+    let cheap_probe_present = recorded_probes
+        .iter()
+        .any(|probe| !probe.is_empty() && Path::new(probe).exists())
+        || app_execution_alias().is_some_and(|path| path.is_file());
+    let slow_confirm_present =
+        !cheap_probe_present && appx_registered(fsw_core::STORE_IDENTITY_NAME);
     !state::product_confirmed_gone(cheap_probe_present, slow_confirm_present)
 }
 

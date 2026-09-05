@@ -572,13 +572,24 @@ profile verbatim, and never revisits either. The Rust adapter hardens the whole
 lifecycle so an upgrade or an MSIX uninstall can never leave a broken shell:
 
 - **The profile block is guarded, fenced, and self-cleaning.** `block_text`
-  emits `$m`/`$p`/`$c` (module, product-presence probe, staged controller) and
-  `if (Test-Path $p) { if (Test-Path $m) { Import-Module … } } elseif
-  (Test-Path $c) { & $c uninstall --orphaned *> $null }`. A pruned module
-  directory can no longer throw the red `no valid module file` error, and a
-  product that was uninstalled with no code run (MSIX) is cleaned up by the
-  leftover hook on the next shell start. The region is delimited by
+  emits `$m`/`$p`/`$a`/`$c` (module, product-presence probe, app-execution
+  alias, staged controller) and
+  `if ((Test-Path $p) -or (Test-Path $a)) { if (Test-Path $m) { Import-Module … } }
+  elseif (Test-Path $c) { Start-Process $c uninstall --orphaned }`. A pruned
+  module directory can no longer throw the red `no valid module file` error,
+  and a product that was uninstalled with no code run (MSIX) is cleaned up by
+  the leftover hook on the next shell start — launched detached, so a shell
+  never blocks on it. The region is delimited by
   `# >>> Forward Slash Windows <ver> <id> >>>` / `# <<< … <<<` fence lines.
+- **The probe is the package's app-data folder, not the alias.** A packaged
+  install records `%LOCALAPPDATA%\Packages\<family>` (from the actual
+  `fsw_core::package_family()` at install time, so either flavor works); an
+  unpackaged one records the controller's directory. The app-execution alias is
+  only ever an additional OR, because a user can switch it off under
+  Settings > Apps > App execution aliases without uninstalling anything — using
+  it as *the* probe would silently disable the integration and spawn a
+  self-clean on every shell start. The package folder also survives an update,
+  which closes the in-flight-update race.
 - **Install/enable is replace-not-append and idempotent.** `commit_install`
   computes the *true* original — the current profile with **every** fwdslash
   fence stripped (`strip_fwdslash_blocks`, encoding-aware over UTF-8/16/32) —
@@ -603,13 +614,19 @@ lifecycle so an upgrade or an MSIX uninstall can never leave a broken shell:
   present, and otherwise runs the self-clean instead of routing through an
   orphaned controller copy.
 - **`fwdslash uninstall --orphaned`** is the deferred self-clean. It confirms
-  the product is really gone (cheap probe, then a `Get-AppxPackage` slow confirm
-  so an in-flight update's alias blip is safe), runs the transactional sweep
-  (restoring profiles/AutoRun byte-exact, cmd still refusing a third-party
-  change), deletes `HKCU\Software\ForwardSlashWindows` plus the unpackaged Run
-  value and protocol key, and schedules deletion of `%LOCALAPPDATA%\
-  ForwardSlashWindows` — including the directory it is running from — after it
-  exits. Idempotent and safe to run twice.
+  the product is really gone (cheap file-system probes, then a
+  `Get-AppxPackage` slow confirm only if those fail, so an in-flight update is
+  safe), runs the transactional sweep (restoring profiles/AutoRun byte-exact,
+  cmd still refusing a third-party change), then belt-and-braces strips what a
+  refusal left: any fwdslash profile fence, and — the cmd analogue — fwdslash's
+  own `call` segment out of `AutoRun`, keeping every third-party segment
+  byte-for-byte and deleting the value only if nothing else remains. It removes
+  `HKCU\Software\ForwardSlashWindows` and the unpackaged Run value, deletes the
+  protocol key **only when its `shell\open\command` is still ours** (the normal
+  uninstall's refusal, kept), and schedules deletion of
+  `%LOCALAPPDATA%\ForwardSlashWindows` — including the directory it is running
+  from — after it exits, but **never while `AutoRun` still references the
+  payload**. Idempotent and safe to run twice.
 
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 

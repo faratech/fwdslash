@@ -127,10 +127,14 @@ pub struct BlockParams<'a> {
     pub transaction_id: &'a str,
     /// The deployed `ForwardSlashWindows.psm1`.
     pub module_path: &'a str,
-    /// A path that exists while the product is installed: the packaged
-    /// app-execution alias, or the unpackaged controller. Its absence is the
-    /// cheap "product gone" signal that arms the self-clean.
+    /// A path that exists while the product is installed: the package's own
+    /// app-data folder (packaged) or the controller's directory (unpackaged).
+    /// Its absence is the cheap "product gone" signal that arms the self-clean.
     pub probe_path: &'a str,
+    /// The app-execution alias, checked as a second "present" signal. It is
+    /// only ever an OR: a user can disable the alias under Settings > Apps,
+    /// which must not look like an uninstall.
+    pub alias_path: &'a str,
     /// The staged `fwdslash.exe` next to the module, invoked as the self-clean
     /// entry point (`uninstall --orphaned`) — it survives an MSIX uninstall
     /// because `%LOCALAPPDATA%` is not virtualized.
@@ -153,6 +157,7 @@ pub struct BlockParams<'a> {
 pub fn block_text(params: &BlockParams) -> String {
     let module = escape_single_quoted(params.module_path);
     let probe = escape_single_quoted(params.probe_path);
+    let alias = escape_single_quoted(params.alias_path);
     let controller = escape_single_quoted(params.controller_path);
     let prefix = if params.original_non_empty { "\r\n" } else { "" };
     let version = params.version;
@@ -161,8 +166,9 @@ pub fn block_text(params: &BlockParams) -> String {
         "{prefix}# >>> Forward Slash Windows {version} {id} >>>\r\n\
          $m = '{module}'\r\n\
          $p = '{probe}'\r\n\
+         $a = '{alias}'\r\n\
          $c = '{controller}'\r\n\
-         if (Test-Path -LiteralPath $p) {{ if (Test-Path -LiteralPath $m) {{ Import-Module -Name $m -Global -Force }} }} elseif (Test-Path -LiteralPath $c) {{ Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }}\r\n\
+         if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) {{ if (Test-Path -LiteralPath $m) {{ Import-Module -Name $m -Global -Force }} }} elseif (Test-Path -LiteralPath $c) {{ Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }}\r\n\
          # <<< Forward Slash Windows {version} {id} <<<\r\n"
     )
 }
