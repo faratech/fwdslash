@@ -207,6 +207,8 @@ cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc   # shell adapters
 
 > **Do not load the unsigned driver on a physical machine.** Build and test it only in a checkpointed Hyper-V guest. See [`SECURITY.md`](SECURITY.md) and [`docs/compatibility.md`](docs/compatibility.md).
 
+[`docs/driver-lab.md`](docs/driver-lab.md) is the operator runbook for that guest: how to create it, why Windows Sandbox cannot be used, and how to run the release gate in it.
+
 ---
 
 ## Docs

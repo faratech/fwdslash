@@ -54,19 +54,39 @@ that satisfies neither test now passes Enter through untouched.
 
 ## Driver release gate
 
-- Unsigned/test-signed installation only in a checkpointed Hyper-V guest.
-- Alias-versus-UNC tests for create, read, write, enumerate, metadata, rename,
-  delete, and long/Unicode paths.
-- Standard and elevated callers across ARM64 native, x64 emulated, and x86
-  emulated processes; native x64 coverage in an x64 VM.
-- Two concurrent users and sessions with different WSL registrations.
-- Broker disconnect/crash, logoff, WSL shutdown/restart, mapping refresh,
-  malformed messages, allocation failures, sleep/resume, and unload under load.
-- Driver Verifier with Special Pool, pool tracking, force IRQL checking, I/O
-  verification, deadlock detection, security checks, and miscellaneous checks.
-- Applicable HLK filter/filesystem playlists and Microsoft production signing.
-- Verified transactional install, rollback, unload, driver-store removal, and
-  collision warnings for every registered distro name on every mounted drive.
+The gate is executed by `tools/Test-Driver.ps1`, inside the checkpointed
+Hyper-V guest that `tools/New-DriverLabVm.ps1` creates and
+`tools/Bootstrap-DriverLabGuest.ps1` prepares. Each row names the harness step
+that produces its evidence. `docs/driver-lab.md` is the operator runbook.
+
+| Gate | Harness step | Evidence |
+|---|---|---|
+| Unsigned/test-signed installation only in a checkpointed Hyper-V guest | a | VM gate pending |
+| Alias-versus-UNC parity for create, read, write, enumerate, metadata, rename, delete, long and Unicode paths | c | VM gate pending |
+| Standard and elevated callers redirected; AppContainer and SYSTEM not | d | VM gate pending |
+| ARM64 native, x64 emulated and x86 emulated callers; native x64 in an x64 VM | c (re-run per lab) | VM gate pending; x64 lab not stood up |
+| Two concurrent users and sessions with different WSL registrations | not automated | VM gate pending |
+| Broker disconnect, crash, restart and mapping refresh | e | VM gate pending |
+| Logoff, WSL shutdown/restart | not automated | VM gate pending |
+| Malformed messages rejected without a bugcheck; slot accounting | e | VM gate pending |
+| Allocation failures | not automated (fail-open by design; see the Verifier note) | VM gate pending |
+| Sleep/resume | manual, reported `[SKIPPED]` by step f | VM gate pending |
+| Unload under load, then reload | f | VM gate pending |
+| Driver Verifier: Special Pool, pool tracking, force IRQL checking, I/O verification, deadlock detection, security checks, miscellaneous checks (mask `0x93B`) | a asserts it is active for the whole run | VM gate pending |
+| Create-rate cost on non-matching paths | g (informational, no threshold) | VM gate pending |
+| Transactional install, unload and driver-store removal | a and h | VM gate pending |
+| Collision warning for every registered distro name on every mounted drive | not automated | VM gate pending |
+| Applicable HLK filter/filesystem playlists and Microsoft production signing | out of scope of the lab | Deferred (Tier 3: altitude allocation, Partner Center, attestation signing) |
+
+Verifier runs with mask `0x93B` and deliberately **without** low-resource
+simulation (`0x0004`): the filter is fail-open on every allocation failure by
+design, so randomized failures would turn a real bug into a silent pass.
+
+A `[SKIPPED]` step is not evidence. A row stays "VM gate pending" until the
+harness step that covers it passes in a run with Driver Verifier active, and a
+`-FakeShare` run never clears a row on its own — it proves the reparse
+mechanism, not WSL semantics (`docs/driver-lab.md`, "The FakeShare trick, and
+its limits").
 
 The driver is not included in normal packages until all driver gates pass.
 

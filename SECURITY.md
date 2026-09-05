@@ -19,3 +19,12 @@ The filter under `driver/` is development code. It must not be installed on a
 physical workstation or distributed as a production driver until it has passed
 the documented Driver Verifier and HLK gates and has a Microsoft production
 signature. Test-signed packages belong only in checkpointed virtual machines.
+
+`docs/driver-lab.md` is the runbook for that machine: a Hyper-V Generation 2
+guest with Secure Boot off and test signing on, created by
+`tools/New-DriverLabVm.ps1`, prepared by `tools/Bootstrap-DriverLabGuest.ps1`
+and driven by `tools/Test-Driver.ps1`, with a `clean-os` checkpoint restored
+after every run. Windows Sandbox is not a substitute — it shares the host's
+kernel image and boot policy and cannot enable test signing, reboot, run Driver
+Verifier or load a kernel driver. The gate itself, and which of its rows are
+still unverified, is in `docs/compatibility.md`.
