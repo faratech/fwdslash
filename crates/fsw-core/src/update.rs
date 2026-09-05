@@ -111,7 +111,14 @@ pub fn extract_tag_name(release_json: &str) -> Option<&str> {
         .or_else(|| extract_json_string_field(release_json, "\"tag_name\": \""))
 }
 
-/// The first `browser_download_url` whose value ends in `.msixbundle`.
+/// The name suffix of the Microsoft Store submission artifact. Every release
+/// carries two bundles: the Trusted Signing-signed GitHub flavor, which is the
+/// one to install, and this unsigned Partner Center-identity bundle, which
+/// `Add-AppxPackage` would reject outright. Skip it.
+const STORE_BUNDLE_SUFFIX: &str = "-store-unsigned.msixbundle";
+
+/// The first `browser_download_url` whose value ends in `.msixbundle` but is
+/// not the unsigned Store submission artifact.
 #[must_use]
 pub fn extract_bundle_url(release_json: &str) -> Option<&str> {
     let compact = "\"browser_download_url\":\"";
@@ -133,7 +140,7 @@ pub fn extract_bundle_url(release_json: &str) -> Option<&str> {
         };
         let value_end = value_start + value_end;
         let url = &release_json[value_start..value_end];
-        if url.ends_with(".msixbundle") {
+        if url.ends_with(".msixbundle") && !url.ends_with(STORE_BUNDLE_SUFFIX) {
             return Some(url);
         }
         search_from = value_end;

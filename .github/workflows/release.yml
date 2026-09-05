@@ -14,9 +14,19 @@
 # mismatch would ship a package whose identity contradicts its contents; the
 # assertion below fails the run instead.
 #
+# The same run also packages the tree a second time as the **Store flavor** —
+# the Partner Center package identity, deliberately unsigned, since Partner
+# Center re-signs what it accepts. That bundle is attached to the release as
+# `fwdslash-<version>-store-unsigned.msixbundle` (a submission artifact, not
+# something a user installs) and, once the release exists, the `publish-to-store`
+# job dispatches `publish-to-store.yml` to upload it.
+#
 # Required repository secrets (Settings > Secrets and variables > Actions):
 #   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the
-#   windowsforum-codesigning-sp service principal for fara-codesigning.
+#   windowsforum-codesigning-sp service principal for fara-codesigning. The
+#   same Azure AD application is authorized on Partner Center, so
+#   publish-to-store.yml reuses these three; it additionally needs
+#   STORE_SELLER_ID.
 
 name: release
 
@@ -43,6 +53,9 @@ jobs:
   release:
     runs-on: windows-latest
     timeout-minutes: 45
+    outputs:
+      short: ${{ steps.version.outputs.short }}
+      released: ${{ steps.publish.outputs.released }}
     defaults:
       run:
         shell: pwsh
@@ -127,6 +140,35 @@ jobs:
         run: |
           .\tools\Build-ReleaseZips.ps1 -Version '${{ steps.version.outputs.short }}'
 
+      # The Store flavor of the same binaries. Package-Msix.ps1's identity
+      # defaults are the Partner Center ones, so this is the same command with
+      # no -Publisher override — only Identity differs between the flavors,
+      # and the runtime tells them apart by package family (is_store_flavor).
+      #
+      # It runs after the signing step and into a root of its own: the bundles
+      # share a file name, and the signing glob walks out\msix recursively. A
+      # Store upload must be unsigned — Partner Center discards a signature it
+      # did not make, so an accidentally signed upload burns a submission.
+      - name: Package the Store-flavor MSIX bundle (unsigned)
+        id: store
+        run: |
+          .\tools\Package-Msix.ps1 -BinarySource Rust `
+              -Version '${{ steps.version.outputs.version }}' `
+              -OutputRoot 'out\msix-store'
+          $packed = Join-Path 'out\msix-store' ('fwdslash-{0}.msixbundle' -f '${{ steps.version.outputs.version }}')
+          if (-not (Test-Path -LiteralPath $packed)) { throw "The Store bundle was not produced: $packed" }
+          # The -store-unsigned suffix is load-bearing: it is how
+          # publish-to-store.yml, Install-fwdslash.ps1 and the in-app updater
+          # each tell this bundle from the signed GitHub-flavor one.
+          $bundle = Join-Path 'out\msix-store' ('fwdslash-{0}-store-unsigned.msixbundle' -f '${{ steps.version.outputs.version }}')
+          Move-Item -LiteralPath $packed -Destination $bundle -Force
+          "bundle=$bundle" >> $env:GITHUB_OUTPUT
+
+      - name: Validate the Store bundle
+        run: |
+          .\tools\Test-StoreBundle.ps1 -Bundle '${{ steps.store.outputs.bundle }}' `
+              -Version '${{ steps.version.outputs.version }}'
+
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
         continue-on-error: true
@@ -134,6 +176,7 @@ jobs:
           subject-path: |
             out\msix\*.msix
             out\msix\*.msixbundle
+            out\msix-store\*-store-unsigned.msixbundle
             out\package\*.zip
 
       - name: Upload workflow artifacts (always, for inspection)
@@ -143,12 +186,14 @@ jobs:
           path: |
             out\msix\*.msix
             out\msix\*.msixbundle
+            out\msix-store\*-store-unsigned.msixbundle
             out\package\*.zip
 
       # A tag push publishes; a manual run publishes only when dry_run was
       # explicitly turned off. `inputs.dry_run` is empty on a push, which is
       # why the event name is tested first.
       - name: Create the GitHub Release
+        id: publish
         if: >-
           startsWith(github.ref, 'refs/tags/v') &&
           (github.event_name == 'push' ||
@@ -160,6 +205,54 @@ jobs:
               ForEach-Object { $_.FullName })
           $assets += @(Get-ChildItem 'out\package' -Filter '*.zip' -Recurse |
               ForEach-Object { $_.FullName })
+          $assets += (Resolve-Path -LiteralPath '${{ steps.store.outputs.bundle }}').Path
           gh release create "$env:GITHUB_REF_NAME" @assets `
               --title "Forward Slash Windows ${{ steps.version.outputs.short }}" `
               --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
+
+          # Append the asset guide *after* GitHub's generated "What's Changed"
+          # list. It cannot be passed to --notes, because gh puts that text
+          # before the generated section, and publish-to-store.yml derives the
+          # Store "What's new" by truncating the body at the '## Downloads'
+          # marker — a marker at the top would truncate the changelog away.
+          $downloads = @(
+            '## Downloads',
+            '',
+            '| Asset | What it is |',
+            '| --- | --- |',
+            '| `fwdslash-<version>.msixbundle` | **Install this one.** The GitHub flavor, signed with a publicly trusted certificate through Azure Trusted Signing. `Install-fwdslash.ps1` and the in-app updater both take this asset, and it checks GitHub for updates daily. |',
+            '| `forward-slash-windows-<version>-<arch>.zip` | The same signed executables loose, for an unpackaged install (`fwdslash install`). Needs the Windows App Runtime 2.x installed separately. |',
+            '| `fwdslash-<version>-store-unsigned.msixbundle` | **Not installable — do not download this to install fwdslash.** It is the Microsoft Store submission artifact: identical binaries, but carrying the Partner Center package identity and deliberately left unsigned, because the Store re-signs what it accepts. Windows refuses to install it. It is attached here so the Store submission is reproducible from the release, and `publish-to-store.yml` uploads it to Partner Center; Store users get this build from [the Store listing](https://apps.microsoft.com/detail/9P51CM0MTMK2). |'
+          ) -join "`n"
+          $body = (gh release view "$env:GITHUB_REF_NAME" --json body -q .body) -join "`n"
+          ($body.TrimEnd() + "`n`n" + $downloads) | Out-File -Encoding utf8 release-body.md
+          gh release edit "$env:GITHUB_REF_NAME" --notes-file release-body.md
+          if ($LASTEXITCODE -ne 0) { throw 'gh release edit failed.' }
+
+          "released=true" >> $env:GITHUB_OUTPUT
+
+  # Hands the finished release to publish-to-store.yml. Split into its own job
+  # because the dispatch needs `actions: write`, which the release job (holding
+  # contents: write and the attestation permissions) should not also carry.
+  #
+  # `gh workflow run` resolves the workflow file on the DEFAULT branch, so
+  # publish-to-store.yml has to be merged to main before a tag can trigger it.
+  publish-to-store:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Trigger the Store publish workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.release.outputs.short }}"
+          echo "Triggering publish-to-store for v$VERSION..."
+          gh workflow run publish-to-store.yml \
+            --repo "${{ github.repository }}" \
+            -f version="$VERSION"
+          echo "Store publish workflow dispatched."
