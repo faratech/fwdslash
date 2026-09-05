@@ -91,6 +91,11 @@ appsettings.*.local.json
 *.userprefs
 /test/results/
 
+# Python bytecode. tools/test_bump_version.py imports tools/bump_version.py as
+# a module, so running the suite leaves a tools/__pycache__ behind.
+__pycache__/
+*.pyc
+
 # OS metadata
 .DS_Store
 Thumbs.db

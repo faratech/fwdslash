@@ -81,8 +81,10 @@ change. `fsw-core` adds the funnel and update-check tests. **`fwdslash` has no l
 the adapter unit tests live in the bin, hence `--bins`, and they need a Windows target (and a
 host that can run the resulting exe).
 
-**CI runs all three** (`.github/workflows/build.yml`): the `rust` job on ubuntu-latest runs the
-two portable crates, the `cargo tree -p fsw-path` single-line assertion, the `windows-core`
+**CI runs all three** (`.github/workflows/build.yml`): the `rust` job on ubuntu-latest runs
+`python3 tools/bump_version.py --check` and its unit tests (`python3 -m unittest
+tools.test_bump_version`, no toolchain needed, so they go first), the two portable crates, the
+`cargo tree -p fsw-path` single-line assertion, the `windows-core`
 single-version assertion and `cargo check --workspace --all-targets` for both MSVC targets; the
 `rust-windows` job on windows-latest runs the CLI bin tests, a release build and a binary-size
 report (reported, not gated — clippy is not clean on this tree yet, so there is no
@@ -139,6 +141,26 @@ before each `Add-AppxPackage`, or bump `workspace.package.version`. Launch the p
 app with `explorer.exe 'shell:AppsFolder\32827MikeFara.fwdslash!App'`, and remember the
 running-process rule above applies to the packaged copy too — a running settings window
 (often the leftover unpackaged dev build in `target\release`) blocks relinking.
+
+## Release
+
+A release is a version bump and a tag; everything after the tag is automated.
+
+```bash
+python3 tools/bump_version.py 0.0.4     # rewrites every registered literal
+python3 tools/bump_version.py --check   # what CI will assert
+```
+
+Open a PR with that bump, merge it, then tag the merge commit `v0.0.4` and push the tag
+(`tools/bump_version.py --commit --tag` will make the commit and the annotated tag for you;
+it never pushes). The tag push starts `.github/workflows/release.yml`, which asserts the tag
+matches `workspace.package.version` — this is why the bump must be merged first — then builds
+x64 + ARM64, signs the GitHub flavor through Azure Trusted Signing, packages the tree a second
+time under the Partner Center identity (deliberately unsigned, since the Store re-signs),
+creates the GitHub release with both bundles and the sideload ZIPs, and dispatches
+`publish-to-store.yml` to submit the `*-store-unsigned.msixbundle` to the Store. A
+`workflow_dispatch` run is a dry run unless `dry_run` is explicitly false: it builds and signs
+into workflow artifacts and creates no release. Nothing needs to be built or signed locally.
 
 ## Architecture
 
@@ -402,18 +424,31 @@ change) whether or not the driver is actually loaded.
     `FSW_VER_STR` defines to `embed_resource::compile`, so both the numeric
     `FILEVERSION`/`PRODUCTVERSION` fields **and** the string block in `crates/*/app.rc` come
     from `CARGO_PKG_VERSION` (the `#ifndef` fallbacks in those `.rc` files are a last-resort
-    literal — keep them in step, but they are not the source);
+    literal, not the source — the bump script below is what keeps them in step);
   - `adapters::PAYLOAD_VERSION` is `env!("CARGO_PKG_VERSION")`;
   - `tools/package_msix.py` and `Package-Msix.ps1 -BinarySource Rust` read it (from the TOML
     and from `cargo metadata` respectively);
   - `release.yml` fails the run when the tag disagrees with it.
 
-  Still hand-copied, and all of them must move together with a bump:
-  `crates/fsw-settings/app.manifest` (`0.0.3.0`), `src/settings/app.manifest` (`0.0.3.0`),
-  `src/settings/main.cpp` (the About header literal), `assets/fwdslash.rc` (**both** the
-  numeric `FILEVERSION`/`PRODUCTVERSION` fields and the `FileVersion`/`ProductVersion`
-  strings), `CMakeLists.txt`, `tools/Package.ps1` (the ZIP stage directory), `SECURITY.md`
-  (supported version) and `docs/store-submission.md` §5.
+  Everything else that carries the version as a literal — the `#ifndef` fallbacks, both
+  `app.manifest` files, the About header, `assets/fwdslash.rc`, `CMakeLists.txt`,
+  `tools/Package.ps1`, `SECURITY.md`, `docs/store-submission.md` §5, this bullet, and the
+  workspace members' `Cargo.lock` entries — **is never edited by hand**. Run:
+
+  ```bash
+  python3 tools/bump_version.py --check       # CI mode: do all the copies agree?
+  python3 tools/bump_version.py 0.0.4         # the bump; add --dry-run to preview
+  ```
+
+  (`.\tools\Bump-Version.ps1` is the Windows wrapper; it forwards to the same script.)
+  Each location is a `Site` in that script — an anchored pattern with an expected match
+  count — so a literal that moves fails the run loudly instead of being skipped, and the
+  whole rewrite is all-or-nothing. The `rust` job in `.github/workflows/build.yml` runs
+  `--check` and `tools/test_bump_version.py` on every push, so a stale copy cannot merge.
+  **Adding a new version literal to the tree means adding a `Site`**; there is deliberately
+  no global search-and-replace fallback. The script's docstring also lists what is
+  *deliberately* excluded (historical "new in 0.0.x" mentions, the Store's
+  last-published-version comment, version-comparison test fixtures).
 - The icon resource id `IDI_FSW_APP = 101` also has copies: `include/fsw_resources.h`
   for the C++ tree, and `crates/fsw-broker/app.rc` plus a `const` in
   `crates/fsw-broker/src/main.rs` for the Rust broker. Each Rust binary links a

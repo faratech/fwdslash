@@ -75,6 +75,18 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      # Every version literal outside the workspace manifest is registered in
+      # tools/bump_version.py; --check fails the job the moment one drifts.
+      # This is the standing half of the guarantee -- release.yml's
+      # tag-vs-workspace assertion is the other half, and only fires on a tag.
+      # Both run before anything expensive: they need no toolchain.
+      - name: Assert every version literal agrees with Cargo.toml
+        run: python3 tools/bump_version.py --check
+
+      - name: Test the version bumper
+        run: python3 -m unittest tools.test_bump_version
+
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.98.1
         with:
