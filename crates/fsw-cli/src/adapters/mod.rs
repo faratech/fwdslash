@@ -136,6 +136,13 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
             upgrading = true;
         }
 
+        // Before staging anything: if no marker references the payload tree at
+        // all, it is debris a deferred delete failed to remove — drop it rather
+        // than install on top of it (#37).
+        if enabled {
+            prune_orphaned_payload_tree();
+        }
+
         let controller = std::env::current_exe().unwrap_or_default();
         // An upgrade is the old payload's uninstall followed by this one's
         // install; `upgrading` is only ever set on the enable path.
@@ -249,7 +256,14 @@ fn ps_health_status(edition: state::Edition) -> String {
                 fsw_core::POWERSHELL_ADAPTER_ROOT,
                 edition.registry_leaf()
             )) {
-                "installed, no profile block".to_string()
+                // Installed but no block: the write that should have put one
+                // there is the thing to explain, and a Controlled Folder Access
+                // block is the usual cause (#37).
+                if powershell::profile_write_blocked(edition) {
+                    "installed, but the profile is not writable — Controlled Folder Access may be blocking it".to_string()
+                } else {
+                    "installed, no profile block".to_string()
+                }
             } else {
                 "not installed".to_string()
             }
@@ -345,6 +359,9 @@ pub fn repair_all() -> i32 {
             let _ = powershell::repair(edition, &controller);
         }
         powershell::prune_orphaned_module_dirs();
+        // A payload tree no marker names is debris from a deferred delete that
+        // never completed (#37).
+        prune_orphaned_payload_tree();
         0
     }
     #[cfg(not(windows))]
@@ -460,29 +477,200 @@ fn strip_all_ps_profiles() {
     }
 }
 
+/// The fixed name of the one-shot cleanup task. Fixed rather than per-run so
+/// repeated self-cleans overwrite one task (`/f`) instead of accumulating them:
+/// at most one can ever be left behind.
+pub const CLEANUP_TASK_NAME: &str = "fwdslash-orphan-cleanup";
+
+/// `HH:MM` one minute after `hour:minute`, wrapping at midnight — the `/st`
+/// value for the backstop trigger.
+#[must_use]
+pub fn task_start_time(hour: u32, minute: u32) -> String {
+    let next = (hour * 60 + minute + 1) % (24 * 60);
+    format!("{:02}:{:02}", next / 60, next % 60)
+}
+
+/// The batch file the cleanup task runs: wait for this process to exit, remove
+/// the payload tree, then delete the task and itself. Every path is quoted, so
+/// a space in the profile-independent `%LOCALAPPDATA%` path is safe.
+#[must_use]
+pub fn cleanup_script_body(payload_dir: &str, task_name: &str) -> String {
+    format!(
+        "@echo off\r\n\
+         ping -n 3 127.0.0.1 >nul\r\n\
+         rd /s /q \"{payload_dir}\"\r\n\
+         schtasks /delete /tn \"{task_name}\" /f >nul 2>&1\r\n\
+         del /q \"%~f0\"\r\n"
+    )
+}
+
+/// The `schtasks /create` argument vector. `/tr` is a bare quoted script path —
+/// no embedded command line — so schtasks' own quoting rules cannot bite.
+#[must_use]
+pub fn cleanup_task_args(task_name: &str, script_path: &str, start_time: &str) -> Vec<String> {
+    vec![
+        "/create".to_string(),
+        "/tn".to_string(),
+        task_name.to_string(),
+        "/sc".to_string(),
+        "once".to_string(),
+        "/st".to_string(),
+        start_time.to_string(),
+        "/f".to_string(),
+        "/tr".to_string(),
+        script_path.to_string(),
+    ]
+}
+
+/// Whether `payload` is exactly the tree the self-clean is allowed to remove.
+/// The deferred delete runs `rd /s /q`, so this is the last line of defence
+/// against ever pointing it anywhere else.
+#[must_use]
+pub fn is_payload_tree(payload: &Path, local_app_data: &Path) -> bool {
+    payload == local_app_data.join("ForwardSlashWindows")
+}
+
 /// Removes `%LOCALAPPDATA%\ForwardSlashWindows`, deferring the running
-/// directory's deletion to a detached `cmd.exe` that waits for this process to
-/// exit. Idempotent: an already-gone tree is not an error.
+/// directory's own deletion to a **one-shot per-user scheduled task**.
+///
+/// A detached `cmd.exe` child is not enough: when the triggering shell was
+/// itself launched inside a job object (WSL interop is the case that exposed
+/// this), the whole process tree — including a `DETACHED_PROCESS` child — is
+/// killed the moment the launching command returns, so the delete never ran.
+/// Measured on the dev host: the detached helper spawns but never deletes, and
+/// `CREATE_BREAKAWAY_FROM_JOB` does not even spawn (the job forbids breakaway,
+/// `CreateProcess` fails). The Task Scheduler service starts the script in its
+/// own session, outside any job we are in, so it always survives.
+///
+/// The task is created (backstop trigger one minute out) *and* run immediately;
+/// the script waits ~2 s for this process to exit, deletes the tree, then
+/// removes the task and itself. Idempotent: an already-gone tree is not an
+/// error and `/f` overwrites any previous task of the same name.
 #[cfg(windows)]
 fn schedule_payload_delete() {
     let Ok(local_app_data) = local_app_data() else {
         return;
     };
     let payload = local_app_data.join("ForwardSlashWindows");
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let system32 = Path::new(&system_root).join("System32");
-    let command = format!(
-        "ping -n 3 127.0.0.1 >nul & rd /s /q \"{}\"",
-        payload.display()
-    );
-    let _ = Command::new("cmd.exe")
-        .args(["/c", &command])
-        .current_dir(&system32)
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+    if !is_payload_tree(&payload, &local_app_data) {
+        return;
+    }
+    if schedule_payload_delete_task(&payload, &local_app_data).is_some() {
+        return;
+    }
+    // No usable Task Scheduler: fall back to a detached child. Try to break
+    // away from any job first; if that is refused, spawn plainly — which still
+    // works for an ordinary interactive shell.
+    spawn_detached_delete(&payload);
+}
+
+/// Creates and starts the cleanup task. `None` when schtasks is unavailable or
+/// refuses, so the caller can fall back.
+#[cfg(windows)]
+fn schedule_payload_delete_task(payload: &Path, local_app_data: &Path) -> Option<()> {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+
+    let script = local_app_data
+        .join("Temp")
+        .join(format!("{CLEANUP_TASK_NAME}.cmd"));
+    if let Some(parent) = script.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = cleanup_script_body(&payload.display().to_string(), CLEANUP_TASK_NAME);
+    std::fs::write(&script, body).ok()?;
+
+    // SAFETY: GetLocalTime only writes the SYSTEMTIME it is handed.
+    let now = unsafe {
+        let mut time = std::mem::zeroed();
+        GetLocalTime(&mut time);
+        time
+    };
+    let start = task_start_time(u32::from(now.wHour), u32::from(now.wMinute));
+    let args = cleanup_task_args(CLEANUP_TASK_NAME, &script.display().to_string(), &start);
+
+    let created = Command::new("schtasks.exe")
+        .args(&args)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .status()
+        .ok()?;
+    if !created.success() {
+        return None;
+    }
+    // Fire it now; the scheduled trigger is only the backstop.
+    let _ = Command::new("schtasks.exe")
+        .args(["/run", "/tn", CLEANUP_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    Some(())
+}
+
+/// The pre-scheduled-task fallback: a detached `cmd.exe` that waits, then
+/// deletes. Kept because it is enough for an ordinary interactive shell.
+#[cfg(windows)]
+fn spawn_detached_delete(payload: &Path) {
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let system32 = Path::new(&system_root).join("System32");
+    let command = format!("ping -n 3 127.0.0.1 >nul & rd /s /q \"{}\"", payload.display());
+    for flags in [
+        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+        CREATE_NO_WINDOW | DETACHED_PROCESS,
+    ] {
+        let spawned = Command::new("cmd.exe")
+            .args(["/c", &command])
+            .current_dir(&system32)
+            .creation_flags(flags)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return;
+        }
+    }
+}
+
+/// Whether any adapter marker key exists at all — including a half-finished
+/// `prepared`/`removing` transaction, which must not be swept out from under.
+#[cfg(windows)]
+fn any_adapter_marker_present() -> bool {
+    use windows_registry::CURRENT_USER;
+
+    CURRENT_USER.open(fsw_core::CMD_ADAPTER_KEY).is_ok()
+        || CURRENT_USER
+            .open(&format!(
+                "{}WindowsPowerShell",
+                fsw_core::POWERSHELL_ADAPTER_ROOT
+            ))
+            .is_ok()
+        || CURRENT_USER
+            .open(&format!("{}PowerShell", fsw_core::POWERSHELL_ADAPTER_ROOT))
+            .is_ok()
+}
+
+/// Belt and braces for a deferred delete that never completed: when no adapter
+/// marker references it at all, the whole `%LOCALAPPDATA%\ForwardSlashWindows`
+/// tree is stale and goes before anything new is staged into it. Best effort
+/// and silent; never touches a tree any marker still names.
+#[cfg(windows)]
+pub fn prune_orphaned_payload_tree() {
+    if any_adapter_marker_present() {
+        return;
+    }
+    let Ok(local_app_data) = local_app_data() else {
+        return;
+    };
+    let payload = local_app_data.join("ForwardSlashWindows");
+    if is_payload_tree(&payload, &local_app_data) && payload.is_dir() {
+        let _ = std::fs::remove_dir_all(&payload);
+    }
 }
 
 /// The payload directory for an adapter kind, relative to the executable:
@@ -685,15 +873,36 @@ pub fn real_copy_file(source: &Path, destination_dir: &Path) -> Result<(), Adapt
     )))
 }
 
+/// Whether a failed write to a path whose parent directory exists should be
+/// reported as a Controlled Folder Access block.
+///
+/// Access-denied is the obvious signature. The subtle one (#37): CFA does
+/// **not** always surface as `ERROR_ACCESS_DENIED` — on the dev host a blocked
+/// `CreateFile` for the temp file `write_atomic` creates inside a protected
+/// `Documents` subfolder came back as `ERROR_FILE_NOT_FOUND`, which used to be
+/// reported as the useless "The system cannot find the file specified". A
+/// "not found" only means a block when the containing folder is actually
+/// there; otherwise it is a genuinely missing path.
+#[must_use]
+pub fn looks_like_blocked_write(error_text: &str, parent_exists: bool) -> bool {
+    let denied = error_text.contains("os error 5") || error_text.contains("Access is denied");
+    let not_found = error_text.contains("os error 2")
+        || error_text.contains("cannot find the file")
+        || error_text.contains("cannot find the path");
+    denied || (not_found && parent_exists)
+}
+
+/// The user-facing explanation for a blocked profile write.
+pub const BLOCKED_WRITE_GUIDANCE: &str = "was blocked by Windows Controlled Folder Access, or the folder is otherwise not writable. Allow Forward Slash Windows under Windows Security > Virus & threat protection > Ransomware protection > Allow an app through Controlled folder access, then try again.";
+
 /// Wraps a file error with Controlled Folder Access guidance when the failure
-/// looks like a Defender block (access denied against a protected folder).
+/// looks like a Defender block against `target`.
 #[cfg(windows)]
-pub fn explain_file_error(error: &AdapterError, what: &str) -> AdapterError {
+pub fn explain_file_error(error: &AdapterError, what: &str, target: &Path) -> AdapterError {
     let text = error.to_string();
-    if text.contains("os error 5") || text.contains("Access is denied") {
-        return AdapterError::new(&format!(
-            "{what} was blocked by Windows Controlled Folder Access. Allow Forward Slash Windows under Windows Security > Virus & threat protection > Ransomware protection > Allow an app through Controlled folder access, then try again."
-        ));
+    let parent_exists = target.parent().is_some_and(Path::is_dir);
+    if looks_like_blocked_write(&text, parent_exists) {
+        return AdapterError::new(&format!("{what} {BLOCKED_WRITE_GUIDANCE}"));
     }
     AdapterError::new(&text)
 }

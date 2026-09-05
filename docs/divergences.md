@@ -627,6 +627,33 @@ lifecycle so an upgrade or an MSIX uninstall can never leave a broken shell:
   `%LOCALAPPDATA%\ForwardSlashWindows` — including the directory it is running
   from — after it exits, but **never while `AutoRun` still references the
   payload**. Idempotent and safe to run twice.
+- **The deferred delete is a scheduled task, not a detached child.** A
+  `DETACHED_PROCESS` `cmd.exe` is killed with the rest of the tree when the
+  launching shell lives inside a job object — measured on the dev host, where a
+  WSL-interop-launched shell left the payload directory behind on 2/2 uninstall
+  cycles even though nothing held the file open. `CREATE_BREAKAWAY_FROM_JOB` is
+  not a fix either: that job forbids breakaway, so `CreateProcess` fails
+  outright. The self-clean therefore writes
+  `%LOCALAPPDATA%\Temp\fwdslash-orphan-cleanup.cmd` and registers a one-shot
+  per-user task (`schtasks /create /sc once /st <now+1min> /f /tr <script>`,
+  no elevation), then runs it immediately — the Task Scheduler service starts
+  the script in its own session, outside any job we are in. The script waits
+  ~2 s, removes the tree, then deletes the task and itself, so nothing
+  accumulates; the one-minute trigger is only a backstop. The task name is
+  fixed, so `/f` overwrites rather than piling up one task per run, and the
+  detached child remains as the fallback when schtasks is unavailable.
+  Belt and braces: `enable` and `repair-adapters` drop a payload tree that no
+  adapter marker names before staging into it.
+- **Controlled Folder Access is recognised through `ERROR_FILE_NOT_FOUND`.**
+  CFA does not always block with `ERROR_ACCESS_DENIED`: on the dev host the
+  blocked temp-file create inside a protected `Documents` subfolder surfaced as
+  `os error 2`, and the user got "The system cannot find the file specified"
+  instead of the product's guidance. `looks_like_blocked_write` now treats a
+  "not found" as a block **when the containing folder exists**, keeps the
+  access-denied case unconditional, and the message says "…or the folder is
+  otherwise not writable". The same explanation reaches the settings InfoBar —
+  `run_controller` captures the controller's stderr — and `doctor` /
+  `integrations` report an installed adapter whose profile cannot be written.
 
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 

@@ -477,6 +477,10 @@ enum Msg {
         action: &'static str,
         terminal: bool,
         succeeded: bool,
+        /// The controller's stderr, so an actionable failure — a Controlled
+        /// Folder Access block, say — reaches the InfoBar instead of the
+        /// generic "failed" (#37).
+        detail: String,
     },
 }
 
@@ -546,21 +550,33 @@ impl SettingsModel {
         arguments: Vec<String>,
     ) {
         self.pending = Some(action);
-        context.spawn_background(move |_| Msg::ControllerFinished {
-            action,
-            terminal,
-            succeeded: run_controller(arguments),
+        context.spawn_background(move |_| {
+            let (succeeded, detail) = run_controller_detailed(arguments);
+            Msg::ControllerFinished {
+                action,
+                terminal,
+                succeeded,
+                detail,
+            }
         });
     }
 
     /// The single notification path, reproducing `ShowResult`
     /// (`src/settings/main.cpp:874-887`). Only Success and Error are ever used.
-    fn show_result(&mut self, succeeded: bool, action: &str, terminal: bool) {
+    fn show_result(&mut self, succeeded: bool, action: &str, terminal: bool, detail: &str) {
         let mut message = action.to_string();
         if succeeded && terminal {
             message.push_str(". Reopen affected terminals.");
         } else if !succeeded {
             message.push_str(" failed. Existing settings were left in place.");
+            // The controller already explains an actionable failure (a
+            // Controlled Folder Access block, a missing PowerShell 7); show
+            // that rather than make the user run the CLI to find out (#37).
+            let detail = detail.trim();
+            if !detail.is_empty() {
+                message.push(' ');
+                message.push_str(detail);
+            }
         }
         self.notice = Some((
             if succeeded {
@@ -906,12 +922,12 @@ impl Component for SettingsModel {
 
             Msg::OpenWslRoot => {
                 if !open_wsl_root() {
-                    self.show_result(false, "Opening the WSL root", false);
+                    self.show_result(false, "Opening the WSL root", false, "");
                 }
             }
             Msg::RefreshStatus => {
                 Self::refresh(context);
-                self.show_result(true, "Status refreshed", false);
+                self.show_result(true, "Status refreshed", false, "");
             }
             Msg::UpdateCheckFinished(outcome) => {
                 let UpdateOutcome::Ready(tag) = outcome else {
@@ -969,6 +985,7 @@ impl Component for SettingsModel {
                         "Automatic updates disabled"
                     },
                     false,
+                    "",
                 );
             }
             Msg::DismissNotice => {
@@ -984,6 +1001,7 @@ impl Component for SettingsModel {
                 action,
                 terminal,
                 succeeded,
+                detail,
             } => {
                 self.pending = None;
                 if action == UPGRADE_ACTION {
@@ -994,7 +1012,7 @@ impl Component for SettingsModel {
                 if succeeded && action == ROOT_ACTION {
                     self.folder_selected = false;
                 }
-                self.show_result(succeeded, action, terminal);
+                self.show_result(succeeded, action, terminal, &detail);
                 Self::refresh(context);
             }
             Msg::StateLoaded(state) => {
@@ -1629,8 +1647,19 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    run_controller_detailed(arguments).0
+}
+
+/// Runs the controller and returns `(succeeded, stderr)`. The stderr text is
+/// what carries an actionable explanation — a Controlled Folder Access block,
+/// a missing PowerShell 7 — to the InfoBar (#37).
+fn run_controller_detailed<I, S>(arguments: I) -> (bool, String)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let Some(controller) = controller_path() else {
-        return false;
+        return (false, String::new());
     };
     let mut command = Command::new(controller);
     for argument in arguments {
@@ -1642,7 +1671,13 @@ where
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    command.status().is_ok_and(|status| status.success())
+    match command.output() {
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            (output.status.success(), detail)
+        }
+        Err(_) => (false, String::new()),
+    }
 }
 
 /// Opens the WSL provider root through the shell, as `main.cpp:561-563` does.

@@ -206,7 +206,13 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     let mut installed_bytes = true_original;
     installed_bytes.extend_from_slice(&transaction.block_bytes);
     super::write_atomic(&transaction.profile_path, &installed_bytes)
-        .map_err(|error| super::explain_file_error(&error, "The PowerShell profile update"))?;
+        .map_err(|error| {
+            super::explain_file_error(
+                &error,
+                "The PowerShell profile update",
+                &transaction.profile_path,
+            )
+        })?;
     transaction.profile_changed = true;
 
     reg::set_string(&key, "State", "installed")?;
@@ -500,6 +506,31 @@ fn inspect(edition: Edition) -> Result<Inspection, AdapterError> {
 /// `integrations`. Never writes.
 pub fn profile_health(edition: Edition) -> profile::ProfileHealth {
     inspect(edition).map_or(profile::ProfileHealth::Clean, |i| i.health)
+}
+
+/// Whether `edition`'s profile directory refuses a write — the signature of a
+/// Controlled Folder Access block (#37). Probes the same way `write_atomic`
+/// does, by creating and removing a temp file, and only when the directory is
+/// actually there. Cheap and only reached for an adapter whose marker claims
+/// installed while its profile carries no block.
+pub fn profile_write_blocked(edition: Edition) -> bool {
+    let Ok(inspection) = inspect(edition) else {
+        return false;
+    };
+    let Some(parent) = inspection.profile_path.parent() else {
+        return false;
+    };
+    if !parent.is_dir() {
+        return false;
+    }
+    let probe = parent.join(format!(".fsw-probe-{}.tmp", super::new_transaction_id()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(error) => super::looks_like_blocked_write(&error.to_string(), true),
+    }
 }
 
 /// The product-presence probe recorded in `edition`'s marker, if any — one

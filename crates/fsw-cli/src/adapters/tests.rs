@@ -621,6 +621,114 @@ fn product_confirmed_gone_requires_both_checks_absent() {
     assert!(!state::product_confirmed_gone(true, true));
 }
 
+// ---------------------------------------------------------------------------
+// mod.rs — deferred payload delete + blocked-write classification (#37)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_start_time_formats_and_wraps_at_midnight() {
+    assert_eq!(super::task_start_time(9, 5), "09:06");
+    assert_eq!(super::task_start_time(0, 0), "00:01");
+    // Two-digit padding on both fields.
+    assert_eq!(super::task_start_time(13, 0), "13:01");
+    // Minute rollover into the next hour.
+    assert_eq!(super::task_start_time(9, 59), "10:00");
+    // Midnight wrap must stay a valid HH:MM rather than "24:00".
+    assert_eq!(super::task_start_time(23, 59), "00:00");
+}
+
+#[test]
+fn cleanup_script_quotes_every_path_and_self_destructs() {
+    let dir = r"C:\Users\a b\AppData\Local\ForwardSlashWindows";
+    let body = super::cleanup_script_body(dir, super::CLEANUP_TASK_NAME);
+    // The payload path is quoted, so a space in the profile name is safe.
+    assert!(body.contains(&format!("rd /s /q \"{dir}\"\r\n")));
+    // It waits for the launching process to exit before deleting.
+    assert!(body.contains("ping -n 3 127.0.0.1 >nul\r\n"));
+    // ...then removes the task and itself, so nothing accumulates.
+    assert!(body.contains(&format!(
+        "schtasks /delete /tn \"{}\" /f",
+        super::CLEANUP_TASK_NAME
+    )));
+    assert!(body.contains("del /q \"%~f0\""));
+    assert!(body.starts_with("@echo off\r\n"));
+}
+
+#[test]
+fn cleanup_task_args_pass_the_script_as_a_bare_quoted_path() {
+    let args = super::cleanup_task_args(
+        super::CLEANUP_TASK_NAME,
+        r"C:\Users\a b\AppData\Local\Temp\fwdslash-orphan-cleanup.cmd",
+        "09:06",
+    );
+    assert_eq!(
+        args,
+        vec![
+            "/create",
+            "/tn",
+            "fwdslash-orphan-cleanup",
+            "/sc",
+            "once",
+            "/st",
+            "09:06",
+            "/f",
+            "/tr",
+            r"C:\Users\a b\AppData\Local\Temp\fwdslash-orphan-cleanup.cmd",
+        ]
+    );
+    // A fixed task name, so repeated self-cleans overwrite one task under /f
+    // rather than accumulating one per run.
+    assert!(!super::CLEANUP_TASK_NAME.is_empty());
+    // /tr carries no embedded command line, so schtasks' quoting cannot bite.
+    assert!(!args.iter().any(|argument| argument.contains(" & ")));
+}
+
+#[cfg(windows)]
+#[test]
+fn only_the_payload_tree_is_ever_deletable() {
+    use std::path::Path;
+
+    let local = Path::new(r"C:\Users\me\AppData\Local");
+    assert!(super::is_payload_tree(
+        &local.join("ForwardSlashWindows"),
+        local
+    ));
+    // Anything else — a parent, a sibling, a subdirectory — is refused.
+    assert!(!super::is_payload_tree(local, local));
+    assert!(!super::is_payload_tree(&local.join("Packages"), local));
+    assert!(!super::is_payload_tree(
+        &local.join("ForwardSlashWindows").join("cmd"),
+        local
+    ));
+    assert!(!super::is_payload_tree(Path::new(r"C:\"), local));
+}
+
+#[test]
+fn blocked_write_classification_covers_the_cfa_not_found_case() {
+    // Access denied is a block whether or not the folder is there.
+    assert!(super::looks_like_blocked_write(
+        "file operation failed (Access is denied. (os error 5))",
+        false
+    ));
+    assert!(super::looks_like_blocked_write("os error 5", true));
+    // The #37 case: Controlled Folder Access surfaced the blocked profile
+    // write as ERROR_FILE_NOT_FOUND, and the folder does exist.
+    assert!(super::looks_like_blocked_write(
+        "file operation failed (The system cannot find the file specified. (os error 2))",
+        true
+    ));
+    // ...but a genuinely missing folder is not a CFA block.
+    assert!(!super::looks_like_blocked_write(
+        "file operation failed (The system cannot find the file specified. (os error 2))",
+        false
+    ));
+    // Unrelated failures stay unexplained.
+    assert!(!super::looks_like_blocked_write(
+        "file operation failed (The disk is full. (os error 112))",
+        true
+    ));
+}
+
 #[test]
 fn find_subslice_locations() {
     assert_eq!(profile::find_subslice(b"abcdef", b"cd"), Some(2));
