@@ -57,7 +57,7 @@ fn driver_state() -> (bool, &'static str) {
 fn send_resume() -> bool {
     unsafe {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            FindWindowW, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
+            FindWindowW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW,
         };
 
         let class = to_u16_vec(FSW_BROKER_WINDOW_CLASS);
@@ -740,8 +740,7 @@ fn cmd_status(json: bool) -> i32 {
             snap.disabled,
             mode_str,
             bare_target,
-            snap
-                .bare_slash_root
+            snap.bare_slash_root
                 .as_deref()
                 .map(|root| format!("\"{}\"", json_escape(root)))
                 .unwrap_or_else(|| "null".to_string()),
@@ -984,16 +983,9 @@ fn cmd_doctor_single(path: &str, snap: &Snapshot) -> i32 {
     // neither the provider root nor a distribution path, and calling it one
     // printed an empty distribution and a Linux path that was really the
     // tail under a Win32 folder.
-    let kind = match resolved {
-        Resolved::WslRoot => "WSL distribution list",
-        Resolved::Distribution(_) => "distribution path",
-        Resolved::Folder(_) if resolved.linux_path() == "/" => "custom folder root",
-        Resolved::Folder(_) => "path under custom root",
-    };
-    println!("target kind: {kind}");
-    println!("distribution: {}", resolved.distribution().unwrap_or("none"));
-    println!("linux path: {}", resolved.linux_path());
-    println!("windows target: {}", resolved.unc_display());
+    for (label, value) in doctor_target_fields(resolved, snap) {
+        println!("{label}: {value}");
+    }
 
     if is_root {
         println!(
@@ -1030,6 +1022,131 @@ fn cmd_doctor_single(path: &str, snap: &Snapshot) -> i32 {
     #[cfg(not(windows))]
     {
         0
+    }
+}
+
+/// The diagnostic fields for one resolved target. Folder roots are Win32
+/// locations, not distributions, so their normalized tail is never labelled a
+/// Linux path.
+fn doctor_target_fields(resolved: Resolved<'_>, snap: &Snapshot) -> Vec<(&'static str, String)> {
+    match resolved {
+        Resolved::WslRoot => vec![
+            ("target kind", "WSL distribution list".to_string()),
+            ("distribution", "none".to_string()),
+            ("linux path", "/".to_string()),
+            ("windows target", resolved.unc_display().to_string()),
+        ],
+        Resolved::Distribution(path) => vec![
+            ("target kind", "distribution path".to_string()),
+            ("distribution", path.distribution().to_string()),
+            ("linux path", path.linux_path().to_string()),
+            ("windows target", path.unc_display().to_string()),
+        ],
+        Resolved::Folder(path) => vec![
+            (
+                "target kind",
+                if path.under_root() == "/" {
+                    "custom folder root"
+                } else {
+                    "path under custom root"
+                }
+                .to_string(),
+            ),
+            (
+                "custom root",
+                snap.bare_slash_root
+                    .as_deref()
+                    .unwrap_or(path.display())
+                    .to_string(),
+            ),
+            ("path under root", path.under_root().to_string()),
+            ("windows target", path.display().to_string()),
+        ],
+    }
+}
+
+/// A scheduler task from a current or legacy updater attempt. Matching the
+/// complete generated grammar, rather than a broad prefix, keeps uninstall
+/// from touching another product's task with a similar name.
+fn is_owned_update_task_name(name: &str) -> bool {
+    let name = name.strip_prefix('\\').unwrap_or(name);
+    if name == update::relaunch::WATCHDOG_TASK_NAME {
+        return true;
+    }
+    if !scheduled_task::is_safe_task_literal(name) {
+        return false;
+    }
+    let mut parts = name.split('-');
+    matches!(
+        (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ),
+        (Some("fwdslash"), Some("update"), Some("watchdog" | "apply"), Some(pid), Some(sequence), None)
+            if !pid.is_empty() && !sequence.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_digit())
+                && sequence.bytes().all(|byte| byte.is_ascii_digit())
+    )
+}
+
+/// Task Scheduler CSV is locale-independent in its first (task-name) field.
+/// Our names cannot contain a quote, so this intentionally small CSV reader is
+/// safer than interpreting localized headers or command text.
+fn owned_update_task_inventory(csv: &str) -> Vec<String> {
+    csv.lines()
+        .filter_map(|line| {
+            let field = line.trim().strip_prefix('"')?;
+            let name = field.split('"').next()?;
+            is_owned_update_task_name(name).then(|| name.trim_start_matches('\\').to_string())
+        })
+        .collect()
+}
+
+fn cleanup_update_tasks_for_uninstall() {
+    use std::process::{Command, Stdio};
+
+    let mut names = Command::new("schtasks.exe")
+        .args(["/query", "/fo", "csv", "/nh"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .map_or_else(Vec::new, |output| {
+            owned_update_task_inventory(&String::from_utf8_lossy(&output.stdout))
+        });
+    // Query failure must not leave the legacy fixed watchdog behind.
+    if !names
+        .iter()
+        .any(|name| name == update::relaunch::WATCHDOG_TASK_NAME)
+    {
+        names.push(update::relaunch::WATCHDOG_TASK_NAME.to_string());
+    }
+    // Stop/delete every task before deleting either its sidecar or update
+    // storage. `delete_task` issues `/end` before releasing its definition.
+    for name in &names {
+        let _ = scheduled_task::delete_task(name);
+    }
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let temp = PathBuf::from(local_app_data).join("Temp");
+        if let Ok(entries) = std::fs::read_dir(temp) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let stem = file_name
+                    .strip_suffix(".cmd")
+                    .or_else(|| file_name.strip_suffix(".xml"));
+                if stem.is_some_and(is_owned_update_task_name) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
     }
 }
 
@@ -1423,11 +1540,17 @@ fn main() {
             // uninstall. The relaunch watchdog is a scheduled task rather than
             // a file, so it needs its own sweep -- an update task that fired
             // after an uninstall would relaunch a product that is gone.
+            cleanup_update_tasks_for_uninstall();
             let _ = fsw_core::update::sweep_update_directory();
-            let _ = scheduled_task::delete_task(update::relaunch::WATCHDOG_TASK_NAME);
             let win = set_windows_integration(false);
             let proto = set_settings_protocol(false);
-            if win != 0 { win } else if proto != 0 { proto } else { sweep }
+            if win != 0 {
+                win
+            } else if proto != 0 {
+                proto
+            } else {
+                sweep
+            }
         }
         _ => {
             usage();
@@ -1478,6 +1601,64 @@ fn broadcasts_state_change(command: &str, argc: usize) -> bool {
         // `bare-slash` alone is a read; every longer form writes.
         "bare-slash" => argc > 2,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod doctor_and_update_cleanup_tests {
+    use super::{doctor_target_fields, is_owned_update_task_name, owned_update_task_inventory};
+    use fsw_core::Snapshot;
+    use fsw_path::{BareSlashMode, RenderBuf};
+
+    #[test]
+    fn updater_inventory_only_selects_the_generated_task_grammar() {
+        for name in [
+            "fwdslash-update",
+            "\\fwdslash-update-watchdog-123-1",
+            "fwdslash-update-apply-456-99",
+        ] {
+            assert!(is_owned_update_task_name(name), "{name}");
+        }
+        for name in [
+            "fwdslash-update-watchdog-x-1",
+            "fwdslash-update-apply-1-2-extra",
+            "fwdslash-update-other-1-2",
+            "fwdslash-update-watchdog-1-2 & whoami",
+            "someone-elses-update-watchdog-1-2",
+        ] {
+            assert!(!is_owned_update_task_name(name), "{name}");
+        }
+        let inventory = owned_update_task_inventory(
+            "\"\\fwdslash-update-watchdog-123-1\",\"Task\"\r\n\"\\unrelated\",\"Task\"\r\n\"\\fwdslash-update\",\"Task\"\r\n",
+        );
+        assert_eq!(
+            inventory,
+            ["fwdslash-update-watchdog-123-1", "fwdslash-update"]
+        );
+    }
+
+    #[test]
+    fn folder_doctor_fields_describe_the_custom_root_not_a_fake_distro() {
+        let root = r"C:\source";
+        let snap = Snapshot {
+            distributions: Vec::new(),
+            default_distribution: None,
+            bare_slash_mode: BareSlashMode::DistributionList,
+            bare_slash_pinned: None,
+            bare_slash_root: Some(root.to_string()),
+            disabled: false,
+        };
+        let mut buffer = RenderBuf::new();
+        let resolved =
+            fsw_path::resolve_under_root("/tools", root, &mut buffer).expect("folder path");
+        let fields = doctor_target_fields(resolved, &snap);
+        assert!(fields.contains(&("custom root", root.to_string())));
+        assert!(fields.contains(&("path under root", "/tools".to_string())));
+        assert!(
+            !fields
+                .iter()
+                .any(|(label, _)| *label == "distribution" || *label == "linux path")
+        );
     }
 }
 

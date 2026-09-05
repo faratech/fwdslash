@@ -161,9 +161,8 @@ pub fn apply_store_update(product_id: &str) -> Outcome {
     // to close the running package to complete the install — which is exactly
     // why the watchdog task is registered before this function is called.
     let _ = options.SetAllowForcedAppRestart(true);
-    let _ = options.SetInstallInProgressToastNotificationMode(
-        AppInstallationToastNotificationMode::NoToast,
-    );
+    let _ = options
+        .SetInstallInProgressToastNotificationMode(AppInstallationToastNotificationMode::NoToast);
     let _ = options
         .SetCompletedInstallToastNotificationMode(AppInstallationToastNotificationMode::NoToast);
     // An update, never a repair: a repair would reinstall the current version.
@@ -199,12 +198,17 @@ pub fn apply_store_update(product_id: &str) -> Outcome {
         let mut still_working = false;
         for index in 0..count {
             let Ok(item) = items.GetAt(index) else {
+                // Completion needs a positive terminal observation for every
+                // queued item. A transient COM failure is unresolved.
+                still_working = true;
                 continue;
             };
             let Ok(status) = item.GetCurrentStatus() else {
+                still_working = true;
                 continue;
             };
             let Ok(state) = status.InstallState() else {
+                still_working = true;
                 continue;
             };
             match code_for(state) {

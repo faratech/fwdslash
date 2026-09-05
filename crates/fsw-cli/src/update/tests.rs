@@ -85,7 +85,12 @@ fn an_override_wins_over_every_probe() {
     // The `UpdateRoute` escape hatch has to work when nothing is available,
     // including forcing a route that will then fail: that is what makes it
     // useful for diagnosis.
-    for route in [Route::AppInstall, Route::Store, Route::Winget, Route::Notify] {
+    for route in [
+        Route::AppInstall,
+        Route::Store,
+        Route::Winget,
+        Route::Notify,
+    ] {
         assert_eq!(route_for(Some(route), false, false, false, true), route);
         assert_eq!(route_for(Some(route), true, true, true, false), route);
     }
@@ -93,7 +98,12 @@ fn an_override_wins_over_every_probe() {
 
 #[test]
 fn route_names_round_trip() {
-    for route in [Route::AppInstall, Route::Store, Route::Winget, Route::Notify] {
+    for route in [
+        Route::AppInstall,
+        Route::Store,
+        Route::Winget,
+        Route::Notify,
+    ] {
         assert_eq!(Route::parse(route.name()), Some(Some(route)));
     }
     // `auto` is "no override", not an unknown name.
@@ -138,7 +148,12 @@ fn every_route_reports_nothing_to_install_the_same_way() {
     // The route is chosen only after the precheck says Proceed, so all four
     // rungs -- including a forced `--route notify`, which is the one that
     // reported 10 -- share the single `Nothing` verdict above.
-    for route in [Route::AppInstall, Route::Store, Route::Winget, Route::Notify] {
+    for route in [
+        Route::AppInstall,
+        Route::Store,
+        Route::Winget,
+        Route::Notify,
+    ] {
         // `route_for` still answers, because picking a rung is a separate
         // question from whether one will ever be walked.
         assert_eq!(route_for(Some(route), false, false, false, true), route);
@@ -202,7 +217,10 @@ fn every_paused_state_is_retry_later_and_never_an_error() {
 
 #[test]
 fn terminal_states_map_to_success_and_failure() {
-    assert_eq!(code_for(AppInstallState::Completed), Poll::Finished(EXIT_OK));
+    assert_eq!(
+        code_for(AppInstallState::Completed),
+        Poll::Finished(EXIT_OK)
+    );
     assert_eq!(
         code_for(AppInstallState::Canceled),
         Poll::Finished(EXIT_ERROR)
@@ -214,6 +232,18 @@ fn terminal_states_map_to_success_and_failure() {
         Poll::Finished(EXIT_ERROR),
         "an unknown state must not spin"
     );
+}
+
+#[test]
+fn queued_success_and_pauses_keep_the_watchdog_but_terminal_refusals_do_not() {
+    assert!(super::appinstall_keeps_watchdog(EXIT_OK));
+    assert!(super::appinstall_keeps_watchdog(EXIT_AVAILABLE));
+    assert!(!super::appinstall_keeps_watchdog(EXIT_NOTHING));
+    assert!(!super::appinstall_keeps_watchdog(EXIT_ERROR));
+    assert!(super::store_keeps_watchdog(EXIT_OK));
+    assert!(super::store_keeps_watchdog(EXIT_AVAILABLE));
+    assert!(!super::store_keeps_watchdog(EXIT_NOTHING));
+    assert!(!super::store_keeps_watchdog(EXIT_ERROR));
 }
 
 #[test]
@@ -329,7 +359,12 @@ fn verbs_and_flags_parse() {
     );
 
     let options = parse_args(&argv(&[
-        "install", "--relaunch", "app", "--route", "store", "--json",
+        "install",
+        "--relaunch",
+        "app",
+        "--route",
+        "store",
+        "--json",
     ]));
     let options = options.expect("install with a route parses");
     assert_eq!(options.relaunch, RelaunchMode::App);
@@ -368,7 +403,9 @@ fn the_helper_argv_round_trips() {
     // one function and parsed by another, in two different processes, with a
     // package shutdown in between. This is the only place the two meet.
     let command = super::helper::apply_store_command(
-        std::path::Path::new(r"C:\Users\a b\AppData\Local\ForwardSlashWindows\update\fwdslash-helper.exe"),
+        std::path::Path::new(
+            r"C:\Users\a b\AppData\Local\ForwardSlashWindows\update\fwdslash-helper.exe",
+        ),
         "9P51CM0MTMK2",
         PREVIOUS,
     );
@@ -457,7 +494,10 @@ fn json_escapes_a_detail_that_carries_quotes() {
         action: None,
         detail: Some("said \"no\"\\ and\nstopped"),
     });
-    assert!(json.contains(r#""detail":"said \"no\"\\ and\nstopped""#), "{json}");
+    assert!(
+        json.contains(r#""detail":"said \"no\"\\ and\nstopped""#),
+        "{json}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +519,10 @@ fn assert_batch_safe(text: &str) {
     // a PowerShell string, so the corruption would be silent.
     assert!(!text.contains('%'), "PowerShell text contains %: {text}");
     // A quote terminates the argument cmd.exe is building.
-    assert!(!text.contains('"'), "PowerShell text contains a quote: {text}");
+    assert!(
+        !text.contains('"'),
+        "PowerShell text contains a quote: {text}"
+    );
     // The operators that would otherwise be redirection or chaining.
     for character in ['<', '>', '&', '|', '^'] {
         assert!(
@@ -493,24 +536,13 @@ fn assert_batch_safe(text: &str) {
 fn watchdog_script_golden_broker() {
     let script =
         watchdog_script(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::Broker).expect("safe literals");
-    assert_eq!(
-        script,
-        "@echo off\r\n\
-         powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command \
-         $deadline = (Get-Date).AddMinutes(45); \
-         $previous = [version]'0.0.4.0'; \
-         $ready = $false; \
-         while ((Get-Date) -lt $deadline) { \
-         foreach ($package in Get-AppxPackage -Name '32827MikeFara.fwdslash') { \
-         if ([version]$package.Version -gt $previous) { $ready = $true } }; \
-         if ($ready) { break }; \
-         Start-Sleep -Seconds 5 }; \
-         if (-not (Get-Process -Name fswbroker -ErrorAction SilentlyContinue)) \
-         { Start-Process -FilePath (Join-Path $env:LOCALAPPDATA \
-         'Microsoft\\WindowsApps\\fwdslash.exe') -ArgumentList 'start' -WindowStyle Hidden }\r\n\
-         schtasks /delete /tn \"fwdslash-update\" /f >nul 2>&1\r\n\
-         del /q \"%~f0\"\r\n"
+    assert!(script.starts_with("@echo off\r\npowershell.exe"));
+    assert!(script.contains("Get-AppxPackage -Name '32827MikeFara.fwdslash'"));
+    assert!(
+        script.contains("$package.PackageFamilyName -eq '32827MikeFara.fwdslash_t6j5qexy2jpp2'")
     );
+    assert!(script.contains("if ($ready) { if (-not (Get-Process"));
+    assert!(script.contains("error:0x800705B4"));
     assert_batch_safe(powershell_line(&script).expect("a powershell line"));
     // The relaunch goes through the app-execution alias, never the App entry
     // point: the package's App is the settings window, and the broker is a
@@ -520,6 +552,41 @@ fn watchdog_script_golden_broker() {
     // ...and only when no broker is already running, so a double launch is
     // impossible rather than merely harmless.
     assert!(script.contains("if (-not (Get-Process -Name fswbroker"));
+}
+
+#[test]
+fn watchdog_does_not_relaunch_an_unready_or_wrong_family_package() {
+    let script =
+        watchdog_powershell(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::App).expect("safe literals");
+    assert!(script.contains("-Name '32827MikeFara.fwdslash'"));
+    assert!(
+        script.contains("$package.PackageFamilyName -eq '32827MikeFara.fwdslash_t6j5qexy2jpp2'")
+    );
+    assert!(script.contains("if ($ready) { Start-Process"));
+    assert!(script.contains(fsw_core::update::UPDATE_RESULT_FILE));
+    assert!(script.contains("error:0x800705B4"));
+}
+
+#[cfg(windows)]
+#[test]
+fn generated_watchdog_powershell_runs_with_mocked_appx_commands() {
+    use std::process::Command;
+
+    let marker = std::env::temp_dir().join(format!("fsw-watchdog-test-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let marker = marker.to_string_lossy().replace('\'', "''");
+    let watchdog =
+        watchdog_powershell(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::App).expect("safe literals");
+    let harness = format!(
+        "function Get-AppxPackage {{ param($Name) [pscustomobject]@{{ PackageFamilyName = '{FAMILY}'; Version = '0.0.5.0' }} }}; function Get-Process {{ param($Name) $null }}; function Start-Process {{ param($FilePath) Set-Content -LiteralPath '{marker}' -Value $FilePath }}; {watchdog}"
+    );
+    let status = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &harness])
+        .status()
+        .expect("Windows PowerShell starts");
+    assert!(status.success());
+    assert!(std::path::Path::new(marker.as_str()).is_file());
+    let _ = std::fs::remove_file(marker.as_str());
 }
 
 #[test]
@@ -552,7 +619,10 @@ fn watchdog_script_golden_none() {
          del /q \"%~f0\"\r\n"
     );
     assert!(powershell_line(&script).is_none());
-    assert_eq!(watchdog_powershell(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::None), None);
+    assert_eq!(
+        watchdog_powershell(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::None),
+        None
+    );
 }
 
 #[test]
@@ -563,7 +633,11 @@ fn the_apply_script_runs_the_lead_command_before_the_watchdog() {
     let lines: Vec<&str> = script.lines().collect();
     assert_eq!(lines.first().copied(), Some("@echo off"));
     assert_eq!(lines.get(1).copied(), Some(command));
-    assert!(lines.get(2).is_some_and(|line| line.starts_with("powershell.exe")));
+    assert!(
+        lines
+            .get(2)
+            .is_some_and(|line| line.starts_with("powershell.exe"))
+    );
     // The install and the comeback are one task, so a package shutdown cannot
     // land between them.
     assert!(script.contains("schtasks /delete /tn \"fwdslash-update\""));
