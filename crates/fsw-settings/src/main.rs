@@ -26,6 +26,7 @@ use std::process::Command;
 use windows_reactor::*;
 
 mod folder_picker;
+mod state_watch;
 
 /// The WSL provider root. Bare `/` may resolve elsewhere depending on bare-slash mode,
 /// so "Open WSL root" targets this literally, as `src/settings/main.cpp:562` does.
@@ -468,6 +469,14 @@ enum Msg {
     /// A background `State::read()` completed. Every refresh is off-thread: the
     /// read touches the registry, the broker window and the update directory.
     StateLoaded(State),
+    /// One turn of the external-change watch ended (issue #55): either a
+    /// component broadcast that it changed something, or the safety poll.
+    /// Carries no state — the read it may start is a separate task.
+    ExternalStateChanged(state_watch::Wake),
+    /// The state read an `ExternalStateChanged` started. Separate from
+    /// `StateLoaded` because this one is coalesced and compared: a poll that
+    /// finds nothing new must not touch the model at all.
+    StateRefreshed(State),
     /// `ensure_broker_running()` finished off-thread; the broker column of the
     /// status line may have changed.
     BrokerProbed,
@@ -531,6 +540,9 @@ struct SettingsModel {
     /// Guards the one-shot detect-and-repair sweep (#37) so it runs once per
     /// window, after any upgrade queue has drained.
     repair_started: bool,
+    /// Keeps the external-change watch (#55) down to one state read at a time,
+    /// however many notifications a burst of writes produces.
+    external_reads: state_watch::ReadCoalescer,
 }
 
 impl SettingsModel {
@@ -597,6 +609,22 @@ impl SettingsModel {
     /// `Msg::StateLoaded`.
     fn refresh(context: &ComponentContext<Self>) {
         context.spawn_background(|_| Msg::StateLoaded(State::read()));
+    }
+
+    /// Arms one turn of the external-change watch (#55).
+    ///
+    /// The wait blocks — on the broadcast, or on the poll interval — so it
+    /// runs as background work like every other blocking call this window
+    /// makes, and the loop continues because handling the message it produces
+    /// arms the next turn. Nothing re-arms it if the component goes away,
+    /// which is the point: a retired scope never sees the message.
+    fn arm_state_watch(context: &ComponentContext<Self>) {
+        context.spawn_background(|_| Msg::ExternalStateChanged(state_watch::wait()));
+    }
+
+    /// Starts the coalesced state read behind an external notification.
+    fn read_external_state(context: &ComponentContext<Self>) {
+        context.spawn_background(|_| Msg::StateRefreshed(State::read()));
     }
 
     /// Starts the automatic upgrade if any installed adapter is outdated.
@@ -748,7 +776,14 @@ impl Component for SettingsModel {
             upgrade: None,
             upgrade_attempted: false,
             repair_started: false,
+            external_reads: state_watch::ReadCoalescer::default(),
         };
+        // Listen for state this window did not change (#55): the CLI, the
+        // broker's tray toggle, a shell adapter's staged copy of `fwdslash`.
+        // The listener window is created on its own thread; a failure to
+        // create it leaves the safety poll, so nothing here is fatal.
+        state_watch::start();
+        Self::arm_state_watch(context);
         // An outdated adapter is repaired on sight, at the first state the
         // window ever sees.
         model.maybe_start_upgrade(context);
@@ -1023,6 +1058,34 @@ impl Component for SettingsModel {
                 Self::refresh(context);
             }
             Msg::StateLoaded(state) => {
+                self.state = state;
+                self.maybe_start_upgrade(context);
+            }
+
+            Msg::ExternalStateChanged(wake) => {
+                // Re-arm first: every path below can return, and the watch has
+                // to outlive all of them.
+                Self::arm_state_watch(context);
+                if !state_watch::should_read(wake, state_watch::window_visible()) {
+                    return;
+                }
+                if self.external_reads.wake() {
+                    Self::read_external_state(context);
+                }
+            }
+            Msg::StateRefreshed(state) => {
+                // A notification arrived while this read was running: one more
+                // read covers whatever it did not see.
+                if self.external_reads.finished() {
+                    Self::read_external_state(context);
+                }
+                // The poll runs forever and finds nothing almost every time.
+                // Assigning an equal state would republish the whole view for
+                // no reason -- and, worse, restart the upgrade check on a
+                // timer.
+                if state == self.state {
+                    return;
+                }
                 self.state = state;
                 self.maybe_start_upgrade(context);
             }

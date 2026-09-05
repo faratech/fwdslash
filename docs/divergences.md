@@ -229,6 +229,37 @@ packaged process compares its merged view (authoritative) against a child
 runs from the broker's startup sweep, the settings window's launch sweep and
 `fwdslash repair-adapters`, and logs `event=settings_synced` — category only.
 
+## Product behaviour (Rust-only): a state-changed broadcast (#55)
+
+The C++ tree has no cross-component change notification at all: the settings
+window catches an external change only on `window_.Activated`, and the broker
+catches one never. Both keep rendering what they read at launch.
+
+The Rust tree adds one registered window message,
+`fsw_core::FSW_STATE_CHANGED_MESSAGE` = `ForwardSlashWindows.StateChanged`,
+registered per session with `RegisterWindowMessageW` and posted to
+`HWND_BROADCAST` by whoever changed something, *after* the change lands:
+`fsw_core::settings_write` announces every successful settings write (so the
+bare-slash values, `Disabled` and the update values are covered wherever they
+are written from), and `fwdslash` announces the verbs whose state lives
+elsewhere — `integration … enable|disable|repair`, `repair-adapters`,
+`install`/`uninstall`, `start`/`stop`, `pause`/`resume` — once per invocation
+and only on exit 0. It carries no payload: every listener re-reads what it
+needs, so nothing about what changed travels between processes (`PRIVACY.md`).
+
+The broker listens on its existing top-level window and re-reads the settings
+(Broker §2). The settings window listens on a hidden top-level window of its
+own, on its own thread, because it has no window procedure it can reach
+otherwise — `crates/fsw-settings/src/state_watch.rs`, class
+`ForwardSlashWindows.SettingsWatcher`, and a real top-level window because
+`HWND_BROADCAST` skips message-only ones (the same reason the broker's window is
+one). Both are unchanged by the message itself; the re-read is what applies it.
+
+`RegNotifyChangeKeyValue` was considered and rejected as the primary mechanism:
+under MSIX registry virtualization it is not clear which hive layer the
+notification tracks, and writes now go to both (#52). A broadcast plus a poll is
+deterministic in a way that does not depend on the answer.
+
 `Invoke-ForwardSlashWindowsSetLocation` also answers `cd ..` at a distribution's
 share root (`\\wsl.localhost\<Distro>`, or the `\\wsl$` spelling) with one
 line naming the distribution, instead of PowerShell's `Cannot find path
@@ -325,14 +356,35 @@ being covered.
 
 Reverting to strict parity is a one-word change back to `LeftCompact`.
 
-### 3. No refresh when the window is activated
+### 3. A change watch instead of a refresh on activation
 
 The C++ hooks `window_.Activated` (`main.cpp:443-446`) so a change made by
 `fwdslash` in a terminal shows up on alt-tab. reactor exposes no activation
-observation — `HostEvent` carries only `WindowSize`, `ColorScheme` and errors.
-The Rust app refreshes on every mutation, on navigation, and on the explicit
-"Refresh status" button, which covers everything except an external change made
-while the window is already open and untouched.
+observation — `HostEvent` carries only `WindowSize`, `ColorScheme` and errors —
+and the Rust app used to refresh only on its own mutations, on navigation and on
+the "Refresh status" button, which left exactly the case the C++ covered: an
+external change while the window sits open and untouched (#55).
+
+It now watches instead, which covers more than alt-tab did — the window follows
+a change it never touched, without being touched itself.
+`crates/fsw-settings/src/state_watch.rs` owns both halves:
+
+- **The broadcast.** A hidden top-level window on its own thread receives
+  `FSW_STATE_CHANGED_MESSAGE` and signals a manual-reset event. `wait()` — one
+  turn, run as background work and re-armed by handling the message it produces
+  — waits on that event, and on a signal sleeps 250 ms and clears the event
+  before returning, so a multi-value write (`bare-slash default` writes three)
+  costs one read, and a signal raised after the clear wakes the next turn.
+- **The poll.** The same wait times out after 5 s and reports `Wake::Poll`,
+  which covers writers that do not broadcast — an older staged `fwdslash.exe`,
+  a hand `reg.exe` edit. It is skipped while the window is minimized or hidden
+  (`should_read`); a broadcast never is, so a restored window is right the
+  moment it appears.
+
+`ReadCoalescer` keeps it to one `State::read()` at a time, remembering at most
+one owed read, and `Msg::StateRefreshed` compares before assigning: an equal
+`State` — which is what the poll finds almost every time — touches nothing. All
+of it is off the UI thread; the UI thread only swaps the value in.
 
 ### 4. Deep links select the page but do not focus the control
 
@@ -534,8 +586,21 @@ three, and this section is the whole list.
   `event=worker_start_failed`, `event=worker_detached`,
   `event=debug_uia_failed`, `event=debug_hook_failed`,
   `event=adapter_upgraded`, `event=adapter_upgrade_failed`,
-  `event=adapter_upgrade_skipped`, `event=settings_synced`. The C++'s
+  `event=adapter_upgrade_skipped`, `event=settings_synced`,
+  `event=state_changed`, `event=hook_unavailable`. The C++'s
   `event=enter_handler_failed` has no Rust counterpart.
+- **It re-reads the settings on a state-changed broadcast** (#55). The tray
+  tooltip, the keyboard hook and the published mapping all derive from state
+  another process can change; before this they caught up at the next health
+  tick, or — for the pause flag, which the broker held only in memory — never.
+  `reload_settings` compares the stored `Disabled` against `PAUSED` and, when
+  they differ, applies the pause exactly as the tray toggle does minus the write
+  (`apply_paused`), then refreshes the tooltip and republishes. It skips the
+  comparison entirely while one of its own pause writes is in flight
+  (`PERSIST_IN_FLIGHT`): the tray toggle changes `PAUSED` first and persists
+  off-thread, so a broadcast arriving in between would otherwise be read as an
+  external change and revert it. The tray menus need nothing — they are built
+  from live state when the menu opens. The C++ broker has no equivalent.
 
 ## CLI (fwdslash)
 

@@ -21,6 +21,10 @@ fsw-core = { path = "../fsw-core" }
 fsw-path = { path = "../fsw-path" }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    # Not for drawing: `WNDCLASSW` names GDI handle types, so registering the
+    # hidden window class in `state_watch.rs` needs this feature. The broker's
+    # manifest carries it for the same reason.
+    "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",

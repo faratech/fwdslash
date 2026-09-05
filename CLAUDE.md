@@ -203,6 +203,17 @@ window's caption is `Forward Slash Windows` and the two used to collide.
 `FSW_WM_SET_PAUSED` replies with the resulting `BrokerState` (`Active` = 1, `Paused` = 2) or
 **0** when the change could not be applied; it is not a boolean ack.
 
+One more message is not addressed to anyone: `FSW_STATE_CHANGED_MESSAGE`
+(`ForwardSlashWindows.StateChanged`, a `RegisterWindowMessageW` id) is posted to
+`HWND_BROADCAST` after a state change lands, so a running settings window and the broker stop
+rendering what they read at launch (issue #55). `fsw_core::broadcast_state_changed()` is the
+only way to send it: `settings_write` calls it after every successful write, and the CLI once
+per mutating verb that exited 0. **Never broadcast before the write lands or after one that
+failed** — every listener re-reads, so an early notice just re-renders the old value. The
+broker handles it in its window proc (`reload_settings`); the settings window listens on a
+hidden top-level window of its own (`crates/fsw-settings/src/state_watch.rs` — `HWND_BROADCAST`
+skips message-only windows) and backs it with a 5 s poll for writers that say nothing.
+
 `crates/fsw-path` holds the pure resolver and `crates/fsw-core` the registry reads and the
 funnel (`src/core/path_resolver.cpp` + `wsl_registry.cpp` are the C++ originals). **All
 resolution flows through `resolve_user_slash_path` / `ResolveUserSlashPath`**, so a change
@@ -327,13 +338,13 @@ WinRT API slot is missing, the vtable in `native/winui/bindings.rs` usually rese
 position as a `usize` placeholder — implement the fn pointer + wrapper method, then wire the
 slot/property through `generated.rs` and `native/winui/generated.rs`.
 
-`crates/fsw-settings/src/tray.rs` is the wfdiag `reactor-spike/window_support.rs` solution
-ported onto `windows-sys`: the window is subclassed with `SetWindowSubclass` and that one file
-owns tray icon, minimize/close-to-tray, and the Show/Exit menu. Window discovery enumerates
-**current-process** windows only — a bare `FindWindowW(NULL, title)` matches another
-instance's window and `SetWindowSubclass` fails cross-process. The app is also
-single-instance (`activate_existing_instance` + `Local\ForwardSlashWindows.Settings` mutex):
-a second launch raises the existing window. The C++ settings app has neither guard.
+The settings app has no tray icon and no window subclass (an earlier `tray.rs` was removed);
+its only Win32 surfaces are `folder_picker.rs`, the single-instance guard, and
+`state_watch.rs`. Window discovery in all of them enumerates **current-process** windows only —
+a bare `FindWindowW(NULL, title)` matches another instance's window, and the broker's own
+window has carried the same caption. The app is single-instance
+(`activate_existing_instance` + `Local\ForwardSlashWindows.Settings` mutex): a second launch
+raises the existing window. The C++ settings app has no such guard.
 
 `docs/divergences.md` pins every place the Rust resolver is deliberately not byte-identical to
 the C++ one (case-folding table, error-shape tightening, an unreachable error variant, malformed

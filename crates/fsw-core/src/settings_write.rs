@@ -501,11 +501,26 @@ mod imp {
     }
 }
 
+/// Broadcasts [`crate::FSW_STATE_CHANGED_MESSAGE`] for a write that landed, and
+/// says nothing about one that did not (issue #55).
+///
+/// Every settings write funnels through the four functions below, so this is
+/// the one place that has to remember: a running settings window and the
+/// broker both re-read on the broadcast, and re-reading after a *failed* write
+/// would show the same state twice while claiming something changed.
+#[cfg(windows)]
+fn announce(result: Result<(), u32>) -> Result<(), u32> {
+    if result.is_ok() {
+        crate::broadcast_state_changed();
+    }
+    result
+}
+
 /// Writes a `REG_DWORD` settings value through [`write_plan`].
 pub fn set_setting_u32(name: &str, value: u32) -> Result<(), u32> {
     #[cfg(windows)]
     {
-        imp::set_setting(name, &SettingValue::Dword(value))
+        announce(imp::set_setting(name, &SettingValue::Dword(value)))
     }
     #[cfg(not(windows))]
     {
@@ -518,7 +533,7 @@ pub fn set_setting_u32(name: &str, value: u32) -> Result<(), u32> {
 pub fn set_setting_u64(name: &str, value: u64) -> Result<(), u32> {
     #[cfg(windows)]
     {
-        imp::set_setting(name, &SettingValue::Qword(value))
+        announce(imp::set_setting(name, &SettingValue::Qword(value)))
     }
     #[cfg(not(windows))]
     {
@@ -531,7 +546,7 @@ pub fn set_setting_u64(name: &str, value: u64) -> Result<(), u32> {
 pub fn set_setting_string(name: &str, value: &str) -> Result<(), u32> {
     #[cfg(windows)]
     {
-        imp::set_setting(name, &SettingValue::Sz(value.to_owned()))
+        announce(imp::set_setting(name, &SettingValue::Sz(value.to_owned())))
     }
     #[cfg(not(windows))]
     {
@@ -545,7 +560,7 @@ pub fn set_setting_string(name: &str, value: &str) -> Result<(), u32> {
 pub fn delete_setting(name: &str) -> Result<(), u32> {
     #[cfg(windows)]
     {
-        imp::delete_setting(name)
+        announce(imp::delete_setting(name))
     }
     #[cfg(not(windows))]
     {

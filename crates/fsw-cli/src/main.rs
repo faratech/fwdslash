@@ -1412,5 +1412,107 @@ fn main() {
         }
     };
 
+    // One notification for the whole invocation, and only for a verb that
+    // finished cleanly (issue #55). A settings window that is open right now
+    // re-reads on this; without it it keeps rendering what it read at launch
+    // until it is closed and reopened.
+    if exit_code == 0 && broadcasts_state_change(command, args.len()) {
+        broadcast_state_changed();
+    }
+
     std::process::exit(exit_code);
+}
+
+/// Whether a verb that just succeeded changed state some other component
+/// renders, and so has to be broadcast (issue #55).
+///
+/// Deliberately a whitelist of the mutating verbs rather than "everything that
+/// exited 0": `resolve`, `status`, `list` and the three shell-adapter verbs run
+/// on every prompt and every `cd`, and a broadcast per `cd` would have the
+/// settings window re-reading the registry all day.
+///
+/// `argc` is the whole `argv` length, matching the dispatch above, and is what
+/// separates `bare-slash` (prints the current mode, changes nothing) from
+/// `bare-slash default` (changes it).
+///
+/// The settings-key writes already broadcast from `fsw_core::settings_write`,
+/// so `bare-slash` and `pause`/`resume` are covered twice on the happy path;
+/// they stay listed because the verbs are the contract, and a write that is
+/// skipped as redundant is not.
+fn broadcasts_state_change(command: &str, argc: usize) -> bool {
+    match command {
+        // Adapter payload, profile blocks and marker keys — none of them under
+        // the settings key, so nothing else announces them.
+        "integration" => argc == 4,
+        "repair-adapters" => argc == 2,
+        // Run key, protocol registration, the adapter sweep.
+        "install" | "uninstall" => true,
+        // The broker's presence is the status line's "broker" column.
+        "start" | "stop" => true,
+        // Global pause, via the broker when one is running and the registry
+        // when none is.
+        "pause" | "disable" | "resume" | "enable" => argc == 2,
+        // `bare-slash` alone is a read; every longer form writes.
+        "bare-slash" => argc > 2,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::broadcasts_state_change;
+
+    #[test]
+    fn mutating_verbs_broadcast() {
+        assert!(broadcasts_state_change("bare-slash", 3));
+        assert!(broadcasts_state_change("bare-slash", 4));
+        assert!(broadcasts_state_change("integration", 4));
+        assert!(broadcasts_state_change("repair-adapters", 2));
+        assert!(broadcasts_state_change("install", 2));
+        assert!(broadcasts_state_change("uninstall", 2));
+        assert!(broadcasts_state_change("uninstall", 3));
+        assert!(broadcasts_state_change("start", 2));
+        assert!(broadcasts_state_change("stop", 2));
+        for verb in ["pause", "resume", "enable", "disable"] {
+            assert!(broadcasts_state_change(verb, 2), "{verb}");
+        }
+    }
+
+    /// The read-only verbs, including the two that run on every shell prompt.
+    #[test]
+    fn read_only_verbs_stay_quiet() {
+        for verb in [
+            "status",
+            "resolve",
+            "open",
+            "list",
+            "cmd-list",
+            "cmd-cd",
+            "shell-resolve",
+            "doctor",
+            "settings",
+            "integrations",
+            "version",
+            "driver",
+        ] {
+            assert!(!broadcasts_state_change(verb, 3), "{verb}");
+        }
+    }
+
+    /// `bare-slash` with no operand prints the mode; `integration` with the
+    /// wrong arity never reaches an adapter. Neither changed anything.
+    #[test]
+    fn arity_separates_reads_from_writes() {
+        assert!(!broadcasts_state_change("bare-slash", 2));
+        assert!(!broadcasts_state_change("integration", 3));
+        assert!(!broadcasts_state_change("integration", 5));
+    }
+
+    /// `enable`/`disable` are the pause verbs only in their bare form — the
+    /// operand forms are `integration <id> enable`, dispatched elsewhere.
+    #[test]
+    fn pause_aliases_need_their_bare_form() {
+        assert!(!broadcasts_state_change("enable", 3));
+        assert!(!broadcasts_state_change("disable", 3));
+    }
 }
