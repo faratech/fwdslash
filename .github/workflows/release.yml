@@ -78,15 +78,15 @@ jobs:
           $core = @($metadata.packages | Where-Object { $_.name -eq 'fsw-core' })
           if ($core.Count -ne 1) { throw 'cargo metadata did not report exactly one fsw-core package.' }
           $workspace = $core[0].version
-          if ($env:GITHUB_REF_NAME -like 'v*') {
-              $tag = $env:GITHUB_REF_NAME.Substring(1)
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+              $tag = $env:GITHUB_REF.Substring('refs/tags/v'.Length)
               if ($tag -ne $workspace) {
                   throw "Tag v$tag does not match workspace.package.version $workspace. " +
                         'Bump the root Cargo.toml (and the version-copy list in CLAUDE.md) or retag.'
               }
               Write-Host "Tag v$tag matches workspace.package.version $workspace."
           } else {
-              Write-Host "Not a tag ref ('$env:GITHUB_REF_NAME'); using workspace version $workspace."
+              Write-Host "Not a release tag ref ('$env:GITHUB_REF'); using workspace version $workspace."
           }
           if ($workspace -notmatch '^\d+\.\d+\.\d+$') {
               throw "workspace.package.version must be MAJOR.MINOR.PATCH (got '$workspace')."
