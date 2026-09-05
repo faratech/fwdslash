@@ -1141,7 +1141,22 @@ fn cmd_integrations(json: bool) -> i32 {
         print!(" (PowerShell 7 unavailable)");
     }
     println!();
+    print_shell_integration_health();
     0
+}
+
+/// Prints each shell adapter's integration-hygiene line (#37): `healthy`, or a
+/// named problem such as `orphaned profile block for 0.0.1`. Read-only — the
+/// broker/settings `repair-adapters` sweep is what fixes them.
+fn print_shell_integration_health() {
+    let lines = adapters::health_report();
+    if lines.is_empty() {
+        return;
+    }
+    println!("shell integration health:");
+    for (label, status) in lines {
+        println!("  {label}: {status}");
+    }
 }
 
 /// `fwdslash version`. The packaged four-part identity version when there is
@@ -1169,7 +1184,7 @@ fn usage() {
          \x20 fwdslash doctor /Distro/path | --all\n\
          \x20 fwdslash settings [general|windows|cmd|windows-powershell|powershell]\n\
          \x20 fwdslash integrations [--json]\n\
-         \x20 fwdslash integration <name> enable|disable\n\
+         \x20 fwdslash integration <name> enable|disable|repair\n\
          \x20 fwdslash bare-slash\n\
          \x20 fwdslash bare-slash list | default [Distro]\n\
          \x20 fwdslash bare-slash root <WindowsPath>\n\
@@ -1214,11 +1229,15 @@ fn main() {
             if args.len() != 3 {
                 usage();
                 2
-            } else if args[2] == "--all" {
-                cmd_doctor_all()
             } else {
-                let snap = Snapshot::current();
-                cmd_doctor_single(&args[2], &snap)
+                let code = if args[2] == "--all" {
+                    cmd_doctor_all()
+                } else {
+                    let snap = Snapshot::current();
+                    cmd_doctor_single(&args[2], &snap)
+                };
+                print_shell_integration_health();
+                code
             }
         }
         "settings" if args.len() == 2 || args.len() == 3 => {
@@ -1265,7 +1284,19 @@ fn main() {
         "integration" if args.len() == 4 => {
             let name = args[2].as_str();
             let op = args[3].as_str();
-            if op != "enable" && op != "disable" {
+            if op == "repair" {
+                // Detect-and-repair a single adapter's shell-integration
+                // hygiene (#37). `windows` is registry-only, nothing to repair.
+                if name == "windows" {
+                    0
+                } else {
+                    let result = adapters::repair_integration(name);
+                    if result == 2 {
+                        usage();
+                    }
+                    result
+                }
+            } else if op != "enable" && op != "disable" {
                 usage();
                 2
             } else {
@@ -1281,6 +1312,10 @@ fn main() {
                 }
             }
         }
+        // Repairs every shell adapter's hygiene. The broker startup sweep and
+        // the settings launch sweep invoke this so orphaned/duplicate profile
+        // blocks self-heal on the next run (#37).
+        "repair-adapters" if args.len() == 2 => adapters::repair_all(),
         "pause" | "disable" if args.len() == 2 => set_paused(true),
         "resume" | "enable" if args.len() == 2 => set_paused(false),
         "driver" if args.len() == 3 && args[2] == "status" => {
@@ -1291,6 +1326,13 @@ fn main() {
         "start" => start_broker(),
         "stop" => stop_broker(),
         "install" => set_windows_integration(true),
+        // The orphan self-clean a leftover shell hook runs on the next shell
+        // start after the product was removed without running code, e.g. an
+        // MSIX uninstall (#37). It confirms the product is gone, then removes
+        // every trace including its own directory.
+        "uninstall" if args.get(2).map(String::as_str) == Some("--orphaned") => {
+            adapters::cleanup_orphaned()
+        }
         "uninstall" => {
             // Sweep the shell adapters first so their helper state (payload,
             // markers, profile blocks) goes with the rest of the product.

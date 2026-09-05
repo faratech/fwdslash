@@ -215,6 +215,242 @@ pub fn sweep_uninstall() -> i32 {
     worst
 }
 
+/// `DETACHED_PROCESS` — the self-clean's delayed directory delete must outlive
+/// this process and not share its console.
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+/// One adapter's health for `fwdslash doctor` / `integrations`: a display
+/// label and a one-line status (#37).
+pub fn health_report() -> Vec<(String, String)> {
+    #[cfg(windows)]
+    {
+        let mut lines = vec![("Command Prompt".to_string(), cmd_health_status())];
+        for (label, edition) in [
+            ("Windows PowerShell", state::Edition::WindowsPowerShell),
+            ("PowerShell 7", state::Edition::PowerShell),
+        ] {
+            lines.push((label.to_string(), ps_health_status(edition)));
+        }
+        lines
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(windows)]
+fn ps_health_status(edition: state::Edition) -> String {
+    match powershell::profile_health(edition) {
+        profile::ProfileHealth::Clean => {
+            if fsw_core::adapter_installed(&format!(
+                "{}{}",
+                fsw_core::POWERSHELL_ADAPTER_ROOT,
+                edition.registry_leaf()
+            )) {
+                "installed, no profile block".to_string()
+            } else {
+                "not installed".to_string()
+            }
+        }
+        profile::ProfileHealth::Healthy => "healthy".to_string(),
+        profile::ProfileHealth::Orphaned(version) => {
+            format!("orphaned profile block for {version}")
+        }
+        profile::ProfileHealth::Stale(version) => format!("stale profile block for {version}"),
+        profile::ProfileHealth::Duplicated => "duplicate profile blocks".to_string(),
+    }
+}
+
+#[cfg(windows)]
+fn cmd_health_status() -> String {
+    match cmd::health() {
+        cmd::CmdHealth::Clean => "not installed".to_string(),
+        cmd::CmdHealth::Healthy => "healthy".to_string(),
+        cmd::CmdHealth::Orphaned => "orphaned AutoRun hook (missing fsw-autorun.cmd)".to_string(),
+    }
+}
+
+/// Repairs a single adapter's shell-integration hygiene (#37) and prints a
+/// `label: status — outcome` line. Exit 0 always: a repair that cannot run is
+/// reported, not fatal.
+pub fn repair_integration(id: &str) -> i32 {
+    #[cfg(windows)]
+    {
+        let controller = std::env::current_exe().unwrap_or_default();
+        match id {
+            "cmd" => {
+                let before = cmd::repair();
+                report_cmd_repair(before);
+            }
+            "windows-powershell" => report_ps_repair("Windows PowerShell", state::Edition::WindowsPowerShell, &controller),
+            "powershell" => report_ps_repair("PowerShell 7", state::Edition::PowerShell, &controller),
+            _ => return 2,
+        }
+        0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        1
+    }
+}
+
+#[cfg(windows)]
+fn report_cmd_repair(result: Result<cmd::CmdHealth, AdapterError>) {
+    match result {
+        // Health after the repair attempt: Orphaned here means the restore was
+        // refused (a third party changed AutoRun) or there is no marker to
+        // restore from — reported, not silently claimed as fixed.
+        Ok(cmd::CmdHealth::Orphaned) => {
+            println!(
+                "Command Prompt: orphaned AutoRun hook — could not repair automatically (reconcile AutoRun and retry)"
+            );
+        }
+        Ok(_) => println!("Command Prompt: healthy"),
+        Err(error) => println!("Command Prompt: repair failed ({error})"),
+    }
+}
+
+#[cfg(windows)]
+fn report_ps_repair(label: &str, edition: state::Edition, controller: &Path) {
+    match powershell::repair(edition, controller) {
+        Ok(profile::ProfileHealth::Healthy | profile::ProfileHealth::Clean) => {
+            println!("{label}: healthy");
+        }
+        Ok(profile::ProfileHealth::Orphaned(version)) => {
+            println!("{label}: orphaned profile block for {version} — repaired");
+        }
+        Ok(profile::ProfileHealth::Stale(version)) => {
+            println!("{label}: stale profile block for {version} — repaired");
+        }
+        Ok(profile::ProfileHealth::Duplicated) => {
+            println!("{label}: duplicate profile blocks — repaired");
+        }
+        Err(error) => println!("{label}: repair failed ({error})"),
+    }
+}
+
+/// Repairs every shell adapter's hygiene (#37). The broker's startup sweep and
+/// the settings window's launch sweep both invoke this (via
+/// `fwdslash repair-adapters`) so an orphaned or duplicated block self-heals on
+/// the next run. Best effort; exit 0.
+pub fn repair_all() -> i32 {
+    #[cfg(windows)]
+    {
+        let controller = std::env::current_exe().unwrap_or_default();
+        let _ = cmd::repair();
+        for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+            let _ = powershell::repair(edition, &controller);
+        }
+        powershell::prune_orphaned_module_dirs();
+        0
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
+/// The orphan self-clean (`fwdslash uninstall --orphaned`), invoked by a
+/// leftover shell hook on the next shell start after the product was removed
+/// without running code (an MSIX uninstall). Confirms the product is really
+/// gone, then runs the transactional sweep and deletes every trace — including
+/// the directory it is running from (#37 addendum).
+pub fn cleanup_orphaned() -> i32 {
+    #[cfg(windows)]
+    {
+        // Slow confirm: the cheap probe already failed for the hook to call us,
+        // so re-check every signal. A transient alias blip during an in-flight
+        // update must never destroy a live install.
+        let mut probes = Vec::new();
+        if let Some(probe) = cmd::recorded_probe() {
+            probes.push(probe);
+        }
+        for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+            if let Some(probe) = powershell::recorded_probe(edition) {
+                probes.push(probe);
+            }
+        }
+        if product_present(&probes) {
+            return 0;
+        }
+
+        // Product confirmed gone. Restore the profiles / AutoRun byte-exact
+        // through the transactional sweep (cmd still refuses if a third party
+        // changed AutoRun), then belt-and-braces strip any block a refused or
+        // missing-recovery uninstall could have left behind.
+        let _ = sweep_uninstall();
+        strip_all_ps_profiles();
+
+        // Wipe the settings hive + adapter markers, and the unpackaged-only Run
+        // value and protocol registration (a packaged orphan has neither).
+        let _ = reg::delete_tree("Software\\ForwardSlashWindows");
+        let _ = reg::delete_value(fsw_core::RUN_KEY, fsw_core::RUN_VALUE);
+        let _ = reg::delete_tree(fsw_core::PROTOCOL_KEY);
+
+        // Delete the payload tree, scheduling the running directory's own
+        // removal for after this process exits.
+        schedule_payload_delete();
+        0
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
+/// Belt-and-braces removal of any fwdslash block left in either edition's
+/// default profile, used by the orphan self-clean when a marker-driven restore
+/// could not run.
+#[cfg(windows)]
+fn strip_all_ps_profiles() {
+    let Ok(documents) = documents_dir() else {
+        return;
+    };
+    for folder in ["WindowsPowerShell", "PowerShell"] {
+        let path = documents.join(folder).join("profile.ps1");
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let cleaned = profile::strip_fwdslash_blocks(&bytes);
+        if cleaned == bytes {
+            continue;
+        }
+        if cleaned.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = write_atomic(&path, &cleaned);
+        }
+    }
+}
+
+/// Removes `%LOCALAPPDATA%\ForwardSlashWindows`, deferring the running
+/// directory's deletion to a detached `cmd.exe` that waits for this process to
+/// exit. Idempotent: an already-gone tree is not an error.
+#[cfg(windows)]
+fn schedule_payload_delete() {
+    let Ok(local_app_data) = local_app_data() else {
+        return;
+    };
+    let payload = local_app_data.join("ForwardSlashWindows");
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let system32 = Path::new(&system_root).join("System32");
+    let command = format!(
+        "ping -n 3 127.0.0.1 >nul & rd /s /q \"{}\"",
+        payload.display()
+    );
+    let _ = Command::new("cmd.exe")
+        .args(["/c", &command])
+        .current_dir(&system32)
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 /// The payload directory for an adapter kind, relative to the executable:
 /// a packaged install carries `shell\` beside the exes; a dev build run from
 /// `target\<triple>\release` falls back to the repo checkout.
@@ -244,6 +480,75 @@ pub fn local_app_data() -> Result<PathBuf, AdapterError> {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| AdapterError::new("%LOCALAPPDATA% is not set."))
+}
+
+/// The per-user app-execution alias both packaged flavors register:
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\fwdslash.exe`. It is user-readable
+/// (unlike the `WindowsApps` install root) and vanishes when the package is
+/// removed, which makes it the cheap "is the product still installed" probe
+/// the shell hooks test on every start (#37 addendum).
+#[cfg(windows)]
+pub fn app_execution_alias() -> Option<PathBuf> {
+    local_app_data()
+        .ok()
+        .map(|dir| dir.join("Microsoft").join("WindowsApps").join("fwdslash.exe"))
+}
+
+/// The product-presence probe recorded in an adapter's marker at install time.
+/// Packaged: the app-execution alias. Unpackaged: the directory the real
+/// controller runs from. Its absence arms the shell hook's self-clean.
+#[cfg(windows)]
+pub fn product_probe_path(controller: &Path) -> PathBuf {
+    if fsw_core::has_package_identity() {
+        if let Some(alias) = app_execution_alias() {
+            return alias;
+        }
+    }
+    // Unpackaged (or, defensively, a packaged build with no %LOCALAPPDATA%):
+    // the real controller's own directory proves the product is present.
+    controller
+        .parent()
+        .map_or_else(|| controller.to_path_buf(), Path::to_path_buf)
+}
+
+/// The slow product-presence confirm, run only after the cheap probe has
+/// already failed (`--orphaned`): the alias, any recorded install directory,
+/// or — last — whether either package flavor is still registered. Conservative
+/// on error: an appx query that cannot even run counts as "present" so a
+/// transient failure never destroys a live install.
+#[cfg(windows)]
+pub fn product_present(recorded_probes: &[String]) -> bool {
+    // Cheap: the app-execution alias. Slow — only paid when the alias is
+    // absent: a recorded install directory, then, last, an appx query.
+    let cheap_probe_present = app_execution_alias().is_some_and(|path| path.is_file());
+    let slow_confirm_present = !cheap_probe_present
+        && (recorded_probes
+            .iter()
+            .any(|probe| !probe.is_empty() && Path::new(probe).exists())
+            || appx_registered(fsw_core::STORE_IDENTITY_NAME));
+    !state::product_confirmed_gone(cheap_probe_present, slow_confirm_present)
+}
+
+/// Whether a package with `identity_name` (shared by both flavors) is still
+/// registered for this user. Spawns in-box Windows PowerShell — acceptable
+/// because this only runs on the rare cleanup path. Returns `true` (present) if
+/// the query cannot be run at all.
+#[cfg(windows)]
+fn appx_registered(identity_name: &str) -> bool {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let shell = Path::new(&system_root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let script = format!(
+        "if (Get-AppxPackage -Name '{}') {{ exit 0 }} else {{ exit 1 }}",
+        identity_name.replace('\'', "''")
+    );
+    Command::new(shell)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |status| status.success())
 }
 
 /// The real Documents folder, following OneDrive redirection

@@ -524,6 +524,9 @@ struct SettingsModel {
     /// Every refresh re-reads the adapter versions, and a failed upgrade would
     /// otherwise restart itself on every one of them.
     upgrade_attempted: bool,
+    /// Guards the one-shot detect-and-repair sweep (#37) so it runs once per
+    /// window, after any upgrade queue has drained.
+    repair_started: bool,
 }
 
 impl SettingsModel {
@@ -662,7 +665,24 @@ impl SettingsModel {
         // Not the update-available notice, so dismissal must not clear the
         // persisted AvailableUpdate value.
         self.notice_is_update = false;
+        // The upgrade queue has drained; now sweep any remaining hygiene
+        // problems (orphaned/duplicate blocks the version bump did not touch).
+        self.start_repair_sweep(context);
         Self::refresh(context);
+    }
+
+    /// Starts the one-shot detect-and-repair sweep (#37): `fwdslash
+    /// repair-adapters` off the UI thread, then a state reload so a healed
+    /// adapter shows healthy. No-op after the first call.
+    fn start_repair_sweep(&mut self, context: &ComponentContext<Self>) {
+        if self.repair_started {
+            return;
+        }
+        self.repair_started = true;
+        context.spawn_background(|_| {
+            let _ = run_controller(["repair-adapters"]);
+            Msg::StateLoaded(State::read())
+        });
     }
 }
 
@@ -704,10 +724,17 @@ impl Component for SettingsModel {
             pending: None,
             upgrade: None,
             upgrade_attempted: false,
+            repair_started: false,
         };
         // An outdated adapter is repaired on sight, at the first state the
         // window ever sees.
         model.maybe_start_upgrade(context);
+        // If nothing is being upgraded, sweep the adapters' hygiene now;
+        // otherwise the sweep runs when the upgrade queue drains, so the two
+        // never reinstall the same adapter at once (#37).
+        if model.upgrade.is_none() {
+            model.start_repair_sweep(context);
+        }
         model
     }
 

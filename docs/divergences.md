@@ -565,6 +565,52 @@ payload is frozen at install time. The Rust CLI adds:
   the manual fallback. Without this an updated product kept running a frozen
   copy of the old payload and old `fwdslash.exe` forever.
 
+### 3. Self-healing shell integrations (#37)
+
+The C++ adapter writes a bare `Import-Module` into the profile, snapshots the
+profile verbatim, and never revisits either. The Rust adapter hardens the whole
+lifecycle so an upgrade or an MSIX uninstall can never leave a broken shell:
+
+- **The profile block is guarded, fenced, and self-cleaning.** `block_text`
+  emits `$m`/`$p`/`$c` (module, product-presence probe, staged controller) and
+  `if (Test-Path $p) { if (Test-Path $m) { Import-Module … } } elseif
+  (Test-Path $c) { & $c uninstall --orphaned *> $null }`. A pruned module
+  directory can no longer throw the red `no valid module file` error, and a
+  product that was uninstalled with no code run (MSIX) is cleaned up by the
+  leftover hook on the next shell start. The region is delimited by
+  `# >>> Forward Slash Windows <ver> <id> >>>` / `# <<< … <<<` fence lines.
+- **Install/enable is replace-not-append and idempotent.** `commit_install`
+  computes the *true* original — the current profile with **every** fwdslash
+  fence stripped (`strip_fwdslash_blocks`, encoding-aware over UTF-8/16/32) —
+  snapshots that, and writes it plus exactly one current block. A repeated
+  enable, or an upgrade over an older block, can never accumulate duplicates or
+  strand a stale block, and uninstall restores the genuine pre-fwdslash profile.
+  `OriginalPresent` now tracks whether that true original is non-empty, so a
+  profile that was purely our own block is deleted on removal.
+- **Detect-and-repair.** `fwdslash repair-adapters` (run by the broker startup
+  sweep and the settings launch sweep) and the per-adapter
+  `fwdslash integration <id> repair` classify each profile — orphaned (missing
+  module), stale (wrong version), duplicated — and repair to exactly one current
+  block when the adapter should be installed, or strip it out when it should
+  not. `fwdslash doctor` and `fwdslash integrations` print a
+  `shell integration health:` line per adapter.
+- **cmd never snapshots its own hook.** `begin_install` strips any
+  `call "…ForwardSlashWindows…fsw-autorun.cmd"` segment from the observed
+  `AutoRun` before recording the original, so an MSIX-leftover hook is not
+  mistaken for a third-party value and `installed_autorun` never composes
+  `call fsw & call fsw`. `fsw-autorun.cmd` is generated at install time with the
+  probe baked in: it installs the doskey macros only while the product is
+  present, and otherwise runs the self-clean instead of routing through an
+  orphaned controller copy.
+- **`fwdslash uninstall --orphaned`** is the deferred self-clean. It confirms
+  the product is really gone (cheap probe, then a `Get-AppxPackage` slow confirm
+  so an in-flight update's alias blip is safe), runs the transactional sweep
+  (restoring profiles/AutoRun byte-exact, cmd still refusing a third-party
+  change), deletes `HKCU\Software\ForwardSlashWindows` plus the unpackaged Run
+  value and protocol key, and schedules deletion of `%LOCALAPPDATA%\
+  ForwardSlashWindows` — including the directory it is running from — after it
+  exits. Idempotent and safe to run twice.
+
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 
 These are planned, not yet implemented. Each needs its own entry with a test
