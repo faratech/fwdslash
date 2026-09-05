@@ -453,27 +453,42 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires an interactive Task Scheduler; run explicitly after setting the test process compatibility layer"]
     fn xml_registration_runs_an_isolated_harmless_task() {
         use std::time::{Duration, Instant};
 
         let name = format!("fsw-task-test-{}", std::process::id());
-        let marker = std::env::temp_dir().join(format!("{name}.marker"));
-        let _ = std::fs::remove_file(&marker);
+        struct Fixture {
+            name: String,
+            marker: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // Covers both a marker timeout and `/create` failing after it
+                // wrote the per-attempt .cmd/.xml pair.
+                let _ = super::delete_task(&self.name);
+                let _ = std::fs::remove_file(&self.marker);
+            }
+        }
+        let fixture = Fixture {
+            marker: std::env::temp_dir().join(format!("{name}.marker")),
+            name,
+        };
+        let _ = std::fs::remove_file(&fixture.marker);
         let script = format!(
             "@echo off\r\necho scheduler-ok>\"{}\"\r\nschtasks /delete /tn \"{name}\" /f >nul 2>&1\r\ndel /q \"%~dpn0.xml\" >nul 2>&1\r\ndel /q \"%~f0\"\r\n",
-            marker.display()
+            fixture.marker.display(),
+            name = fixture.name,
         );
-        let task = super::OneShotTask::new(&name, script);
+        let task = super::OneShotTask::new(&fixture.name, script);
         assert!(super::register_and_run(&task).is_some());
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !marker.exists() && Instant::now() < deadline {
+        while !fixture.marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
-        let _ = super::delete_task(&name);
         assert!(
-            marker.is_file(),
+            fixture.marker.is_file(),
             "Task Scheduler did not execute the XML task"
         );
-        let _ = std::fs::remove_file(marker);
     }
 }

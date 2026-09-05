@@ -570,23 +570,63 @@ fn watchdog_does_not_relaunch_an_unready_or_wrong_family_package() {
 #[cfg(windows)]
 #[test]
 fn generated_watchdog_powershell_runs_with_mocked_appx_commands() {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
-    let marker = std::env::temp_dir().join(format!("fsw-watchdog-test-{}.txt", std::process::id()));
-    let _ = std::fs::remove_file(&marker);
-    let marker = marker.to_string_lossy().replace('\'', "''");
+    struct FixtureDirectory(std::path::PathBuf);
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let fixture = FixtureDirectory(std::env::temp_dir().join(format!(
+        "fsw-watchdog-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos()
+    )));
+    std::fs::create_dir_all(&fixture.0).expect("fixture directory");
+    let local_app_data = fixture.0.join("local-app-data");
+    std::fs::create_dir_all(&local_app_data).expect("isolated local app data");
+    let marker_path = fixture.0.join("started.txt");
+    let marker = marker_path.to_string_lossy().replace('\'', "''");
     let watchdog =
         watchdog_powershell(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::App).expect("safe literals");
     let harness = format!(
         "function Get-AppxPackage {{ param($Name) [pscustomobject]@{{ PackageFamilyName = '{FAMILY}'; Version = '0.0.5.0' }} }}; function Get-Process {{ param($Name) $null }}; function Start-Process {{ param($FilePath) Set-Content -LiteralPath '{marker}' -Value $FilePath }}; {watchdog}"
     );
-    let status = Command::new("powershell.exe")
+    let mut child = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &harness])
-        .status()
+        .env("LOCALAPPDATA", &local_app_data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .expect("Windows PowerShell starts");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("watchdog child state") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("mocked watchdog exceeded its five-second fixture deadline");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     assert!(status.success());
-    assert!(std::path::Path::new(marker.as_str()).is_file());
-    let _ = std::fs::remove_file(marker.as_str());
+    assert!(marker_path.is_file());
+    assert!(
+        !local_app_data
+            .join("ForwardSlashWindows")
+            .join("update")
+            .join(fsw_core::update::UPDATE_RESULT_FILE)
+            .exists()
+    );
 }
 
 #[test]
