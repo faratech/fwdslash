@@ -251,13 +251,23 @@ a normal machine, and every item has external lead time.
       Monitor group (or FSFilter Virtualization, if Microsoft prefers that group
       for a name-redirecting filter). Replace `371120` in
       `driver/fswfilter/fswfilter.inf` when it is allocated.
-- [ ] **Register a Partner Center Hardware Program account** against the Azure
-      Trusted Signing identity in `signing/`. Microsoft has accepted Trusted
-      Signing in place of an EV certificate since 2024; verify at registration
-      time, and fall back to an EV certificate if it is refused.
+- [ ] **Obtain an Extended Validation code-signing certificate.** This is
+      unavoidable and it is the long pole: registering for the Windows Hardware
+      Developer Program requires signing a `.bin` file downloaded from Partner
+      Center with an **EV** certificate, which is how Partner Center extracts
+      the company name and the Seller/Publisher ID. Azure Trusted Signing does
+      **not** issue EV certificates and is not accepted for this. The
+      `signing/` kit stays what it is — the user-mode/MSIX signer — and has no
+      role here. EV private keys are non-exportable and live on a hardware
+      token or a cloud HSM.
+- [ ] **Register a Partner Center Hardware Program account** with that EV
+      certificate.
 - [ ] **Build the submission cab** — `makecab` over `fswfilter.sys`, `.inf` and
-      the `Inf2Cat` catalog, per architecture — and sign the cab with the
-      Trusted Signing kit.
+      the `Inf2Cat` catalog, per architecture — and sign **the cab** with the
+      same EV certificate. The `.sys` itself does not need an EV signature:
+      attestation re-signs the driver and regenerates the catalog. Because the
+      EV key lives on a token, cab signing is an interactive step on the machine
+      holding it — `release.yml` cannot do it.
 - [ ] **Submit for attestation signing** (Windows 10/11 client, x64 and ARM64).
       No HLK run is required for client SKUs.
 - [ ] **Ship the bytes Microsoft returns.** Never rebuild after signing; the
