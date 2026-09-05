@@ -84,12 +84,46 @@ jobs:
 
           base_url="https://manage.devcenter.microsoft.com/v1.0/my/applications/${APP_ID}"
 
+          # `curl` succeeds for an HTTP error unless asked otherwise, and jq
+          # happily projects an error object into null submission fields. Keep
+          # the response off stdout until both transport and JSON shape have
+          # been accepted; command substitution then cannot turn a 401/404/500
+          # into a successful-looking empty diagnostic.
+          get_json() {
+            local url="$1"
+            local label="$2"
+            local body
+            body="$(mktemp)"
+            local http_status
+            if ! http_status="$(curl -sS -o "$body" -w '%{http_code}' -X GET "$url" \
+              -H "Authorization: Bearer $token")"; then
+              rm -f "$body"
+              echo "::error::$label request did not reach Partner Center." >&2
+              return 1
+            fi
+            if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+              rm -f "$body"
+              echo "::error::$label request failed with HTTP $http_status." >&2
+              return 1
+            fi
+            if ! jq -e 'type == "object"' "$body" >/dev/null; then
+              rm -f "$body"
+              echo "::error::$label response was not a JSON object." >&2
+              return 1
+            fi
+            cat "$body"
+            rm -f "$body"
+          }
+
           echo "Partner Center app ID: ${APP_ID}"
           echo "Submission ID: ${SUBMISSION_ID}"
           echo ""
 
-          app_details="$(curl -sS -X GET "$base_url" \
-            -H "Authorization: Bearer $token")"
+          app_details="$(get_json "$base_url" 'Application')"
+          if ! echo "$app_details" | jq -e '(.id | type == "string") and (.id | length > 0)' >/dev/null; then
+            echo '::error::Application response did not contain a non-empty string id.'
+            exit 1
+          fi
 
           echo "Application submission pointers:"
           echo "$app_details" | jq '{
@@ -100,8 +134,12 @@ jobs:
           }'
           echo ""
 
-          submission="$(curl -sS -X GET "$base_url/submissions/${SUBMISSION_ID}" \
-            -H "Authorization: Bearer $token")"
+          submission="$(get_json "$base_url/submissions/${SUBMISSION_ID}" 'Submission')"
+          if ! echo "$submission" | jq -e --arg id "$SUBMISSION_ID" \
+            '(.id | type == "string") and (.id == $id) and (.status | type == "string")' >/dev/null; then
+            echo '::error::Submission response did not contain the requested id and a string status.'
+            exit 1
+          fi
 
           echo "Submission details:"
           echo "$submission" | jq '{
@@ -125,8 +163,11 @@ jobs:
           }'
           echo ""
 
-          status="$(curl -sS -X GET "$base_url/submissions/${SUBMISSION_ID}/status" \
-            -H "Authorization: Bearer $token")"
+          status="$(get_json "$base_url/submissions/${SUBMISSION_ID}/status" 'Submission status')"
+          if ! echo "$status" | jq -e '(.status | type == "string")' >/dev/null; then
+            echo '::error::Submission status response did not contain a string status.'
+            exit 1
+          fi
 
           echo "Submission status endpoint:"
           echo "$status" | jq '{
@@ -161,8 +202,11 @@ jobs:
           fi
 
           for attempt in $(seq 1 30); do
-            app_after="$(curl -sS -X GET "$base_url" \
-              -H "Authorization: Bearer $token")"
+            app_after="$(get_json "$base_url" 'Application cancellation status')"
+            if ! echo "$app_after" | jq -e '(.id | type == "string") and (.id | length > 0)' >/dev/null; then
+              echo '::error::Application cancellation-status response did not contain a non-empty string id.'
+              exit 1
+            fi
             pending_after="$(echo "$app_after" | jq -r '.pendingApplicationSubmission.id // empty')"
             if [ -z "$pending_after" ]; then
               echo "Submission $SUBMISSION_ID cancelled; Partner Center pending pointer is clear."
