@@ -132,6 +132,30 @@ fn script_path(name: &str) -> Option<PathBuf> {
 #[must_use]
 pub fn register_and_run(task: &OneShotTask) -> Option<()> {
     use std::os::windows::process::CommandExt;
+
+    register(task)?;
+    // Fire it now; the scheduled trigger is only the backstop.
+    let _ = Command::new("schtasks.exe")
+        .args(["/run", "/tn", &task.name])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    Some(())
+}
+
+/// Writes the script and registers the task **without** running it: it fires at
+/// the one-minute backstop trigger instead.
+///
+/// The self-updater needs this. Phase 1a of its install ladder registers the
+/// relaunch watchdog before it calls the Store, and may then have to replace
+/// that same script with a different one — which is only safe while no
+/// `cmd.exe` has the file open. A minute is far longer than that decision takes.
+#[cfg(windows)]
+#[must_use]
+pub fn register(task: &OneShotTask) -> Option<()> {
+    use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
     let script = script_path(&task.name)?;
@@ -160,14 +184,6 @@ pub fn register_and_run(task: &OneShotTask) -> Option<()> {
     if !created.success() {
         return None;
     }
-    // Fire it now; the scheduled trigger is only the backstop.
-    let _ = Command::new("schtasks.exe")
-        .args(["/run", "/tn", &task.name])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
     Some(())
 }
 

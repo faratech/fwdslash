@@ -728,8 +728,12 @@ fn cmd_status(json: bool) -> i32 {
             .map(|d| format!("\"{}\"", json_escape(d)))
             .collect();
 
+        // The four update fields are APPENDED. Everything already in this line
+        // keeps its name and its position: the settings window, the shell
+        // adapters and the packaging scripts all read it, and a reordering
+        // would be a silent break.
         println!(
-            "{{\"broker\":\"{}\",\"driverConnected\":{},\"driverState\":\"{}\",\"disabled\":{},\"bareSlashMode\":\"{}\",\"bareSlashTarget\":{},\"bareSlashRoot\":{},\"wslRoot\":\"\\\\\\\\wsl.localhost\",\"distributions\":[{}]}}",
+            "{{\"broker\":\"{}\",\"driverConnected\":{},\"driverState\":\"{}\",\"disabled\":{},\"bareSlashMode\":\"{}\",\"bareSlashTarget\":{},\"bareSlashRoot\":{},\"wslRoot\":\"\\\\\\\\wsl.localhost\",\"distributions\":[{}],\"flavor\":\"{}\",\"autoUpdate\":{},\"availableUpdate\":{},\"lastUpdateCheck\":{}}}",
             broker_status,
             driver_conn,
             driver_state_label,
@@ -741,7 +745,14 @@ fn cmd_status(json: bool) -> i32 {
                 .as_deref()
                 .map(|root| format!("\"{}\"", json_escape(root)))
                 .unwrap_or_else(|| "null".to_string()),
-            distro_list.join(",")
+            distro_list.join(","),
+            update::flavor_name(),
+            fsw_core::update::read_auto_update_enabled(),
+            fsw_core::update::cached_update_tag()
+                .map(|tag| format!("\"{}\"", json_escape(&tag)))
+                .unwrap_or_else(|| "null".to_string()),
+            fsw_core::update::last_update_check()
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
         );
         return 0;
     }
@@ -1252,6 +1263,9 @@ fn usage() {
          \x20 fwdslash bare-slash root <WindowsPath>\n\
          \x20 fwdslash disable | enable\n\
          \x20 fwdslash pause | resume       Aliases for disable and enable\n\
+         \x20 fwdslash update check [--json] [--force]\n\
+         \x20 fwdslash update install [--json] [--force] [--relaunch app|broker|none]\n\
+         \x20 fwdslash update status --json\n\
          \x20 fwdslash driver status\n\
          \x20 fwdslash start | stop\n\
          \x20 fwdslash install       Register and start the per-user broker\n\
@@ -1385,6 +1399,10 @@ fn main() {
             println!("{label}");
             if connected { 0 } else { 1 }
         }
+        // Self-update. Every route, both flavors, and the two helper-only
+        // apply verbs live behind this one arm -- and so does the only
+        // CoInitializeEx in the binary.
+        "update" if args.len() >= 3 => update::run(args.get(2..).unwrap_or_default()),
         "start" => start_broker(),
         "stop" => stop_broker(),
         "install" => set_windows_integration(true),
@@ -1399,9 +1417,14 @@ fn main() {
             // Sweep the shell adapters first so their helper state (payload,
             // markers, profile blocks) goes with the rest of the product.
             let sweep = adapters::sweep_uninstall();
-            // Downloaded update bundles go with the product; best effort,
-            // since a leftover bundle must not fail the uninstall.
+            // Downloaded update bundles, the staged helper and the helper's
+            // result file all live in the update directory and go with the
+            // product; best effort, since a leftover must not fail the
+            // uninstall. The relaunch watchdog is a scheduled task rather than
+            // a file, so it needs its own sweep -- an update task that fired
+            // after an uninstall would relaunch a product that is gone.
             let _ = fsw_core::update::sweep_update_directory();
+            let _ = scheduled_task::delete_task(update::relaunch::WATCHDOG_TASK_NAME);
             let win = set_windows_integration(false);
             let proto = set_settings_protocol(false);
             if win != 0 { win } else if proto != 0 { proto } else { sweep }

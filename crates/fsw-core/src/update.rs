@@ -1,8 +1,13 @@
-//! Update check and atomic self-update for the GitHub-distributed flavor.
+//! Update check and atomic self-update for the GitHub-distributed flavor,
+//! plus the flavor-independent state both flavors' updaters persist.
 //!
-//! Gated to `packaged && !is_store_flavor() && AutoUpdate`: the Microsoft
-//! Store build updates through the Store and must never perform this check
-//! (Store policy), and unpackaged dev builds should not ping GitHub either.
+//! The GitHub download/register path below is gated to
+//! `packaged && !is_store_flavor()`: the Microsoft Store build updates through
+//! the Store (`fwdslash update`, in the CLI, which owns every route) and must
+//! never fetch a bundle from GitHub, and unpackaged dev builds should not ping
+//! GitHub either. The *switch* is no longer flavor-gated —
+//! [`update_check_allowed`] takes `packaged` and `auto_update` only, and the
+//! flavor now only decides the switch's **default** ([`default_auto_update`]).
 //!
 //! Two-phase flow: `run_update_check` consults the GitHub latest-release API
 //! (via the System32 `curl.exe`, a real child whose files land in the real
@@ -15,11 +20,12 @@
 //! other `*.msixbundle` first, and `sweep_update_directory` (called by
 //! `fwdslash uninstall`) removes the directory outright. A registered bundle
 //! is deliberately KEPT — deferred registration only applies at the next
-//! launch, and `pending_bundle_path` + `restart_to_update` are the apply-now
-//! path for it: the settings app's "Restart to update", which registers with
-//! `-ForceApplicationShutdown` because the broker is resident and the deferred
-//! registration would otherwise never land. The bundle is deleted by the first
-//! check that finds the running version current, which is the proof it applied.
+//! launch, and [`pending_bundle_path`] is the apply-now path for it: the CLI's
+//! `fwdslash update install` hands the bundle to an identity-less helper that
+//! registers it with `-ForceApplicationShutdown` (the broker is resident, so a
+//! deferred registration would never land) behind a watchdog task that brings
+//! the product back afterwards. The bundle is deleted by the first check that
+//! finds the running version current, which is the proof it applied.
 //!
 //! Registry values `AutoUpdate`/`LastUpdateCheck`/`AvailableUpdate` live under
 //! the settings key, so — like every other value there — they are written
@@ -35,6 +41,17 @@ pub const CHECK_CADENCE_SECS: u64 = 24 * 60 * 60;
 pub const AUTO_UPDATE_VALUE: &str = "AutoUpdate";
 pub const LAST_UPDATE_CHECK_VALUE: &str = "LastUpdateCheck";
 pub const AVAILABLE_UPDATE_VALUE: &str = "AvailableUpdate";
+/// Optional `REG_SZ` override for the install ladder, read by the CLI:
+/// `auto` (the default when absent), `appinstall`, `store`, `winget`, `notify`.
+/// The one-line escape hatch if a route ever has to be switched off in the
+/// field without shipping a build.
+pub const UPDATE_ROUTE_VALUE: &str = "UpdateRoute";
+/// The file the identity-less update helper reports through, in
+/// [`update_directory_path`]. The helper must never write HKCU — its writes
+/// would land in the real hive while the packaged app reads the virtualized
+/// one — so it writes one of `completed`, `paused` or `error:0x…` here and the
+/// next packaged `update check`/`update status` folds that into the registry.
+pub const UPDATE_RESULT_FILE: &str = "last-result.txt";
 
 /// A semantic `(major, minor, patch)` triple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -166,9 +183,68 @@ pub fn check_is_due(last_check: Option<u64>, now: u64) -> bool {
     }
 }
 
-/// The gate: only the packaged GitHub flavor with auto-update enabled checks.
-pub fn update_check_allowed(packaged: bool, store_flavor: bool, auto_update: bool) -> bool {
-    packaged && !store_flavor && auto_update
+/// The gate for an **automatic** check: a packaged build whose Automatic
+/// updates switch is on. Both flavors now qualify — the Store flavor checks
+/// through `StoreContext` and the GitHub flavor through the releases API — so
+/// the flavor is no longer part of the question. It survives only in
+/// [`default_auto_update`], which decides what the switch means when the user
+/// has never touched it.
+///
+/// Unpackaged builds never check: there is nothing they could install.
+#[must_use]
+pub fn update_check_allowed(packaged: bool, auto_update: bool) -> bool {
+    packaged && auto_update
+}
+
+/// What the Automatic updates switch means when nothing is stored: on for the
+/// GitHub flavor (its only update route is this one), off for the Store flavor
+/// (the Store already updates the app on its own schedule, and driving the
+/// Store from inside the app is opt-in by decision).
+#[must_use]
+pub fn default_auto_update(store_flavor: bool) -> bool {
+    !store_flavor
+}
+
+/// The Automatic updates switch, from the raw stored DWORD.
+///
+/// The stored value is the **inverted** flag — `1` means auto-update off — and
+/// that is deliberately unchanged, so an explicit "off" recorded by an older
+/// build still reads as off. Only the absent case consults the flavor.
+#[must_use]
+pub fn auto_update_from_value(stored: Option<u32>, store_flavor: bool) -> bool {
+    match stored {
+        Some(value) => value == 0,
+        None => default_auto_update(store_flavor),
+    }
+}
+
+/// "never" / "just now" / "N minutes ago" / "N hours ago" / "N days ago" — the
+/// one-line last-check line the settings About card and `update status` print.
+///
+/// A `last` in the future (a clock that moved backwards) reads as "just now"
+/// rather than as a negative age.
+#[must_use]
+pub fn format_last_check(now: u64, last: Option<u64>) -> String {
+    let Some(last) = last else {
+        return "never".to_string();
+    };
+    let elapsed = now.saturating_sub(last);
+    let plural = |count: u64, unit: &str| -> String {
+        if count == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{count} {unit}s ago")
+        }
+    };
+    if elapsed < 60 {
+        "just now".to_string()
+    } else if elapsed < 60 * 60 {
+        plural(elapsed / 60, "minute")
+    } else if elapsed < 24 * 60 * 60 {
+        plural(elapsed / (60 * 60), "hour")
+    } else {
+        plural(elapsed / (24 * 60 * 60), "day")
+    }
 }
 
 /// The outcome of one update-check attempt.
@@ -193,7 +269,7 @@ pub mod windows_impl {
     };
     use crate::{FSW_SETTINGS_KEY, is_store_flavor, package_version};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows_registry::CURRENT_USER;
 
@@ -206,17 +282,16 @@ pub mod windows_impl {
             .unwrap_or(0)
     }
 
-    /// Reads the auto-update switch. Absent or unreadable means on: the
-    /// default for the GitHub flavor.
+    /// Reads the Automatic updates switch. Absent or unreadable falls back to
+    /// the flavor default (on for GitHub, off for the Store); an explicitly
+    /// stored value always wins, and the stored encoding is unchanged, so
+    /// nobody's recorded "off" flips.
     pub fn read_auto_update_enabled() -> bool {
-        match CURRENT_USER.open(FSW_SETTINGS_KEY) {
-            Ok(key) => match key.get_u32(AUTO_UPDATE_VALUE) {
-                // The value stores the DISABLED flag inverted (1 = off).
-                Ok(value) => value == 0,
-                Err(_) => true,
-            },
-            Err(_) => true,
-        }
+        let stored = CURRENT_USER
+            .open(FSW_SETTINGS_KEY)
+            .ok()
+            .and_then(|key| key.get_u32(AUTO_UPDATE_VALUE).ok());
+        super::auto_update_from_value(stored, is_store_flavor())
     }
 
     pub fn set_auto_update_enabled(enabled: bool) -> Result<(), u32> {
@@ -251,7 +326,11 @@ pub mod windows_impl {
         crate::set_setting_u64(LAST_UPDATE_CHECK_VALUE, now)
     }
 
-    fn last_check_time() -> Option<u64> {
+    /// The Unix time of the last check attempt, or `None` when none has run.
+    /// Public because both the CLI's `update status` and the settings About
+    /// card render it through [`super::format_last_check`].
+    #[must_use]
+    pub fn last_update_check() -> Option<u64> {
         let key = CURRENT_USER.open(FSW_SETTINGS_KEY).ok()?;
         key.get_u64(LAST_UPDATE_CHECK_VALUE).ok()
     }
@@ -268,9 +347,12 @@ pub mod windows_impl {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// `%LOCALAPPDATA%\ForwardSlashWindows\update`, the only place a
-    /// downloaded bundle is ever written.
-    fn update_directory() -> Option<PathBuf> {
+    /// `%LOCALAPPDATA%\ForwardSlashWindows\update`: the only place a
+    /// downloaded bundle, the staged update helper and the helper's
+    /// [`super::UPDATE_RESULT_FILE`] are ever written. Public because the CLI
+    /// stages the helper into it and reads the result file back out.
+    #[must_use]
+    pub fn update_directory_path() -> Option<PathBuf> {
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .map(|dir| dir.join("ForwardSlashWindows").join("update"))
@@ -302,7 +384,7 @@ pub mod windows_impl {
     /// Called once the running version has caught up: whatever was downloaded
     /// has been applied, so no bundle is worth its ~10 MB any more.
     fn discard_downloaded_bundles() {
-        if let Some(directory) = update_directory() {
+        if let Some(directory) = update_directory_path() {
             prune_bundles(&directory, None);
         }
     }
@@ -311,7 +393,7 @@ pub mod windows_impl {
     /// an uninstall leaves no downloaded bundle behind. An absent directory
     /// is success.
     pub fn sweep_update_directory() -> Result<(), u32> {
-        let Some(directory) = update_directory() else {
+        let Some(directory) = update_directory_path() else {
             return Ok(());
         };
         match std::fs::remove_dir_all(&directory) {
@@ -326,51 +408,12 @@ pub mod windows_impl {
     #[must_use]
     pub fn pending_bundle_path() -> Option<PathBuf> {
         let tag = cached_update_tag()?;
-        let bundle = update_directory()?.join(bundle_name(&tag));
+        let bundle = update_directory_path()?.join(bundle_name(&tag));
         bundle.is_file().then_some(bundle)
     }
 
-    /// Hands the update to a detached PowerShell that outlives this process:
-    /// wait for the app to exit, register the bundle with
-    /// `-ForceApplicationShutdown` (the broker is resident, so deferred
-    /// registration would never apply), then relaunch the packaged app.
-    ///
-    /// Returns whether the helper was spawned — not whether the update
-    /// succeeded, which happens after this process is gone. Always `false`
-    /// for an unpackaged build, which has no app to relaunch.
-    #[must_use]
-    pub fn restart_to_update(bundle: &Path) -> bool {
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-
-        let Some(family) = crate::package_family() else {
-            return false;
-        };
-        // Single-quoted PowerShell strings escape a quote by doubling it.
-        let quoted = bundle.to_string_lossy().replace('\'', "''");
-        let script = format!(
-            "Start-Sleep -Seconds 2; \
-             Add-AppxPackage -Path '{quoted}' -ForceApplicationShutdown; \
-             Start-Process 'shell:AppsFolder\\{family}!App'"
-        );
-        Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &script,
-            ])
-            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .is_ok()
-    }
-
     fn download_bundle(url: &str, tag: &str) -> Option<PathBuf> {
-        let update_dir = update_directory()?;
+        let update_dir = update_directory_path()?;
         std::fs::create_dir_all(&update_dir).ok()?;
         let destination = update_dir.join(bundle_name(tag));
         // Whatever an earlier release left here is dead weight.
@@ -407,16 +450,23 @@ pub mod windows_impl {
     /// Runs one update-check attempt. Never blocks longer than the curl
     /// timeouts; never surfaces an error to the caller — failures are
     /// `Unavailable`.
-    pub fn run_update_check() -> UpdateOutcome {
+    /// `force` is the user pressing "Check now": it bypasses the daily
+    /// cadence and the Automatic updates switch, but never the two facts —
+    /// packaged, and not the Store flavor — that decide whether this route
+    /// exists at all.
+    pub fn run_update_check(force: bool) -> UpdateOutcome {
         let packaged = crate::has_package_identity();
-        let store_flavor = is_store_flavor();
         let auto_update = read_auto_update_enabled();
-        if !update_check_allowed(packaged, store_flavor, auto_update) {
+        // The gate no longer knows about flavors, so the flavor test the
+        // GitHub route needs is spelled out here: this function downloads a
+        // bundle from GitHub, which the Store flavor must never do.
+        if is_store_flavor() || !(packaged && (force || update_check_allowed(packaged, auto_update)))
+        {
             return UpdateOutcome::NotDue;
         }
         // Throttle first: even an offline or rate-limited attempt counts.
-        let last = last_check_time();
-        if !super::check_is_due(last, now_unix()) {
+        let last = last_update_check();
+        if !force && !super::check_is_due(last, now_unix()) {
             return UpdateOutcome::NotDue;
         }
         let _ = note_check_attempt();
@@ -458,7 +508,11 @@ pub mod windows_impl {
         UpdateOutcome::Ready(tag.to_string())
     }
 
-    fn set_cached_update_tag(tag: &str) -> Result<(), u32> {
+    /// Records the tag (GitHub) or version (Store) an update would move to.
+    /// Public because the CLI's Store routes persist it from outside this
+    /// module — and, like every other Settings write, it goes through
+    /// `settings_write` so a packaged write reaches both hives (issue #52).
+    pub fn set_cached_update_tag(tag: &str) -> Result<(), u32> {
         crate::set_setting_string(AVAILABLE_UPDATE_VALUE, tag)
     }
 
@@ -467,8 +521,9 @@ pub mod windows_impl {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    cached_update_tag, dismiss_update, pending_bundle_path, read_auto_update_enabled,
-    restart_to_update, run_update_check, set_auto_update_enabled, sweep_update_directory,
+    cached_update_tag, clear_cached_update_tag, dismiss_update, last_update_check,
+    note_check_attempt, pending_bundle_path, read_auto_update_enabled, run_update_check,
+    set_auto_update_enabled, set_cached_update_tag, sweep_update_directory, update_directory_path,
 };
 
 // Non-Windows stand-ins for the three entry points other crates call
@@ -488,10 +543,16 @@ pub fn pending_bundle_path() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Nothing to restart into off Windows.
+/// No update directory off Windows.
 #[cfg(not(windows))]
 #[must_use]
-pub fn restart_to_update(bundle: &std::path::Path) -> bool {
-    let _ = bundle;
-    false
+pub fn update_directory_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// No check has ever run off Windows.
+#[cfg(not(windows))]
+#[must_use]
+pub fn last_update_check() -> Option<u64> {
+    None
 }

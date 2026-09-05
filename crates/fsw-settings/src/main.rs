@@ -754,12 +754,8 @@ impl Component for SettingsModel {
         // `run_update_check` no-ops for the Store flavor and unpackaged
         // builds). Off the UI thread so the curl timeouts cannot stall the
         // window.
-        if update::update_check_allowed(
-            has_package_identity(),
-            is_store_flavor(),
-            update::read_auto_update_enabled(),
-        ) {
-            context.spawn_background(|_| Msg::UpdateCheckFinished(update::run_update_check()));
+        if update::update_check_allowed(has_package_identity(), update::read_auto_update_enabled()) {
+            context.spawn_background(|_| Msg::UpdateCheckFinished(update::run_update_check(false)));
         }
         let mut model = Self {
             section: *input,
@@ -990,19 +986,25 @@ impl Component for SettingsModel {
                 Self::refresh(context);
             }
             Msg::RestartToUpdate => {
-                let Some(bundle) = update::pending_bundle_path() else {
+                // Presence only: the CLI resolves the bundle itself now, so
+                // this is just "is there anything to apply?".
+                if update::pending_bundle_path().is_none() {
                     self.notice = Some((
                         InfoBarSeverity::Error,
                         "Could not start the update",
                         "The update could not be started.".to_string(),
                     ));
                     return;
-                };
+                }
                 // Ask the broker to close first so it removes its notification
                 // icon itself; a forced shutdown by the installer would leave a
                 // ghost icon behind.
                 close_broker_window();
-                if update::restart_to_update(&bundle) {
+                // The apply itself moved into the CLI: it stages the
+                // identity-less helper, registers the relaunch watchdog and
+                // only then lets the registration force this package down.
+                // `--force` because the user just asked for it explicitly.
+                if run_controller(["update", "install", "--force", "--relaunch", "app"]) {
                     // Exit through the window's own close path: the reactor's
                     // only process-exit route is WinUI's `Window.Closed`.
                     request_close();
