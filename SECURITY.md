@@ -2,7 +2,7 @@
 
 ## Supported version
 
-The project is pre-release. Only the current `main` branch and version `0.0.4`
+The project is pre-release. Only the current `main` branch and version `0.0.5`
 receive security fixes.
 
 ## Reporting a vulnerability
