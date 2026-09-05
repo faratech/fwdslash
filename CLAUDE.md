@@ -418,7 +418,7 @@ change) whether or not the driver is actually loaded.
   settings app uses `/MD`. Warnings are errors — a new warning fails the build.
 - **Per-user only.** Everything is HKCU and `asInvoker`; there are no HKLM writes and nothing
   requires elevation. Keep it that way.
-- **Version `0.0.3`.** The Rust tree has one source of truth — `workspace.package.version` in
+- **Version `0.0.4`.** The Rust tree has one source of truth — `workspace.package.version` in
   the root `Cargo.toml` — and everything downstream of it derives:
   - each `build.rs` (`fsw-broker`, `fsw-settings`, `fsw-cli`) passes `FSW_VER_COMMAS` /
     `FSW_VER_STR` defines to `embed_resource::compile`, so both the numeric

@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $repo ("out\user\{0}\{1}" -f $Architecture.ToLowerInvariant(), $Configuration)
 $packageRoot = Join-Path $repo 'out\package'
-$stage = Join-Path $packageRoot ("forward-slash-windows-0.0.3-{0}" -f $Architecture.ToLowerInvariant())
+$stage = Join-Path $packageRoot ("forward-slash-windows-0.0.4-{0}" -f $Architecture.ToLowerInvariant())
 $archive = "$stage.zip"
 
 if (-not (Test-Path -LiteralPath $source)) {
