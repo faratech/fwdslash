@@ -128,6 +128,18 @@ pub fn result_for(code: i32, error: Option<&str>) -> HelperResult {
 }
 
 /// Runs the whole sequence for `product_id`.
+///
+/// **There is no already-up-to-date guard here, on purpose.** The identity-less
+/// helper cannot ask — `StoreContext::GetAppAndOptionalStorePackageUpdatesAsync`
+/// fails with `0x803F6101` without package identity — so the two things that
+/// stop a pointless install are both upstream: the packaged
+/// `fwdslash update install` resolves the available version before it schedules
+/// the helper at all, and the Store itself treats a start call for a product
+/// that is already current as a **completed no-op**. That second behaviour is
+/// measured, not assumed: an accidental identity-less
+/// `update apply-store --product 9P51CM0MTMK2` against a current 0.0.4 install
+/// returned zero queued items, wrote `completed`, left the package at 0.0.4 and
+/// left the broker running. The zero-item arm below is that case.
 pub fn apply_store_update(product_id: &str) -> Outcome {
     let product = HSTRING::from(product_id);
     let empty = HSTRING::new();

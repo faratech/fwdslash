@@ -254,6 +254,51 @@ pub fn install_moment_ok(forced: bool, settings_window_open: bool, worker_busy: 
     forced || (!settings_window_open && !worker_busy)
 }
 
+/// What `install` decides before any route runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precheck {
+    /// Nothing to install: exit 12.
+    Nothing,
+    /// Something to install, but not now: exit 10.
+    Defer,
+    /// Run the ladder.
+    Proceed,
+}
+
+/// The order the two gates have to be asked in.
+///
+/// **Availability outranks the moment**, and both outrank `--route` — which is
+/// why the route is not an argument here at all. A forced route says *how* to
+/// install, never *whether* there is anything to; and exit 10 means "there is
+/// an update, come back later", so answering it with nothing available would
+/// tell the broker to keep retrying an install that can never happen. That was
+/// the shipped bug: an open settings window turned "up to date" into
+/// "deferred, exit 10".
+#[must_use]
+pub fn install_precheck(update_available: bool, moment_ok: bool) -> Precheck {
+    if !update_available {
+        return Precheck::Nothing;
+    }
+    if moment_ok {
+        Precheck::Proceed
+    } else {
+        Precheck::Defer
+    }
+}
+
+/// The `state` string that goes with an exit code. Split out from
+/// [`report_for_code`] so the mapping is testable on its own.
+#[must_use]
+pub fn state_for_code(code: i32) -> &'static str {
+    match code {
+        EXIT_OK => "installed",
+        EXIT_AVAILABLE => "deferred",
+        EXIT_NEEDS_USER => "needsUser",
+        EXIT_NOTHING => "upToDate",
+        _ => "error",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The helper's result file
 // ---------------------------------------------------------------------------
@@ -518,6 +563,12 @@ fn now_unix() -> u64 {
 /// The `UpdateRoute` escape hatch: a `REG_SZ` under the settings key that pins
 /// one rung of the ladder without a rebuild, if the Store ever objects to
 /// route 1.
+///
+/// A **read**, which is why it may use `windows_registry` directly: the merged
+/// view a packaged process gets is always correct. Every settings *write* in
+/// this module goes through `fsw_core::update`, which routes to
+/// `fsw_core::settings_write` so a packaged write reaches the real hive too
+/// (issue #52). Nothing here may call `set_*`/`remove_value`.
 fn route_override() -> Option<Route> {
     let key = windows_registry::CURRENT_USER
         .open(fsw_core::FSW_SETTINGS_KEY)
@@ -653,30 +704,76 @@ fn resolve_route(explicit: Option<Route>) -> Route {
     route_for(override_route, appinstall, silent, winget, metered)
 }
 
+/// What the Store is offering, or — when it cannot be reached — whatever the
+/// last successful check recorded. `None` means there is nothing to install.
+///
+/// This is also the **guard on route 1b**. The staged helper has no package
+/// identity, so it cannot run `GetAppAndOptionalStorePackageUpdatesAsync` for
+/// itself; the Store treats `StartProductInstallWithOptionsAsync` for an
+/// already-current product as a completed no-op (measured), but relying on that
+/// would mean scheduling a task, staging an exe and driving an install to
+/// discover there was nothing to do. Asking here, once, from the process that
+/// *can* ask, is the cheap version.
+#[cfg(windows)]
+fn available_update() -> Option<String> {
+    match store::check_store_updates() {
+        Ok(versions) => {
+            // A real answer: keep the cached notice honest while we have one.
+            let _ = fsw_core::update::note_check_attempt();
+            let first = versions.into_iter().next();
+            match &first {
+                Some(version) => {
+                    let _ = fsw_core::update::set_cached_update_tag(version);
+                }
+                None => {
+                    let _ = fsw_core::update::clear_cached_update_tag();
+                }
+            }
+            first
+        }
+        // Offline, or the Store refused: trust what the last successful check
+        // recorded rather than refusing an install the user just asked for.
+        Err(_) => fsw_core::update::cached_update_tag(),
+    }
+}
+
 fn cmd_install(options: &Options) -> i32 {
     if !fsw_core::has_package_identity() {
         return Report::new("disabled", EXIT_NOTHING).emit(options, None);
     }
     let folded = fold_result_file();
-    // `worker_busy` is always false from here: only the broker knows whether
-    // its Enter worker is mid-handler, so it gates before it ever invokes us.
-    if !install_moment_ok(options.force, fsw_core::settings_window_exists(), false) {
-        return Report::new("deferred", EXIT_AVAILABLE).emit(options, folded);
-    }
 
     if !fsw_core::is_store_flavor() {
         return install_github_bundle(options, folded);
     }
 
-    // One apartment for the whole Store path; the route probes and every rung
-    // below nest inside it.
+    // One apartment for the whole Store path; the availability probe, the route
+    // probes and every rung below nest inside it.
     let _com = ComScope::new();
+    // Nothing to install outranks everything, including `--route`: a forced
+    // route says *how* to install, never *whether* there is anything to.
+    let Some(available) = available_update() else {
+        return Report::new("upToDate", EXIT_NOTHING).emit(options, folded);
+    };
+    // `worker_busy` is always false from here: only the broker knows whether
+    // its Enter worker is mid-handler, so it gates before it ever invokes us.
+    if install_precheck(
+        true,
+        install_moment_ok(options.force, fsw_core::settings_window_exists(), false),
+    ) == Precheck::Defer
+    {
+        return Report::new("deferred", EXIT_AVAILABLE)
+            .available(Some(available))
+            .emit(options, folded);
+    }
+
     match resolve_route(options.route) {
-        Route::AppInstall => install_via_appinstall(options, folded),
-        Route::Store => install_via_store(options, folded),
-        Route::Winget => install_via_winget(options, folded),
+        Route::AppInstall => install_via_appinstall(options, &available, folded),
+        Route::Store => install_via_store(options, &available, folded),
+        Route::Winget => install_via_winget(options, &available, folded),
         Route::Notify => Report::new("needsUser", EXIT_NEEDS_USER)
             .route(Route::Notify)
+            .available(Some(available))
             .emit(options, folded),
     }
 }
@@ -685,9 +782,21 @@ fn cmd_install(options: &Options) -> i32 {
 /// applying it is one `Add-AppxPackage -ForceApplicationShutdown` from a process
 /// that shutdown cannot reach.
 fn install_github_bundle(options: &Options, folded: Option<String>) -> i32 {
+    // Same order as the Store path: no bundle is "nothing to install" (12), and
+    // that answer comes before the moment gate, because a deferral is a promise
+    // that there is something to defer.
     let Some(bundle) = fsw_core::update::pending_bundle_path() else {
         return Report::new("upToDate", EXIT_NOTHING).emit(options, folded);
     };
+    if install_precheck(
+        true,
+        install_moment_ok(options.force, fsw_core::settings_window_exists(), false),
+    ) == Precheck::Defer
+    {
+        return Report::new("deferred", EXIT_AVAILABLE)
+            .available(fsw_core::update::cached_update_tag())
+            .emit(options, folded);
+    }
     let Some(helper) = helper::stage_helper() else {
         return Report::new("error", EXIT_ERROR)
             .detail("The update helper could not be staged.".to_string())
@@ -713,7 +822,7 @@ fn install_github_bundle(options: &Options, folded: Option<String>) -> i32 {
 /// *install* is allowed is only knowable at runtime. Any failure before an item
 /// is queued — `E_ACCESSDENIED` above all — drops to 1b, the identity-less
 /// staged helper; a failure to even schedule that drops to route 2.
-fn install_via_appinstall(options: &Options, folded: Option<String>) -> i32 {
+fn install_via_appinstall(options: &Options, available: &str, folded: Option<String>) -> i32 {
     let previous = previous_version();
     // Registered but deliberately NOT run yet. Its backstop trigger is a minute
     // out, which is longer than the 1a/1b decision takes, so the script 1b may
@@ -727,7 +836,7 @@ fn install_via_appinstall(options: &Options, folded: Option<String>) -> i32 {
                 // either way the cached notice is spent.
                 let _ = fsw_core::update::clear_cached_update_tag();
             }
-            let mut report = report_for_code(code, Route::AppInstall);
+            let mut report = report_for_code(code, Route::AppInstall).available(Some(available.to_string()));
             if let Some(detail) = helper_result_detail(&result) {
                 report = report.detail(detail);
             }
@@ -741,29 +850,33 @@ fn install_via_appinstall(options: &Options, folded: Option<String>) -> i32 {
                     return Report::new("installing", EXIT_OK)
                         .route(Route::AppInstall)
                         .action("scheduled")
+                        .available(Some(available.to_string()))
                         .detail(format!("In-process install unavailable ({detail})."))
                         .emit(options, folded);
                 }
             }
             // 1b is out too: continue down the ladder rather than reporting a
             // failure the user cannot act on.
-            install_via_store(options, folded)
+            install_via_store(options, available, folded)
         }
     }
 }
 
 /// Route 2: `StoreContext`, which only downloads silently when the user's Store
 /// is set to update apps automatically and the network is unmetered.
-fn install_via_store(options: &Options, folded: Option<String>) -> i32 {
+fn install_via_store(options: &Options, available: &str, folded: Option<String>) -> i32 {
     let previous = previous_version();
     // This one can terminate the package the moment deployment starts, so its
     // watchdog runs immediately rather than waiting for the backstop trigger.
     let _ = relaunch::schedule_watchdog(options.relaunch, &previous, true);
 
     match store::silent_download_and_install() {
-        Ok(code) => report_for_code(code, Route::Store).emit(options, folded),
+        Ok(code) => report_for_code(code, Route::Store)
+            .available(Some(available.to_string()))
+            .emit(options, folded),
         Err(detail) => Report::new("needsUser", EXIT_NEEDS_USER)
             .route(Route::Notify)
+            .available(Some(available.to_string()))
             .detail(format!("The Store declined a silent install ({detail})."))
             .emit(options, folded),
     }
@@ -772,10 +885,11 @@ fn install_via_store(options: &Options, folded: Option<String>) -> i32 {
 /// Route 3: hand the whole thing to `winget`, from the scheduled task so it
 /// survives the package going down. Skipped on a metered network — winget
 /// downloads regardless of the user's data settings.
-fn install_via_winget(options: &Options, folded: Option<String>) -> i32 {
+fn install_via_winget(options: &Options, available: &str, folded: Option<String>) -> i32 {
     if store::network_is_metered() {
         return Report::new("deferred", EXIT_AVAILABLE)
             .route(Route::Winget)
+            .available(Some(available.to_string()))
             .detail("The network is metered.".to_string())
             .emit(options, folded);
     }
@@ -788,22 +902,18 @@ fn install_via_winget(options: &Options, folded: Option<String>) -> i32 {
         Report::new("installing", EXIT_OK)
             .route(Route::Winget)
             .action("scheduled")
+            .available(Some(available.to_string()))
             .emit(options, folded)
     } else {
         Report::new("needsUser", EXIT_NEEDS_USER)
             .route(Route::Notify)
+            .available(Some(available.to_string()))
             .emit(options, folded)
     }
 }
 
 fn report_for_code(code: i32, route: Route) -> Report {
-    let state = match code {
-        EXIT_OK => "installed",
-        EXIT_AVAILABLE => "deferred",
-        EXIT_NOTHING => "upToDate",
-        _ => "error",
-    };
-    Report::new(state, code).route(route)
+    Report::new(state_for_code(code), code).route(route)
 }
 
 // ---------------------------------------------------------------------------

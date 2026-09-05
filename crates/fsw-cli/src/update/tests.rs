@@ -19,9 +19,9 @@ use super::relaunch::{
     winget_command,
 };
 use super::{
-    EXIT_AVAILABLE, EXIT_ERROR, EXIT_NOTHING, EXIT_OK, Fold, HelperResult, Options, Route,
-    UpdateJson, Verb, fold_helper_result, install_moment_ok, parse_args, parse_helper_result,
-    render_json, route_for,
+    EXIT_AVAILABLE, EXIT_ERROR, EXIT_NEEDS_USER, EXIT_NOTHING, EXIT_OK, Fold, HelperResult,
+    Options, Precheck, Route, UpdateJson, Verb, fold_helper_result, install_moment_ok,
+    install_precheck, parse_args, parse_helper_result, render_json, route_for, state_for_code,
 };
 use crate::scheduled_task::is_safe_task_literal;
 
@@ -100,6 +100,51 @@ fn route_names_round_trip() {
     assert_eq!(Route::parse("auto"), Some(None));
     assert_eq!(Route::parse("nonsense"), None);
     assert_eq!(Route::parse(""), None);
+}
+
+#[test]
+fn nothing_to_install_outranks_the_moment_gate_and_the_route() {
+    // The shipped bug: `update install --route notify` on an up-to-date Store
+    // package with the settings window open answered `deferred`, exit 10 --
+    // which tells the broker "there is an update, retry later" about an update
+    // that does not exist, and it would have retried forever.
+    //
+    // `install_precheck` takes no route at all, which is the fix stated as a
+    // type: a forced route says *how* to install, never *whether* there is
+    // anything to.
+    assert_eq!(install_precheck(false, false), Precheck::Nothing);
+    assert_eq!(install_precheck(false, true), Precheck::Nothing);
+    // With something to install, the moment gate decides.
+    assert_eq!(install_precheck(true, false), Precheck::Defer);
+    assert_eq!(install_precheck(true, true), Precheck::Proceed);
+}
+
+#[test]
+fn the_precheck_verdicts_carry_the_exit_codes_the_broker_keys_on() {
+    // 12 is "nothing to install" and is silent; 10 is "an update exists, come
+    // back later"; 11 is "an update exists and needs the user". Confusing the
+    // first two is what made an up-to-date install look like a pending one.
+    assert_eq!(state_for_code(EXIT_NOTHING), "upToDate");
+    assert_eq!(state_for_code(EXIT_AVAILABLE), "deferred");
+    assert_eq!(state_for_code(EXIT_NEEDS_USER), "needsUser");
+    assert_eq!(state_for_code(EXIT_OK), "installed");
+    assert_eq!(state_for_code(EXIT_ERROR), "error");
+    // An exit code no route produces is still an error, never a success.
+    assert_eq!(state_for_code(99), "error");
+}
+
+#[test]
+fn every_route_reports_nothing_to_install_the_same_way() {
+    // The route is chosen only after the precheck says Proceed, so all four
+    // rungs -- including a forced `--route notify`, which is the one that
+    // reported 10 -- share the single `Nothing` verdict above.
+    for route in [Route::AppInstall, Route::Store, Route::Winget, Route::Notify] {
+        // `route_for` still answers, because picking a rung is a separate
+        // question from whether one will ever be walked.
+        assert_eq!(route_for(Some(route), false, false, false, true), route);
+        // ...and the precheck that gates it never sees the route.
+        assert_eq!(install_precheck(false, true), Precheck::Nothing);
+    }
 }
 
 #[test]
