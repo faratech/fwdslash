@@ -120,6 +120,10 @@ jobs:
               -DescriptionUrl 'https://github.com/faratech/fwdslash'
 
       - name: Build the per-architecture ZIPs (signed executables)
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
           .\tools\Build-ReleaseZips.ps1 -Version '${{ steps.version.outputs.short }}'
 
