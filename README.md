@@ -227,3 +227,13 @@ MIT — see [LICENSE](LICENSE). By Mike Fara, Fara Technologies LLC, New York.
   <b>Star this repo if you find it useful!</b><br>
   <a href="https://github.com/faratech/fwdslash">https://github.com/faratech/fwdslash</a>
 </p>
+
+<p align="center">
+  <a href="https://apps.microsoft.com/detail/9P51CM0MTMK2?mode=direct">
+    <picture>
+      <source media="(prefers-color-scheme: light)" srcset="https://get.microsoft.com/images/en-us%20light.svg">
+      <img src="https://get.microsoft.com/images/en-us%20dark.svg" width="220" alt="Get fwdslash from the Microsoft Store">
+    </picture>
+  </a><br>
+  <sub>Available on the Microsoft Store as <b>fwdslash</b> — Store ID <code>9P51CM0MTMK2</code></sub>
+</p>
