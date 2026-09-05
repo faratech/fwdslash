@@ -201,7 +201,11 @@ here but resembles a keylogger to an automated scan, so state plainly:
   integrations from the settings app before uninstalling.
 - **Version is `0.0.3.0`.** Each submission must increase it, and the fourth
   field is reserved by the Store (always `0`). It comes from
-  `workspace.package.version`; see the version-copy list in CLAUDE.md.
+  `workspace.package.version`, and the statement above is one of the locations
+  `tools/bump_version.py` rewrites — bump with `python3 tools/bump_version.py
+  <x.y.z>` rather than editing it, and CI's `--check` will catch it if this
+  line ever falls behind the workspace. The three-field version in the tag and
+  in `Cargo.toml` always gains the reserved `.0` here.
 
 ## 6. Verification checklist for the 0.0.3 submission
 

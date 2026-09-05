@@ -194,6 +194,12 @@ cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc   # shell adapters
 
 ---
 
+## Releasing
+
+The version lives in one place — `[workspace.package] version` in the root `Cargo.toml` — and every other copy of it (the VERSIONINFO fallbacks, both app manifests, the CMake project version, the ZIP stage name, `SECURITY.md`, the Store doc) is rewritten by `python3 tools/bump_version.py 0.0.4` (`.\tools\Bump-Version.ps1` on Windows). CI runs `tools/bump_version.py --check` on every push, so a copy left behind fails the build rather than shipping. To cut a release: bump, open a PR, merge it, then tag the merge commit `v0.0.4` and push the tag. [`.github/workflows/release.yml`](.github/workflows/release.yml) takes it from there — it refuses to run if the tag and the workspace version disagree, then builds x64 and ARM64, signs the GitHub flavor with Azure Trusted Signing, publishes the GitHub release, and submits the unsigned Store bundle to Partner Center. Nothing is built or signed by hand.
+
+---
+
 ## Filesystem driver
 
 `driver/` holds an optional minifilter that would extend `/Ubuntu/...` paths to every Windows filesystem API (PowerShell, .NET, Python). It is **not part of any release**.
