@@ -61,11 +61,15 @@ reads the text of the focused control through Windows UI Automation. If that
 text begins with `/`, it is translated into the equivalent WSL path (for
 example `/etc/apt` becomes `\\wsl.localhost\Ubuntu\etc\apt`) and written back to
 the control so Windows opens the right location. If the text does not begin with
-`/`, the keystroke is replayed unchanged and nothing further happens.
+`/`, the keystroke is replayed unchanged and nothing further happens. Before
+any read, rewrite, replay, or Escape action, the app rechecks that both the
+original foreground window and exact focused control are still current; a stale
+request is dropped rather than redirected to a later window.
 
-The text is only read at all when the focused control is an editable, non-password
-Edit or ComboBox that the app could write back to — so a Find box, a password
-field or a read-only control in one of those windows is never read, and the
+The text is only read at all when the focused control positively reports an
+editable, non-password Edit or ComboBox with a writable ValuePattern. A failed
+UI Automation property query is a rejection, not a guess. A Find box, password
+field, read-only control, or unavailable UIA property is never read, and the
 keystroke passes through untouched.
 
 This text is used immediately, in memory, and is never written to disk or sent
@@ -91,9 +95,10 @@ All of it is local, and all of it is reversible from the settings app.
 | `HKCU\Software\ForwardSlashWindows\Settings` (`LastUpdateCheck`) | Both builds. A timestamp, so the check runs at most once a day. |
 | `HKCU\Software\ForwardSlashWindows\Settings` (`AvailableUpdate`) | Both builds. The version or release tag of an update that is waiting, so the notice survives a restart. |
 | `HKCU\Software\ForwardSlashWindows\Settings` (`UpdateRoute`) | Both builds. Optional and never written by the app: set it by hand to pin one install route, or to `notify` to stop the app installing anything by itself. |
-| `%LOCALAPPDATA%\ForwardSlashWindows\update` | Both builds. The GitHub build's downloaded update package, deleted once it has been applied; the two files below. `fwdslash uninstall` removes the directory. |
+| `%LOCALAPPDATA%\ForwardSlashWindows\update` | Both builds. Updater storage: a GitHub download is kept as a `*.part` file until atomically promoted, `update-attempt.lock` holds an attempt-owner token, and `fwdslash uninstall` cancels owned update tasks before sweeping this directory. |
 | `%LOCALAPPDATA%\ForwardSlashWindows\update\fwdslash-helper.exe` | Only while an update installs. A byte-identical copy of the app's own command-line executable, run without package identity — the only way to ask the Store to install an update over the running app, and to register a downloaded GitHub package while it is in use. The next install overwrites it and `fwdslash uninstall` removes it. |
 | `%LOCALAPPDATA%\ForwardSlashWindows\update\last-result.txt` | One word written by that helper — `completed`, `paused`, or `error:` with the Windows error code — so the app can learn how the install ended. The next check or status reads it and deletes it. It records no path and nothing you typed. |
+| `%TEMP%\fwdslash-update-<pid>-<sequence>.cmd` and `.xml` | Immutable temporary sidecars for one uniquely named `fwdslash-update-watchdog-<pid>-<sequence>` task. They contain updater commands and package metadata only, never typed paths or keystrokes, and are removed with their owning task. |
 
 **Diagnostics.** The background process writes a diagnostic log only if you set
 the `FSW_DIAGNOSTIC_LOG` environment variable yourself. It is off by default.

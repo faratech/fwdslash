@@ -35,6 +35,50 @@ $storePublisher = 'CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4'
 # it is a redirector, and a wrong channel installs a runtime the package still
 # refuses to run against.
 $runtimeInstallerUrl = 'https://aka.ms/windowsappsdk/2.0/latest/windowsappruntimeinstall-{0}.exe'
+$runtimeFrameworkName = 'Microsoft.WindowsAppRuntime.2'
+$runtimeMinimumVersion = [version]'2.0.0.0'
+
+function Get-ForwardSlashWindowsNativeArchitecture {
+    # Under WOW64, PROCESSOR_ARCHITECTURE describes the emulated PowerShell
+    # process while PROCESSOR_ARCHITEW6432 describes the native OS. This works
+    # in Windows PowerShell 5.1 without Core-only RuntimeInformation APIs.
+    $architecture = $env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = $env:PROCESSOR_ARCHITECTURE
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        throw 'Forward Slash Windows supports only x64 and ARM64 Windows (no native architecture was reported).'
+    }
+    switch ($architecture.ToUpperInvariant()) {
+        'AMD64' { return 'x64' }
+        'X64' { return 'x64' }
+        'ARM64' { return 'arm64' }
+        default { throw "Forward Slash Windows supports only x64 and ARM64 Windows (detected '$architecture')." }
+    }
+}
+
+function Test-ForwardSlashWindowsRuntime {
+    param([Parameter(Mandatory = $true)][string]$Architecture)
+
+    foreach ($package in @(Get-AppxPackage -Name $runtimeFrameworkName -ErrorAction SilentlyContinue)) {
+        if ($null -eq $package -or
+            $package.Name -ne $runtimeFrameworkName -or
+            -not $package.IsFramework -or
+            ([string]$package.Architecture) -ine $Architecture) {
+            continue
+        }
+        try {
+            if ([version]$package.Version -ge $runtimeMinimumVersion) {
+                return $true
+            }
+        } catch {
+            # A malformed registration cannot satisfy a package dependency.
+        }
+    }
+    return $false
+}
+
+$runtimeArchitecture = Get-ForwardSlashWindowsNativeArchitecture
 
 $storeInstall = Get-AppxPackage -Name '32827MikeFara.fwdslash' -ErrorAction SilentlyContinue |
     Where-Object { $_.Publisher -eq $storePublisher }
@@ -73,11 +117,7 @@ Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $outFile
 # package present, Add-AppxPackage fails with 0x80073CF3 (dependency missing)
 # and, if it were installed anyway, the app would refuse to start. The Store
 # flavor gets this resolved for it; a bare Add-AppxPackage does not.
-if (-not (Get-AppxPackage -Name 'Microsoft.WindowsAppRuntime.2*' -ErrorAction SilentlyContinue)) {
-    $runtimeArchitecture = switch ($env:PROCESSOR_ARCHITECTURE) {
-        'ARM64' { 'arm64' }
-        default { 'x64' }
-    }
+if (-not (Test-ForwardSlashWindowsRuntime -Architecture $runtimeArchitecture)) {
     $runtimeUrl = $runtimeInstallerUrl -f $runtimeArchitecture
     $runtimeFile = Join-Path $env:TEMP "WindowsAppRuntimeInstall-$runtimeArchitecture.exe"
     Write-Host "Installing the Windows App Runtime 2.x ($runtimeArchitecture); this is a one-time prerequisite..."

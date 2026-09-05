@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -34,6 +33,36 @@ jobs:
         if: matrix.preset == 'x64-debug'
         shell: pwsh
         run: ctest --preset x64-debug
+
+  powershell-regressions:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # These fixtures import the adapter but never install it, use no profile,
+      # and mock every installer/network/package action. Invoke the Windows
+      # PowerShell 5.1 executable explicitly: pwsh has different binding and
+      # session-state behavior that would miss the compatibility contract.
+      - name: Test PowerShell adapter location wrappers
+        shell: powershell
+        run: |
+          & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\test\powershell\ForwardSlashWindows.LocationRegression.ps1
+          if ($LASTEXITCODE -ne 0) { throw "location regression fixture failed with $LASTEXITCODE" }
+      - name: Test PowerShell adapter location wrappers (PowerShell 7)
+        shell: pwsh
+        run: |
+          & pwsh -NoProfile -File .\test\powershell\ForwardSlashWindows.LocationRegression.ps1
+          if ($LASTEXITCODE -ne 0) { throw "PowerShell 7 location regression fixture failed with $LASTEXITCODE" }
+      - name: Test installer runtime architecture selection
+        shell: powershell
+        run: |
+          & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\test\powershell\Install-fwdslash.RuntimeRegression.ps1
+          if ($LASTEXITCODE -ne 0) { throw "runtime regression fixture failed with $LASTEXITCODE" }
+      - name: Test release version/ref validation
+        shell: powershell
+        run: |
+          & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\test\powershell\ReleaseVersionRegression.ps1
+          if ($LASTEXITCODE -ne 0) { throw "release-version regression fixture failed with $LASTEXITCODE" }
 
   driver-compile:
     # Hosted Windows images ship no WDK (stampinf.exe is missing), so this job
@@ -86,6 +115,13 @@ jobs:
 
       - name: Test the version bumper
         run: python3 -m unittest tools.test_bump_version
+
+      - name: Test Store-submission HTTP verifier
+        run: |
+          command -v python3
+          command -v curl
+          command -v jq
+          python3 tools/test_check_store_submission_http.py
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.98.1
@@ -176,8 +212,13 @@ jobs:
           git diff --exit-code -- crates/fsw-cli/src/update/install_control.rs
           if ($LASTEXITCODE -ne 0) { throw 'install_control.rs is stale: run python tools/regen_install_control.py' }
 
-      - name: Test the CLI (adapter tests live in the bin, not a lib)
-        run: cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc --locked
+      - name: Test CLI, broker, and settings binaries
+        env:
+          # The update integration executable probes installer state. On a
+          # hosted non-elevated runner, prevent that child process from asking
+          # for elevation; this applies only to this test process tree.
+          __COMPAT_LAYER: RunAsInvoker
+        run: cargo test -p fwdslash -p fswbroker -p fswsettings --bins --target x86_64-pc-windows-msvc --locked
 
       - name: Release build
         run: cargo build --release --workspace --target x86_64-pc-windows-msvc --locked

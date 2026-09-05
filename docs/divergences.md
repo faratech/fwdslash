@@ -266,21 +266,22 @@ the same. It reports through `last-result.txt` in the same directory —
 it**, so one helper run is folded exactly once. Only `completed` clears the
 cached `AvailableUpdate` notice; a pause or an error leaves it standing.
 
-**The watchdog** is one per-user scheduled task, `fwdslash-update`, registered
-with `/f` (so retries overwrite rather than accumulate) **before** the install
-runs, because a process the Store has just force-closed cannot relaunch itself.
-Its `.cmd` runs the optional lead command (the helper, or `winget`), then an
-inline `powershell.exe -Command` watchdog that polls `Get-AppxPackage` every 5 s
-until the installed version is greater than the one that was running, ceiling 45
-minutes, then relaunches — `--relaunch broker` (the default) starts the broker
-through the app-execution alias and only when none is running, `app` starts the
-package's `App` entry point, `none` skips. Then the task deletes itself and its
-script. The script text obeys two rules the tests assert: **no `%`** (`cmd.exe`
-would expand it silently — hence `$env:LOCALAPPDATA`) and **no `"`** (it would
-end the argument `cmd.exe` is building), which is also why the comparisons are
-`-lt`/`-gt`/`-not`. Every literal spliced in is checked by
-`is_safe_task_literal` first, and an unsafe one produces **no script at all**
-rather than a mangled one.
+**The watchdog** is a unique per-user task named
+`fwdslash-update-watchdog-<pid>-<sequence>`, registered before the install
+runs because a force-closed package cannot relaunch itself. Each attempt owns
+immutable temporary `.cmd` and `.xml` sidecars rather than rewriting a shared
+script. The command runs the optional helper or `winget`, then polls
+`Get-AppxPackage` every 5 s for a **newer version of the exact package family**.
+Only that condition permits `--relaunch broker` (the default) or `app`; `none`
+skips it. A 45-minute timeout reports a failed handoff and does not relaunch the
+old package. The task removes only its own task and sidecars. Script literals
+remain validated before they are written.
+
+Each attempt owns an `update-attempt.lock` token in the updater directory.
+GitHub downloads remain `*.part` files until atomic promotion, and
+`last-result.txt` contains only the compact completed/paused/error outcome.
+`fwdslash uninstall` cancels owned tasks before sweeping updater storage, so it
+does not delete another attempt's live files.
 
 **`UpdateRoute`** (`REG_SZ` under the settings key, values `auto`, `appinstall`,
 `store`, `winget`, `notify`) pins one rung without a rebuild — the escape hatch
@@ -615,7 +616,8 @@ three, and this section is the whole list.
   `wParam` and the foreground HWND in `lParam`.
 - Everything that can block runs there: UI Automation, the resolver,
   `ShellExecuteExW` (now with `SEE_MASK_ASYNCOK | SEE_MASK_FLAG_NO_UI`),
-  `SendInput`, `Navigate2`, and `persist_disabled`. A low-level hook whose
+  `SendInput`, and `Navigate2`. Pause persistence has its own FIFO background
+  queue. A low-level hook whose
   thread exceeds `LowLevelHooksTimeout` is removed by Windows without telling
   the process, and binding `\\wsl.localhost\<distro>` boots a stopped
   distribution — seconds, on the thread that owns every keystroke on the
@@ -629,16 +631,22 @@ three, and this section is the whole list.
 
 **Behaviour.**
 
-- **A stale request is dropped, not replayed.** If the foreground window changed
-  while the request was queued, the worker logs
+- **Worker delivery never becomes hook-thread work.** A missing worker window
+  passes Enter through natively; a failed menu-path post discards the request
+  and reports it. Neither path falls back to inline `ShellExecuteExW` or a
+  synchronous persistence write on the hook-owning thread.
+- **A stale request is dropped, not replayed.** If the foreground window or the
+  exact focused control changed while the request was queued or a blocking UIA/
+  COM call was in progress, the worker logs
   `event=enter_dropped_foreground_changed` and returns. Replaying Enter into
   whatever the user switched to would send a half-written message or run a
   half-typed command.
 - **`#32770` is narrowed twice.** In the hook, a dialog outside `explorer.exe`
   qualifies only if it has a `DUIViewWndClassName` child (the modern
   common-item dialog) or a `cmb13`/`edt1` control (the classic one). In the
-  worker, **every** surface additionally requires the focused element to be an
-  Edit or ComboBox, `IsPassword == false`, and a non-read-only `ValuePattern`;
+  worker, **every** surface additionally requires the focused element to
+  positively report Edit or ComboBox, `IsPassword == false`, and a non-read-only
+  `ValuePattern`; an unavailable property is a rejection, not a false value;
   otherwise it logs `event=surface_rejected` and replays untouched. The C++
   claims every `#32770` in every process, which is how it swallowed Enter in
   Find boxes and rewrote their search text. Requiring the writable pattern
@@ -652,11 +660,14 @@ three, and this section is the whole list.
   (`fsw_core::settings_write`, issue #52), and a process creation plus wait on
   the hook thread is exactly what must not happen.
   A failed write surfaces later as a balloon plus
-  `event=persist_disabled_failed`; a failed `install_hook` on resume shows the
+  `event=persist_disabled_failed`. Persistence is one FIFO background queue,
+  so rapid toggles preserve submission order; a queue/start failure is reported
+  asynchronously and never falls back to an inline registry write. A failed
+  `install_hook` on resume shows the
   hook balloon and answers 0. The CLI turns that 0 into a specific message by
   asking the broker what state it actually reached.
 - **The tray icon and its menu.** Tooltip:
-  `Forward Slash Windows — active` / `— paused` / `— hook unavailable`.
+  `Forward Slash Windows — active` / `— paused` / `— processing unavailable`.
   `Shell_NotifyIconW(NIM_ADD)` is checked (it fails with `ERROR_TIMEOUT` while
   the shell is busy — exactly when the MSIX startup task runs at logon); a
   failure sets `ICON_ADDED = false`, logs `event=tray_icon_add_failed`,
@@ -736,7 +747,7 @@ three, and this section is the whole list.
   the same rule as the adapter sweep, because this thread owns the low-level
   keyboard hook; a spawn failure logs `event=update_cycle_skipped` and waits for
   the next tick, and a `Drop` guard clears `UPDATE_RUNNING` however the cycle
-  ends. It runs `fwdslash update check --json` (120 s ceiling) against the
+  ends. It runs `fwdslash update check --json` (180 s ceiling) against the
   `fwdslash.exe` **beside the broker**, never one from PATH, and on exit 10 goes
   on to `fwdslash update install --relaunch broker --json` (300 s) — no
   `--force`, so the CLI's own moment gate still declines while a settings window
@@ -957,4 +968,3 @@ before the milestone that lands it can close.
   `PowerShell\<version>` module directory is keyed on the version each edition's marker records, and
   orphaned version directories are pruned on uninstall, on the `fwdslash uninstall` sweep, and after
   every successful PowerShell `enable`.
-

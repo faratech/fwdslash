@@ -10,8 +10,9 @@ recognized navigation edit receives Enter
                  |
    broker WORKER thread (own STA + UIA)
                  |
-   focused control must be a writable
-   Edit/ComboBox; foreground rechecked
+   focused control must positively report a
+   non-password, writable Edit/ComboBox;
+   foreground and focused control rechecked
           /                  \
    not a slash path       slash path
           |                  |
@@ -35,8 +36,33 @@ open, the replay and the Explorer COM navigation all happen there. Windows
 removes a low-level hook whose thread exceeds `LowLevelHooksTimeout` and does
 not say so, and binding `\\wsl.localhost\<distro>` boots a stopped distribution
 — seconds of blocking on the thread that owns every keystroke on the machine.
-If the foreground window changed while the request was queued it is dropped
-rather than replayed into whatever the user switched to.
+If the foreground window or focused control changed while the request was
+queued or while a blocking UIA/COM call was running, it is dropped rather than
+replayed into whatever the user switched to. UIA failures to establish that a
+control is non-password and writable fail closed: its text is never read.
+
+The worker is an admission boundary as well as a queue: if it is unavailable,
+the hook passes Enter through natively and the broker reports processing as
+unavailable. Menu path opens are likewise dropped and reported when they cannot
+be posted to the worker; the hook-owning thread never falls back to an inline
+shell open. Pause state changes immediately remove or install the hook, then
+enter one FIFO persistence queue. Registry writes and their failures are
+reported asynchronously, so rapid pause/resume/pause requests cannot persist an
+older toggle last.
+
+## Update handoff and cleanup
+
+Each install attempt owns a tokenized `update-attempt.lock` in the updater
+directory. Downloaded GitHub bundles remain `*.part` files until atomically
+promoted. The helper records a compact outcome in `last-result.txt`; it never
+records a user path or keystroke.
+
+The updater creates uniquely named `fwdslash-update-watchdog-<pid>-<sequence>`
+tasks. Their `.cmd` and `.xml` sidecars are immutable temporary files, so one
+attempt cannot overwrite another's launch plan. The watchdog relaunches only
+after it observes a newer package from the exact package family. A 45-minute
+wait timeout is a failed handoff, not permission to relaunch an old package.
+Uninstall cancels tasks owned by this product before it sweeps updater storage.
 
 Explorer and native dialogs receive a UNC rewrite followed by Enter, preserving
 native behavior and the active Explorer tab. Bare `/` is special-cased by the
