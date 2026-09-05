@@ -286,49 +286,85 @@ function Test-ForwardSlashWindowsParentReference {
 function Invoke-ForwardSlashWindowsSetLocation {
     [CmdletBinding(DefaultParameterSetName = 'Path')]
     param(
-        [Parameter(Position = 0, ParameterSetName = 'Path')]
+        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]
         [string]$Path,
         [Parameter(Mandatory = $true, ParameterSetName = 'LiteralPath')]
         [string]$LiteralPath,
-        [Parameter(ParameterSetName = 'Path')]
-        [Parameter(ParameterSetName = 'LiteralPath')]
+        [Parameter(Mandatory = $true, ParameterSetName = 'Stack')]
         [string]$StackName,
-        [Parameter(ParameterSetName = 'Path')]
-        [Parameter(ParameterSetName = 'LiteralPath')]
-        [switch]$PassThru
+        [switch]$PassThru,
+        [switch]$UseTransaction
     )
 
-    $forward = $PSBoundParameters
-    $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
-    if ($null -eq $result) {
+    process {
+        $forward = $PSBoundParameters
+        $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
+        if ($null -eq $result) {
         # 'cd ..' at a distribution's share root: PowerShell's own answer is
         # "Cannot find path '\\wsl.localhost'", which reads like a broken
         # install rather than "there is nothing above this". Both checks here
         # are string work on arguments already in hand, and the registry read
         # is only reached in that rare case, so an ordinary 'cd ..' still pays
         # nothing. Paused, the native error is the honest answer.
-        if (Test-ForwardSlashWindowsParentReference -Arguments @($forward.Values)) {
+            if (Test-ForwardSlashWindowsParentReference -Arguments @($forward.Values)) {
             $distribution = Get-ForwardSlashWindowsDistributionRoot
             if ($distribution -and -not (Test-ForwardSlashWindowsDisabled)) {
                 Write-Host "Already at the root of $distribution; a distribution share has no parent directory."
                 return
             }
         }
-        Microsoft.PowerShell.Management\Set-Location @forward
-        return
-    }
-    if ($result.Message) {
+            Microsoft.PowerShell.Management\Set-Location @forward
+            return
+        }
+        if ($result.Message) {
         # A rejected input or the bare root: never fall through to the
         # native cmdlet's misleading "Cannot find path 'C:\etc'".
-        Write-Error $result.Message
-        return
+            Write-Error $result.Message
+            return
+        }
+        # The resolver's target is filesystem data, never a wildcard pattern.
+        # Replace Path rather than retaining it so native wildcard expansion
+        # cannot reinterpret a literal '[' or ']' in a resolved directory.
+        [void]$forward.Remove('Path')
+        $forward['LiteralPath'] = $result.Target
+        Microsoft.PowerShell.Management\Set-Location @forward
     }
-    # Replace only the selected path parameter; native named options retain
-    # their original binding and semantics.
-    $pathParameter = if ($forward.ContainsKey('LiteralPath')) { 'LiteralPath' } else { 'Path' }
-    $forward[$pathParameter] = $result.Target
-    Microsoft.PowerShell.Management\Set-Location @forward
 }
+
+# Set-Location has location stacks too. Its module-scoped function would use a
+# module stack for -StackName, so install the same caller-scope wrapper used by
+# pushd. The module function above remains exported for module-qualified use.
+$script:FswSetLocationBody = @'
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true, ParameterSetName = 'LiteralPath')]
+        [string]$LiteralPath,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Stack')]
+        [string]$StackName,
+        [switch]$PassThru,
+        [switch]$UseTransaction
+    )
+
+    process {
+        $forward = $PSBoundParameters
+        $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
+        if ($null -eq $result) {
+            Microsoft.PowerShell.Management\Set-Location @forward
+            return
+        }
+        if ($result.Message) {
+            Write-Error $result.Message
+            return
+        }
+        [void]$forward.Remove('Path')
+        $forward['LiteralPath'] = $result.Target
+        Microsoft.PowerShell.Management\Set-Location @forward
+    }
+'@
+Set-Item -Path function:global:Invoke-ForwardSlashWindowsSetLocation `
+    -Value ([scriptblock]::Create($script:FswSetLocationBody))
 
 # The pushd wrapper is installed as a *global* function built from an unbound
 # script block, not as a module function, for two reasons that only affect
@@ -342,31 +378,30 @@ function Invoke-ForwardSlashWindowsSetLocation {
 $script:FswPushLocationBody = @'
     [CmdletBinding(DefaultParameterSetName = 'Path')]
     param(
-        [Parameter(Position = 0, ParameterSetName = 'Path')]
+        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]
         [string]$Path,
         [Parameter(Mandatory = $true, ParameterSetName = 'LiteralPath')]
         [string]$LiteralPath,
-        [Parameter(ParameterSetName = 'Path')]
-        [Parameter(ParameterSetName = 'LiteralPath')]
         [string]$StackName,
-        [Parameter(ParameterSetName = 'Path')]
-        [Parameter(ParameterSetName = 'LiteralPath')]
-        [switch]$PassThru
+        [switch]$PassThru,
+        [switch]$UseTransaction
     )
 
-    $forward = $PSBoundParameters
-    $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
-    if ($null -eq $result) {
+    process {
+        $forward = $PSBoundParameters
+        $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
+        if ($null -eq $result) {
+            Microsoft.PowerShell.Management\Push-Location @forward
+            return
+        }
+        if ($result.Message) {
+            Write-Error $result.Message
+            return
+        }
+        [void]$forward.Remove('Path')
+        $forward['LiteralPath'] = $result.Target
         Microsoft.PowerShell.Management\Push-Location @forward
-        return
     }
-    if ($result.Message) {
-        Write-Error $result.Message
-        return
-    }
-    $pathParameter = if ($forward.ContainsKey('LiteralPath')) { 'LiteralPath' } else { 'Path' }
-    $forward[$pathParameter] = $result.Target
-    Microsoft.PowerShell.Management\Push-Location @forward
 '@
 Set-Item -Path function:global:Invoke-ForwardSlashWindowsPushLocation `
     -Value ([scriptblock]::Create($script:FswPushLocationBody))
@@ -378,5 +413,4 @@ Set-Alias -Name chdir -Value Invoke-ForwardSlashWindowsSetLocation -Scope Global
 Set-Alias -Name sl -Value Invoke-ForwardSlashWindowsSetLocation -Scope Global -Option AllScope -Force
 Set-Alias -Name pushd -Value Invoke-ForwardSlashWindowsPushLocation -Scope Global -Option AllScope -Force
 Export-ModuleMember -Function Invoke-ForwardSlashWindowsChildItem,
-    Invoke-ForwardSlashWindowsSetLocation,
     Resolve-ForwardSlashWindowsLocationTarget
