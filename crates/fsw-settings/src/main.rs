@@ -10,16 +10,16 @@
 //! reads it; `fwdslash.exe` is spawned only to *change* state. Anything that differs
 //! on purpose belongs in `docs/divergences.md`.
 
-use fsw_core::{
-    BrokerState, CMD_ADAPTER_KEY, FSW_BROKER_WINDOW_CLASS, FSW_VERSION, FilterServiceState,
-    POWERSHELL_ADAPTER_ROOT, STORE_PRODUCT_ID, SettingsValues, adapter_installed,
-    adapter_outdated, adapter_version, broker_state, broker_window_exists, ensure_broker_running,
-    executable_available, executable_directory, filter_port_available, filter_service_state,
-    get_default_distribution, has_package_identity, is_store_flavor,
-    list_registered_distributions, package_architecture, package_version,
-    sync_settings_to_real_hive, update, windows_integration_installed,
-};
 use fsw_core::update::UpdateOutcome;
+use fsw_core::{
+    BrokerState, CMD_ADAPTER_KEY, ExecutionPolicy, FSW_BROKER_WINDOW_CLASS, FSW_VERSION,
+    FilterServiceState, POWERSHELL_ADAPTER_ROOT, STORE_PRODUCT_ID, SettingsValues,
+    adapter_installed, adapter_outdated, adapter_version, broker_state, broker_window_exists,
+    ensure_broker_running, executable_available, executable_directory, filter_port_available,
+    filter_service_state, get_default_distribution, has_package_identity, is_store_flavor,
+    list_registered_distributions, package_architecture, package_version, probe_windows_powershell,
+    restricted_policy_message, sync_settings_to_real_hive, update, windows_integration_installed,
+};
 use fsw_path::{BareSlashMode, eq_ignore_case, is_valid_windows_root};
 use std::env;
 use std::path::PathBuf;
@@ -138,9 +138,7 @@ impl Integration {
         match self {
             Self::Windows => state.windows,
             // One source of truth: the adapter row read in `State::read`.
-            _ => state
-                .adapter(self)
-                .is_some_and(|adapter| adapter.installed),
+            _ => state.adapter(self).is_some_and(|adapter| adapter.installed),
         }
     }
 
@@ -286,7 +284,10 @@ impl State {
         let powershell7_key = format!("{POWERSHELL_ADAPTER_ROOT}PowerShell");
         let adapters = [
             (Integration::Cmd, CMD_ADAPTER_KEY),
-            (Integration::WindowsPowerShell, windows_powershell_key.as_str()),
+            (
+                Integration::WindowsPowerShell,
+                windows_powershell_key.as_str(),
+            ),
             (Integration::PowerShell7, powershell7_key.as_str()),
         ]
         .into_iter()
@@ -716,9 +717,16 @@ impl SettingsModel {
         terminal: bool,
         arguments: Vec<String>,
     ) {
+        let windows_powershell_enable = Self::is_windows_powershell_enable(&arguments);
         self.pending = Some(action);
         context.spawn_background(move |_| {
-            let (succeeded, detail) = run_controller_detailed(arguments);
+            let (succeeded, detail) = match Self::preflight_windows_powershell_enable(
+                windows_powershell_enable,
+                probe_windows_powershell,
+            ) {
+                Ok(()) => run_controller_detailed(arguments),
+                Err(error) => (false, error),
+            };
             Msg::ControllerFinished {
                 action,
                 terminal,
@@ -726,6 +734,30 @@ impl SettingsModel {
                 detail,
             }
         });
+    }
+
+    fn is_windows_powershell_enable(arguments: &[String]) -> bool {
+        arguments
+            .iter()
+            .map(String::as_str)
+            .eq(["integration", "windows-powershell", "enable"])
+    }
+
+    fn preflight_windows_powershell_enable<F>(
+        windows_powershell_enable: bool,
+        probe: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce() -> Result<ExecutionPolicy, fsw_core::ProbeError>,
+    {
+        if !windows_powershell_enable {
+            return Ok(());
+        }
+
+        match probe().map_err(|error| error.to_string())? {
+            ExecutionPolicy::Restricted => Err(restricted_policy_message().to_string()),
+            _ => Ok(()),
+        }
     }
 
     /// The single notification path, reproducing `ShowResult`
@@ -928,7 +960,8 @@ impl Component for SettingsModel {
         // here). Off the UI thread, because a Store round trip or a `curl.exe`
         // timeout would otherwise stall the first frame. Silent unless it
         // finds something — see `Msg::UpdateCheckFinished`.
-        if update::update_check_allowed(has_package_identity(), update::read_auto_update_enabled()) {
+        if update::update_check_allowed(has_package_identity(), update::read_auto_update_enabled())
+        {
             context.spawn_background(|_| {
                 let (code, stdout, _) = run_controller_code(["update", "check", "--json"]);
                 Msg::UpdateCheckFinished {
@@ -1018,7 +1051,9 @@ impl Component for SettingsModel {
                 // the echo guard must account for it: picking this radio
                 // while a root is live is a real change, not an echo.
                 if !checked
-                    || (self.state.is_list_mode() && self.state.root.is_none() && !self.folder_selected)
+                    || (self.state.is_list_mode()
+                        && self.state.root.is_none()
+                        && !self.folder_selected)
                 {
                     return;
                 }
@@ -1032,7 +1067,9 @@ impl Component for SettingsModel {
             }
             Msg::BareSlashDefaultChecked(checked) => {
                 if !checked
-                    || (!self.state.is_list_mode() && self.state.root.is_none() && !self.folder_selected)
+                    || (!self.state.is_list_mode()
+                        && self.state.root.is_none()
+                        && !self.folder_selected)
                 {
                     return;
                 }
@@ -1070,7 +1107,8 @@ impl Component for SettingsModel {
                 };
                 self.root_draft = path.clone();
                 self.folder_selected = true;
-                if !is_valid_windows_root(&path) || Some(path.as_str()) == self.state.root.as_deref()
+                if !is_valid_windows_root(&path)
+                    || Some(path.as_str()) == self.state.root.as_deref()
                 {
                     return;
                 }
@@ -1248,7 +1286,12 @@ impl Component for SettingsModel {
                     // only then lets the install force this package down.
                     // `--force` because the user just asked for it explicitly.
                     let (code, stdout, stderr) = run_controller_code([
-                        "update", "install", "--force", "--relaunch", "app", "--json",
+                        "update",
+                        "install",
+                        "--force",
+                        "--relaunch",
+                        "app",
+                        "--json",
                     ]);
                     // Exit 0 hands control to the update machinery, including
                     // its watchdog restart. Every other result leaves this
@@ -1523,7 +1566,10 @@ impl SettingsModel {
                 .tag(section.tag())
                 .is_selected(section == self.section)
                 .slots([
-                    SlotView::new(NavigationViewItemSlot::Content, TextBlock::new().text(label)),
+                    SlotView::new(
+                        NavigationViewItemSlot::Content,
+                        TextBlock::new().text(label),
+                    ),
                     SlotView::new(
                         NavigationViewItemSlot::Icon,
                         SymbolIcon::new().symbol(symbol),
@@ -1562,20 +1608,18 @@ impl SettingsModel {
             Section::About => self.view_about(),
         };
 
-        Border::new()
-            .padding(Thickness::uniform(24.0))
-            .content(
-                Grid::new()
-                    .rows([GridLength::Auto, GridLength::Auto, GridLength::Star(1.0)])
-                    .children((
-                        notice,
-                        self.banners(context),
-                        ScrollViewer::new()
-                            .grid_row(2)
-                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                            .content(page),
-                    )),
-            )
+        Border::new().padding(Thickness::uniform(24.0)).content(
+            Grid::new()
+                .rows([GridLength::Auto, GridLength::Auto, GridLength::Star(1.0)])
+                .children((
+                    notice,
+                    self.banners(context),
+                    ScrollViewer::new()
+                        .grid_row(2)
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .content(page),
+                )),
+        )
     }
 
     /// The second fixed row: standing notices and actions that are derived from
@@ -1665,101 +1709,100 @@ impl SettingsModel {
         let folder_picker: View = if !state.is_folder_mode() && !self.folder_selected {
             View::empty()
         } else {
-            StackPanel::new()
-                .spacing(8.0)
-                .children((
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(8.0)
-                        .children((
-                            TextBox::new()
-                                .min_width(240.0)
-                                .placeholder_text(r"C:\code or \\wsl.localhost\Ubuntu\home")
-                                .text(self.root_draft.clone())
-                                .is_enabled(self.controls_enabled())
-                                .on_text_changed(context.callback(Msg::RootTextChanged)),
-                            Button::new()
-                                .is_enabled(self.controls_enabled())
-                                .on_click(context.message(Msg::BrowseRoot))
-                                .content("Browse\u{2026}"),
-                            Button::new()
-                                .is_enabled(self.controls_enabled())
-                                .on_click(context.message(Msg::ApplyRoot))
-                                .content("Apply folder"),
-                        )),
-                    body("Typing / opens this folder; /name goes inside it.")
-                        .foreground(ThemeBrush::TextSecondary),
-                ))
+            StackPanel::new().spacing(8.0).children((
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        TextBox::new()
+                            .min_width(240.0)
+                            .placeholder_text(r"C:\code or \\wsl.localhost\Ubuntu\home")
+                            .text(self.root_draft.clone())
+                            .is_enabled(self.controls_enabled())
+                            .on_text_changed(context.callback(Msg::RootTextChanged)),
+                        Button::new()
+                            .is_enabled(self.controls_enabled())
+                            .on_click(context.message(Msg::BrowseRoot))
+                            .content("Browse\u{2026}"),
+                        Button::new()
+                            .is_enabled(self.controls_enabled())
+                            .on_click(context.message(Msg::ApplyRoot))
+                            .content("Apply folder"),
+                    )),
+                body("Typing / opens this folder; /name goes inside it.")
+                    .foreground(ThemeBrush::TextSecondary),
+            ))
         };
 
         let picker: View = if state.is_list_mode() || state.is_folder_mode() || self.folder_selected
         {
             View::empty()
         } else {
-            StackPanel::new()
-                .spacing(8.0)
-                .children((
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(8.0)
-                        .children((
-                            body("Distribution:").vertical_alignment(VerticalAlignment::Center),
-                            ComboBox::new()
-                                .min_width(240.0)
-                                .automation_name("Default distribution for bare slash")
-                                .items_source(state.distribution_options())
-                                .selected_index(Some(state.distribution_index()))
-                                .is_enabled(self.controls_enabled())
-                                .on_selection_changed(
-                                    context.callback(Msg::SelectDistribution),
-                                ),
-                        )),
-                    body(state.bare_target_caption()).foreground(ThemeBrush::TextSecondary),
-                ))
+            StackPanel::new().spacing(8.0).children((
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        body("Distribution:").vertical_alignment(VerticalAlignment::Center),
+                        ComboBox::new()
+                            .min_width(240.0)
+                            .automation_name("Default distribution for bare slash")
+                            .items_source(state.distribution_options())
+                            .selected_index(Some(state.distribution_index()))
+                            .is_enabled(self.controls_enabled())
+                            .on_selection_changed(context.callback(Msg::SelectDistribution)),
+                    )),
+                body(state.bare_target_caption()).foreground(ThemeBrush::TextSecondary),
+            ))
         };
 
-        page_stack(16.0)
-            .children((
-                page_header(
-                    "Forward Slash Windows",
-                    "Use Linux-style WSL paths in the Windows places you choose.",
-                ),
-                toggle_card(
-                    "Forward-slash resolution",
-                    "Disable temporarily without removing selected integrations.",
-                    ToggleSwitch::new()
-                        .is_on(!state.disabled)
-                        .is_enabled(self.controls_enabled())
-                        .automation_name("Enable forward-slash resolution")
-                        .on_toggled(context.callback(Msg::ToggleGlobal))
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .slots([
-                            SlotView::new(
-                                ToggleSwitchSlot::OnContent,
-                                TextBlock::new().text("Enabled"),
-                            ),
-                            SlotView::new(
-                                ToggleSwitchSlot::OffContent,
-                                TextBlock::new().text("Disabled"),
-                            ),
-                        ]),
-                ),
-                card(StackPanel::new().spacing(8.0).children((
+        page_stack(16.0).children((
+            page_header(
+                "Forward Slash Windows",
+                "Use Linux-style WSL paths in the Windows places you choose.",
+            ),
+            toggle_card(
+                "Forward-slash resolution",
+                "Disable temporarily without removing selected integrations.",
+                ToggleSwitch::new()
+                    .is_on(!state.disabled)
+                    .is_enabled(self.controls_enabled())
+                    .automation_name("Enable forward-slash resolution")
+                    .on_toggled(context.callback(Msg::ToggleGlobal))
+                    .grid_column(1)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .slots([
+                        SlotView::new(
+                            ToggleSwitchSlot::OnContent,
+                            TextBlock::new().text("Enabled"),
+                        ),
+                        SlotView::new(
+                            ToggleSwitchSlot::OffContent,
+                            TextBlock::new().text("Disabled"),
+                        ),
+                    ]),
+            ),
+            card(
+                StackPanel::new().spacing(8.0).children((
                     strong("Bare slash ( / ) behavior"),
-                    body("Choose what typing only / means on enabled surfaces.").foreground(ThemeBrush::TextSecondary),
+                    body("Choose what typing only / means on enabled surfaces.")
+                        .foreground(ThemeBrush::TextSecondary),
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Show all distributions")
                         .is_enabled(self.controls_enabled())
-                        .is_checked(state.is_list_mode() && state.root.is_none() && !self.folder_selected)
+                        .is_checked(
+                            state.is_list_mode() && state.root.is_none() && !self.folder_selected,
+                        )
                         .on_checked(context.callback(Msg::BareSlashListChecked))
                         .content("Show all distributions"),
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Open my default distribution")
                         .is_enabled(self.controls_enabled())
-                        .is_checked(!state.is_list_mode() && state.root.is_none() && !self.folder_selected)
+                        .is_checked(
+                            !state.is_list_mode() && state.root.is_none() && !self.folder_selected,
+                        )
                         .on_checked(context.callback(Msg::BareSlashDefaultChecked))
                         .content("Open my default distribution"),
                     RadioButton::new()
@@ -1771,59 +1814,60 @@ impl SettingsModel {
                         .content("Open a folder I choose"),
                     picker,
                     folder_picker,
-                ))),
-                // Automatic updates: both flavors, for any packaged build. The
-                // Store build asks the Store for its own update instead of
-                // GitHub, and is off by default — the Store already updates
-                // the app on its own schedule, so driving it from in here is
-                // something the user opts into.
-                if state.packaged {
-                    toggle_card_detail(
-                        "Automatic updates",
-                        if state.store_flavor {
-                            "Let fwdslash install Store updates in the background. Off by \
+                )),
+            ),
+            // Automatic updates: both flavors, for any packaged build. The
+            // Store build asks the Store for its own update instead of
+            // GitHub, and is off by default — the Store already updates
+            // the app on its own schedule, so driving it from in here is
+            // something the user opts into.
+            if state.packaged {
+                toggle_card_detail(
+                    "Automatic updates",
+                    if state.store_flavor {
+                        "Let fwdslash install Store updates in the background. Off by \
                              default; the Store still updates the app on its own schedule."
-                        } else {
-                            "Check GitHub daily and install new versions automatically."
-                        },
-                        Some(state.last_check_line()),
-                        ToggleSwitch::new()
-                            .is_on(state.auto_update)
+                    } else {
+                        "Check GitHub daily and install new versions automatically."
+                    },
+                    Some(state.last_check_line()),
+                    ToggleSwitch::new()
+                        .is_on(state.auto_update)
+                        .is_enabled(self.controls_enabled())
+                        .automation_name("Automatic updates")
+                        .on_toggled(context.callback(Msg::SetAutoUpdate))
+                        .grid_column(1)
+                        .vertical_alignment(VerticalAlignment::Center),
+                )
+            } else {
+                View::empty()
+            },
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(12.0)
+                .children((
+                    Button::new()
+                        .on_click(context.message(Msg::OpenWslRoot))
+                        .content("Open WSL root"),
+                    Button::new()
+                        .on_click(context.message(Msg::RefreshStatus))
+                        .content("Refresh status"),
+                    // Independent of the Automatic updates switch: asking
+                    // once, now, is not the same decision as checking every
+                    // day. Hidden only where there is no package to update.
+                    if state.packaged {
+                        Button::new()
                             .is_enabled(self.controls_enabled())
-                            .automation_name("Automatic updates")
-                            .on_toggled(context.callback(Msg::SetAutoUpdate))
-                            .grid_column(1)
-                            .vertical_alignment(VerticalAlignment::Center),
-                    )
-                } else {
-                    View::empty()
-                },
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(12.0)
-                    .children((
-                        Button::new()
-                            .on_click(context.message(Msg::OpenWslRoot))
-                            .content("Open WSL root"),
-                        Button::new()
-                            .on_click(context.message(Msg::RefreshStatus))
-                            .content("Refresh status"),
-                        // Independent of the Automatic updates switch: asking
-                        // once, now, is not the same decision as checking every
-                        // day. Hidden only where there is no package to update.
-                        if state.packaged {
-                            Button::new()
-                                .is_enabled(self.controls_enabled())
-                                .automation_name("Check for updates now")
-                                .on_click(context.message(Msg::CheckForUpdates))
-                                .content("Check now")
-                                .into()
-                        } else {
-                            View::empty()
-                        },
-                    )),
-                body(state.status_text()).foreground(ThemeBrush::TextSecondary),
-            ))
+                            .automation_name("Check for updates now")
+                            .on_click(context.message(Msg::CheckForUpdates))
+                            .content("Check now")
+                            .into()
+                    } else {
+                        View::empty()
+                    },
+                )),
+            body(state.status_text()).foreground(ThemeBrush::TextSecondary),
+        ))
     }
 
     fn view_windows(&self, context: &mut ViewContext<Self>) -> View {
@@ -1838,77 +1882,73 @@ impl SettingsModel {
             View::empty()
         };
 
-        page_stack(16.0)
-            .children((
-                page_header(
-                    "Windows surfaces",
-                    "Native navigation through the address bar and shell entry points.",
-                ),
-                toggle_card(
-                    "Explorer, Run, and Search",
-                    "Installs the per-user broker and startup entry. Turning this off stops the \
+        page_stack(16.0).children((
+            page_header(
+                "Windows surfaces",
+                "Native navigation through the address bar and shell entry points.",
+            ),
+            toggle_card(
+                "Explorer, Run, and Search",
+                "Installs the per-user broker and startup entry. Turning this off stops the \
                      broker and removes its startup registration.",
-                    integration_toggle(Integration::Windows, self, context)
-                        .is_enabled(!state.packaged && self.controls_enabled())
-                        .automation_name("Install Windows surface integration"),
-                ),
-                body(
-                    "Invalid slash paths are blocked instead of being sent to Edge or web search.",
-                )
+                integration_toggle(Integration::Windows, self, context)
+                    .is_enabled(!state.packaged && self.controls_enabled())
+                    .automation_name("Install Windows surface integration"),
+            ),
+            body("Invalid slash paths are blocked instead of being sent to Edge or web search.")
                 .foreground(ThemeBrush::TextSecondary),
-                managed,
-            ))
+            managed,
+        ))
     }
 
     fn view_terminals(&self, context: &mut ViewContext<Self>) -> View {
         let state = &self.state;
-        page_stack(12.0)
-            .children((
-                page_header(
-                    "Terminal integrations",
-                    "Each shell is independent and can be removed without changing the others.",
-                ),
-                toggle_card_detail(
-                    "Command Prompt",
-                    "Adds reversible dir and ls DOSKEY adapters for new cmd.exe sessions.",
-                    state.adapter_detail(Integration::Cmd),
-                    integration_toggle(Integration::Cmd, self, context)
-                        .automation_name("Install Command Prompt integration"),
-                ),
-                toggle_card_detail(
-                    "Windows PowerShell 5.1",
-                    "Adds a guarded profile import and preserves normal Get-ChildItem behavior.",
-                    state.adapter_detail(Integration::WindowsPowerShell),
-                    integration_toggle(Integration::WindowsPowerShell, self, context)
-                        .automation_name("Install Windows PowerShell integration"),
-                ),
-                toggle_card_detail(
-                    "PowerShell 7",
-                    if state.powershell7_available {
-                        "Adds the same reversible adapter to the PowerShell 7 profile."
-                    } else {
-                        "PowerShell 7 is not installed on this computer."
-                    },
-                    state.adapter_detail(Integration::PowerShell7),
-                    integration_toggle(Integration::PowerShell7, self, context)
-                        .is_enabled(
-                            (state.powershell7_available
-                                || Integration::PowerShell7.installed(state))
-                                && self.controls_enabled(),
-                        )
-                        .automation_name("Install PowerShell 7 integration"),
-                ),
-                body(
-                    "Profile and AutoRun changes apply to newly opened terminal sessions. \
+        page_stack(12.0).children((
+            page_header(
+                "Terminal integrations",
+                "Each shell is independent and can be removed without changing the others.",
+            ),
+            toggle_card_detail(
+                "Command Prompt",
+                "Adds reversible dir and ls DOSKEY adapters for new cmd.exe sessions.",
+                state.adapter_detail(Integration::Cmd),
+                integration_toggle(Integration::Cmd, self, context)
+                    .automation_name("Install Command Prompt integration"),
+            ),
+            toggle_card_detail(
+                "Windows PowerShell 5.1",
+                "Adds a guarded profile import and preserves normal Get-ChildItem behavior.",
+                state.adapter_detail(Integration::WindowsPowerShell),
+                integration_toggle(Integration::WindowsPowerShell, self, context)
+                    .automation_name("Install Windows PowerShell integration"),
+            ),
+            toggle_card_detail(
+                "PowerShell 7",
+                if state.powershell7_available {
+                    "Adds the same reversible adapter to the PowerShell 7 profile."
+                } else {
+                    "PowerShell 7 is not installed on this computer."
+                },
+                state.adapter_detail(Integration::PowerShell7),
+                integration_toggle(Integration::PowerShell7, self, context)
+                    .is_enabled(
+                        (state.powershell7_available || Integration::PowerShell7.installed(state))
+                            && self.controls_enabled(),
+                    )
+                    .automation_name("Install PowerShell 7 integration"),
+            ),
+            body(
+                "Profile and AutoRun changes apply to newly opened terminal sessions. \
                      Existing sessions retain what they already loaded.",
-                )
-                .foreground(ThemeBrush::TextSecondary)
-                .margin(Thickness::new(0.0, 4.0, 0.0, 0.0)),
-                // The button the broker's "could not be updated automatically"
-                // balloon points at (#56). Before this the balloon said "Open
-                // Settings to retry" and there was nothing to press: the retry
-                // happened by accident, in the launch sweep.
-                card(StackPanel::new().spacing(8.0).children((
+            )
+            .foreground(ThemeBrush::TextSecondary)
+            .margin(Thickness::new(0.0, 4.0, 0.0, 0.0)),
+            // The button the broker's "could not be updated automatically"
+            // balloon points at (#56). Before this the balloon said "Open
+            // Settings to retry" and there was nothing to press: the retry
+            // happened by accident, in the launch sweep.
+            card(
+                StackPanel::new().spacing(8.0).children((
                     strong("Repair integrations"),
                     body(
                         "Re-applies each installed adapter and cleans up an orphaned or \
@@ -1921,8 +1961,9 @@ impl SettingsModel {
                         .automation_name("Repair integrations")
                         .on_click(context.message(Msg::RepairIntegrations))
                         .content("Repair integrations"),
-                ))),
-            ))
+                )),
+            ),
+        ))
     }
 
     /// The running package version (the MSIX identity when packaged, the crate
@@ -1942,25 +1983,27 @@ impl SettingsModel {
     /// the broker line and the three adapter versions are live.
     fn components_card(&self) -> View {
         let state = &self.state;
-        card(StackPanel::new().spacing(4.0).children((
-            strong("Components"),
-            body(state.broker_component_line()).foreground(ThemeBrush::TextSecondary),
-            body(state.driver_component_line()).foreground(ThemeBrush::TextSecondary),
-            body(state.adapter_component_line(Integration::Cmd))
-                .foreground(ThemeBrush::TextSecondary),
-            body(state.adapter_component_line(Integration::WindowsPowerShell))
-                .foreground(ThemeBrush::TextSecondary),
-            body(state.adapter_component_line(Integration::PowerShell7))
-                .foreground(ThemeBrush::TextSecondary),
-            body(format!("Package: {}", Self::package_label()))
-                .foreground(ThemeBrush::TextSecondary),
-            body(state.flavor_component_line()).foreground(ThemeBrush::TextSecondary),
-            body(state.last_check_line()).foreground(ThemeBrush::TextSecondary),
-            match state.update_available_line() {
-                Some(line) => body(line).foreground(ThemeBrush::TextSecondary).into(),
-                None => View::empty(),
-            },
-        )))
+        card(
+            StackPanel::new().spacing(4.0).children((
+                strong("Components"),
+                body(state.broker_component_line()).foreground(ThemeBrush::TextSecondary),
+                body(state.driver_component_line()).foreground(ThemeBrush::TextSecondary),
+                body(state.adapter_component_line(Integration::Cmd))
+                    .foreground(ThemeBrush::TextSecondary),
+                body(state.adapter_component_line(Integration::WindowsPowerShell))
+                    .foreground(ThemeBrush::TextSecondary),
+                body(state.adapter_component_line(Integration::PowerShell7))
+                    .foreground(ThemeBrush::TextSecondary),
+                body(format!("Package: {}", Self::package_label()))
+                    .foreground(ThemeBrush::TextSecondary),
+                body(state.flavor_component_line()).foreground(ThemeBrush::TextSecondary),
+                body(state.last_check_line()).foreground(ThemeBrush::TextSecondary),
+                match state.update_available_line() {
+                    Some(line) => body(line).foreground(ThemeBrush::TextSecondary).into(),
+                    None => View::empty(),
+                },
+            )),
+        )
     }
 
     // The only `expect`s in the crate: `navigate_uri` on a compile-time
@@ -1968,30 +2011,30 @@ impl SettingsModel {
     #[allow(clippy::expect_used)]
     fn view_about(&self) -> View {
         let subtitle = format!("Forward Slash Windows {}", Self::package_label());
-        page_stack(16.0)
-            .children((
-                // page_header demands &'static str; the subtitle is dynamic.
-                StackPanel::new().spacing(4.0).children((
-                    TextBlock::new()
-                        .text("About")
-                        .font_size(28.0)
-                        .font_weight(FontWeight::SEMI_BOLD)
-                        .text_wrapping(TextWrapping::Wrap),
-                    body(&subtitle).foreground(ThemeBrush::TextSecondary),
-                )),
-                self.components_card(),
-                body(
-                    "Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to either the \
+        page_stack(16.0).children((
+            // page_header demands &'static str; the subtitle is dynamic.
+            StackPanel::new().spacing(4.0).children((
+                TextBlock::new()
+                    .text("About")
+                    .font_size(28.0)
+                    .font_weight(FontWeight::SEMI_BOLD)
+                    .text_wrapping(TextWrapping::Wrap),
+                body(&subtitle).foreground(ThemeBrush::TextSecondary),
+            )),
+            self.components_card(),
+            body(
+                "Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to either the \
                      WSL distribution list or your default distribution, on supported Windows \
                      surfaces.",
-                ),
-                Border::new()
-                    .padding(Thickness::new(18.0, 16.0, 18.0, 16.0))
-                    .corner_radius(CornerRadius::uniform(8.0))
-                    .border_thickness(Thickness::uniform(1.0))
-                    .background(ThemeBrush::CardBackground)
-                    .border_brush(ThemeBrush::CardStroke)
-                    .content(StackPanel::new().spacing(4.0).children((
+            ),
+            Border::new()
+                .padding(Thickness::new(18.0, 16.0, 18.0, 16.0))
+                .corner_radius(CornerRadius::uniform(8.0))
+                .border_thickness(Thickness::uniform(1.0))
+                .background(ThemeBrush::CardBackground)
+                .border_brush(ThemeBrush::CardStroke)
+                .content(
+                    StackPanel::new().spacing(4.0).children((
                         TextBlock::new()
                             .text("Mike Fara")
                             .font_size(16.0)
@@ -1999,24 +2042,24 @@ impl SettingsModel {
                             .text_wrapping(TextWrapping::Wrap),
                         body("Fara Technologies LLC"),
                         body("New York, United States").foreground(ThemeBrush::TextSecondary),
-                    ))),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        HyperlinkButton::new()
-                            .navigate_uri("https://github.com/faratech/fwdslash")
-                            .expect("static URI")
-                            .content("GitHub repository"),
-                        HyperlinkButton::new()
-                            .navigate_uri(
-                                "https://github.com/faratech/fwdslash/blob/main/LICENSE",
-                            )
-                            .expect("static URI")
-                            .content("MIT License"),
                     )),
-                body("Open-source software licensed under the MIT License.").foreground(ThemeBrush::TextSecondary),
-            ))
+                ),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    HyperlinkButton::new()
+                        .navigate_uri("https://github.com/faratech/fwdslash")
+                        .expect("static URI")
+                        .content("GitHub repository"),
+                    HyperlinkButton::new()
+                        .navigate_uri("https://github.com/faratech/fwdslash/blob/main/LICENSE")
+                        .expect("static URI")
+                        .content("MIT License"),
+                )),
+            body("Open-source software licensed under the MIT License.")
+                .foreground(ThemeBrush::TextSecondary),
+        ))
     }
 }
 
@@ -2416,9 +2459,7 @@ mod sweep_lock {
     pub(crate) fn acquire() -> bool {
         #[cfg(windows)]
         {
-            use windows_sys::Win32::Foundation::{
-                CloseHandle, ERROR_ALREADY_EXISTS, GetLastError,
-            };
+            use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
             use windows_sys::Win32::System::Threading::CreateMutexW;
 
             if HELD.load(Ordering::Acquire) != 0 {
@@ -2552,7 +2593,7 @@ fn activate_existing_instance() -> bool {
         use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
         use windows_sys::Win32::System::Threading::CreateMutexW;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SetForegroundWindow, ShowWindow, SW_RESTORE,
+            SW_RESTORE, SetForegroundWindow, ShowWindow,
         };
 
         let name = to_wide(SETTINGS_MUTEX_NAME);
@@ -2562,7 +2603,9 @@ fn activate_existing_instance() -> bool {
             // and silently running a second instance is exactly the
             // duplicate-window failure this guard exists to prevent.
             let code = GetLastError();
-            log_crash(&format!("single-instance mutex creation failed: Win32 error {code}"));
+            log_crash(&format!(
+                "single-instance mutex creation failed: Win32 error {code}"
+            ));
             show_startup_error(&format!(
                 "Forward Slash Windows could not verify that it is not already running \
                  (Win32 error {code})."
@@ -2730,7 +2773,7 @@ fn request_close() {}
 #[cfg(windows)]
 fn show_startup_error(message: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
+        MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW,
     };
     unsafe {
         MessageBoxW(
@@ -2753,10 +2796,68 @@ fn show_startup_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        InfoBarSeverity, NoticeAction, UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NEEDS_USER,
-        UPDATE_EXIT_NOTHING, UPDATE_EXIT_OK, UpdateOutcome, check_outcome, install_banner_label,
-        install_notice, json_string_field, store_product_uri,
+        ExecutionPolicy, InfoBarSeverity, NoticeAction, SettingsModel, UPDATE_EXIT_AVAILABLE,
+        UPDATE_EXIT_NEEDS_USER, UPDATE_EXIT_NOTHING, UPDATE_EXIT_OK, UpdateOutcome, check_outcome,
+        install_banner_label, install_notice, json_string_field, store_product_uri,
     };
+    use std::cell::Cell;
+
+    fn integration_arguments(integration: &str, operation: &str) -> Vec<String> {
+        ["integration", integration, operation]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn windows_powershell_enable_preflights_once_before_dispatch() {
+        let probes = Cell::new(0);
+        let result = SettingsModel::preflight_windows_powershell_enable(
+            SettingsModel::is_windows_powershell_enable(&integration_arguments(
+                "windows-powershell",
+                "enable",
+            )),
+            || {
+                probes.set(probes.get() + 1);
+                Ok(ExecutionPolicy::RemoteSigned)
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(probes.get(), 1);
+    }
+
+    #[test]
+    fn only_windows_powershell_enable_dispatches_a_policy_probe() {
+        for arguments in [
+            integration_arguments("windows-powershell", "disable"),
+            integration_arguments("powershell", "enable"),
+            integration_arguments("cmd", "enable"),
+        ] {
+            let result = SettingsModel::preflight_windows_powershell_enable(
+                SettingsModel::is_windows_powershell_enable(&arguments),
+                || -> Result<ExecutionPolicy, fsw_core::ProbeError> {
+                    panic!("non-enable integration action must not probe")
+                },
+            );
+            assert_eq!(result, Ok(()));
+        }
+    }
+
+    #[test]
+    fn restricted_or_failed_preflight_never_allows_dispatch() {
+        let restricted = SettingsModel::preflight_windows_powershell_enable(true, || {
+            Ok(ExecutionPolicy::Restricted)
+        });
+        assert_eq!(
+            restricted,
+            Err(fsw_core::restricted_policy_message().to_string())
+        );
+
+        let timed_out = SettingsModel::preflight_windows_powershell_enable(true, || {
+            Err(fsw_core::ProbeError::TimedOut)
+        });
+        assert!(timed_out.unwrap_err().contains("timed out"));
+    }
 
     /// A line in the exact shape `render_json` produces.
     fn json_line(state: &str, available: &str) -> String {
@@ -2772,8 +2873,14 @@ mod tests {
     #[test]
     fn a_string_field_is_read_to_its_closing_quote() {
         let line = json_line("available", "\"0.0.5\"");
-        assert_eq!(json_string_field(&line, "state").as_deref(), Some("available"));
-        assert_eq!(json_string_field(&line, "available").as_deref(), Some("0.0.5"));
+        assert_eq!(
+            json_string_field(&line, "state").as_deref(),
+            Some("available")
+        );
+        assert_eq!(
+            json_string_field(&line, "available").as_deref(),
+            Some("0.0.5")
+        );
         assert_eq!(json_string_field(&line, "flavor").as_deref(), Some("store"));
     }
 
@@ -2900,7 +3007,13 @@ mod tests {
 
     #[test]
     fn failed_or_deferred_installs_restore_only_a_previously_running_broker() {
-        for code in [-1, UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NEEDS_USER, UPDATE_EXIT_NOTHING, 1] {
+        for code in [
+            -1,
+            UPDATE_EXIT_AVAILABLE,
+            UPDATE_EXIT_NEEDS_USER,
+            UPDATE_EXIT_NOTHING,
+            1,
+        ] {
             assert!(super::should_restore_broker_after_install(code, true));
         }
         assert!(!super::should_restore_broker_after_install(

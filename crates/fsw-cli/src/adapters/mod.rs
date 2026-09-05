@@ -15,20 +15,20 @@
 pub mod cmd;
 #[cfg(windows)]
 pub mod powershell;
+pub mod profile;
 #[cfg(windows)]
 pub mod reg;
-pub mod profile;
 pub mod state;
 #[cfg(test)]
 mod tests;
 
+pub use state::Edition;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-pub use state::Edition;
 
 /// CREATE_NO_WINDOW for the real-process children.
 #[cfg(windows)]
@@ -88,7 +88,8 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
         };
 
         // PowerShell 7 must exist before its adapter can be installed.
-        if enabled && edition == Some(state::Edition::PowerShell)
+        if enabled
+            && edition == Some(state::Edition::PowerShell)
             && !fsw_core::executable_available("pwsh.exe")
         {
             println!("PowerShell 7 is not installed.");
@@ -136,6 +137,16 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
             upgrading = true;
         }
 
+        // An upgrade removes the prior adapter before installing the new one.
+        // Refuse a Windows PowerShell upgrade before that destructive half if
+        // a fresh ordinary shell cannot run the profile.
+        if upgrading && edition == Some(state::Edition::WindowsPowerShell) {
+            if let Some(error) = powershell::execution_policy_refusal(edition.unwrap()) {
+                eprintln!("{error}");
+                return 1;
+            }
+        }
+
         // Before staging anything: if no marker references the payload tree at
         // all, it is debris a deferred delete failed to remove — drop it rather
         // than install on top of it (#37).
@@ -157,6 +168,12 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
         let result = removal.and_then(|()| match (edition, enabled) {
             (None, true) => cmd::install(&controller),
             (None, false) => cmd::uninstall(),
+            (Some(state::Edition::WindowsPowerShell), true) if upgrading => {
+                powershell::install_after_policy_preflight(
+                    state::Edition::WindowsPowerShell,
+                    &controller,
+                )
+            }
             (Some(edition), true) => powershell::install(edition, &controller),
             (Some(edition), false) => powershell::uninstall(edition),
         });
@@ -286,7 +303,10 @@ impl PolicyStatus {
 #[cfg(windows)]
 pub fn execution_policy_statuses() -> Vec<PolicyStatus> {
     let mut statuses = Vec::new();
-    for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+    for edition in [
+        state::Edition::WindowsPowerShell,
+        state::Edition::PowerShell,
+    ] {
         let Some((reported, verdict)) = powershell::execution_policy_verdict(edition) else {
             continue;
         };
@@ -295,7 +315,10 @@ pub fn execution_policy_statuses() -> Vec<PolicyStatus> {
             edition,
             reported: reported.trim().to_string(),
             blocked: verdict.is_blocked(),
-            remedy: verdict.blocked().map(|block| block.remedy.clone()).unwrap_or_default(),
+            remedy: verdict
+                .blocked()
+                .map(|block| block.remedy.clone())
+                .unwrap_or_default(),
             status,
         });
     }
@@ -353,8 +376,14 @@ pub fn repair_integration(id: &str) -> i32 {
                 let before = cmd::repair();
                 report_cmd_repair(before);
             }
-            "windows-powershell" => report_ps_repair("Windows PowerShell", state::Edition::WindowsPowerShell, &controller),
-            "powershell" => report_ps_repair("PowerShell 7", state::Edition::PowerShell, &controller),
+            "windows-powershell" => report_ps_repair(
+                "Windows PowerShell",
+                state::Edition::WindowsPowerShell,
+                &controller,
+            ),
+            "powershell" => {
+                report_ps_repair("PowerShell 7", state::Edition::PowerShell, &controller)
+            }
             _ => return 2,
         }
         0
@@ -410,7 +439,10 @@ pub fn repair_all() -> i32 {
     {
         let controller = std::env::current_exe().unwrap_or_default();
         let _ = cmd::repair();
-        for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+        for edition in [
+            state::Edition::WindowsPowerShell,
+            state::Edition::PowerShell,
+        ] {
             let _ = powershell::repair(edition, &controller);
         }
         powershell::prune_orphaned_module_dirs();
@@ -440,7 +472,10 @@ pub fn cleanup_orphaned() -> i32 {
         if let Some(probe) = cmd::recorded_probe() {
             probes.push(probe);
         }
-        for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+        for edition in [
+            state::Edition::WindowsPowerShell,
+            state::Edition::PowerShell,
+        ] {
             if let Some(probe) = powershell::recorded_probe(edition) {
                 probes.push(probe);
             }
@@ -622,7 +657,8 @@ fn spawn_detached_delete(payload: &Path) {
     let system32 = Path::new(&system_root).join("System32");
     let command = format!(
         "ping -n 3 127.0.0.1 >nul & rd /s /q \"{}\\cmd\" & rd /s /q \"{}\\PowerShell\"",
-        payload.display(), payload.display()
+        payload.display(),
+        payload.display()
     );
     for flags in [
         CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
@@ -663,12 +699,16 @@ fn any_adapter_marker_present() -> bool {
 /// The parent is shared with the updater. Delete only adapter-owned children.
 #[cfg(windows)]
 fn prune_adapter_directories(payload: &Path) {
-    let Ok(entries) = std::fs::read_dir(payload) else { return };
+    let Ok(entries) = std::fs::read_dir(payload) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("PowerShell")
-            || name.starts_with(".cmd-staging-") || name.starts_with(".cmd-rollback-")
+        if name.eq_ignore_ascii_case("cmd")
+            || name.eq_ignore_ascii_case("PowerShell")
+            || name.starts_with(".cmd-staging-")
+            || name.starts_with(".cmd-rollback-")
         {
             let _ = std::fs::remove_dir_all(entry.path());
         }
@@ -741,9 +781,11 @@ pub fn local_app_data() -> Result<PathBuf, AdapterError> {
 /// the shell hooks test on every start (#37 addendum).
 #[cfg(windows)]
 pub fn app_execution_alias() -> Option<PathBuf> {
-    local_app_data()
-        .ok()
-        .map(|dir| dir.join("Microsoft").join("WindowsApps").join("fwdslash.exe"))
+    local_app_data().ok().map(|dir| {
+        dir.join("Microsoft")
+            .join("WindowsApps")
+            .join("fwdslash.exe")
+    })
 }
 
 /// The product-presence probe recorded in an adapter's marker at install time.
@@ -822,7 +864,7 @@ fn appx_registered(identity_name: &str) -> bool {
 /// (`SHGetKnownFolderPath`, not `%USERPROFILE%\Documents`).
 #[cfg(windows)]
 pub fn documents_dir() -> Result<PathBuf, AdapterError> {
-    use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Documents};
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
 
     unsafe {
         let mut path = std::ptr::null_mut();

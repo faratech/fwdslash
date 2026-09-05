@@ -7,9 +7,13 @@ use fsw_path::{
     BareSlashMode, Context, RenderBuf, ResolveError, Resolved, eq_ignore_case,
     is_valid_distribution_name, is_valid_windows_root, resolve, resolve_under_root,
 };
+pub mod powershell_policy;
 pub mod settings_write;
 pub mod update;
 
+pub use powershell_policy::{
+    ExecutionPolicy, ProbeError, probe_windows_powershell, restricted_policy_message,
+};
 pub use settings_write::{
     WritePlan, delete_setting, set_setting_string, set_setting_u32, set_setting_u64,
     sync_settings_to_real_hive, write_plan,
@@ -188,7 +192,9 @@ impl SettingsValues {
                 return Self::default();
             };
             Self {
-                disabled: key.get_u32(FSW_DISABLED_VALUE).is_ok_and(|value| value != 0),
+                disabled: key
+                    .get_u32(FSW_DISABLED_VALUE)
+                    .is_ok_and(|value| value != 0),
                 bare_slash_mode: match key.get_u32(FSW_BARE_SLASH_MODE_VALUE) {
                     Ok(value) if value != 0 => BareSlashMode::DefaultDistribution,
                     _ => BareSlashMode::DistributionList,
@@ -435,7 +441,11 @@ fn default_distribution_from_lxss(
     registered: &[String],
 ) -> Option<String> {
     let default_guid = lxss.get_string("DefaultDistribution").ok()?;
-    let name = lxss.open(&default_guid).ok()?.get_string("DistributionName").ok()?;
+    let name = lxss
+        .open(&default_guid)
+        .ok()?
+        .get_string("DistributionName")
+        .ok()?;
     registered
         .iter()
         .any(|distro| eq_ignore_case(distro, &name))

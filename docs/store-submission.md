@@ -285,7 +285,7 @@ can observe is a 0.0.5 install being offered 0.0.6.
   The `AutoRun` value, the PowerShell profile blocks and
   `%LOCALAPPDATA%\ForwardSlashWindows` survive package removal. Disable the
   integrations from the settings app before uninstalling.
-- **Version is `0.0.5.0`.** Each submission must increase it, and the fourth
+- **Version is `0.0.6.0`.** Each submission must increase it, and the fourth
   field is reserved by the Store (always `0`). It comes from
   `workspace.package.version`, and the statement above is one of the locations
   `tools/bump_version.py` rewrites — bump with `python3 tools/bump_version.py

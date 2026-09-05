@@ -6,11 +6,11 @@
 //! `tools/Install-PowerShellAdapter.ps1` / `Uninstall-PowerShellAdapter.ps1`
 //! with registry writes routed through `reg.exe`.
 
-use super::{profile, reg, state, AdapterError, Edition};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use super::{AdapterError, Edition, profile, reg, state};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MARKER_ROOT: &str = "Software\\ForwardSlashWindows\\PowerShellAdapter";
@@ -19,7 +19,6 @@ const VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 /// bounded by process start-up alone. Shorter than the verification budget on
 /// purpose: it runs before anything has been written, and a hung probe must
 /// fall through to the old behaviour rather than stall an install.
-const POLICY_TIMEOUT: Duration = Duration::from_secs(10);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Installs the adapter for `edition`. `controller` is the running
@@ -40,6 +39,16 @@ pub fn install(edition: Edition, controller: &Path) -> Result<(), AdapterError> 
     if let Some(error) = execution_policy_refusal(edition) {
         return Err(error);
     }
+
+    install_after_policy_preflight(edition, controller)
+}
+
+/// Finishes an install after `execution_policy_refusal` has run. Upgrades use
+/// this after their early preflight, before they remove the prior adapter.
+pub(super) fn install_after_policy_preflight(
+    edition: Edition,
+    controller: &Path,
+) -> Result<(), AdapterError> {
     let mut transaction = match begin_install(edition)? {
         Some(transaction) => transaction,
         // Already installed: the scripts reported it and exited 0.
@@ -82,10 +91,10 @@ struct InstallTransaction {
 fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, AdapterError> {
     let marker_key = marker_key(edition);
     let marker_state = read_marker_state(&marker_key)?;
-    match state::decide_ps_install(marker_state.is_some(), marker_state.map_or(
-        state::MarkerState::Unknown,
-        |text| state::classify(&text),
-    )) {
+    match state::decide_ps_install(
+        marker_state.is_some(),
+        marker_state.map_or(state::MarkerState::Unknown, |text| state::classify(&text)),
+    ) {
         state::InstallDecision::Proceed => {}
         state::InstallDecision::AlreadyInstalled => return Ok(None),
         state::InstallDecision::RecoverRequired => {
@@ -98,9 +107,7 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
     }
 
     let documents = super::documents_dir()?;
-    let profile_path = documents
-        .join(edition.folder_name())
-        .join("profile.ps1");
+    let profile_path = documents.join(edition.folder_name()).join("profile.ps1");
     let install_root = super::local_app_data()?
         .join("ForwardSlashWindows")
         .join("PowerShell");
@@ -127,7 +134,10 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
         state_root: install_root.join("state").join(edition.folder_name()),
         state_staging: PathBuf::from(format!(
             "{}.staging-{}",
-            install_root.join("state").join(edition.folder_name()).display(),
+            install_root
+                .join("state")
+                .join(edition.folder_name())
+                .display(),
             super::new_transaction_id()
         )),
         state_deployed: false,
@@ -171,7 +181,9 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     // profile (#37). The raw bytes stay on the transaction for exact rollback.
     let true_original = profile::strip_fwdslash_blocks(&transaction.original_bytes);
     let true_original_present = profile::original_profile_present(
-        transaction.original_present, &transaction.original_bytes, &true_original,
+        transaction.original_present,
+        &transaction.original_bytes,
+        &true_original,
     );
 
     // State directory with the recovery files, staged then renamed.
@@ -210,8 +222,16 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     reg::set_string(&key, "State", "prepared")?;
     reg::set_string(&key, "Version", super::PAYLOAD_VERSION)?;
     reg::set_string(&key, "TransactionId", &transaction.transaction_id)?;
-    reg::set_string(&key, "ProfilePath", &transaction.profile_path.display().to_string())?;
-    reg::set_string(&key, "StateDirectory", &transaction.state_root.display().to_string())?;
+    reg::set_string(
+        &key,
+        "ProfilePath",
+        &transaction.profile_path.display().to_string(),
+    )?;
+    reg::set_string(
+        &key,
+        "StateDirectory",
+        &transaction.state_root.display().to_string(),
+    )?;
     reg::set_string(&key, "ProductProbe", &probe_path.display().to_string())?;
     // An originally empty file must survive; an orphaned block-only file need not.
     reg::set_dword(&key, "OriginalPresent", u32::from(true_original_present))?;
@@ -219,14 +239,13 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     // Installed profile = true original + one current guarded block.
     let mut installed_bytes = true_original;
     installed_bytes.extend_from_slice(&transaction.block_bytes);
-    super::write_atomic(&transaction.profile_path, &installed_bytes)
-        .map_err(|error| {
-            super::explain_file_error(
-                &error,
-                "The PowerShell profile update",
-                &transaction.profile_path,
-            )
-        })?;
+    super::write_atomic(&transaction.profile_path, &installed_bytes).map_err(|error| {
+        super::explain_file_error(
+            &error,
+            "The PowerShell profile update",
+            &transaction.profile_path,
+        )
+    })?;
     transaction.profile_changed = true;
 
     reg::set_string(&key, "State", "installed")?;
@@ -635,11 +654,21 @@ fn shell_path(edition: Edition) -> Option<String> {
 /// `verify_aliases` runs under. `Get-ExecutionPolicy` is a cmdlet, not a
 /// script, so it answers even under Restricted.
 pub fn effective_execution_policy(edition: Edition) -> Option<String> {
+    if edition == Edition::WindowsPowerShell {
+        return fsw_core::probe_windows_powershell()
+            .ok()
+            .map(|policy| policy.as_str().to_string());
+    }
     use std::io::Read;
 
     let shell = shell_path(edition)?;
     let mut child = Command::new(&shell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", "Get-ExecutionPolicy"])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-ExecutionPolicy",
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -647,7 +676,7 @@ pub fn effective_execution_policy(edition: Edition) -> Option<String> {
         .spawn()
         .ok()?;
 
-    let deadline = Instant::now() + POLICY_TIMEOUT;
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -687,7 +716,18 @@ pub fn execution_policy_verdict(edition: Edition) -> Option<(String, state::Poli
 
 /// The install-time refusal for a blocking policy, or `None` when the policy
 /// allows scripts or could not be read.
-fn execution_policy_refusal(edition: Edition) -> Option<AdapterError> {
+pub(super) fn execution_policy_refusal(edition: Edition) -> Option<AdapterError> {
+    if edition == Edition::WindowsPowerShell {
+        return match fsw_core::probe_windows_powershell() {
+            Ok(fsw_core::ExecutionPolicy::Restricted) => {
+                Some(AdapterError::new(fsw_core::restricted_policy_message()))
+            }
+            Ok(policy) => state::classify_execution_policy(edition, policy.as_str())
+                .blocked()
+                .map(|block| AdapterError::new(&state::policy_install_error(block))),
+            Err(error) => Some(AdapterError::new(&error.to_string())),
+        };
+    }
     let (_, verdict) = execution_policy_verdict(edition)?;
     let block = verdict.blocked()?;
     Some(AdapterError::new(&state::policy_install_error(block)))
@@ -709,7 +749,11 @@ fn verify_aliases(edition: Edition) -> Result<(), AdapterError> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| AdapterError::new(&format!("verification shell could not be started ({error}).")))?;
+        .map_err(|error| {
+            AdapterError::new(&format!(
+                "verification shell could not be started ({error})."
+            ))
+        })?;
 
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     while deadline > Instant::now() {
