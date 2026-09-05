@@ -13,9 +13,14 @@
 # listing.
 #
 # Required repository secrets (Settings > Secrets and variables > Actions):
-#   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the same Azure AD
-#   application publish-to-store.yml uses. STORE_SELLER_ID is not needed here;
-#   the REST API addresses the product by app ID.
+#   STORE_TENANT_ID / STORE_CLIENT_ID / STORE_CLIENT_SECRET, falling back to
+#   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the same pair
+#   publish-to-store.yml resolves, in the same order. Whichever one is used,
+#   its Azure AD app must be associated with the Partner Center account
+#   (Account settings > User management > Azure AD applications, Manager
+#   role) or every call below 401s with "Identity cannot be authorized" —
+#   see docs/store-submission.md §1a. STORE_SELLER_ID is not needed here; the
+#   REST API addresses the product by app ID.
 
 name: Check Microsoft Store Submission
 
@@ -46,25 +51,27 @@ jobs:
           APP_ID: ${{ github.event.inputs.app_id }}
           SUBMISSION_ID: ${{ github.event.inputs.submission_id }}
           CANCEL_SUBMISSION: ${{ github.event.inputs.cancel_submission }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          STORE_TENANT_ID: ${{ secrets.STORE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+          STORE_CLIENT_ID: ${{ secrets.STORE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+          STORE_CLIENT_SECRET: ${{ secrets.STORE_CLIENT_SECRET || secrets.AZURE_CLIENT_SECRET }}
+          CREDENTIAL_SOURCE: ${{ secrets.STORE_TENANT_ID && 'STORE_*' || 'AZURE_* fallback' }}
         run: |
           set -euo pipefail
 
-          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET; do
+          for name in STORE_TENANT_ID STORE_CLIENT_ID STORE_CLIENT_SECRET; do
             if [ -z "${!name}" ]; then
-              echo "::error::Missing repository secret $name."
+              echo "::error::Missing Store credentials (resolved credential source: $CREDENTIAL_SOURCE): $name is empty. See docs/store-submission.md §1a."
               exit 1
             fi
           done
+          echo "Resolved credential source: $CREDENTIAL_SOURCE"
 
           token_response="$(curl -sS -X POST \
-            "https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/token" \
+            "https://login.microsoftonline.com/${STORE_TENANT_ID}/oauth2/token" \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "grant_type=client_credentials" \
-            -d "client_id=${AZURE_CLIENT_ID}" \
-            -d "client_secret=${AZURE_CLIENT_SECRET}" \
+            -d "client_id=${STORE_CLIENT_ID}" \
+            -d "client_secret=${STORE_CLIENT_SECRET}" \
             -d "resource=https://manage.devcenter.microsoft.com")"
 
           token="$(echo "$token_response" | jq -r '.access_token // empty')"

@@ -16,8 +16,17 @@
 # already has is rejected by Partner Center, not by anything here.
 #
 # Required repository secrets (Settings > Secrets and variables > Actions):
-#   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the Azure AD
-#     application authorized on the Partner Center account.
+#   STORE_TENANT_ID / STORE_CLIENT_ID / STORE_CLIENT_SECRET — the Azure AD
+#     application associated with the Partner Center account (Account
+#     settings > User management > Azure AD applications, Manager role).
+#   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — fallback used
+#     when the STORE_* secrets above are not set. This is the Trusted Signing
+#     service principal, which is a DIFFERENT identity and is not guaranteed
+#     to be associated with Partner Center — run 33955525282 failed at the
+#     upload step because it wasn't ("Could not retrieve your application.
+#     Please make sure you have the correct AppId." with a correct AppId; the
+#     real cause was an HTTP 401 "Identity cannot be authorized" from
+#     manage.devcenter.microsoft.com). See docs/store-submission.md §1a.
 #   STORE_SELLER_ID — the Partner Center seller ID (Account settings >
 #     Organization profile > Legal info). Not the Store ID; this one is not
 #     public, which is why it is a secret and not a workflow constant.
@@ -60,20 +69,21 @@ jobs:
       # every later call 401s with an opaque message.
       - name: Check the Store credentials are configured
         env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          STORE_TENANT_ID: ${{ secrets.STORE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+          STORE_CLIENT_ID: ${{ secrets.STORE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+          STORE_CLIENT_SECRET: ${{ secrets.STORE_CLIENT_SECRET || secrets.AZURE_CLIENT_SECRET }}
           STORE_SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
+          CREDENTIAL_SOURCE: ${{ secrets.STORE_TENANT_ID && 'STORE_*' || 'AZURE_* fallback' }}
         run: |
           $missing = @()
-          foreach ($name in 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'STORE_SELLER_ID') {
+          foreach ($name in 'STORE_TENANT_ID', 'STORE_CLIENT_ID', 'STORE_CLIENT_SECRET', 'STORE_SELLER_ID') {
               if (-not [Environment]::GetEnvironmentVariable($name)) { $missing += $name }
           }
           if ($missing.Count -gt 0) {
               $names = $missing -join ', '
-              throw "Missing repository secret(s): $names. Add them under Settings > Secrets and variables > Actions. STORE_SELLER_ID is the Partner Center seller ID from Account settings > Organization profile > Legal info."
+              throw "Missing repository secret(s) (resolved credential source: $env:CREDENTIAL_SOURCE): $names. Add dedicated STORE_TENANT_ID/STORE_CLIENT_ID/STORE_CLIENT_SECRET secrets, or rely on the AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET fallback, under Settings > Secrets and variables > Actions. STORE_SELLER_ID is the Partner Center seller ID from Account settings > Organization profile > Legal info. Whichever identity is used, its Azure AD app must also be associated with the Partner Center account (Account settings > User management > Azure AD applications, Manager role) or the upload step will fail later with 'Could not retrieve your application' even though the AppId is correct."
           }
-          Write-Host 'Store credentials are present.'
+          Write-Host "Store credentials are present (resolved credential source: $env:CREDENTIAL_SOURCE)."
 
       # Deliberately no actions/checkout: msstore CLI probes the working
       # directory for a project to infer the app from, and a repository full of
@@ -104,12 +114,16 @@ jobs:
         uses: microsoft/setup-msstore-cli@v1
 
       - name: Configure Store credentials
+        env:
+          STORE_TENANT_ID: ${{ secrets.STORE_TENANT_ID || secrets.AZURE_TENANT_ID }}
+          STORE_CLIENT_ID: ${{ secrets.STORE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+          STORE_CLIENT_SECRET: ${{ secrets.STORE_CLIENT_SECRET || secrets.AZURE_CLIENT_SECRET }}
         run: |
           msstore reconfigure `
-            --tenantId ${{ secrets.AZURE_TENANT_ID }} `
+            --tenantId $env:STORE_TENANT_ID `
             --sellerId ${{ secrets.STORE_SELLER_ID }} `
-            --clientId ${{ secrets.AZURE_CLIENT_ID }} `
-            --clientSecret ${{ secrets.AZURE_CLIENT_SECRET }}
+            --clientId $env:STORE_CLIENT_ID `
+            --clientSecret $env:STORE_CLIENT_SECRET
           if ($LASTEXITCODE -ne 0) { throw 'msstore reconfigure failed.' }
 
       - name: Prepare Store release notes
@@ -203,7 +217,7 @@ jobs:
             }
           }
           if (-not $succeeded) {
-            throw "msstore publish --noCommit failed after $maxAttempts attempts. If this keeps happening, a pending submission on Partner Center is likely stuck (undeletable via API) and needs to be cancelled — run check-store-submission.yml with cancel_submission, or cancel it from the Store portal — before retrying."
+            throw "msstore publish --noCommit failed after $maxAttempts attempts. If this keeps happening, a pending submission on Partner Center is likely stuck (undeletable via API) and needs to be cancelled — run check-store-submission.yml with cancel_submission, or cancel it from the Store portal — before retrying. If the error is 'Could not retrieve your application. Please make sure you have the correct AppId.', the AppId is very likely fine: msstore prints that same message when Partner Center's submission API rejects the credentials outright with HTTP 401 'Identity cannot be authorized', i.e. the Azure AD app behind the tenant/client ID in use is not associated with this Partner Center account at all. Fix it by adding that Azure AD application under Partner Center > Account settings > User management > Azure AD applications with the Manager role, in the tenant linked to the account — or configure dedicated STORE_TENANT_ID/STORE_CLIENT_ID/STORE_CLIENT_SECRET secrets for an app that is already associated, so this workflow stops relying on the Trusted Signing app's identity."
           }
 
       - name: Set release notes on draft submission
