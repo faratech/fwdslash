@@ -176,8 +176,8 @@ jobs:
           git diff --exit-code -- crates/fsw-cli/src/update/install_control.rs
           if ($LASTEXITCODE -ne 0) { throw 'install_control.rs is stale: run python tools/regen_install_control.py' }
 
-      - name: Test the CLI (adapter tests live in the bin, not a lib)
-        run: cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc --locked
+      - name: Test CLI, broker, and settings binaries
+        run: cargo test -p fwdslash -p fswbroker -p fswsettings --bins --target x86_64-pc-windows-msvc --locked
 
       - name: Release build
         run: cargo build --release --workspace --target x86_64-pc-windows-msvc --locked

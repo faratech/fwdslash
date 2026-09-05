@@ -71,37 +71,28 @@ jobs:
         with:
           targets: aarch64-pc-windows-msvc,x86_64-pc-windows-msvc
 
-      - name: Assert the tag matches the workspace version
+      - name: Derive the package version and validate a tag, if present
+        id: version
         run: |
           $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
           $core = @($metadata.packages | Where-Object { $_.name -eq 'fsw-core' })
           if ($core.Count -ne 1) { throw 'cargo metadata did not report exactly one fsw-core package.' }
           $workspace = $core[0].version
-          if ($env:GITHUB_REF_NAME -notlike 'v*') {
-              Write-Host "Not a tag ref ('$env:GITHUB_REF_NAME'); workspace version is $workspace."
-              exit 0
-          }
-          $tag = $env:GITHUB_REF_NAME.Substring(1)
-          if ($tag -ne $workspace) {
-              throw "Tag v$tag does not match workspace.package.version $workspace. " +
-                    'Bump the root Cargo.toml (and the version-copy list in CLAUDE.md) or retag.'
-          }
-          Write-Host "Tag v$tag matches workspace.package.version $workspace."
-
-      - name: Derive version from tag
-        id: version
-        run: |
           if ($env:GITHUB_REF_NAME -like 'v*') {
-              $raw = $env:GITHUB_REF_NAME.Substring(1)
+              $tag = $env:GITHUB_REF_NAME.Substring(1)
+              if ($tag -ne $workspace) {
+                  throw "Tag v$tag does not match workspace.package.version $workspace. " +
+                        'Bump the root Cargo.toml (and the version-copy list in CLAUDE.md) or retag.'
+              }
+              Write-Host "Tag v$tag matches workspace.package.version $workspace."
           } else {
-              $raw = $env:GITHUB_RUN_NUMBER
-              $raw = "0.0.$raw"
+              Write-Host "Not a tag ref ('$env:GITHUB_REF_NAME'); using workspace version $workspace."
           }
-          if ($raw -notmatch '^\d+\.\d+\.\d+$') {
-              throw "Tag must be vMAJOR.MINOR.PATCH (got '$env:GITHUB_REF_NAME')."
+          if ($workspace -notmatch '^\d+\.\d+\.\d+$') {
+              throw "workspace.package.version must be MAJOR.MINOR.PATCH (got '$workspace')."
           }
-          "version=$raw.0" >> $env:GITHUB_OUTPUT
-          "short=$raw" >> $env:GITHUB_OUTPUT
+          "version=$workspace.0" >> $env:GITHUB_OUTPUT
+          "short=$workspace" >> $env:GITHUB_OUTPUT
 
       - name: Build (ARM64)
         run: cargo build --release --target aarch64-pc-windows-msvc --workspace
