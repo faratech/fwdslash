@@ -96,13 +96,58 @@ Names only; the values live in Settings > Secrets and variables > Actions.
 
 | Secret | Used by | What it is |
 |---|---|---|
-| `AZURE_TENANT_ID` | release, publish-to-store, check-store-submission | The Azure AD tenant of the app registration authorized on Partner Center. Already present — it is the Trusted Signing service principal. |
+| `STORE_TENANT_ID` | publish-to-store, check-store-submission | The Azure AD tenant of an app registration **associated with the Partner Center account**. Preferred over the `AZURE_*` fallback below — optional, but see the failure signature further down for why it may be required. |
+| `STORE_CLIENT_ID` | same | Same application. |
+| `STORE_CLIENT_SECRET` | same | Same application. |
+| `AZURE_TENANT_ID` | release, publish-to-store (fallback), check-store-submission (fallback) | The Azure AD tenant of the Trusted Signing service principal. Already present, and used by `release.yml` regardless. Both workflows fall back to this trio when `STORE_*` is not set — but it is a **different identity** than the Store one and is not guaranteed to be associated with Partner Center; see below. |
 | `AZURE_CLIENT_ID` | same | Same application. |
 | `AZURE_CLIENT_SECRET` | same | Same application. |
-| `STORE_SELLER_ID` | publish-to-store | The Partner Center **seller ID** (Account settings > Organization profile > Legal info). Not the Store ID, and not public. **This one still has to be added**; `publish-to-store.yml` fails its first step with a message naming it until it is. |
+| `STORE_SELLER_ID` | publish-to-store | The Partner Center **seller ID** (Account settings > Organization profile > Legal info). Not the Store ID, and not public. |
+
+Both workflows resolve credentials the same way, expressed once per value:
+`${{ secrets.STORE_TENANT_ID || secrets.AZURE_TENANT_ID }}` (and the same
+pattern for client ID / client secret). The "Check the Store credentials are
+configured" step in `publish-to-store.yml`, and the equivalent check in
+`check-store-submission.yml`, log which side of the `||` resolved — the literal
+words `STORE_*` or `AZURE_* fallback` — never a secret value.
 
 The Store ID `9P51CM0MTMK2` is public (it is in the README and the Store URL),
 so it is a workflow `env:` constant, not a secret.
+
+### When the upload fails with "Could not retrieve your application"
+
+Run [33955525282](https://github.com/faratech/fwdslash/actions/runs/33955525282)
+(the first automatic Store submission) failed at "Upload package to draft
+submission" with `msstore publish` printing, three times:
+
+> Could not retrieve your application. Please make sure you have the correct AppId.
+
+The AppId (`9P51CM0MTMK2`) was correct. Reproducing the same call directly
+against the Partner Center REST API (`https://manage.devcenter.microsoft.com`)
+showed the actual cause: the Azure AD app in `AZURE_TENANT_ID` /
+`AZURE_CLIENT_ID` — the Trusted Signing service principal — obtains an OAuth
+token fine, but the submission API rejects it with **HTTP 401 "Identity cannot
+be authorized"**. The app simply isn't associated with this Partner Center
+account; msstore's CLI turns that 401 into the generic AppId message, which is
+misleading. (The sibling repo `faratech/wfdiag` uses a *different* Azure AD app
+for its Store submission under the same `AZURE_*` secret names, which is how
+this went unnoticed — the fallback here mirrors that split.)
+
+The fix is one of:
+
+- Add the Azure AD application (the one behind whichever tenant/client ID is
+  in use) under Partner Center > **Account settings > User management > Azure
+  AD applications**, with the **Manager** role, in the tenant that is linked to
+  the account — not just the tenant that owns Trusted Signing.
+- Or configure dedicated `STORE_TENANT_ID` / `STORE_CLIENT_ID` /
+  `STORE_CLIENT_SECRET` secrets for an app that is already associated, so
+  publishing stops depending on the Trusted Signing app's identity at all.
+
+Once fixed, re-run the same release rather than re-tagging:
+
+```bash
+gh workflow run publish-to-store.yml -f version=0.0.4
+```
 
 ### Publishing an existing release by hand
 
