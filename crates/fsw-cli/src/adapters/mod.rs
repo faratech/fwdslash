@@ -136,6 +136,13 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
             upgrading = true;
         }
 
+        // Before staging anything: if no marker references the payload tree at
+        // all, it is debris a deferred delete failed to remove — drop it rather
+        // than install on top of it (#37).
+        if enabled {
+            prune_orphaned_payload_tree();
+        }
+
         let controller = std::env::current_exe().unwrap_or_default();
         // An upgrade is the old payload's uninstall followed by this one's
         // install; `upgrading` is only ever set on the enable path.
@@ -215,6 +222,457 @@ pub fn sweep_uninstall() -> i32 {
     worst
 }
 
+/// `DETACHED_PROCESS` — the self-clean's delayed directory delete must outlive
+/// this process and not share its console.
+#[cfg(windows)]
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+/// One adapter's health for `fwdslash doctor` / `integrations`: a display
+/// label and a one-line status (#37).
+pub fn health_report() -> Vec<(String, String)> {
+    #[cfg(windows)]
+    {
+        let mut lines = vec![("Command Prompt".to_string(), cmd_health_status())];
+        for (label, edition) in [
+            ("Windows PowerShell", state::Edition::WindowsPowerShell),
+            ("PowerShell 7", state::Edition::PowerShell),
+        ] {
+            lines.push((label.to_string(), ps_health_status(edition)));
+        }
+        lines
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(windows)]
+fn ps_health_status(edition: state::Edition) -> String {
+    match powershell::profile_health(edition) {
+        profile::ProfileHealth::Clean => {
+            if fsw_core::adapter_installed(&format!(
+                "{}{}",
+                fsw_core::POWERSHELL_ADAPTER_ROOT,
+                edition.registry_leaf()
+            )) {
+                // Installed but no block: the write that should have put one
+                // there is the thing to explain, and a Controlled Folder Access
+                // block is the usual cause (#37).
+                if powershell::profile_write_blocked(edition) {
+                    "installed, but the profile is not writable — Controlled Folder Access may be blocking it".to_string()
+                } else {
+                    "installed, no profile block".to_string()
+                }
+            } else {
+                "not installed".to_string()
+            }
+        }
+        profile::ProfileHealth::Healthy => "healthy".to_string(),
+        profile::ProfileHealth::Orphaned(version) => {
+            format!("orphaned profile block for {version}")
+        }
+        profile::ProfileHealth::Stale(version) => format!("stale profile block for {version}"),
+        profile::ProfileHealth::Duplicated => "duplicate profile blocks".to_string(),
+    }
+}
+
+#[cfg(windows)]
+fn cmd_health_status() -> String {
+    match cmd::health() {
+        cmd::CmdHealth::Clean => "not installed".to_string(),
+        cmd::CmdHealth::Healthy => "healthy".to_string(),
+        cmd::CmdHealth::Orphaned => "orphaned AutoRun hook (missing fsw-autorun.cmd)".to_string(),
+    }
+}
+
+/// Repairs a single adapter's shell-integration hygiene (#37) and prints a
+/// `label: status — outcome` line. Exit 0 always: a repair that cannot run is
+/// reported, not fatal.
+pub fn repair_integration(id: &str) -> i32 {
+    #[cfg(windows)]
+    {
+        let controller = std::env::current_exe().unwrap_or_default();
+        match id {
+            "cmd" => {
+                let before = cmd::repair();
+                report_cmd_repair(before);
+            }
+            "windows-powershell" => report_ps_repair("Windows PowerShell", state::Edition::WindowsPowerShell, &controller),
+            "powershell" => report_ps_repair("PowerShell 7", state::Edition::PowerShell, &controller),
+            _ => return 2,
+        }
+        0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = id;
+        1
+    }
+}
+
+#[cfg(windows)]
+fn report_cmd_repair(result: Result<cmd::CmdHealth, AdapterError>) {
+    match result {
+        // Health after the repair attempt: Orphaned here means the restore was
+        // refused (a third party changed AutoRun) or there is no marker to
+        // restore from — reported, not silently claimed as fixed.
+        Ok(cmd::CmdHealth::Orphaned) => {
+            println!(
+                "Command Prompt: orphaned AutoRun hook — could not repair automatically (reconcile AutoRun and retry)"
+            );
+        }
+        Ok(_) => println!("Command Prompt: healthy"),
+        Err(error) => println!("Command Prompt: repair failed ({error})"),
+    }
+}
+
+#[cfg(windows)]
+fn report_ps_repair(label: &str, edition: state::Edition, controller: &Path) {
+    match powershell::repair(edition, controller) {
+        Ok(profile::ProfileHealth::Healthy | profile::ProfileHealth::Clean) => {
+            println!("{label}: healthy");
+        }
+        Ok(profile::ProfileHealth::Orphaned(version)) => {
+            println!("{label}: orphaned profile block for {version} — repaired");
+        }
+        Ok(profile::ProfileHealth::Stale(version)) => {
+            println!("{label}: stale profile block for {version} — repaired");
+        }
+        Ok(profile::ProfileHealth::Duplicated) => {
+            println!("{label}: duplicate profile blocks — repaired");
+        }
+        Err(error) => println!("{label}: repair failed ({error})"),
+    }
+}
+
+/// Repairs every shell adapter's hygiene (#37). The broker's startup sweep and
+/// the settings window's launch sweep both invoke this (via
+/// `fwdslash repair-adapters`) so an orphaned or duplicated block self-heals on
+/// the next run. Best effort; exit 0.
+pub fn repair_all() -> i32 {
+    #[cfg(windows)]
+    {
+        let controller = std::env::current_exe().unwrap_or_default();
+        let _ = cmd::repair();
+        for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+            let _ = powershell::repair(edition, &controller);
+        }
+        powershell::prune_orphaned_module_dirs();
+        // A payload tree no marker names is debris from a deferred delete that
+        // never completed (#37).
+        prune_orphaned_payload_tree();
+        0
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
+/// The orphan self-clean (`fwdslash uninstall --orphaned`), invoked by a
+/// leftover shell hook on the next shell start after the product was removed
+/// without running code (an MSIX uninstall). Confirms the product is really
+/// gone, then runs the transactional sweep and deletes every trace — including
+/// the directory it is running from (#37 addendum).
+pub fn cleanup_orphaned() -> i32 {
+    #[cfg(windows)]
+    {
+        // Slow confirm: the cheap probe already failed for the hook to call us,
+        // so re-check every signal. A transient alias blip during an in-flight
+        // update must never destroy a live install.
+        let mut probes = Vec::new();
+        if let Some(probe) = cmd::recorded_probe() {
+            probes.push(probe);
+        }
+        for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+            if let Some(probe) = powershell::recorded_probe(edition) {
+                probes.push(probe);
+            }
+        }
+        if product_present(&probes) {
+            return 0;
+        }
+
+        // Product confirmed gone. Restore the profiles / AutoRun byte-exact
+        // through the transactional sweep (cmd still refuses if a third party
+        // changed AutoRun), then belt-and-braces strip anything a refused or
+        // missing-recovery uninstall could have left behind.
+        let _ = sweep_uninstall();
+        strip_all_ps_profiles();
+        // The cmd analogue: a refused uninstall leaves our `call` in AutoRun,
+        // and deleting the payload under it would break every console start.
+        let _ = cmd::strip_autorun_hook();
+
+        // Wipe the settings hive + adapter markers, and the unpackaged-only Run
+        // value (a packaged orphan has neither).
+        let _ = reg::delete_tree("Software\\ForwardSlashWindows");
+        let _ = reg::delete_value(fsw_core::RUN_KEY, fsw_core::RUN_VALUE);
+        // The protocol registration goes only if it is still ours — the normal
+        // uninstall refuses to remove another application's handler, and so
+        // does this.
+        if protocol_is_ours() {
+            let _ = reg::delete_tree(fsw_core::PROTOCOL_KEY);
+        }
+
+        // Delete the payload tree, scheduling the running directory's own
+        // removal for after this process exits — but never while AutoRun still
+        // calls into it.
+        if cmd::autorun_still_hooked() {
+            return 0;
+        }
+        schedule_payload_delete();
+        0
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
+/// Whether `HKCU\Software\Classes\fwdslash` still names *our* handler.
+///
+/// `set_settings_protocol` writes `"<dir>\fswsettings.exe" "%1"` and refuses to
+/// remove the key when another application has since taken the scheme; the
+/// orphan self-clean keeps that promise rather than deleting a handler that is
+/// no longer ours.
+#[cfg(windows)]
+fn protocol_is_ours() -> bool {
+    use windows_registry::CURRENT_USER;
+
+    let command_key = format!(r"{}\shell\open\command", fsw_core::PROTOCOL_KEY);
+    let Ok(key) = CURRENT_USER.open(&command_key) else {
+        // No handler registered at all: nothing of ours to remove.
+        return false;
+    };
+    let Ok(command) = key.get_string("") else {
+        return false;
+    };
+    let command = command.to_ascii_lowercase();
+    command.contains("fswsettings.exe") || command.contains("fwdslash.exe")
+}
+
+/// Belt-and-braces removal of any fwdslash block left in either edition's
+/// default profile, used by the orphan self-clean when a marker-driven restore
+/// could not run.
+#[cfg(windows)]
+fn strip_all_ps_profiles() {
+    let Ok(documents) = documents_dir() else {
+        return;
+    };
+    for folder in ["WindowsPowerShell", "PowerShell"] {
+        let path = documents.join(folder).join("profile.ps1");
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let cleaned = profile::strip_fwdslash_blocks(&bytes);
+        if cleaned == bytes {
+            continue;
+        }
+        if cleaned.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = write_atomic(&path, &cleaned);
+        }
+    }
+}
+
+/// The fixed name of the one-shot cleanup task. Fixed rather than per-run so
+/// repeated self-cleans overwrite one task (`/f`) instead of accumulating them:
+/// at most one can ever be left behind.
+pub const CLEANUP_TASK_NAME: &str = "fwdslash-orphan-cleanup";
+
+/// `HH:MM` one minute after `hour:minute`, wrapping at midnight — the `/st`
+/// value for the backstop trigger.
+#[must_use]
+pub fn task_start_time(hour: u32, minute: u32) -> String {
+    let next = (hour * 60 + minute + 1) % (24 * 60);
+    format!("{:02}:{:02}", next / 60, next % 60)
+}
+
+/// The batch file the cleanup task runs: wait for this process to exit, remove
+/// the payload tree, then delete the task and itself. Every path is quoted, so
+/// a space in the profile-independent `%LOCALAPPDATA%` path is safe.
+#[must_use]
+pub fn cleanup_script_body(payload_dir: &str, task_name: &str) -> String {
+    format!(
+        "@echo off\r\n\
+         ping -n 3 127.0.0.1 >nul\r\n\
+         rd /s /q \"{payload_dir}\"\r\n\
+         schtasks /delete /tn \"{task_name}\" /f >nul 2>&1\r\n\
+         del /q \"%~f0\"\r\n"
+    )
+}
+
+/// The `schtasks /create` argument vector. `/tr` is a bare quoted script path —
+/// no embedded command line — so schtasks' own quoting rules cannot bite.
+#[must_use]
+pub fn cleanup_task_args(task_name: &str, script_path: &str, start_time: &str) -> Vec<String> {
+    vec![
+        "/create".to_string(),
+        "/tn".to_string(),
+        task_name.to_string(),
+        "/sc".to_string(),
+        "once".to_string(),
+        "/st".to_string(),
+        start_time.to_string(),
+        "/f".to_string(),
+        "/tr".to_string(),
+        script_path.to_string(),
+    ]
+}
+
+/// Whether `payload` is exactly the tree the self-clean is allowed to remove.
+/// The deferred delete runs `rd /s /q`, so this is the last line of defence
+/// against ever pointing it anywhere else.
+#[must_use]
+pub fn is_payload_tree(payload: &Path, local_app_data: &Path) -> bool {
+    payload == local_app_data.join("ForwardSlashWindows")
+}
+
+/// Removes `%LOCALAPPDATA%\ForwardSlashWindows`, deferring the running
+/// directory's own deletion to a **one-shot per-user scheduled task**.
+///
+/// A detached `cmd.exe` child is not enough: when the triggering shell was
+/// itself launched inside a job object (WSL interop is the case that exposed
+/// this), the whole process tree — including a `DETACHED_PROCESS` child — is
+/// killed the moment the launching command returns, so the delete never ran.
+/// Measured on the dev host: the detached helper spawns but never deletes, and
+/// `CREATE_BREAKAWAY_FROM_JOB` does not even spawn (the job forbids breakaway,
+/// `CreateProcess` fails). The Task Scheduler service starts the script in its
+/// own session, outside any job we are in, so it always survives.
+///
+/// The task is created (backstop trigger one minute out) *and* run immediately;
+/// the script waits ~2 s for this process to exit, deletes the tree, then
+/// removes the task and itself. Idempotent: an already-gone tree is not an
+/// error and `/f` overwrites any previous task of the same name.
+#[cfg(windows)]
+fn schedule_payload_delete() {
+    let Ok(local_app_data) = local_app_data() else {
+        return;
+    };
+    let payload = local_app_data.join("ForwardSlashWindows");
+    if !is_payload_tree(&payload, &local_app_data) {
+        return;
+    }
+    if schedule_payload_delete_task(&payload, &local_app_data).is_some() {
+        return;
+    }
+    // No usable Task Scheduler: fall back to a detached child. Try to break
+    // away from any job first; if that is refused, spawn plainly — which still
+    // works for an ordinary interactive shell.
+    spawn_detached_delete(&payload);
+}
+
+/// Creates and starts the cleanup task. `None` when schtasks is unavailable or
+/// refuses, so the caller can fall back.
+#[cfg(windows)]
+fn schedule_payload_delete_task(payload: &Path, local_app_data: &Path) -> Option<()> {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+
+    let script = local_app_data
+        .join("Temp")
+        .join(format!("{CLEANUP_TASK_NAME}.cmd"));
+    if let Some(parent) = script.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = cleanup_script_body(&payload.display().to_string(), CLEANUP_TASK_NAME);
+    std::fs::write(&script, body).ok()?;
+
+    // SAFETY: GetLocalTime only writes the SYSTEMTIME it is handed.
+    let now = unsafe {
+        let mut time = std::mem::zeroed();
+        GetLocalTime(&mut time);
+        time
+    };
+    let start = task_start_time(u32::from(now.wHour), u32::from(now.wMinute));
+    let args = cleanup_task_args(CLEANUP_TASK_NAME, &script.display().to_string(), &start);
+
+    let created = Command::new("schtasks.exe")
+        .args(&args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    if !created.success() {
+        return None;
+    }
+    // Fire it now; the scheduled trigger is only the backstop.
+    let _ = Command::new("schtasks.exe")
+        .args(["/run", "/tn", CLEANUP_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    Some(())
+}
+
+/// The pre-scheduled-task fallback: a detached `cmd.exe` that waits, then
+/// deletes. Kept because it is enough for an ordinary interactive shell.
+#[cfg(windows)]
+fn spawn_detached_delete(payload: &Path) {
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let system32 = Path::new(&system_root).join("System32");
+    let command = format!("ping -n 3 127.0.0.1 >nul & rd /s /q \"{}\"", payload.display());
+    for flags in [
+        CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
+        CREATE_NO_WINDOW | DETACHED_PROCESS,
+    ] {
+        let spawned = Command::new("cmd.exe")
+            .args(["/c", &command])
+            .current_dir(&system32)
+            .creation_flags(flags)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if spawned.is_ok() {
+            return;
+        }
+    }
+}
+
+/// Whether any adapter marker key exists at all — including a half-finished
+/// `prepared`/`removing` transaction, which must not be swept out from under.
+#[cfg(windows)]
+fn any_adapter_marker_present() -> bool {
+    use windows_registry::CURRENT_USER;
+
+    CURRENT_USER.open(fsw_core::CMD_ADAPTER_KEY).is_ok()
+        || CURRENT_USER
+            .open(&format!(
+                "{}WindowsPowerShell",
+                fsw_core::POWERSHELL_ADAPTER_ROOT
+            ))
+            .is_ok()
+        || CURRENT_USER
+            .open(&format!("{}PowerShell", fsw_core::POWERSHELL_ADAPTER_ROOT))
+            .is_ok()
+}
+
+/// Belt and braces for a deferred delete that never completed: when no adapter
+/// marker references it at all, the whole `%LOCALAPPDATA%\ForwardSlashWindows`
+/// tree is stale and goes before anything new is staged into it. Best effort
+/// and silent; never touches a tree any marker still names.
+#[cfg(windows)]
+pub fn prune_orphaned_payload_tree() {
+    if any_adapter_marker_present() {
+        return;
+    }
+    let Ok(local_app_data) = local_app_data() else {
+        return;
+    };
+    let payload = local_app_data.join("ForwardSlashWindows");
+    if is_payload_tree(&payload, &local_app_data) && payload.is_dir() {
+        let _ = std::fs::remove_dir_all(&payload);
+    }
+}
+
 /// The payload directory for an adapter kind, relative to the executable:
 /// a packaged install carries `shell\` beside the exes; a dev build run from
 /// `target\<triple>\release` falls back to the repo checkout.
@@ -244,6 +702,90 @@ pub fn local_app_data() -> Result<PathBuf, AdapterError> {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or_else(|| AdapterError::new("%LOCALAPPDATA% is not set."))
+}
+
+/// The per-user app-execution alias both packaged flavors register:
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\fwdslash.exe`. It is user-readable
+/// (unlike the `WindowsApps` install root) and vanishes when the package is
+/// removed, which makes it the cheap "is the product still installed" probe
+/// the shell hooks test on every start (#37 addendum).
+#[cfg(windows)]
+pub fn app_execution_alias() -> Option<PathBuf> {
+    local_app_data()
+        .ok()
+        .map(|dir| dir.join("Microsoft").join("WindowsApps").join("fwdslash.exe"))
+}
+
+/// The product-presence probe recorded in an adapter's marker at install time.
+/// Its absence arms the shell hook's self-clean.
+///
+/// Packaged: the package's own app-data folder,
+/// `%LOCALAPPDATA%\Packages\<package family>`, resolved from the *actual*
+/// family at install time so either flavor works. It exists while the package
+/// is registered, survives updates (closing the in-flight-update race), and is
+/// removed by an MSIX uninstall. Deliberately **not** the app-execution alias:
+/// a user can turn that off under Settings > Apps > App execution aliases,
+/// which would silently disable the integration and spawn a self-clean on
+/// every shell start.
+///
+/// Unpackaged: the directory the real controller runs from.
+#[cfg(windows)]
+pub fn product_probe_path(controller: &Path) -> PathBuf {
+    if fsw_core::has_package_identity() {
+        if let (Some(family), Ok(local_app_data)) = (fsw_core::package_family(), local_app_data()) {
+            return local_app_data.join("Packages").join(family);
+        }
+        if let Some(alias) = app_execution_alias() {
+            return alias;
+        }
+    }
+    // Unpackaged (or, defensively, a packaged build we could not resolve a
+    // family for): the real controller's own directory proves it is present.
+    controller
+        .parent()
+        .map_or_else(|| controller.to_path_buf(), Path::to_path_buf)
+}
+
+/// The slow product-presence confirm, run only after the cheap probe has
+/// already failed (`--orphaned`): the alias, any recorded install directory,
+/// or — last — whether either package flavor is still registered. Conservative
+/// on error: an appx query that cannot even run counts as "present" so a
+/// transient failure never destroys a live install.
+#[cfg(windows)]
+pub fn product_present(recorded_probes: &[String]) -> bool {
+    // Cheap: the recorded probes (the package app-data folder, or the
+    // unpackaged install directory) and the app-execution alias — plain file
+    // system checks. Slow, and only paid when every cheap check has failed:
+    // an appx registration query.
+    let cheap_probe_present = recorded_probes
+        .iter()
+        .any(|probe| !probe.is_empty() && Path::new(probe).exists())
+        || app_execution_alias().is_some_and(|path| path.is_file());
+    let slow_confirm_present =
+        !cheap_probe_present && appx_registered(fsw_core::STORE_IDENTITY_NAME);
+    !state::product_confirmed_gone(cheap_probe_present, slow_confirm_present)
+}
+
+/// Whether a package with `identity_name` (shared by both flavors) is still
+/// registered for this user. Spawns in-box Windows PowerShell — acceptable
+/// because this only runs on the rare cleanup path. Returns `true` (present) if
+/// the query cannot be run at all.
+#[cfg(windows)]
+fn appx_registered(identity_name: &str) -> bool {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let shell = Path::new(&system_root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let script = format!(
+        "if (Get-AppxPackage -Name '{}') {{ exit 0 }} else {{ exit 1 }}",
+        identity_name.replace('\'', "''")
+    );
+    Command::new(shell)
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_or(true, |status| status.success())
 }
 
 /// The real Documents folder, following OneDrive redirection
@@ -331,15 +873,36 @@ pub fn real_copy_file(source: &Path, destination_dir: &Path) -> Result<(), Adapt
     )))
 }
 
+/// Whether a failed write to a path whose parent directory exists should be
+/// reported as a Controlled Folder Access block.
+///
+/// Access-denied is the obvious signature. The subtle one (#37): CFA does
+/// **not** always surface as `ERROR_ACCESS_DENIED` — on the dev host a blocked
+/// `CreateFile` for the temp file `write_atomic` creates inside a protected
+/// `Documents` subfolder came back as `ERROR_FILE_NOT_FOUND`, which used to be
+/// reported as the useless "The system cannot find the file specified". A
+/// "not found" only means a block when the containing folder is actually
+/// there; otherwise it is a genuinely missing path.
+#[must_use]
+pub fn looks_like_blocked_write(error_text: &str, parent_exists: bool) -> bool {
+    let denied = error_text.contains("os error 5") || error_text.contains("Access is denied");
+    let not_found = error_text.contains("os error 2")
+        || error_text.contains("cannot find the file")
+        || error_text.contains("cannot find the path");
+    denied || (not_found && parent_exists)
+}
+
+/// The user-facing explanation for a blocked profile write.
+pub const BLOCKED_WRITE_GUIDANCE: &str = "was blocked by Windows Controlled Folder Access, or the folder is otherwise not writable. Allow Forward Slash Windows under Windows Security > Virus & threat protection > Ransomware protection > Allow an app through Controlled folder access, then try again.";
+
 /// Wraps a file error with Controlled Folder Access guidance when the failure
-/// looks like a Defender block (access denied against a protected folder).
+/// looks like a Defender block against `target`.
 #[cfg(windows)]
-pub fn explain_file_error(error: &AdapterError, what: &str) -> AdapterError {
+pub fn explain_file_error(error: &AdapterError, what: &str, target: &Path) -> AdapterError {
     let text = error.to_string();
-    if text.contains("os error 5") || text.contains("Access is denied") {
-        return AdapterError::new(&format!(
-            "{what} was blocked by Windows Controlled Folder Access. Allow Forward Slash Windows under Windows Security > Virus & threat protection > Ransomware protection > Allow an app through Controlled folder access, then try again."
-        ));
+    let parent_exists = target.parent().is_some_and(Path::is_dir);
+    if looks_like_blocked_write(&text, parent_exists) {
+        return AdapterError::new(&format!("{what} {BLOCKED_WRITE_GUIDANCE}"));
     }
     AdapterError::new(&text)
 }

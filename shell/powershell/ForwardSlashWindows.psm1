@@ -32,6 +32,12 @@ function Test-ForwardSlashWindowsDisabled {
 function Resolve-ForwardSlashWindowsTarget {
     param([Parameter(Mandatory = $true)][string]$Path)
 
+    # Zombie guard: if the product was uninstalled while this session had the
+    # module loaded, the staged controller is gone. Fall back to the native
+    # cmdlet rather than spawn a controller that no longer exists (#37).
+    if (-not (Test-Path -LiteralPath $script:FswController)) {
+        return $null
+    }
     # One spawn per slash argument. shell-resolve answers from the settings
     # snapshot alone -- no broker round trip, no filter-port probe -- and
     # returns the kind, the target and the distribution list together.

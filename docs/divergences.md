@@ -565,6 +565,96 @@ payload is frozen at install time. The Rust CLI adds:
   the manual fallback. Without this an updated product kept running a frozen
   copy of the old payload and old `fwdslash.exe` forever.
 
+### 3. Self-healing shell integrations (#37)
+
+The C++ adapter writes a bare `Import-Module` into the profile, snapshots the
+profile verbatim, and never revisits either. The Rust adapter hardens the whole
+lifecycle so an upgrade or an MSIX uninstall can never leave a broken shell:
+
+- **The profile block is guarded, fenced, and self-cleaning.** `block_text`
+  emits `$m`/`$p`/`$a`/`$c` (module, product-presence probe, app-execution
+  alias, staged controller) and
+  `if ((Test-Path $p) -or (Test-Path $a)) { if (Test-Path $m) { Import-Module … } }
+  elseif (Test-Path $c) { Start-Process $c uninstall --orphaned }`. A pruned
+  module directory can no longer throw the red `no valid module file` error,
+  and a product that was uninstalled with no code run (MSIX) is cleaned up by
+  the leftover hook on the next shell start — launched detached, so a shell
+  never blocks on it. The region is delimited by
+  `# >>> Forward Slash Windows <ver> <id> >>>` / `# <<< … <<<` fence lines.
+- **The probe is the package's app-data folder, not the alias.** A packaged
+  install records `%LOCALAPPDATA%\Packages\<family>` (from the actual
+  `fsw_core::package_family()` at install time, so either flavor works); an
+  unpackaged one records the controller's directory. The app-execution alias is
+  only ever an additional OR, because a user can switch it off under
+  Settings > Apps > App execution aliases without uninstalling anything — using
+  it as *the* probe would silently disable the integration and spawn a
+  self-clean on every shell start. The package folder also survives an update,
+  which closes the in-flight-update race.
+- **Install/enable is replace-not-append and idempotent.** `commit_install`
+  computes the *true* original — the current profile with **every** fwdslash
+  fence stripped (`strip_fwdslash_blocks`, encoding-aware over UTF-8/16/32) —
+  snapshots that, and writes it plus exactly one current block. A repeated
+  enable, or an upgrade over an older block, can never accumulate duplicates or
+  strand a stale block, and uninstall restores the genuine pre-fwdslash profile.
+  `OriginalPresent` now tracks whether that true original is non-empty, so a
+  profile that was purely our own block is deleted on removal.
+- **Detect-and-repair.** `fwdslash repair-adapters` (run by the broker startup
+  sweep and the settings launch sweep) and the per-adapter
+  `fwdslash integration <id> repair` classify each profile — orphaned (missing
+  module), stale (wrong version), duplicated — and repair to exactly one current
+  block when the adapter should be installed, or strip it out when it should
+  not. `fwdslash doctor` and `fwdslash integrations` print a
+  `shell integration health:` line per adapter.
+- **cmd never snapshots its own hook.** `begin_install` strips any
+  `call "…ForwardSlashWindows…fsw-autorun.cmd"` segment from the observed
+  `AutoRun` before recording the original, so an MSIX-leftover hook is not
+  mistaken for a third-party value and `installed_autorun` never composes
+  `call fsw & call fsw`. `fsw-autorun.cmd` is generated at install time with the
+  probe baked in: it installs the doskey macros only while the product is
+  present, and otherwise runs the self-clean instead of routing through an
+  orphaned controller copy.
+- **`fwdslash uninstall --orphaned`** is the deferred self-clean. It confirms
+  the product is really gone (cheap file-system probes, then a
+  `Get-AppxPackage` slow confirm only if those fail, so an in-flight update is
+  safe), runs the transactional sweep (restoring profiles/AutoRun byte-exact,
+  cmd still refusing a third-party change), then belt-and-braces strips what a
+  refusal left: any fwdslash profile fence, and — the cmd analogue — fwdslash's
+  own `call` segment out of `AutoRun`, keeping every third-party segment
+  byte-for-byte and deleting the value only if nothing else remains. It removes
+  `HKCU\Software\ForwardSlashWindows` and the unpackaged Run value, deletes the
+  protocol key **only when its `shell\open\command` is still ours** (the normal
+  uninstall's refusal, kept), and schedules deletion of
+  `%LOCALAPPDATA%\ForwardSlashWindows` — including the directory it is running
+  from — after it exits, but **never while `AutoRun` still references the
+  payload**. Idempotent and safe to run twice.
+- **The deferred delete is a scheduled task, not a detached child.** A
+  `DETACHED_PROCESS` `cmd.exe` is killed with the rest of the tree when the
+  launching shell lives inside a job object — measured on the dev host, where a
+  WSL-interop-launched shell left the payload directory behind on 2/2 uninstall
+  cycles even though nothing held the file open. `CREATE_BREAKAWAY_FROM_JOB` is
+  not a fix either: that job forbids breakaway, so `CreateProcess` fails
+  outright. The self-clean therefore writes
+  `%LOCALAPPDATA%\Temp\fwdslash-orphan-cleanup.cmd` and registers a one-shot
+  per-user task (`schtasks /create /sc once /st <now+1min> /f /tr <script>`,
+  no elevation), then runs it immediately — the Task Scheduler service starts
+  the script in its own session, outside any job we are in. The script waits
+  ~2 s, removes the tree, then deletes the task and itself, so nothing
+  accumulates; the one-minute trigger is only a backstop. The task name is
+  fixed, so `/f` overwrites rather than piling up one task per run, and the
+  detached child remains as the fallback when schtasks is unavailable.
+  Belt and braces: `enable` and `repair-adapters` drop a payload tree that no
+  adapter marker names before staging into it.
+- **Controlled Folder Access is recognised through `ERROR_FILE_NOT_FOUND`.**
+  CFA does not always block with `ERROR_ACCESS_DENIED`: on the dev host the
+  blocked temp-file create inside a protected `Documents` subfolder surfaced as
+  `os error 2`, and the user got "The system cannot find the file specified"
+  instead of the product's guidance. `looks_like_blocked_write` now treats a
+  "not found" as a block **when the containing folder exists**, keeps the
+  access-denied case unconditional, and the message says "…or the folder is
+  otherwise not writable". The same explanation reaches the settings InfoBar —
+  `run_controller` captures the controller's stderr — and `doctor` /
+  `integrations` report an installed adapter whose profile cannot be written.
+
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 
 These are planned, not yet implemented. Each needs its own entry with a test

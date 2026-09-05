@@ -351,8 +351,22 @@ fn encode_round_trips_through_utf16() {
     assert_eq!(String::from_utf16(&units).ok().as_deref(), Some(text));
 }
 
+/// A guarded block for the tests: the fixed probe/controller keep the layout
+/// assertions focused on the parts #37 changed.
+fn ps_block(version: &str, id: &str, module: &str, original_non_empty: bool) -> String {
+    profile::block_text(&profile::BlockParams {
+        version,
+        transaction_id: id,
+        module_path: module,
+        probe_path: "C:\\Local\\Packages\\Fam_abc",
+        alias_path: "C:\\Local\\Microsoft\\WindowsApps\\fwdslash.exe",
+        controller_path: "C:\\ctl\\fwdslash.exe",
+        original_non_empty,
+    })
+}
+
 #[test]
-fn block_text_matches_the_script_layout() {
+fn block_text_renders_the_guarded_form() {
     // The payload version follows the crate version, so the layout assertions
     // are built from PAYLOAD_VERSION rather than a literal that goes stale
     // at every release.
@@ -360,23 +374,359 @@ fn block_text_matches_the_script_layout() {
     let module = format!(
         r"C:\Users\me\AppData\Local\ForwardSlashWindows\PowerShell\{version}\ForwardSlashWindows.psm1"
     );
-    let block = profile::block_text(version, "cafe", &module, false);
+    let block = ps_block(version, "cafe", &module, false);
     assert!(block.starts_with(&format!(
         "# >>> Forward Slash Windows {version} cafe >>>\r\n"
     )));
-    assert!(block.contains(&format!(
-        "Import-Module -Name 'C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\PowerShell\\{version}\\ForwardSlashWindows.psm1' -Global -Force\r\n"
-    )));
+    assert!(block.contains(&format!("$m = '{module}'\r\n")));
+    // The import is guarded by Test-Path, never a bare Import-Module (#37); the
+    // product counts as present when EITHER the probe folder or the
+    // app-execution alias is there, so switching the alias off in Settings
+    // cannot look like an uninstall; and the self-clean is launched detached so
+    // a shell never blocks on it.
+    assert!(block.contains("$p = 'C:\\Local\\Packages\\Fam_abc'\r\n"));
+    assert!(block.contains("$a = 'C:\\Local\\Microsoft\\WindowsApps\\fwdslash.exe'\r\n"));
+    // `$a -and` guards the alias: an unresolvable %LOCALAPPDATA% renders it
+    // empty, and a bare `Test-Path -LiteralPath ''` throws on every shell start.
+    assert!(block.contains(
+        "if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) { if (Test-Path -LiteralPath $m) { Import-Module -Name $m -Global -Force } } elseif (Test-Path -LiteralPath $c) { Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }\r\n"
+    ));
+    assert!(
+        !block.contains("Import-Module -Name 'C:"),
+        "no unguarded literal-path import"
+    );
     assert!(block.ends_with(&format!(
         "# <<< Forward Slash Windows {version} cafe <<<\r\n"
     )));
+    // No blank-line prefix when the original was empty.
+    assert!(!block.starts_with("\r\n"));
 }
 
 #[test]
 fn block_text_escapes_quotes_and_prefixes_nonempty_originals() {
-    let block = profile::block_text(super::PAYLOAD_VERSION, "t", "C:\\it's", true);
+    let block = ps_block(super::PAYLOAD_VERSION, "t", "C:\\it's", true);
     assert!(block.starts_with("\r\n"));
-    assert!(block.contains("'C:\\it''s'"));
+    assert!(block.contains("$m = 'C:\\it''s'\r\n"));
+}
+
+#[test]
+fn strip_restores_the_true_original_utf8() {
+    let original = b"Write-Host hi\r\n".to_vec();
+    let block = ps_block(super::PAYLOAD_VERSION, "id1", "C:\\m.psm1", true);
+    let mut installed = original.clone();
+    installed.extend_from_slice(block.as_bytes());
+    assert_eq!(profile::strip_fwdslash_blocks(&installed), original);
+}
+
+#[test]
+fn strip_restores_empty_when_the_original_was_absent() {
+    let block = ps_block(super::PAYLOAD_VERSION, "id1", "C:\\m.psm1", false);
+    assert!(profile::strip_fwdslash_blocks(block.as_bytes()).is_empty());
+}
+
+#[test]
+fn strip_removes_every_block_on_a_multi_version_upgrade() {
+    // The append-not-replace bug (#37): a profile carrying an old block and a
+    // new one must strip back to the genuine original, and both are detected.
+    let original = b"# my profile\r\n".to_vec();
+    let old = ps_block("0.0.1", "old", "C:\\old\\m.psm1", true);
+    let new = ps_block("0.0.3", "new", "C:\\new\\m.psm1", true);
+    let mut polluted = original.clone();
+    polluted.extend_from_slice(old.as_bytes());
+    polluted.extend_from_slice(new.as_bytes());
+    assert_eq!(profile::strip_fwdslash_blocks(&polluted), original);
+    assert_eq!(profile::parse_blocks(&polluted).len(), 2);
+}
+
+#[test]
+fn strip_leaves_a_fenceless_profile_byte_exact() {
+    let original = b"Set-StrictMode -Version 2\r\nWrite-Host hi\r\n";
+    assert_eq!(profile::strip_fwdslash_blocks(original), original.to_vec());
+}
+
+#[test]
+fn strip_restores_the_true_original_utf16le_with_bom() {
+    let text = "Write-Host hi\r\n";
+    let block = ps_block(super::PAYLOAD_VERSION, "id", "C:\\m.psm1", true);
+    let mut installed = vec![0xFF, 0xFE];
+    installed.extend_from_slice(&profile::encode(text, profile::ProfileEncoding::Utf16Le));
+    installed.extend_from_slice(&profile::encode(&block, profile::ProfileEncoding::Utf16Le));
+    let mut expected = vec![0xFF, 0xFE];
+    expected.extend_from_slice(&profile::encode(text, profile::ProfileEncoding::Utf16Le));
+    assert_eq!(profile::strip_fwdslash_blocks(&installed), expected);
+}
+
+#[test]
+fn parse_blocks_extracts_version_and_module() {
+    let block = ps_block("0.0.1", "abc123", "C:\\FSW\\PowerShell\\0.0.1\\ForwardSlashWindows.psm1", true);
+    let blocks = profile::parse_blocks(block.as_bytes());
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].version, "0.0.1");
+    assert_eq!(blocks[0].transaction_id, "abc123");
+    assert_eq!(
+        blocks[0].module_path.as_deref(),
+        Some("C:\\FSW\\PowerShell\\0.0.1\\ForwardSlashWindows.psm1")
+    );
+}
+
+#[test]
+fn parse_and_strip_understand_the_old_one_line_import_format() {
+    // Pre-#37 blocks carried a bare `Import-Module -Name '…'` line; the parser
+    // still finds the module and the strip still removes them cleanly.
+    let legacy = "# >>> Forward Slash Windows 0.0.1 old >>>\r\nImport-Module -Name 'C:\\old\\ForwardSlashWindows.psm1' -Global -Force\r\n# <<< Forward Slash Windows 0.0.1 old <<<\r\n";
+    let blocks = profile::parse_blocks(legacy.as_bytes());
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0].module_path.as_deref(),
+        Some("C:\\old\\ForwardSlashWindows.psm1")
+    );
+    assert!(profile::strip_fwdslash_blocks(legacy.as_bytes()).is_empty());
+}
+
+#[test]
+fn classify_profile_ranks_orphan_over_duplicate_and_stale() {
+    use profile::{BlockPresence, ProfileHealth};
+    let present = BlockPresence {
+        version: super::PAYLOAD_VERSION.to_string(),
+        module_present: true,
+    };
+    let missing = BlockPresence {
+        version: "0.0.1".to_string(),
+        module_present: false,
+    };
+    let stale = BlockPresence {
+        version: "0.0.1".to_string(),
+        module_present: true,
+    };
+    assert_eq!(
+        profile::classify_profile(&[], super::PAYLOAD_VERSION),
+        ProfileHealth::Clean
+    );
+    assert_eq!(
+        profile::classify_profile(std::slice::from_ref(&present), super::PAYLOAD_VERSION),
+        ProfileHealth::Healthy
+    );
+    assert_eq!(
+        profile::classify_profile(&[present.clone(), missing], super::PAYLOAD_VERSION),
+        ProfileHealth::Orphaned("0.0.1".to_string())
+    );
+    assert_eq!(
+        profile::classify_profile(&[present.clone(), present.clone()], super::PAYLOAD_VERSION),
+        ProfileHealth::Duplicated
+    );
+    assert_eq!(
+        profile::classify_profile(std::slice::from_ref(&stale), super::PAYLOAD_VERSION),
+        ProfileHealth::Stale("0.0.1".to_string())
+    );
+}
+
+#[test]
+fn decide_profile_repair_covers_the_matrix() {
+    use profile::{ProfileAction, ProfileHealth};
+    // Healthy: nothing when installed; a dangling leftover to remove otherwise.
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::Healthy, true, true),
+        ProfileAction::Nothing
+    );
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::Healthy, false, true),
+        ProfileAction::RemoveBlocks
+    );
+    // Orphan: write one current block when the module is there, reinstall when
+    // it is missing, strip entirely when the marker is gone.
+    let orphan = ProfileHealth::Orphaned("x".to_string());
+    assert_eq!(
+        profile::decide_profile_repair(&orphan, true, true),
+        ProfileAction::WriteCurrentBlock
+    );
+    assert_eq!(
+        profile::decide_profile_repair(&orphan, true, false),
+        ProfileAction::Reinstall
+    );
+    assert_eq!(
+        profile::decide_profile_repair(&orphan, false, true),
+        ProfileAction::RemoveBlocks
+    );
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::Clean, false, false),
+        ProfileAction::Nothing
+    );
+}
+
+// ---------------------------------------------------------------------------
+// state.rs — cmd AutoRun own-hook strip + product-presence probe (#37)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strip_fwdslash_autorun_recovers_the_true_third_party_value() {
+    let hook =
+        "call \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
+    // The MSIX-leftover case: an AutoRun that is purely our own hook.
+    assert_eq!(state::strip_fwdslash_autorun(hook), "");
+    assert_eq!(state::strip_fwdslash_autorun(&format!("echo hi & {hook}")), "echo hi");
+    assert_eq!(state::strip_fwdslash_autorun(&format!("{hook} & echo hi")), "echo hi");
+    // A doubled install (`call fsw & call fsw`) strips to nothing.
+    assert_eq!(state::strip_fwdslash_autorun(&format!("{hook} & {hook}")), "");
+    // A third-party value that itself contains ` & ` survives intact.
+    assert_eq!(
+        state::strip_fwdslash_autorun(&format!("echo a & echo b & {hook}")),
+        "echo a & echo b"
+    );
+    assert_eq!(state::strip_fwdslash_autorun("echo hi"), "echo hi");
+}
+
+#[test]
+fn a_refused_uninstall_still_strips_only_our_own_autorun_segment() {
+    // The bug this closes (#37): the transactional uninstall REFUSES when a
+    // third party edited AutoRun after we installed, which used to leave our
+    // `call "…fsw-autorun.cmd"` pointing at a script the self-clean then
+    // deleted — a "system cannot find the path specified" on every cmd start.
+    let hook =
+        "call \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
+    let original = "echo hi";
+    let installed = state::installed_autorun(original, hook);
+    let tampered = format!("{installed} & echo later");
+
+    // The refusal still stands...
+    assert_eq!(
+        state::judge_autorun(true, &tampered, &installed, original),
+        state::AutorunVerdict::Changed
+    );
+    // ...but stripping removes only our segment and keeps both third-party
+    // parts byte-for-byte, leaving nothing that references the deleted script.
+    let stripped = state::strip_fwdslash_autorun(&tampered);
+    assert_eq!(stripped, "echo hi & echo later");
+    assert!(!state::autorun_references_fwdslash(&stripped));
+    // Idempotent: stripping an already-clean value changes nothing.
+    assert_eq!(state::strip_fwdslash_autorun(&stripped), stripped);
+}
+
+#[test]
+fn autorun_reference_and_path_helpers() {
+    let hook = "call \"C:\\x\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
+    assert!(state::autorun_references_fwdslash(&format!("echo hi & {hook}")));
+    assert!(!state::autorun_references_fwdslash("echo hi"));
+    assert_eq!(
+        state::fwdslash_autorun_path(hook).as_deref(),
+        Some("C:\\x\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd")
+    );
+    assert_eq!(state::fwdslash_autorun_path("echo hi"), None);
+}
+
+#[test]
+fn product_confirmed_gone_requires_both_checks_absent() {
+    assert!(state::product_confirmed_gone(false, false));
+    assert!(!state::product_confirmed_gone(true, false));
+    assert!(!state::product_confirmed_gone(false, true));
+    assert!(!state::product_confirmed_gone(true, true));
+}
+
+// ---------------------------------------------------------------------------
+// mod.rs — deferred payload delete + blocked-write classification (#37)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn task_start_time_formats_and_wraps_at_midnight() {
+    assert_eq!(super::task_start_time(9, 5), "09:06");
+    assert_eq!(super::task_start_time(0, 0), "00:01");
+    // Two-digit padding on both fields.
+    assert_eq!(super::task_start_time(13, 0), "13:01");
+    // Minute rollover into the next hour.
+    assert_eq!(super::task_start_time(9, 59), "10:00");
+    // Midnight wrap must stay a valid HH:MM rather than "24:00".
+    assert_eq!(super::task_start_time(23, 59), "00:00");
+}
+
+#[test]
+fn cleanup_script_quotes_every_path_and_self_destructs() {
+    let dir = r"C:\Users\a b\AppData\Local\ForwardSlashWindows";
+    let body = super::cleanup_script_body(dir, super::CLEANUP_TASK_NAME);
+    // The payload path is quoted, so a space in the profile name is safe.
+    assert!(body.contains(&format!("rd /s /q \"{dir}\"\r\n")));
+    // It waits for the launching process to exit before deleting.
+    assert!(body.contains("ping -n 3 127.0.0.1 >nul\r\n"));
+    // ...then removes the task and itself, so nothing accumulates.
+    assert!(body.contains(&format!(
+        "schtasks /delete /tn \"{}\" /f",
+        super::CLEANUP_TASK_NAME
+    )));
+    assert!(body.contains("del /q \"%~f0\""));
+    assert!(body.starts_with("@echo off\r\n"));
+}
+
+#[test]
+fn cleanup_task_args_pass_the_script_as_a_bare_quoted_path() {
+    let args = super::cleanup_task_args(
+        super::CLEANUP_TASK_NAME,
+        r"C:\Users\a b\AppData\Local\Temp\fwdslash-orphan-cleanup.cmd",
+        "09:06",
+    );
+    assert_eq!(
+        args,
+        vec![
+            "/create",
+            "/tn",
+            "fwdslash-orphan-cleanup",
+            "/sc",
+            "once",
+            "/st",
+            "09:06",
+            "/f",
+            "/tr",
+            r"C:\Users\a b\AppData\Local\Temp\fwdslash-orphan-cleanup.cmd",
+        ]
+    );
+    // A fixed task name, so repeated self-cleans overwrite one task under /f
+    // rather than accumulating one per run.
+    assert!(!super::CLEANUP_TASK_NAME.is_empty());
+    // /tr carries no embedded command line, so schtasks' quoting cannot bite.
+    assert!(!args.iter().any(|argument| argument.contains(" & ")));
+}
+
+#[cfg(windows)]
+#[test]
+fn only_the_payload_tree_is_ever_deletable() {
+    use std::path::Path;
+
+    let local = Path::new(r"C:\Users\me\AppData\Local");
+    assert!(super::is_payload_tree(
+        &local.join("ForwardSlashWindows"),
+        local
+    ));
+    // Anything else — a parent, a sibling, a subdirectory — is refused.
+    assert!(!super::is_payload_tree(local, local));
+    assert!(!super::is_payload_tree(&local.join("Packages"), local));
+    assert!(!super::is_payload_tree(
+        &local.join("ForwardSlashWindows").join("cmd"),
+        local
+    ));
+    assert!(!super::is_payload_tree(Path::new(r"C:\"), local));
+}
+
+#[test]
+fn blocked_write_classification_covers_the_cfa_not_found_case() {
+    // Access denied is a block whether or not the folder is there.
+    assert!(super::looks_like_blocked_write(
+        "file operation failed (Access is denied. (os error 5))",
+        false
+    ));
+    assert!(super::looks_like_blocked_write("os error 5", true));
+    // The #37 case: Controlled Folder Access surfaced the blocked profile
+    // write as ERROR_FILE_NOT_FOUND, and the folder does exist.
+    assert!(super::looks_like_blocked_write(
+        "file operation failed (The system cannot find the file specified. (os error 2))",
+        true
+    ));
+    // ...but a genuinely missing folder is not a CFA block.
+    assert!(!super::looks_like_blocked_write(
+        "file operation failed (The system cannot find the file specified. (os error 2))",
+        false
+    ));
+    // Unrelated failures stay unexplained.
+    assert!(!super::looks_like_blocked_write(
+        "file operation failed (The disk is full. (os error 112))",
+        true
+    ));
 }
 
 #[test]

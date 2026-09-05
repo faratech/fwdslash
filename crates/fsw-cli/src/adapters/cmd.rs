@@ -45,6 +45,7 @@ struct InstallState {
     original_present: bool,
     original_value: String,
     original_kind: String,
+    product_probe: String,
 }
 
 impl InstallState {
@@ -113,6 +114,7 @@ fn begin_install(controller: &Path) -> Result<InstallState, AdapterError> {
         original_present: false,
         original_value: String::new(),
         original_kind: super::reg::RegKind::Sz.marker_label().to_string(),
+        product_probe: String::new(),
     };
 
     // Idempotence and interrupted-transaction refusal (marker read first).
@@ -143,20 +145,31 @@ fn begin_install(controller: &Path) -> Result<InstallState, AdapterError> {
     let source = payload_source_dir()?;
     super::real_make_dir(&install_parent)?;
     super::real_make_dir(&state.staging)?;
-    // Every file the AutoRun macros call. Keep in step with the payload
-    // lists in tools/Package.ps1 and tools/Package-Msix.ps1.
-    for file in [
-        "fsw-autorun.cmd",
-        "fsw-cd.cmd",
-        "fsw-dir.cmd",
-        "fsw-pushd.cmd",
-    ] {
+    // The macro helpers the AutoRun hook calls. Keep in step with the payload
+    // lists in tools/Package.ps1 and tools/Package-Msix.ps1. fsw-autorun.cmd is
+    // *generated* below rather than copied, so the product-presence probe can
+    // be baked in (#37).
+    for file in ["fsw-cd.cmd", "fsw-dir.cmd", "fsw-pushd.cmd"] {
         super::real_copy_file(&source.join(file), &state.staging)?;
     }
     super::real_copy_file(controller, &state.staging)?;
+    // Generate the AutoRun hook with the product-presence probe baked in.
+    // Direct write — %LOCALAPPDATA%\ForwardSlashWindows writes are real for
+    // this package, so the generated file is visible to unpackaged consoles.
+    let probe = super::product_probe_path(controller);
+    let alias = super::app_execution_alias().unwrap_or_default();
+    state.product_probe = probe.display().to_string();
+    std::fs::write(
+        state.staging.join("fsw-autorun.cmd"),
+        generate_autorun(&state.product_probe, &alias.display().to_string()),
+    )?;
 
-    // Snapshot the user's AutoRun exactly as it is today (raw, kind-aware).
-    let (original_present, original_value, original_kind) =
+    // Snapshot the user's AutoRun as it is today (raw, kind-aware) but strip
+    // any fwdslash hook first: a prior install whose marker was lost (an MSIX
+    // uninstall runs no code) can leave `call "…fsw-autorun.cmd"` in AutoRun,
+    // and snapshotting that would make a later uninstall "restore" our own hook
+    // and let installed_autorun compose `call fsw & call fsw` (#37).
+    let (raw_present, raw_value, original_kind) =
         match reg::read_raw_string(COMMAND_PROCESSOR, AUTORUN_VALUE)? {
             Some((kind, value)) => {
                 let Some(label) = kind_from_raw(&kind) else {
@@ -168,6 +181,11 @@ fn begin_install(controller: &Path) -> Result<InstallState, AdapterError> {
             }
             None => (false, String::new(), super::reg::RegKind::Sz.marker_label().to_string()),
         };
+    let original_value = state::strip_fwdslash_autorun(&raw_value);
+    // "Present" now means there is genuine third-party content to restore; a
+    // value that was purely our hook is treated as absent so uninstall deletes
+    // AutoRun rather than restoring an empty string.
+    let original_present = raw_present && !original_value.is_empty();
     state.original_present = original_present;
     state.original_value = original_value.clone();
     state.original_kind = original_kind.clone();
@@ -194,6 +212,7 @@ fn commit_install(state: &mut InstallState) -> Result<(), AdapterError> {
     reg::set_string(MARKER_KEY, "OriginalKind", &state.original_kind)?;
     reg::set_string(MARKER_KEY, "OriginalAutoRun", &state.original_value)?;
     reg::set_string(MARKER_KEY, "InstalledAutoRun", &installed_value)?;
+    reg::set_string(MARKER_KEY, "ProductProbe", &state.product_probe)?;
 
     // Deploy: rename any previous install out of the way, then move staging in.
     if state.install_root.exists() {
@@ -349,6 +368,136 @@ struct CmdMarkerValues {
     original_present: bool,
     original_kind: String,
     removal_path: String,
+}
+
+/// The generated AutoRun hook (#37). Baking the product-presence probe in lets
+/// the hook install the macros only while the product is present, self-clean
+/// when it is gone, and cost nothing (one `if exist`) on a normal shell start —
+/// with the macros never routing through an orphaned controller copy.
+fn generate_autorun(probe: &str, alias: &str) -> String {
+    format!(
+        "@echo off\r\n\
+         if exist \"{probe}\" goto fsw_present\r\n\
+         if exist \"{alias}\" goto fsw_present\r\n\
+         goto fsw_gone\r\n\
+         :fsw_present\r\n\
+         doskey dir=call \"%~dp0fsw-dir.cmd\" $*\r\n\
+         doskey ls=call \"%~dp0fsw-dir.cmd\" $*\r\n\
+         doskey cd=call \"%~dp0fsw-cd.cmd\" $*\r\n\
+         doskey chdir=call \"%~dp0fsw-cd.cmd\" $*\r\n\
+         doskey pushd=call \"%~dp0fsw-pushd.cmd\" $*\r\n\
+         goto :eof\r\n\
+         :fsw_gone\r\n\
+         if exist \"%~dp0fwdslash.exe\" start \"\" /b \"%~dp0fwdslash.exe\" uninstall --orphaned >nul 2>&1\r\n"
+    )
+}
+
+/// The health of the cmd `AutoRun` hook, for `fwdslash doctor` /
+/// `integrations` (#37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdHealth {
+    /// No hook and no installed marker.
+    Clean,
+    /// A hook whose `fsw-autorun.cmd` target exists.
+    Healthy,
+    /// A hook pointing at a missing `fsw-autorun.cmd`, or an installed marker
+    /// whose hook has vanished.
+    Orphaned,
+}
+
+/// Read-only classification of the cmd adapter's AutoRun state.
+pub fn health() -> CmdHealth {
+    let raw = match reg::read_raw_string(COMMAND_PROCESSOR, AUTORUN_VALUE) {
+        Ok(Some((_, value))) => value,
+        _ => String::new(),
+    };
+    if state::autorun_references_fwdslash(&raw) {
+        if let Some(path) = state::fwdslash_autorun_path(&raw) {
+            if Path::new(&path).exists() {
+                return CmdHealth::Healthy;
+            }
+        }
+        return CmdHealth::Orphaned;
+    }
+    if fsw_core::adapter_installed(MARKER_KEY) {
+        CmdHealth::Orphaned
+    } else {
+        CmdHealth::Clean
+    }
+}
+
+/// The product-presence probe recorded by the cmd marker, if any — one input to
+/// the orphan self-clean's slow confirm.
+pub fn recorded_probe() -> Option<String> {
+    use windows_registry::CURRENT_USER;
+    CURRENT_USER
+        .open(MARKER_KEY)
+        .ok()
+        .and_then(|key| key.get_string("ProductProbe").ok())
+        .filter(|probe| !probe.is_empty())
+}
+
+/// Whether the live `AutoRun` still routes through a fwdslash hook. The payload
+/// must never be deleted while this is true, or every console start prints
+/// "The system cannot find the path specified" with nothing left to fix it.
+pub fn autorun_still_hooked() -> bool {
+    matches!(
+        reg::read_raw_string(COMMAND_PROCESSOR, AUTORUN_VALUE),
+        Ok(Some((_, value))) if state::autorun_references_fwdslash(&value)
+    )
+}
+
+/// Removes **only** fwdslash's own `call "…fsw-autorun.cmd"` segment from the
+/// live `AutoRun`, preserving every third-party segment byte-for-byte and its
+/// registry kind, and deleting the value outright when nothing else remains.
+///
+/// This is the cmd analogue of `strip_all_ps_profiles`: the transactional
+/// uninstall deliberately *refuses* when a third party edited `AutoRun` after
+/// we installed, which would otherwise strand our `call` in a value whose
+/// target we are about to delete (#37). Stripping is always safe because it
+/// only ever removes segments we wrote.
+pub fn strip_autorun_hook() -> Result<(), AdapterError> {
+    let Some((kind, current)) = reg::read_raw_string(COMMAND_PROCESSOR, AUTORUN_VALUE)? else {
+        return Ok(());
+    };
+    if !state::autorun_references_fwdslash(&current) {
+        return Ok(());
+    }
+    let stripped = state::strip_fwdslash_autorun(&current);
+    if stripped.is_empty() {
+        reg::delete_value(COMMAND_PROCESSOR, AUTORUN_VALUE)
+    } else {
+        reg::set_string_kind(COMMAND_PROCESSOR, AUTORUN_VALUE, &stripped, kind)
+    }
+}
+
+/// Detect-and-repair for the cmd adapter (#37). Detection is the point; when
+/// the hook is orphaned *and* the marker is still present, the existing
+/// transactional uninstall restores the true AutoRun (refusing if a third party
+/// changed it). If our hook survives that — a refusal, or a marker-less
+/// dangling hook — strip just our own segment so the console is never left
+/// calling a script that no longer exists. Returns the health *after* the
+/// repair attempt.
+pub fn repair() -> Result<CmdHealth, AdapterError> {
+    if health() == CmdHealth::Orphaned {
+        if marker_state()?.is_some() {
+            let _ = uninstall();
+        }
+        // Only strip a hook whose target is actually gone: a healthy hook is
+        // the working integration, not debris.
+        if autorun_still_hooked() && !hook_target_exists() {
+            strip_autorun_hook()?;
+        }
+    }
+    Ok(health())
+}
+
+/// Whether the `fsw-autorun.cmd` the live AutoRun points at exists on disk.
+fn hook_target_exists() -> bool {
+    let Ok(Some((_, current))) = reg::read_raw_string(COMMAND_PROCESSOR, AUTORUN_VALUE) else {
+        return false;
+    };
+    state::fwdslash_autorun_path(&current).is_some_and(|path| Path::new(&path).exists())
 }
 
 /// The marker `State` text, or `None` when the key is absent.

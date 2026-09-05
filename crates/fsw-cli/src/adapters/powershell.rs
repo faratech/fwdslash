@@ -128,6 +128,10 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
 fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterError> {
     let edition = transaction.edition;
 
+    // The controller to deploy and to probe is the running executable itself.
+    let running = std::env::current_exe()
+        .map_err(|error| AdapterError::new(&format!("could not locate fwdslash.exe ({error}).")))?;
+
     // Shared module directory: deploy once, skip if the other edition (or a
     // previous install) already deployed it. Real-process copies — the real
     // powershell.exe child must be able to load the module, so it cannot be
@@ -141,13 +145,18 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
             &super::payload_source_dir("powershell")?.join("ForwardSlashWindows.psm1"),
             &transaction.module_staging,
         )?;
-        // The controller to deploy is the running executable itself.
-        let running = std::env::current_exe()
-            .map_err(|error| AdapterError::new(&format!("could not locate fwdslash.exe ({error}).")))?;
         super::real_copy_file(&running, &transaction.module_staging)?;
         std::fs::rename(&transaction.module_staging, &transaction.module_root)?;
         transaction.module_deployed = true;
     }
+
+    // The *true* original is the profile with every prior fwdslash block
+    // stripped: installing over a profile a previous version (or a duplicate
+    // enable) already touched must not append a second block or preserve a
+    // stale one, and uninstall must be able to restore the genuine pre-fwdslash
+    // profile (#37). The raw bytes stay on the transaction for exact rollback.
+    let true_original = profile::strip_fwdslash_blocks(&transaction.original_bytes);
+    let true_original_present = !true_original.is_empty();
 
     // State directory with the recovery files, staged then renamed.
     if let Some(parent) = transaction.state_root.parent() {
@@ -156,16 +165,22 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     std::fs::create_dir(&transaction.state_staging)?;
     std::fs::write(
         transaction.state_staging.join("profile.original"),
-        &transaction.original_bytes,
+        &true_original,
     )?;
     let module_path = transaction.module_root.join("ForwardSlashWindows.psm1");
-    let block = profile::block_text(
-        super::PAYLOAD_VERSION,
-        &transaction.transaction_id,
-        &module_path.display().to_string(),
-        !transaction.original_bytes.is_empty(),
-    );
-    let encoding = profile::detect_encoding(&transaction.original_bytes);
+    let controller_path = transaction.module_root.join("fwdslash.exe");
+    let probe_path = super::product_probe_path(&running);
+    let alias_path = super::app_execution_alias().unwrap_or_default();
+    let block = profile::block_text(&profile::BlockParams {
+        version: super::PAYLOAD_VERSION,
+        transaction_id: &transaction.transaction_id,
+        module_path: &module_path.display().to_string(),
+        probe_path: &probe_path.display().to_string(),
+        alias_path: &alias_path.display().to_string(),
+        controller_path: &controller_path.display().to_string(),
+        original_non_empty: true_original_present,
+    });
+    let encoding = profile::detect_encoding(&true_original);
     transaction.block_bytes = profile::encode(&block, encoding);
     std::fs::write(
         transaction.state_staging.join("profile.block"),
@@ -181,13 +196,23 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     reg::set_string(&key, "TransactionId", &transaction.transaction_id)?;
     reg::set_string(&key, "ProfilePath", &transaction.profile_path.display().to_string())?;
     reg::set_string(&key, "StateDirectory", &transaction.state_root.display().to_string())?;
-    reg::set_dword(&key, "OriginalPresent", u32::from(transaction.original_present))?;
+    reg::set_string(&key, "ProductProbe", &probe_path.display().to_string())?;
+    // OriginalPresent tracks whether there is *genuine* content to restore, so
+    // a profile that was purely our own block(s) is deleted on removal, not
+    // left as an empty file.
+    reg::set_dword(&key, "OriginalPresent", u32::from(true_original_present))?;
 
-    // Installed profile = original bytes + block, written atomically.
-    let mut installed_bytes = transaction.original_bytes.clone();
+    // Installed profile = true original + one current guarded block.
+    let mut installed_bytes = true_original;
     installed_bytes.extend_from_slice(&transaction.block_bytes);
     super::write_atomic(&transaction.profile_path, &installed_bytes)
-        .map_err(|error| super::explain_file_error(&error, "The PowerShell profile update"))?;
+        .map_err(|error| {
+            super::explain_file_error(
+                &error,
+                "The PowerShell profile update",
+                &transaction.profile_path,
+            )
+        })?;
     transaction.profile_changed = true;
 
     reg::set_string(&key, "State", "installed")?;
@@ -253,20 +278,18 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
 
     if values.profile_path.is_file() {
         let current = std::fs::read(&values.profile_path)?;
-        match profile::remove_block(&current, &block_bytes) {
-            Some(remaining) => {
-                if profile::should_delete_profile(remaining.len(), values.original_present) {
-                    std::fs::remove_file(&values.profile_path)?;
-                } else {
-                    super::write_atomic(&values.profile_path, &remaining)?;
-                }
-            }
-            None if marker_state == state::MarkerState::Installed => {
-                return Err(AdapterError::new(
-                    "The Forward Slash Windows profile block was changed or removed externally. No profile content was overwritten.",
-                ));
-            }
-            None => {}
+        // Fast path: excise the exact block we recorded. Belt and braces: then
+        // strip every remaining fwdslash fence (an older version, a duplicate,
+        // an externally edited block) so what survives is the genuine
+        // pre-fwdslash profile (#37). Stripping only ever removes our own
+        // fenced regions, never third-party content, so the old
+        // "changed externally" refusal is no longer needed to protect it.
+        let remaining = profile::remove_block(&current, &block_bytes).unwrap_or(current);
+        let cleaned = profile::strip_fwdslash_blocks(&remaining);
+        if profile::should_delete_profile(cleaned.len(), values.original_present) {
+            std::fs::remove_file(&values.profile_path)?;
+        } else {
+            super::write_atomic(&values.profile_path, &cleaned)?;
         }
     }
 
@@ -391,6 +414,7 @@ fn read_marker(key: &str) -> Result<Option<MarkerValues>, AdapterError> {
         profile_path: PathBuf::from(key.get_string("ProfilePath").unwrap_or_default()),
         state_directory: PathBuf::from(key.get_string("StateDirectory").unwrap_or_default()),
         original_present: key.get_u32("OriginalPresent").unwrap_or(0) != 0,
+        product_probe: key.get_string("ProductProbe").unwrap_or_default(),
     }))
 }
 
@@ -403,6 +427,9 @@ struct MarkerValues {
     profile_path: PathBuf,
     state_directory: PathBuf,
     original_present: bool,
+    /// The product-presence probe recorded at install time; empty for a marker
+    /// written before the value existed.
+    product_probe: String,
 }
 
 fn read_marker_state(key: &str) -> Result<Option<String>, AdapterError> {
@@ -412,6 +439,158 @@ fn read_marker_state(key: &str) -> Result<Option<String>, AdapterError> {
         Ok(key) => Ok(Some(key.get_string("State").unwrap_or_default())),
         Err(_) => Ok(None),
     }
+}
+
+/// A snapshot of one edition's on-disk state for the detect-and-repair sweep
+/// (#37): its profile health, whether its marker says installed, and whether
+/// the *current* payload's module is present.
+struct Inspection {
+    health: profile::ProfileHealth,
+    marker_installed: bool,
+    current_module_present: bool,
+    profile_path: PathBuf,
+    profile_exists: bool,
+}
+
+fn inspect(edition: Edition) -> Result<Inspection, AdapterError> {
+    let marker = read_marker(&marker_key(edition))?;
+    let marker_installed = marker
+        .as_ref()
+        .is_some_and(|values| state::classify(&values.state) == state::MarkerState::Installed);
+
+    let profile_path = match marker
+        .as_ref()
+        .filter(|values| !values.profile_path.as_os_str().is_empty())
+    {
+        Some(values) => values.profile_path.clone(),
+        None => super::documents_dir()?
+            .join(edition.folder_name())
+            .join("profile.ps1"),
+    };
+
+    let current_module = super::local_app_data()?
+        .join("ForwardSlashWindows")
+        .join("PowerShell")
+        .join(super::PAYLOAD_VERSION)
+        .join("ForwardSlashWindows.psm1");
+    let current_module_present = current_module.is_file();
+
+    let (profile_exists, bytes) = if profile_path.is_file() {
+        (true, std::fs::read(&profile_path).unwrap_or_default())
+    } else {
+        (false, Vec::new())
+    };
+
+    let presence: Vec<profile::BlockPresence> = profile::parse_blocks(&bytes)
+        .into_iter()
+        .map(|block| profile::BlockPresence {
+            version: block.version,
+            module_present: block
+                .module_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).is_file()),
+        })
+        .collect();
+    let health = profile::classify_profile(&presence, super::PAYLOAD_VERSION);
+
+    Ok(Inspection {
+        health,
+        marker_installed,
+        current_module_present,
+        profile_path,
+        profile_exists,
+    })
+}
+
+/// The read-only profile health of `edition`, for `fwdslash doctor` /
+/// `integrations`. Never writes.
+pub fn profile_health(edition: Edition) -> profile::ProfileHealth {
+    inspect(edition).map_or(profile::ProfileHealth::Clean, |i| i.health)
+}
+
+/// Whether `edition`'s profile directory refuses a write — the signature of a
+/// Controlled Folder Access block (#37). Probes the same way `write_atomic`
+/// does, by creating and removing a temp file, and only when the directory is
+/// actually there. Cheap and only reached for an adapter whose marker claims
+/// installed while its profile carries no block.
+pub fn profile_write_blocked(edition: Edition) -> bool {
+    let Ok(inspection) = inspect(edition) else {
+        return false;
+    };
+    let Some(parent) = inspection.profile_path.parent() else {
+        return false;
+    };
+    if !parent.is_dir() {
+        return false;
+    }
+    let probe = parent.join(format!(".fsw-probe-{}.tmp", super::new_transaction_id()));
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            false
+        }
+        Err(error) => super::looks_like_blocked_write(&error.to_string(), true),
+    }
+}
+
+/// The product-presence probe recorded in `edition`'s marker, if any — one
+/// input to the orphan self-clean's slow confirm.
+pub fn recorded_probe(edition: Edition) -> Option<String> {
+    read_marker(&marker_key(edition))
+        .ok()
+        .flatten()
+        .map(|values| values.product_probe)
+        .filter(|probe| !probe.is_empty())
+}
+
+/// Detect-and-repair for one edition (#37). Returns the health that was found
+/// *before* any repair, so the caller can report what it fixed.
+pub fn repair(edition: Edition, controller: &Path) -> Result<profile::ProfileHealth, AdapterError> {
+    let inspection = inspect(edition)?;
+    let action = profile::decide_profile_repair(
+        &inspection.health,
+        inspection.marker_installed,
+        inspection.current_module_present,
+    );
+    match action {
+        profile::ProfileAction::Nothing => {}
+        profile::ProfileAction::RemoveBlocks => remove_blocks_from_profile(&inspection)?,
+        // Both "write one current block" and "reinstall" mean the adapter
+        // should be installed: the transactional uninstall+install strips the
+        // true original, redeploys the module when it is missing, writes
+        // exactly one current guarded block and refreshes the marker/state.
+        profile::ProfileAction::WriteCurrentBlock | profile::ProfileAction::Reinstall => {
+            reinstall(edition, controller)?;
+        }
+    }
+    Ok(inspection.health)
+}
+
+/// Strips every fwdslash block from a profile that should no longer carry one
+/// (its marker is gone), deleting a profile that was purely our own block(s).
+fn remove_blocks_from_profile(inspection: &Inspection) -> Result<(), AdapterError> {
+    if !inspection.profile_exists {
+        return Ok(());
+    }
+    let current = std::fs::read(&inspection.profile_path)?;
+    let cleaned = profile::strip_fwdslash_blocks(&current);
+    if cleaned == current {
+        return Ok(());
+    }
+    if cleaned.is_empty() {
+        std::fs::remove_file(&inspection.profile_path)?;
+    } else {
+        super::write_atomic(&inspection.profile_path, &cleaned)?;
+    }
+    Ok(())
+}
+
+/// A clean-slate reinstall used by repair: tear the adapter down (best effort),
+/// force the marker away so `begin_install` proceeds, then install fresh.
+fn reinstall(edition: Edition, controller: &Path) -> Result<(), AdapterError> {
+    let _ = uninstall(edition);
+    let _ = reg::delete_tree(&marker_key(edition));
+    install(edition, controller)
 }
 
 /// Spawns the edition's shell and confirms both aliases resolve to the

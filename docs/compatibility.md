@@ -39,6 +39,25 @@ Blank or pending entries are unverified and must not be advertised as working.
 - Each PowerShell profile adapter: fresh-process alias/path tests, byte-exact
   rollback, interrupted-transaction recovery, external-change refusal, and
   graceful Controlled Folder Access failure.
+
+**Controlled Folder Access.** With CFA in Block mode the adapters' writes into
+`Documents` are refused, and the block does **not** always arrive as
+"access denied" — on the 0.0.3 dev host it surfaced as `ERROR_FILE_NOT_FOUND`.
+`fwdslash integration <id> enable` reports the CFA guidance for either shape
+(the failure rolls back cleanly, leaving no `prepared` marker), and the same
+text reaches the settings InfoBar and the `fwdslash doctor` /
+`fwdslash integrations` health lines. Two consequences to know about:
+
+- Enabling a PowerShell adapter needs the executable that performs the write —
+  the packaged `fwdslash.exe`, or the unpackaged one — allowed through
+  *Allow an app through Controlled folder access*.
+- **After an uninstall**, the deferred self-clean runs from the *staged*
+  controller (`%LOCALAPPDATA%\ForwardSlashWindows\PowerShell\<version>\fwdslash.exe`),
+  so it can only remove the profile blocks if that copy is allowed through CFA
+  too. If it is not, the guarded block stays in place — silently and
+  harmlessly, since it either imports a module that is still there or does
+  nothing — and has to be removed by hand. Turning the integrations off before
+  uninstalling avoids it entirely.
 - No lost, duplicated, or delayed Enter behavior in unrelated Explorer views.
 - One notification-area icon, owned by the broker; closing the settings window
   ends `fswsettings.exe` and leaves the icon in place.

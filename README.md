@@ -113,7 +113,11 @@ An unpackaged build needs the Windows App Runtime 2.x installed separately.
 fwdslash uninstall
 ```
 
-Removing the package from Settings > Apps does not sweep the shell adapters (an uninstalling MSIX runs no code), so turn the terminal integrations off in the settings app first.
+Removing the package from Settings > Apps runs no code (an uninstalling MSIX never does), so the leftover shell hooks clean themselves up on the **next shell launch** instead: the first PowerShell or Command Prompt window you open afterward removes every fwdslash profile block and cmd `AutoRun` entry (restoring what was there before, or refusing if you changed it since), deletes the `HKCU\Software\ForwardSlashWindows` keys, and clears the `%LOCALAPPDATA%\ForwardSlashWindows` payload — silently, unless there is an error you need to act on. The payload directory itself goes a few seconds later, through a one-shot scheduled task, because the cleanup is running from inside it.
+
+Turning the terminal integrations off in the settings app first is still the tidy path, and it takes effect immediately.
+
+**With Controlled Folder Access on:** the self-clean writes to your `Documents` folder, so it can only remove the profile blocks if the staged controller (`%LOCALAPPDATA%\ForwardSlashWindows\PowerShell\<version>\fwdslash.exe`) is allowed through Controlled folder access. If it is not, the guarded block stays in place — harmlessly and silently, since it only imports a module that is still there or does nothing at all — and you can remove it by hand or by allowing that executable. Turning the integrations off *before* uninstalling avoids the situation entirely.
 
 ---
 

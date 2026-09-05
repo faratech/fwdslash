@@ -1154,6 +1154,37 @@ fn run_adapter_upgrade(cli: &Path, id: &str) -> bool {
     }
 }
 
+/// Runs one `fwdslash repair-adapters` to completion, bounded by
+/// [`ADAPTER_UPGRADE_TIMEOUT`]. Fire-and-forget: a repair that fails or times
+/// out just retries next launch, and the guarded profile block means an
+/// un-repaired orphan is silent, never a red shell error (#37).
+fn run_adapter_repair(cli: &Path) {
+    let spawned = std::process::Command::new(cli)
+        .arg("repair-adapters")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + ADAPTER_UPGRADE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => return,
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(ADAPTER_UPGRADE_POLL_MS));
+    }
+}
+
 /// `show_notification` silently drops a balloon while the shell has not
 /// accepted `NIM_ADD`, and at logon the add can be waiting on the 60 s
 /// health tick to retry. Give the icon ~10 s to appear before spending the
@@ -1179,16 +1210,6 @@ fn notify_when_icon_ready(message: &str, flags: u32) {
 /// `fwdslash integration <id> enable`. The broker is the one component that
 /// starts at every logon and after every update, so the check belongs here.
 fn adapter_upgrade_sweep() {
-    let targets = adapter_upgrade_targets();
-    let outdated: Vec<(&'static str, &'static str)> = targets
-        .iter()
-        .filter(|(_, _, marker_key)| adapter_outdated(marker_key, FSW_VERSION))
-        .map(|&(id, label, _)| (id, label))
-        .collect();
-    if outdated.is_empty() {
-        return;
-    }
-
     // Beside the broker, never from PATH: an appExecutionAlias or a stale
     // directory on PATH could resolve to a different install entirely.
     let Ok(directory) = executable_directory() else {
@@ -1201,34 +1222,52 @@ fn adapter_upgrade_sweep() {
         return;
     }
 
-    let mut upgraded: Vec<&'static str> = Vec::new();
-    let mut failed = false;
-    for (id, label) in outdated {
-        if run_adapter_upgrade(&cli, id) {
-            log_diagnostic("event=adapter_upgraded");
-            upgraded.push(label);
+    // The version-bump upgrade first, so its "integrations were updated"
+    // balloon still fires. Repair runs afterward regardless, cleaning any
+    // orphaned or duplicated block the version match alone would miss (#37).
+    let targets = adapter_upgrade_targets();
+    let outdated: Vec<(&'static str, &'static str)> = targets
+        .iter()
+        .filter(|(_, _, marker_key)| adapter_outdated(marker_key, FSW_VERSION))
+        .map(|&(id, label, _)| (id, label))
+        .collect();
+    if !outdated.is_empty() {
+        let mut upgraded: Vec<&'static str> = Vec::new();
+        let mut failed = false;
+        for (id, label) in outdated {
+            if run_adapter_upgrade(&cli, id) {
+                log_diagnostic("event=adapter_upgraded");
+                upgraded.push(label);
+            } else {
+                log_diagnostic("event=adapter_upgrade_failed");
+                failed = true;
+            }
+        }
+
+        // Exactly one balloon, whatever the mix: a per-adapter notification
+        // would stack three toasts on top of a logon the user did not ask
+        // about.
+        if failed {
+            notify_when_icon_ready(
+                "Some terminal integrations could not be updated automatically. Open Settings to retry.",
+                NIIF_WARNING,
+            );
         } else {
-            log_diagnostic("event=adapter_upgrade_failed");
-            failed = true;
+            notify_when_icon_ready(
+                &format!(
+                    "Terminal integrations were updated to {FSW_VERSION}: {}.",
+                    upgraded.join(", ")
+                ),
+                NIIF_INFO,
+            );
         }
     }
 
-    // Exactly one balloon, whatever the mix: a per-adapter notification would
-    // stack three toasts on top of a logon the user did not ask about.
-    if failed {
-        notify_when_icon_ready(
-            "Some terminal integrations could not be updated automatically. Open Settings to retry.",
-            NIIF_WARNING,
-        );
-    } else {
-        notify_when_icon_ready(
-            &format!(
-                "Terminal integrations were updated to {FSW_VERSION}: {}.",
-                upgraded.join(", ")
-            ),
-            NIIF_INFO,
-        );
-    }
+    // Detect-and-repair every adapter's profile/AutoRun hygiene: an orphaned or
+    // duplicated block self-heals even when the recorded version already
+    // matches and nothing was "outdated" (#37). Silent — the guarded block
+    // means an un-repaired orphan is never a red shell error anyway.
+    run_adapter_repair(&cli);
 }
 
 /// Starts the adapter-upgrade sweep on a thread of its own, once per process.

@@ -105,6 +105,57 @@ pub fn installed_autorun(original: &str, marker: &str) -> String {
     }
 }
 
+/// Whether one ` & `-joined AutoRun segment is a fwdslash hook — a
+/// `call "…ForwardSlashWindows…fsw-autorun.cmd"`. Recognised case-insensitively
+/// by the two path markers rather than an exact path, so a hook a *different*
+/// install left behind is still ours (#37).
+#[must_use]
+pub fn is_fwdslash_autorun_segment(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    lower.trim_start().starts_with("call ")
+        && lower.contains("forwardslashwindows")
+        && lower.contains("fsw-autorun.cmd")
+}
+
+/// The observed AutoRun with every fwdslash hook segment removed, so the true
+/// third-party value is recovered even when a prior install's marker was lost
+/// but its `call "…fsw-autorun.cmd"` hook persisted (exactly the MSIX-uninstall
+/// leftover). Empty when fwdslash's hook was the only content. Segments are the
+/// ` & ` groups the installer itself composes, so a genuine third-party value —
+/// including one that already contains ` & ` — rejoins byte-for-byte (#37).
+#[must_use]
+pub fn strip_fwdslash_autorun(current: &str) -> String {
+    if current.is_empty() {
+        return String::new();
+    }
+    let kept: Vec<&str> = current
+        .split(" & ")
+        .filter(|segment| !is_fwdslash_autorun_segment(segment))
+        .collect();
+    kept.join(" & ")
+}
+
+/// Whether an AutoRun value routes through a fwdslash hook at all — the cheap
+/// classifier `fwdslash doctor` and the self-clean probe use.
+#[must_use]
+pub fn autorun_references_fwdslash(current: &str) -> bool {
+    current.split(" & ").any(is_fwdslash_autorun_segment)
+}
+
+/// The quoted path out of the first fwdslash hook segment, so its existence can
+/// be tested on disk (a missing target is the cmd orphan). `None` when the
+/// value carries no fwdslash hook or the segment is not quoted.
+#[must_use]
+pub fn fwdslash_autorun_path(current: &str) -> Option<String> {
+    let segment = current
+        .split(" & ")
+        .find(|segment| is_fwdslash_autorun_segment(segment))?;
+    let open = segment.find('"')?;
+    let rest = segment.get(open + 1..)?;
+    let close = rest.find('"')?;
+    rest.get(..close).map(str::to_owned)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutorunVerdict {
     /// Current value equals what we installed (or what was there before us).
@@ -148,6 +199,19 @@ pub fn judge_autorun(
     } else {
         AutorunVerdict::Changed
     }
+}
+
+/// The product-presence decision for the orphan self-clean (#37 addendum).
+///
+/// The cheap check (a `Test-Path` on the probe recorded at install time) runs
+/// on every shell start and must stay negligible; the slow confirm
+/// (`Get-AppxPackage` / a recorded install directory) runs only when the cheap
+/// check has already failed, so a transient alias blip during an in-flight
+/// update never triggers cleanup. The product is confirmed gone only when both
+/// say so.
+#[must_use]
+pub fn product_confirmed_gone(cheap_probe_present: bool, slow_confirm_present: bool) -> bool {
+    !cheap_probe_present && !slow_confirm_present
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
