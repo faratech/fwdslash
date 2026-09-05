@@ -285,24 +285,24 @@ can observe is a 0.0.5 install being offered 0.0.6.
   The `AutoRun` value, the PowerShell profile blocks and
   `%LOCALAPPDATA%\ForwardSlashWindows` survive package removal. Disable the
   integrations from the settings app before uninstalling.
-- **Version is `0.0.5.0`.** Each submission must increase it, and the fourth
-  field is reserved by the Store (always `0`). It comes from
-  `workspace.package.version`, and the statement above is one of the locations
-  `tools/bump_version.py` rewrites — bump with `python3 tools/bump_version.py
-  <x.y.z>` rather than editing it, and CI's `--check` will catch it if this
-  line ever falls behind the workspace. The three-field version in the tag and
-  in `Cargo.toml` always gains the reserved `.0` here.
+- **Versioning.** Each submission must increase the version. The release
+  workflow derives the three-part product version from
+  `workspace.package.version` and passes the Store-required four-part form
+  `<major>.<minor>.<patch>.0` to the packager. A tag must match Cargo exactly;
+  a manual dry run derives the same value from Cargo rather than a run number.
 
-## 6. Verification checklist for the 0.0.3 submission
+## 6. Current verification checklist
 
-Install the self-signed bundle with `Add-AppxPackage` (`Remove-AppxPackage`
-first — a same-version reinstall is blocked) and confirm each of these before
-uploading. Carried over from the 0.0.2 pass and still expected to hold:
+For a candidate build, install the self-signed bundle with `Add-AppxPackage`
+(`Remove-AppxPackage` first when testing the same version) and confirm the
+following before upload. This is a release checklist, not evidence that any
+particular host, logon path, or package install has already been verified.
 
 - Package family name resolves to `32827MikeFara.fwdslash_t6j5qexy2jpp2`.
 - `windows.appExecutionAlias` puts `fwdslash.exe` on PATH at
   `%LOCALAPPDATA%\Microsoft\WindowsApps`, and `fwdslash version` prints
-  `0.0.3.0` (the packaged identity version).
+  the package identity version derived from the current Cargo workspace
+  version with its reserved fourth `.0` field.
 - The packaged controller runs and reports broker/integration state.
 - The packaged controller's writes reach the **real** hive: packaged
   `fwdslash disable` must flip `HKCU\Software\ForwardSlashWindows\Settings`
@@ -314,8 +314,6 @@ uploading. Carried over from the 0.0.2 pass and still expected to hold:
 - `windows.protocol` activation works and `fwdslash://settings/terminals`
   selects the Terminals page, so activation still delivers the URI as a
   command-line argument (`initial_section` in `crates/fsw-settings/src/main.rs`).
-
-New in 0.0.3, and the reason this section is a checklist rather than a record:
 
 - **One notification-area icon.** Launch from Start: exactly one icon. Close the
   settings window: `Get-Process fswsettings` is empty and the icon stays.
@@ -331,13 +329,18 @@ New in 0.0.3, and the reason this section is a checklist rather than a record:
   `fwdslash integration cmd enable` produces a real `Command Processor AutoRun`
   value, and the staged payload under `%LOCALAPPDATA%\ForwardSlashWindows\cmd`
   contains `fsw-cd.cmd` and `fsw-pushd.cmd`.
-- **Adapters auto-upgrade from a 0.0.1/0.0.2 payload.** With an older adapter
-  installed, starting the broker upgrades it on its own and reports
-  "Terminal integrations were updated to 0.0.3: …" in a balloon; opening the
-  settings window with one still outdated repairs it too ("Updating terminal
-  integrations…" → "Terminal integrations updated"). Neither needs a button.
+- **Adapters auto-upgrade from an older payload.** With an older adapter
+  installed, starting the broker upgrades it on its own and reports the current
+  package version in a balloon; opening the settings window with one still
+  outdated repairs it too ("Updating terminal integrations…" → "Terminal
+  integrations updated"). Neither needs a button.
   Confirm afterwards that `fwdslash integrations` no longer prints
   "(update available)" and that the payload directory is
-  `%LOCALAPPDATA%\ForwardSlashWindows\cmd\0.0.3`.
+  `%LOCALAPPDATA%\ForwardSlashWindows\cmd\<current-version>`.
 
-Still unverified: the startup task firing at logon (needs a sign-out).
+### Historical evidence
+
+The first self-update-capable Store build was version 0.0.5; an earlier Store
+install therefore could not exercise this path. This is dated release-history
+context only, not current verification evidence. Logon-startup and fresh
+package-install behavior require their own candidate-build validation.
