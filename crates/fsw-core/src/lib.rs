@@ -799,6 +799,131 @@ pub fn broker_state(timeout_ms: u32) -> BrokerState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Filesystem minifilter probes.
+//
+// The driver is optional, production-gated, and absent from every shipped
+// package (SECURITY.md). These two calls are how the CLI and the settings
+// window report what the machine actually has instead of asserting it is never
+// there.
+// ---------------------------------------------------------------------------
+
+/// The minifilter's service name, a hand copy of `ServiceName` in
+/// `driver/fswfilter/fswfilter.inf`. Only the SCM probe below needs it.
+#[cfg(windows)]
+const FILTER_SERVICE_NAME: &str = "FswFilter";
+
+// `fltlib`'s port-connect entry point.
+//
+// Declared `raw-dylib`, so the import is synthesized from this declaration
+// alone: no import library, and -- the point -- no crate dependency. The
+// version-island rule in docs/dependencies.md (nothing in `fsw-core`'s
+// dependency closure may pull `windows-core`) is untouched by this probe.
+#[cfg(windows)]
+#[link(name = "fltlib", kind = "raw-dylib")]
+unsafe extern "system" {
+    fn FilterConnectCommunicationPort(
+        lpPortName: *const u16,
+        dwOptions: u32,
+        lpContext: *const std::ffi::c_void,
+        wSizeOfContext: u16,
+        lpSecurityAttributes: *mut std::ffi::c_void,
+        hPort: *mut *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+/// Whether the minifilter's communication port accepts a connection right now.
+///
+/// The handle is closed immediately: this is a probe, not the broker's
+/// long-lived publish channel. `false` whenever the port is absent (no driver
+/// loaded) or refuses the connect, and `false` off Windows.
+#[must_use]
+pub fn filter_port_available() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::CloseHandle;
+
+        let port = to_wide(FSW_FILTER_PORT_NAME);
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hr = FilterConnectCommunicationPort(
+            port.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            &raw mut handle,
+        );
+        if hr >= 0 && !handle.is_null() {
+            CloseHandle(handle);
+            true
+        } else {
+            false
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Whether the minifilter's kernel service is registered, and whether it is
+/// running. Independent of [`filter_port_available`]: a loaded filter that has
+/// not opened its port is `Running` but unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterServiceState {
+    /// No `FswFilter` service is registered — every machine that has not
+    /// deliberately installed the driver, which is all of them.
+    NotInstalled,
+    /// Registered but not running.
+    Stopped,
+    /// Running: the filter is loaded.
+    Running,
+}
+
+/// The minifilter service's state, from the service control manager.
+///
+/// Read-only and unprivileged by construction: `SC_MANAGER_CONNECT` plus
+/// `SERVICE_QUERY_STATUS` are rights an ordinary user already holds, and
+/// nothing here starts, stops or installs anything. An SCM that will not open,
+/// a service that is not there and a status that will not read all answer
+/// [`FilterServiceState::NotInstalled`] — the product's default assumption.
+#[must_use]
+pub fn filter_service_state() -> FilterServiceState {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Services::{
+            CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+            SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+        };
+
+        let manager = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+        if manager.is_null() {
+            return FilterServiceState::NotInstalled;
+        }
+        let name = to_wide(FILTER_SERVICE_NAME);
+        let service = OpenServiceW(manager, name.as_ptr(), SERVICE_QUERY_STATUS);
+        if service.is_null() {
+            CloseServiceHandle(manager);
+            return FilterServiceState::NotInstalled;
+        }
+        let mut status = SERVICE_STATUS::default();
+        let queried = QueryServiceStatus(service, &raw mut status);
+        CloseServiceHandle(service);
+        CloseServiceHandle(manager);
+        if queried == 0 {
+            FilterServiceState::NotInstalled
+        } else if status.dwCurrentState == SERVICE_RUNNING {
+            FilterServiceState::Running
+        } else {
+            FilterServiceState::Stopped
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        FilterServiceState::NotInstalled
+    }
+}
+
 /// Launches the broker if a packaged build has not already armed it.
 ///
 /// A packaged build has no install-time hook and its `windows.startupTask` only

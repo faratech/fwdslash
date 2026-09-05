@@ -7,19 +7,6 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
-#[cfg(windows)]
-#[link(name = "fltlib", kind = "raw-dylib")]
-unsafe extern "system" {
-    fn FilterConnectCommunicationPort(
-        lpPortName: *const u16,
-        dwOptions: u32,
-        lpContext: *const std::ffi::c_void,
-        wSizeOfContext: u16,
-        lpSecurityAttributes: *mut std::ffi::c_void,
-        hPort: *mut *mut std::ffi::c_void,
-    ) -> i32;
-}
-
 const SYNCHRONIZE: u32 = 0x0010_0000;
 /// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND); what `remove_value` reports for an
 /// absent value, which is the desired end state rather than a failure.
@@ -38,30 +25,28 @@ fn from_u16_slice(slice: &[u16]) -> String {
         .into_owned()
 }
 
+/// Whether the minifilter's communication port answers. The probe itself lives
+/// in `fsw-core` so the settings window runs exactly the same one.
 fn is_driver_available() -> bool {
-    #[cfg(windows)]
-    unsafe {
-        let port_name = to_u16_vec(FSW_FILTER_PORT_NAME);
-        let mut handle = std::ptr::null_mut();
-        let hr = FilterConnectCommunicationPort(
-            port_name.as_ptr(),
-            0,
-            std::ptr::null(),
-            0,
-            std::ptr::null_mut(),
-            &mut handle,
-        );
-        if hr >= 0 && !handle.is_null() {
-            windows_sys::Win32::Foundation::CloseHandle(handle);
-            true
-        } else {
-            false
-        }
+    filter_port_available()
+}
+
+/// The optional filesystem driver, as one bool plus one of the four words
+/// `fwdslash driver status` prints. A port that answers outranks whatever the
+/// SCM says; otherwise the service decides. The settings window mirrors this
+/// mapping (`DriverStatus` in `crates/fsw-settings/src/main.rs`) — keep the two
+/// in step.
+fn driver_state() -> (bool, &'static str) {
+    let connected = is_driver_available();
+    if connected {
+        return (true, "connected");
     }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    let label = match filter_service_state() {
+        FilterServiceState::NotInstalled => "not installed",
+        FilterServiceState::Stopped => "installed, not loaded",
+        FilterServiceState::Running => "loaded, not connected",
+    };
+    (false, label)
 }
 
 /// Asks the running broker to unpause (`FSW_WM_SET_PAUSED` with 0). True only
@@ -722,7 +707,7 @@ fn cmd_status(json: bool) -> i32 {
             BrokerState::Unavailable => "running (hook unavailable)",
         }
     };
-    let driver_conn = is_driver_available();
+    let (driver_conn, driver_state_label) = driver_state();
 
     if json {
         let mut buf = RenderBuf::new();
@@ -742,9 +727,10 @@ fn cmd_status(json: bool) -> i32 {
             .collect();
 
         println!(
-            "{{\"broker\":\"{}\",\"driverConnected\":{},\"disabled\":{},\"bareSlashMode\":\"{}\",\"bareSlashTarget\":{},\"bareSlashRoot\":{},\"wslRoot\":\"\\\\\\\\wsl.localhost\",\"distributions\":[{}]}}",
+            "{{\"broker\":\"{}\",\"driverConnected\":{},\"driverState\":\"{}\",\"disabled\":{},\"bareSlashMode\":\"{}\",\"bareSlashTarget\":{},\"bareSlashRoot\":{},\"wslRoot\":\"\\\\\\\\wsl.localhost\",\"distributions\":[{}]}}",
             broker_status,
             driver_conn,
+            driver_state_label,
             snap.disabled,
             mode_str,
             bare_target,
@@ -763,14 +749,7 @@ fn cmd_status(json: bool) -> i32 {
         "global state: {}",
         if snap.disabled { "disabled" } else { "enabled" }
     );
-    println!(
-        "filesystem driver: {}",
-        if driver_conn {
-            "connected"
-        } else {
-            "not connected"
-        }
-    );
+    println!("filesystem driver: {driver_state_label}");
     println!("registered distributions: {}", snap.distributions.len());
 
     let mut buf = RenderBuf::new();
@@ -1305,9 +1284,9 @@ fn main() {
         "pause" | "disable" if args.len() == 2 => set_paused(true),
         "resume" | "enable" if args.len() == 2 => set_paused(false),
         "driver" if args.len() == 3 && args[2] == "status" => {
-            let conn = is_driver_available();
-            println!("{}", if conn { "connected" } else { "not connected" });
-            if conn { 0 } else { 1 }
+            let (connected, label) = driver_state();
+            println!("{label}");
+            if connected { 0 } else { 1 }
         }
         "start" => start_broker(),
         "stop" => stop_broker(),

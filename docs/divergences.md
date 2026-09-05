@@ -372,6 +372,15 @@ invocation on the UI thread. Both differ here:
   `Forward Slash Windows — active` / `— paused` / `— hook unavailable`. The
   0.0.2 arrangement of two deliberately-different tooltips is gone with the
   second icon.
+- **The filesystem-driver line is live.** `src/settings/main.cpp:832-838`
+  hardcodes `Filesystem driver: not installed (production-gated)`, and the C++
+  About page repeats the claim in prose. The Rust app probes instead — the
+  `FswFilter` service through the SCM (read-only, never elevating) plus a
+  connect to `\FswFilterPort` — and General and the About Components card both
+  render `Filesystem driver:` followed by one of `not installed` /
+  `installed, not loaded` / `loaded, not connected` / `connected`, the same
+  four states `fwdslash driver status` prints. The About page no longer carries
+  the production-gated sentence at all.
 
 ## Broker (fsw-broker)
 

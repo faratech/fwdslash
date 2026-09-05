@@ -11,10 +11,10 @@
 //! on purpose belongs in `docs/divergences.md`.
 
 use fsw_core::{
-    BrokerState, CMD_ADAPTER_KEY, FSW_BROKER_WINDOW_CLASS, FSW_VERSION, POWERSHELL_ADAPTER_ROOT,
-    SettingsValues, adapter_installed, adapter_outdated, adapter_version, broker_state,
-    broker_window_exists,
-    ensure_broker_running, executable_available, executable_directory, get_default_distribution,
+    BrokerState, CMD_ADAPTER_KEY, FSW_BROKER_WINDOW_CLASS, FSW_VERSION, FilterServiceState,
+    POWERSHELL_ADAPTER_ROOT, SettingsValues, adapter_installed, adapter_outdated, adapter_version,
+    broker_state, broker_window_exists, ensure_broker_running, executable_available,
+    executable_directory, filter_port_available, filter_service_state, get_default_distribution,
     has_package_identity, is_store_flavor, list_registered_distributions, package_architecture,
     package_version, update, windows_integration_installed,
 };
@@ -160,6 +160,44 @@ struct AdapterStatus {
     outdated: bool,
 }
 
+/// The optional filesystem minifilter, as both pages report it.
+///
+/// The four states are the ones `fwdslash driver status` prints; `fsw-core`
+/// exposes the two probes (`filter_port_available`, `filter_service_state`),
+/// not the wording, so the mapping lives here and in `driver_state()` in
+/// `crates/fsw-cli/src/main.rs`. Keep the two in step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverStatus {
+    NotInstalled,
+    InstalledNotLoaded,
+    LoadedNotConnected,
+    Connected,
+}
+
+impl DriverStatus {
+    /// A port that answers outranks whatever the SCM says; otherwise the
+    /// service decides. Both probes are read-only and never elevate.
+    fn read() -> Self {
+        if filter_port_available() {
+            return Self::Connected;
+        }
+        match filter_service_state() {
+            FilterServiceState::NotInstalled => Self::NotInstalled,
+            FilterServiceState::Stopped => Self::InstalledNotLoaded,
+            FilterServiceState::Running => Self::LoadedNotConnected,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not installed",
+            Self::InstalledNotLoaded => "installed, not loaded",
+            Self::LoadedNotConnected => "loaded, not connected",
+            Self::Connected => "connected",
+        }
+    }
+}
+
 /// Everything the window renders, read straight from HKCU and the broker window.
 ///
 /// Mirrors `RefreshState()` at `src/settings/main.cpp:754-841`. Reading in-process
@@ -184,6 +222,8 @@ struct State {
     wsl_default: Option<String>,
     broker: BrokerState,
     broker_window: bool,
+    /// The optional filesystem minifilter, probed live.
+    driver: DriverStatus,
     /// A downloaded update bundle is waiting to be registered (GitHub flavor).
     update_bundle_ready: bool,
 }
@@ -240,6 +280,7 @@ impl State {
             // waits on the result to repaint).
             broker: broker_state(250),
             broker_window: broker_window_exists(),
+            driver: DriverStatus::read(),
             update_bundle_ready: update::pending_bundle_path().is_some(),
         }
     }
@@ -307,6 +348,12 @@ impl State {
         }
     }
 
+    /// The About page's filesystem-driver line — the same four states the
+    /// General page's status text shows.
+    fn driver_component_line(&self) -> String {
+        format!("Filesystem driver: {}", self.driver.label())
+    }
+
     /// Which of the two package flavors is running, or neither.
     fn flavor_component_line(&self) -> &'static str {
         if !self.packaged {
@@ -370,8 +417,11 @@ impl State {
         self.root.is_some()
     }
 
-    /// Verbatim from `src/settings/main.cpp:832-838`, including the hardcoded
-    /// driver line — the driver is production-gated and never queried here.
+    /// Ported from `src/settings/main.cpp:832-838`. The broker line is
+    /// verbatim; the driver line is not. The C++ hardcodes
+    /// "not installed (production-gated)" — this reports what the machine
+    /// actually has, from the service and the filter port
+    /// (docs/divergences.md, settings window).
     fn status_text(&self) -> String {
         let broker = if self.windows {
             match self.broker {
@@ -384,7 +434,8 @@ impl State {
             "not installed"
         };
         format!(
-            "Windows broker: {broker}\nFilesystem driver: not installed (production-gated)"
+            "Windows broker: {broker}\nFilesystem driver: {}",
+            self.driver.label()
         )
     }
 }
@@ -1368,6 +1419,7 @@ impl SettingsModel {
         card(StackPanel::new().spacing(4.0).children((
             strong("Components"),
             body(state.broker_component_line()).foreground(ThemeBrush::TextSecondary),
+            body(state.driver_component_line()).foreground(ThemeBrush::TextSecondary),
             body(state.adapter_component_line(Integration::Cmd))
                 .foreground(ThemeBrush::TextSecondary),
             body(state.adapter_component_line(Integration::WindowsPowerShell))
@@ -1402,11 +1454,6 @@ impl SettingsModel {
                      WSL distribution list or your default distribution, on supported Windows \
                      surfaces.",
                 ),
-                body(
-                    "The filesystem minifilter remains production-gated and is not installed by \
-                     this app.",
-                )
-                .foreground(ThemeBrush::TextSecondary),
                 Border::new()
                     .padding(Thickness::new(18.0, 16.0, 18.0, 16.0))
                     .corner_radius(CornerRadius::uniform(8.0))
