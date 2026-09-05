@@ -11,6 +11,21 @@ typedef enum _FSW_MESSAGE_OPERATION {
   FswOperationPing = 3,
 } FSW_MESSAGE_OPERATION;
 
+/*
+ * Ping reply contract.
+ *
+ * FswOperationPing always succeeds. When the caller supplies an output buffer
+ * of at least sizeof(ULONG) the driver writes FSW_PROTOCOL_VERSION into it and
+ * returns sizeof(ULONG) as the returned output length, so a client can report
+ * the protocol the *loaded* driver speaks rather than the one it was compiled
+ * against. A caller that passes no output buffer, or a shorter one, gets the
+ * original behaviour: success and a returned length of zero. Every other
+ * operation returns no output.
+ *
+ * The client must send the whole FSW_MAPPING_MESSAGE for a ping as well; the
+ * driver rejects any input length other than sizeof(FSW_MAPPING_MESSAGE).
+ */
+
 typedef struct _FSW_MAPPING_MESSAGE {
   ULONG Version;
   ULONG Size;
