@@ -170,7 +170,9 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     // stale one, and uninstall must be able to restore the genuine pre-fwdslash
     // profile (#37). The raw bytes stay on the transaction for exact rollback.
     let true_original = profile::strip_fwdslash_blocks(&transaction.original_bytes);
-    let true_original_present = !true_original.is_empty();
+    let true_original_present = profile::original_profile_present(
+        transaction.original_present, &transaction.original_bytes, &true_original,
+    );
 
     // State directory with the recovery files, staged then renamed.
     if let Some(parent) = transaction.state_root.parent() {
@@ -192,7 +194,7 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
         probe_path: &probe_path.display().to_string(),
         alias_path: &alias_path.display().to_string(),
         controller_path: &controller_path.display().to_string(),
-        original_non_empty: true_original_present,
+        original_non_empty: !true_original.is_empty(),
     });
     let encoding = profile::detect_encoding(&true_original);
     transaction.block_bytes = profile::encode(&block, encoding);
@@ -211,9 +213,7 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     reg::set_string(&key, "ProfilePath", &transaction.profile_path.display().to_string())?;
     reg::set_string(&key, "StateDirectory", &transaction.state_root.display().to_string())?;
     reg::set_string(&key, "ProductProbe", &probe_path.display().to_string())?;
-    // OriginalPresent tracks whether there is *genuine* content to restore, so
-    // a profile that was purely our own block(s) is deleted on removal, not
-    // left as an empty file.
+    // An originally empty file must survive; an orphaned block-only file need not.
     reg::set_dword(&key, "OriginalPresent", u32::from(true_original_present))?;
 
     // Installed profile = true original + one current guarded block.

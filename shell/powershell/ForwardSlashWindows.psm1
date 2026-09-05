@@ -210,21 +210,22 @@ function Resolve-ForwardSlashWindowsLocationTarget {
     #
     # Exported because the pushd wrapper below is defined in the global scope
     # and can only call commands that are visible there.
-    param([object[]]$Arguments = @())
+    param([System.Collections.IDictionary]$BoundParameters)
 
-    $forward = @($Arguments)
-    $slashIndex = -1
-    foreach ($index in (Get-ForwardSlashWindowsPathIndex -Arguments $forward)) {
-        $value = $forward[$index]
-        if ($value -is [string] -and $value.StartsWith('/')) {
-            $slashIndex = $index
-            break
+    $slashPath = $null
+    foreach ($parameterName in @('LiteralPath', 'Path')) {
+        if ($BoundParameters.ContainsKey($parameterName)) {
+            $value = $BoundParameters[$parameterName]
+            if ($value -is [string] -and $value.StartsWith('/')) {
+                $slashPath = $value
+                break
+            }
         }
     }
-    if ($slashIndex -lt 0 -or (Test-ForwardSlashWindowsDisabled)) {
+    if ($null -eq $slashPath -or (Test-ForwardSlashWindowsDisabled)) {
         return $null
     }
-    $result = Resolve-ForwardSlashWindowsTarget -Path ([string]$forward[$slashIndex])
+    $result = Resolve-ForwardSlashWindowsTarget -Path $slashPath
     if ($null -eq $result) {
         return $null
     }
@@ -283,57 +284,124 @@ function Test-ForwardSlashWindowsParentReference {
 }
 
 function Invoke-ForwardSlashWindowsSetLocation {
-    $forward = @($args)
-    $result = Resolve-ForwardSlashWindowsLocationTarget -Arguments $forward
-    if ($null -eq $result) {
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true, ParameterSetName = 'LiteralPath')]
+        [string]$LiteralPath,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Stack')]
+        [string]$StackName,
+        [switch]$PassThru,
+        [switch]$UseTransaction
+    )
+
+    process {
+        $forward = $PSBoundParameters
+        $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
+        if ($null -eq $result) {
         # 'cd ..' at a distribution's share root: PowerShell's own answer is
         # "Cannot find path '\\wsl.localhost'", which reads like a broken
         # install rather than "there is nothing above this". Both checks here
         # are string work on arguments already in hand, and the registry read
         # is only reached in that rare case, so an ordinary 'cd ..' still pays
         # nothing. Paused, the native error is the honest answer.
-        if (Test-ForwardSlashWindowsParentReference -Arguments $forward) {
+            if (Test-ForwardSlashWindowsParentReference -Arguments @($forward.Values)) {
             $distribution = Get-ForwardSlashWindowsDistributionRoot
             if ($distribution -and -not (Test-ForwardSlashWindowsDisabled)) {
                 Write-Host "Already at the root of $distribution; a distribution share has no parent directory."
                 return
             }
         }
-        Microsoft.PowerShell.Management\Set-Location @forward
-        return
-    }
-    if ($result.Message) {
+            Microsoft.PowerShell.Management\Set-Location @forward
+            return
+        }
+        if ($result.Message) {
         # A rejected input or the bare root: never fall through to the
         # native cmdlet's misleading "Cannot find path 'C:\etc'".
-        Write-Error $result.Message
-        return
+            Write-Error $result.Message
+            return
+        }
+        # The resolver's target is filesystem data, never a wildcard pattern.
+        # Replace Path rather than retaining it so native wildcard expansion
+        # cannot reinterpret a literal '[' or ']' in a resolved directory.
+        [void]$forward.Remove('Path')
+        $forward['LiteralPath'] = $result.Target
+        Microsoft.PowerShell.Management\Set-Location @forward
     }
-    # PowerShell, unlike cmd.exe, can make a UNC path current.
-    Microsoft.PowerShell.Management\Set-Location -LiteralPath $result.Target
 }
+
+# Set-Location has location stacks too. Its module-scoped function would use a
+# module stack for -StackName, so install the same caller-scope wrapper used by
+# pushd. The module function above remains exported for module-qualified use.
+$script:FswSetLocationBody = @'
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true, ParameterSetName = 'LiteralPath')]
+        [string]$LiteralPath,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Stack')]
+        [string]$StackName,
+        [switch]$PassThru,
+        [switch]$UseTransaction
+    )
+
+    process {
+        $forward = $PSBoundParameters
+        $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
+        if ($null -eq $result) {
+            Microsoft.PowerShell.Management\Set-Location @forward
+            return
+        }
+        if ($result.Message) {
+            Write-Error $result.Message
+            return
+        }
+        [void]$forward.Remove('Path')
+        $forward['LiteralPath'] = $result.Target
+        Microsoft.PowerShell.Management\Set-Location @forward
+    }
+'@
+Set-Item -Path function:global:Invoke-ForwardSlashWindowsSetLocation `
+    -Value ([scriptblock]::Create($script:FswSetLocationBody))
 
 # The pushd wrapper is installed as a *global* function built from an unbound
 # script block, not as a module function, for two reasons that only affect
 # PUSHD:
 #   * Push-Location run inside a module pushes onto that module's location
 #     stack, and the caller's popd never sees it.
-#   * @args re-splats named parameters faithfully only from a simple
-#     function's own $args; the same array collected by an advanced function
-#     rebinds -LiteralPath as a positional value.
+#   * Its advanced parameters preserve PowerShell's native binding semantics;
+#     the wrapper splats named parameters after replacing only a slash path.
 # Running in the caller's session state fixes both, at the cost of calling
 # only commands the global scope can see (hence the exported resolver above).
 $script:FswPushLocationBody = @'
-    $forward = @($args)
-    $result = Resolve-ForwardSlashWindowsLocationTarget -Arguments $forward
-    if ($null -eq $result) {
+    [CmdletBinding(DefaultParameterSetName = 'Path')]
+    param(
+        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true, ParameterSetName = 'LiteralPath')]
+        [string]$LiteralPath,
+        [string]$StackName,
+        [switch]$PassThru,
+        [switch]$UseTransaction
+    )
+
+    process {
+        $forward = $PSBoundParameters
+        $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
+        if ($null -eq $result) {
+            Microsoft.PowerShell.Management\Push-Location @forward
+            return
+        }
+        if ($result.Message) {
+            Write-Error $result.Message
+            return
+        }
+        [void]$forward.Remove('Path')
+        $forward['LiteralPath'] = $result.Target
         Microsoft.PowerShell.Management\Push-Location @forward
-        return
     }
-    if ($result.Message) {
-        Write-Error $result.Message
-        return
-    }
-    Microsoft.PowerShell.Management\Push-Location -LiteralPath $result.Target
 '@
 Set-Item -Path function:global:Invoke-ForwardSlashWindowsPushLocation `
     -Value ([scriptblock]::Create($script:FswPushLocationBody))
@@ -345,5 +413,4 @@ Set-Alias -Name chdir -Value Invoke-ForwardSlashWindowsSetLocation -Scope Global
 Set-Alias -Name sl -Value Invoke-ForwardSlashWindowsSetLocation -Scope Global -Option AllScope -Force
 Set-Alias -Name pushd -Value Invoke-ForwardSlashWindowsPushLocation -Scope Global -Option AllScope -Force
 Export-ModuleMember -Function Invoke-ForwardSlashWindowsChildItem,
-    Invoke-ForwardSlashWindowsSetLocation,
     Resolve-ForwardSlashWindowsLocationTarget

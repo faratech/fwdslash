@@ -6,6 +6,37 @@
 use super::profile;
 use super::state;
 
+#[test]
+fn empty_originals_remain_present_but_orphan_hooks_do_not() {
+    assert!(profile::original_profile_present(true, b"", b""));
+    assert!(!profile::original_profile_present(false, b"", b""));
+    assert!(!profile::original_profile_present(true, b"old block", b""));
+    assert!(profile::original_profile_present(true, b"user", b"user"));
+    assert!(!profile::should_delete_profile(0, true));
+    assert!(state::original_autorun_present(true, "", ""));
+    assert!(!state::original_autorun_present(false, "", ""));
+    assert!(!state::original_autorun_present(true, "call old-hook", ""));
+    assert!(state::original_autorun_present(true, "%SystemRoot%", "%SystemRoot%"));
+}
+
+#[cfg(windows)]
+#[test]
+fn orphan_cleanup_preserves_updater_and_unrelated_data() {
+    let root = std::env::temp_dir().join(format!("fsw-prune-{}", super::new_transaction_id()));
+    for child in ["cmd", "PowerShell", ".cmd-staging-test", "update", "unrelated"] {
+        std::fs::create_dir_all(root.join(child)).unwrap();
+        std::fs::write(root.join(child).join("sentinel"), b"keep").unwrap();
+    }
+    super::prune_adapter_directories(&root);
+    for child in ["cmd", "PowerShell", ".cmd-staging-test"] {
+        assert!(!root.join(child).exists());
+    }
+    for child in ["update", "unrelated"] {
+        assert_eq!(std::fs::read(root.join(child).join("sentinel")).unwrap(), b"keep");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // state.rs — marker classification and decisions
 // ---------------------------------------------------------------------------
@@ -642,7 +673,9 @@ fn cleanup_script_quotes_every_path_and_self_destructs() {
     let dir = r"C:\Users\a b\AppData\Local\ForwardSlashWindows";
     let body = super::cleanup_script_body(dir, super::CLEANUP_TASK_NAME);
     // The payload path is quoted, so a space in the profile name is safe.
-    assert!(body.contains(&format!("rd /s /q \"{dir}\"\r\n")));
+    assert!(!body.contains(&format!("rd /s /q \"{dir}\"\r\n")));
+    assert!(body.contains(&format!("rd /s /q \"{dir}\\cmd\"\r\n")));
+    assert!(body.contains(&format!("rd /s /q \"{dir}\\PowerShell\"\r\n")));
     // It waits for the launching process to exit before deleting.
     assert!(body.contains("ping -n 3 127.0.0.1 >nul\r\n"));
     // ...then removes the task and itself, so nothing accumulates.

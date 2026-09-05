@@ -199,6 +199,11 @@ pub fn should_delete_profile(remaining_len: usize, original_present: bool) -> bo
     remaining_len == 0 && !original_present
 }
 
+/// Keep empty originals, but discard files consisting only of orphaned blocks.
+pub fn original_profile_present(existed: bool, original: &[u8], cleaned: &[u8]) -> bool {
+    existed && (original.is_empty() || !cleaned.is_empty())
+}
+
 fn line_trim(content: &str) -> &str {
     content.trim()
 }
