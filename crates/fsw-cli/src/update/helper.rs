@@ -94,6 +94,39 @@ pub fn apply_bundle_command(helper: &Path, bundle: &Path, previous_version: &str
     )
 }
 
+/// The final automatic rung after the identity-less AppInstall API refuses
+/// before it queues work. This is deliberately a direct child of the already
+/// running apply task: its watchdog remains in the surrounding batch file, and
+/// no second installer is launched after an AppInstall queue was accepted.
+#[cfg(windows)]
+#[must_use]
+pub fn run_winget_upgrade(product_id: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new("winget.exe")
+        .args([
+            "upgrade",
+            "--id",
+            product_id,
+            "--source",
+            "msstore",
+            "--exact",
+            "--silent",
+            "--force",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Records the helper's verdict for the next packaged run to fold in. Silent on
 /// failure: a helper that cannot write its result file has still done (or not
 /// done) the install, and there is nobody to tell.

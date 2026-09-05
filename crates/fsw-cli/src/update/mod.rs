@@ -698,8 +698,7 @@ fn resolve_route(explicit: Option<Route>) -> Route {
     let probing = override_route.is_none();
     let appinstall = probing && helper::appinstall_available();
     let silent = probing && !appinstall && store::can_silently_download();
-    let winget =
-        probing && !appinstall && !silent && fsw_core::executable_available("winget.exe");
+    let winget = probing && !appinstall && !silent && fsw_core::executable_available("winget.exe");
     let metered = winget && store::network_is_metered();
     route_for(override_route, appinstall, silent, winget, metered)
 }
@@ -824,25 +823,36 @@ fn install_github_bundle(options: &Options, folded: Option<String>) -> i32 {
 /// staged helper; a failure to even schedule that drops to route 2.
 fn install_via_appinstall(options: &Options, available: &str, folded: Option<String>) -> i32 {
     let previous = previous_version();
-    // Registered but deliberately NOT run yet. Its backstop trigger is a minute
-    // out, which is longer than the 1a/1b decision takes, so the script 1b may
-    // replace is never a file `cmd.exe` already has open.
-    let _ = relaunch::schedule_watchdog(options.relaunch, &previous, false);
+    let Some(watchdog) = relaunch::schedule_watchdog(options.relaunch, &previous, false) else {
+        return Report::new("error", EXIT_ERROR)
+            .route(Route::AppInstall)
+            .available(Some(available.to_string()))
+            .detail("The relaunch watchdog could not be registered.".to_string())
+            .emit(options, folded);
+    };
 
     match appinstall::apply_store_update(fsw_core::STORE_PRODUCT_ID) {
         appinstall::Outcome::Finished { code, result } => {
+            // A completed or paused queue can still deploy after this process
+            // returns. In particular, settings stopped the broker before
+            // invoking us and depends on the watchdog to restore it.
+            if !appinstall_keeps_watchdog(code) {
+                watchdog.cancel();
+            }
             if code == EXIT_OK {
                 // We are still alive, so the Store did not force-restart us;
                 // either way the cached notice is spent.
                 let _ = fsw_core::update::clear_cached_update_tag();
             }
-            let mut report = report_for_code(code, Route::AppInstall).available(Some(available.to_string()));
+            let mut report =
+                report_for_code(code, Route::AppInstall).available(Some(available.to_string()));
             if let Some(detail) = helper_result_detail(&result) {
                 report = report.detail(detail);
             }
             report.emit(options, folded)
         }
         appinstall::Outcome::NotStarted(detail) => {
+            watchdog.cancel();
             if let Some(helper) = helper::stage_helper() {
                 let command =
                     helper::apply_store_command(&helper, fsw_core::STORE_PRODUCT_ID, &previous);
@@ -866,19 +876,38 @@ fn install_via_appinstall(options: &Options, available: &str, folded: Option<Str
 /// is set to update apps automatically and the network is unmetered.
 fn install_via_store(options: &Options, available: &str, folded: Option<String>) -> i32 {
     let previous = previous_version();
-    // This one can terminate the package the moment deployment starts, so its
-    // watchdog runs immediately rather than waiting for the backstop trigger.
-    let _ = relaunch::schedule_watchdog(options.relaunch, &previous, true);
+    let Some(watchdog) = relaunch::schedule_watchdog(options.relaunch, &previous, true) else {
+        return Report::new("error", EXIT_ERROR)
+            .route(Route::Store)
+            .available(Some(available.to_string()))
+            .detail("The relaunch watchdog could not be registered.".to_string())
+            .emit(options, folded);
+    };
 
     match store::silent_download_and_install() {
-        Ok(code) => report_for_code(code, Route::Store)
-            .available(Some(available.to_string()))
-            .emit(options, folded),
-        Err(detail) => Report::new("needsUser", EXIT_NEEDS_USER)
-            .route(Route::Notify)
-            .available(Some(available.to_string()))
-            .detail(format!("The Store declined a silent install ({detail})."))
-            .emit(options, folded),
+        Ok(code) => {
+            // `EXIT_OK` can mean Store deployment is still queued, so its
+            // watchdog owns the lock until it observes the new version. Every
+            // other returned result is terminal in this process.
+            if !store_keeps_watchdog(code) {
+                watchdog.cancel();
+            }
+            report_for_code(code, Route::Store)
+                .available(Some(available.to_string()))
+                .emit(options, folded)
+        }
+        Err(_detail) if options.route.is_none() => {
+            watchdog.cancel();
+            install_via_winget(options, available, folded)
+        }
+        Err(detail) => {
+            watchdog.cancel();
+            Report::new("needsUser", EXIT_NEEDS_USER)
+                .route(Route::Notify)
+                .available(Some(available.to_string()))
+                .detail(format!("The Store declined a silent install ({detail})."))
+                .emit(options, folded)
+        }
     }
 }
 
@@ -916,6 +945,16 @@ fn report_for_code(code: i32, route: Route) -> Report {
     Report::new(state_for_code(code), code).route(route)
 }
 
+#[must_use]
+fn appinstall_keeps_watchdog(code: i32) -> bool {
+    matches!(code, EXIT_OK | EXIT_AVAILABLE)
+}
+
+#[must_use]
+fn store_keeps_watchdog(code: i32) -> bool {
+    matches!(code, EXIT_OK | EXIT_AVAILABLE)
+}
+
 // ---------------------------------------------------------------------------
 // Helper-only verbs
 // ---------------------------------------------------------------------------
@@ -932,8 +971,19 @@ fn cmd_apply_store(options: &Options) -> i32 {
             code
         }
         appinstall::Outcome::NotStarted(detail) => {
-            helper::write_result(&HelperResult::Error(detail));
-            EXIT_ERROR
+            // No item was queued, so it is safe to continue the automatic
+            // ladder from the identity-less helper. Metered networks remain a
+            // deferral: winget does not honour the Store's data-cost setting.
+            if store::network_is_metered() {
+                helper::write_result(&HelperResult::Paused);
+                EXIT_AVAILABLE
+            } else if helper::run_winget_upgrade(product) {
+                helper::write_result(&HelperResult::Completed);
+                EXIT_OK
+            } else {
+                helper::write_result(&HelperResult::Error(detail));
+                EXIT_ERROR
+            }
         }
     }
 }
