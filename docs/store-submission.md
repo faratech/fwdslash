@@ -285,11 +285,13 @@ can observe is a 0.0.5 install being offered 0.0.6.
   The `AutoRun` value, the PowerShell profile blocks and
   `%LOCALAPPDATA%\ForwardSlashWindows` survive package removal. Disable the
   integrations from the settings app before uninstalling.
-- **Versioning.** Each submission must increase the version. The release
-  workflow derives the three-part product version from
-  `workspace.package.version` and passes the Store-required four-part form
-  `<major>.<minor>.<patch>.0` to the packager. A tag must match Cargo exactly;
-  a manual dry run derives the same value from Cargo rather than a run number.
+- **Version is `0.0.5.0`.** Each submission must increase it, and the fourth
+  field is reserved by the Store (always `0`). It comes from
+  `workspace.package.version`, and the statement above is one of the locations
+  `tools/bump_version.py` rewrites — bump with `python3 tools/bump_version.py
+  <x.y.z>` rather than editing it, and CI's `--check` will catch it if this
+  line ever falls behind the workspace. The three-field version in the tag and
+  in `Cargo.toml` always gains the reserved `.0` here.
 
 ## 6. Current verification checklist
 
