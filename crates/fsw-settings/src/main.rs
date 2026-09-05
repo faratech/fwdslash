@@ -56,6 +56,9 @@ const INSTALL_ACTION: &str = "Update install";
 
 /// The `show_result` phrase for the manual Repair integrations button (#56).
 const REPAIR_ACTION: &str = "Integrations repaired";
+const AUTO_UPDATE_ACTION: &str = "Automatic updates";
+const OPEN_WSL_ACTION: &str = "Opening the WSL root";
+const OPEN_STORE_ACTION: &str = "Opening the Microsoft Store";
 
 /// `fwdslash update` exit codes, mirrored from `crates/fsw-cli/src/update`.
 /// The contract between the two binaries is exactly these numbers plus the
@@ -522,9 +525,17 @@ enum Msg {
     /// The Check now button.
     CheckForUpdates,
     SetAutoUpdate(bool),
+    AutoUpdateFinished {
+        enabled: bool,
+        succeeded: bool,
+    },
     SelectDistribution(Option<usize>),
     ToggleIntegration(Integration, bool),
     OpenWslRoot,
+    ShellOpenFinished {
+        action: &'static str,
+        succeeded: bool,
+    },
     RefreshStatus,
     DismissNotice,
     /// Install whatever the CLI can install now: the Store's update for the
@@ -1128,8 +1139,19 @@ impl Component for SettingsModel {
             }
 
             Msg::OpenWslRoot => {
-                if !open_wsl_root() {
-                    self.show_result(false, "Opening the WSL root", false, "");
+                if self.pending.is_some() {
+                    return;
+                }
+                self.pending = Some(OPEN_WSL_ACTION);
+                context.spawn_background(|_| Msg::ShellOpenFinished {
+                    action: OPEN_WSL_ACTION,
+                    succeeded: open_wsl_root(),
+                });
+            }
+            Msg::ShellOpenFinished { action, succeeded } => {
+                self.pending = None;
+                if !succeeded {
+                    self.show_result(false, action, false, "");
                 }
             }
             Msg::RefreshStatus => {
@@ -1215,6 +1237,7 @@ impl Component for SettingsModel {
                 }
                 self.pending = Some(INSTALL_ACTION);
                 context.spawn_background(|_| {
+                    let broker_window_before_install = broker_window_exists();
                     // Ask the broker to close first so it removes its
                     // notification icon itself; a forced shutdown by the
                     // installer would leave a ghost icon behind. It waits up to
@@ -1227,6 +1250,14 @@ impl Component for SettingsModel {
                     let (code, stdout, stderr) = run_controller_code([
                         "update", "install", "--force", "--relaunch", "app", "--json",
                     ]);
+                    // Exit 0 hands control to the update machinery, including
+                    // its watchdog restart. Every other result leaves this
+                    // process alive, so restore only the broker that was
+                    // resident before the attempted install. Its persisted
+                    // disabled flag preserves an existing pause preference.
+                    if should_restore_broker_after_install(code, broker_window_before_install) {
+                        ensure_broker_running();
+                    }
                     Msg::UpdateInstallFinished {
                         code,
                         stdout,
@@ -1256,9 +1287,14 @@ impl Component for SettingsModel {
                 Self::refresh(context);
             }
             Msg::OpenStorePage => {
-                if !shell_open(&store_product_uri()) {
-                    self.show_result(false, "Opening the Microsoft Store", false, "");
+                if self.pending.is_some() {
+                    return;
                 }
+                self.pending = Some(OPEN_STORE_ACTION);
+                context.spawn_background(|_| Msg::ShellOpenFinished {
+                    action: OPEN_STORE_ACTION,
+                    succeeded: shell_open(&store_product_uri()),
+                });
             }
             Msg::RepairIntegrations => {
                 if self.pending.is_some() {
@@ -1309,10 +1345,17 @@ impl Component for SettingsModel {
                 Self::refresh(context);
             }
             Msg::SetAutoUpdate(enabled) => {
-                if enabled == update::read_auto_update_enabled() {
+                if enabled == self.state.auto_update || self.pending.is_some() {
                     return;
                 }
-                let succeeded = update::set_auto_update_enabled(enabled).is_ok();
+                self.pending = Some(AUTO_UPDATE_ACTION);
+                context.spawn_background(move |_| Msg::AutoUpdateFinished {
+                    enabled,
+                    succeeded: update::set_auto_update_enabled(enabled).is_ok(),
+                });
+            }
+            Msg::AutoUpdateFinished { enabled, succeeded } => {
+                self.pending = None;
                 self.show_result(
                     succeeded,
                     if enabled {
@@ -2025,6 +2068,14 @@ fn install_notice(code: i32, stderr: &str) -> Option<Notice> {
     })
 }
 
+/// A successful install takes ownership of shutdown and restart through its
+/// watchdog. Every other CLI exit returns to this still-running UI, so only a
+/// broker that was previously serving input should be brought back.
+#[must_use]
+fn should_restore_broker_after_install(code: i32, broker_window_before_install: bool) -> bool {
+    code != UPDATE_EXIT_OK && broker_window_before_install
+}
+
 /// The install banner's button label, or `None` when no banner belongs on
 /// screen.
 ///
@@ -2286,10 +2337,43 @@ fn open_wsl_root() -> bool {
 /// `ms-windows-store:` product page.
 fn shell_open(target: &str) -> bool {
     #[cfg(windows)]
+    {
+        // The reactor pool is deliberately opaque about its apartment model.
+        // ShellExecute can activate STA-only shell extensions, so give each
+        // operation a fresh STA rather than relying on the pool worker.
+        let target = target.to_owned();
+        std::thread::Builder::new()
+            .name("fsw-shell-open".to_owned())
+            .spawn(move || shell_open_sta(&target))
+            .ok()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn shell_open_sta(target: &str) -> bool {
     unsafe {
+        use windows_sys::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+        };
         use windows_sys::Win32::UI::Shell::ShellExecuteW;
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
+        // A new OS thread has no apartment yet. Keep the init and uninit on
+        // this same thread, as required for a shell extension's COM objects.
+        if CoInitializeEx(
+            std::ptr::null(),
+            (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32,
+        ) < 0
+        {
+            return false;
+        }
         let verb = to_wide("open");
         let target = to_wide(target);
         let result = ShellExecuteW(
@@ -2300,13 +2384,9 @@ fn shell_open(target: &str) -> bool {
             std::ptr::null(),
             SW_SHOWNORMAL,
         );
+        CoUninitialize();
         // ShellExecuteW returns a fake HINSTANCE; anything above 32 is success.
         result as isize > 32
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = target;
-        false
     }
 }
 
@@ -2816,6 +2896,21 @@ mod tests {
     #[test]
     fn a_started_install_leaves_no_notice_because_the_window_closes() {
         assert!(install_notice(UPDATE_EXIT_OK, "").is_none());
+    }
+
+    #[test]
+    fn failed_or_deferred_installs_restore_only_a_previously_running_broker() {
+        for code in [-1, UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NEEDS_USER, UPDATE_EXIT_NOTHING, 1] {
+            assert!(super::should_restore_broker_after_install(code, true));
+        }
+        assert!(!super::should_restore_broker_after_install(
+            UPDATE_EXIT_OK,
+            true
+        ));
+        assert!(!super::should_restore_broker_after_install(
+            UPDATE_EXIT_NOTHING,
+            false
+        ));
     }
 
     #[test]
