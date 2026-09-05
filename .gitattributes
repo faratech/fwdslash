@@ -5,6 +5,10 @@
 *.h text eol=lf
 *.hpp text eol=lf
 *.md text eol=lf
+# Rust sources are LF in the working tree on every platform: the Windows CI job
+# regenerates crates/fsw-cli/src/update/install_control.rs and diffs it, and a
+# CRLF checkout would make every line of that generated file look changed.
+*.rs text eol=lf
 *.json text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf

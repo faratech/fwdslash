@@ -537,13 +537,15 @@ fn strip_all_ps_profiles() {
 /// at most one can ever be left behind.
 pub const CLEANUP_TASK_NAME: &str = "fwdslash-orphan-cleanup";
 
-/// `HH:MM` one minute after `hour:minute`, wrapping at midnight — the `/st`
-/// value for the backstop trigger.
-#[must_use]
-pub fn task_start_time(hour: u32, minute: u32) -> String {
-    let next = (hour * 60 + minute + 1) % (24 * 60);
-    format!("{:02}:{:02}", next / 60, next % 60)
-}
+// The one-shot task machinery is shared with the self-updater and now lives in
+// `crate::scheduled_task`. The cleanup path reaches it through
+// `register_and_run`, so these two names survive only for the tests that were
+// written against them here — hence `cfg(test)`, which is also what keeps them
+// from reading as an unused re-export in a normal build.
+#[cfg(test)]
+pub use crate::scheduled_task::task_args as cleanup_task_args;
+#[cfg(test)]
+pub use crate::scheduled_task::task_start_time;
 
 /// The batch file the cleanup task runs: wait for this process to exit, remove
 /// the payload tree, then delete the task and itself. Every path is quoted, so
@@ -557,24 +559,6 @@ pub fn cleanup_script_body(payload_dir: &str, task_name: &str) -> String {
          schtasks /delete /tn \"{task_name}\" /f >nul 2>&1\r\n\
          del /q \"%~f0\"\r\n"
     )
-}
-
-/// The `schtasks /create` argument vector. `/tr` is a bare quoted script path —
-/// no embedded command line — so schtasks' own quoting rules cannot bite.
-#[must_use]
-pub fn cleanup_task_args(task_name: &str, script_path: &str, start_time: &str) -> Vec<String> {
-    vec![
-        "/create".to_string(),
-        "/tn".to_string(),
-        task_name.to_string(),
-        "/sc".to_string(),
-        "once".to_string(),
-        "/st".to_string(),
-        start_time.to_string(),
-        "/f".to_string(),
-        "/tr".to_string(),
-        script_path.to_string(),
-    ]
 }
 
 /// Whether `payload` is exactly the tree the self-clean is allowed to remove.
@@ -610,59 +594,17 @@ fn schedule_payload_delete() {
     if !is_payload_tree(&payload, &local_app_data) {
         return;
     }
-    if schedule_payload_delete_task(&payload, &local_app_data).is_some() {
+    let task = crate::scheduled_task::OneShotTask::new(
+        CLEANUP_TASK_NAME,
+        cleanup_script_body(&payload.display().to_string(), CLEANUP_TASK_NAME),
+    );
+    if crate::scheduled_task::register_and_run(&task).is_some() {
         return;
     }
     // No usable Task Scheduler: fall back to a detached child. Try to break
     // away from any job first; if that is refused, spawn plainly — which still
     // works for an ordinary interactive shell.
     spawn_detached_delete(&payload);
-}
-
-/// Creates and starts the cleanup task. `None` when schtasks is unavailable or
-/// refuses, so the caller can fall back.
-#[cfg(windows)]
-fn schedule_payload_delete_task(payload: &Path, local_app_data: &Path) -> Option<()> {
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-
-    let script = local_app_data
-        .join("Temp")
-        .join(format!("{CLEANUP_TASK_NAME}.cmd"));
-    if let Some(parent) = script.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let body = cleanup_script_body(&payload.display().to_string(), CLEANUP_TASK_NAME);
-    std::fs::write(&script, body).ok()?;
-
-    // SAFETY: GetLocalTime only writes the SYSTEMTIME it is handed.
-    let now = unsafe {
-        let mut time = std::mem::zeroed();
-        GetLocalTime(&mut time);
-        time
-    };
-    let start = task_start_time(u32::from(now.wHour), u32::from(now.wMinute));
-    let args = cleanup_task_args(CLEANUP_TASK_NAME, &script.display().to_string(), &start);
-
-    let created = Command::new("schtasks.exe")
-        .args(&args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    if !created.success() {
-        return None;
-    }
-    // Fire it now; the scheduled trigger is only the backstop.
-    let _ = Command::new("schtasks.exe")
-        .args(["/run", "/tn", CLEANUP_TASK_NAME])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    Some(())
 }
 
 /// The pre-scheduled-task fallback: a detached `cmd.exe` that waits, then
@@ -726,6 +668,11 @@ pub fn prune_orphaned_payload_tree() {
     if is_payload_tree(&payload, &local_app_data) && payload.is_dir() {
         let _ = std::fs::remove_dir_all(&payload);
     }
+    // The task that was going to do this is stale for the same reason, and it
+    // is not harmless: its `rd /s /q` names the tree we are about to stage a
+    // fresh payload into, and its backstop trigger can still be an hour away.
+    // The script deletes its own task, but only once it has run.
+    let _ = crate::scheduled_task::delete_task(CLEANUP_TASK_NAME);
 }
 
 /// The payload directory for an adapter kind, relative to the executable:

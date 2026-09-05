@@ -1,4 +1,6 @@
 mod adapters;
+mod scheduled_task;
+mod update;
 
 use fsw_core::*;
 use fsw_path::{BareSlashMode, RenderBuf, ResolveError, Resolved, is_valid_windows_root};

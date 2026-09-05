@@ -43,6 +43,14 @@ ISLAND_PINNED: dict[str, str] = {
     "windows-registry": "0.100.x pulls windows-core into fsw-core's closure",
     # windows/windows-sys 0.100.x do not exist yet; when they do, migration
     # is a deliberate cross-major port (see docs/dependencies.md), not a bump.
+    #
+    # The three crates the vendored Store bindings in fsw-cli name directly.
+    # They are re-exported by `windows` 0.62.2, so bumping one on its own puts a
+    # second windows-core in fwdslash.exe -- two incompatible COM type systems
+    # in one binary.
+    "windows-core": "0.62 island -- must match windows 0.62.2",
+    "windows-future": "0.62 island -- must match windows 0.62.2",
+    "windows-collections": "0.62 island -- must match windows 0.62.2",
 }
 
 
