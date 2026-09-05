@@ -25,6 +25,16 @@ authors = ["Mike Fara", "Fara Technologies LLC"]
 windows-registry = "0.6.1"
 windows-sys = "0.61.2"
 windows = "0.62.2"
+# The three crates the `windows` 0.62 umbrella re-exports from, named directly
+# because the vendored Store bindings in crates/fsw-cli/src/update/ are
+# windows-bindgen output and spell their types as `windows_core::`,
+# `windows_future::` and `windows_collections::`. They are part of the 0.62
+# island and have to resolve to exactly what `windows` 0.62.2 itself resolves
+# to -- a second `windows-core` in one binary is two incompatible COM type
+# systems. tools/update-deps.py pins all three; see docs/dependencies.md.
+windows-core = "0.62.2"
+windows-future = "0.3.2"
+windows-collections = "0.3.2"
 # Pinned once here; two [build-dependencies] copies drifted as literals before.
 # windows-registry is island-pinned at 0.6 -- see docs/dependencies.md and
 # tools/update-deps.py's ISLAND_PINNED list.

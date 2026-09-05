@@ -117,6 +117,18 @@ jobs:
           echo "$versions"
           test "$(echo "$versions" | wc -l)" -eq 1
 
+      # The CLI joined the 0.62 island for the Store update path: it names
+      # windows-core, windows-future and windows-collections directly (the
+      # vendored InstallControl bindings are generated against them) alongside
+      # the `windows` umbrella that re-exports all three. A drift in any one of
+      # them is a second windows-core here, so this is the same gate as above.
+      - name: Assert one windows-core version in fwdslash
+        run: |
+          versions=$(cargo tree -p fwdslash --target aarch64-pc-windows-msvc -e normal \
+            | grep -o 'windows-core v[0-9.]*' | sort -u)
+          echo "$versions"
+          test "$(echo "$versions" | wc -l)" -eq 1
+
       # `cargo check` links nothing, so the MSVC targets type-check here
       # without a linker or the Windows SDK.
       - name: Check x64 (all targets)
@@ -140,6 +152,29 @@ jobs:
         uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: x86_64-pc-windows-msvc
+          # rustfmt because windows-bindgen shells out to it to format its
+          # output, and does so silently: without it the regeneration below
+          # would "succeed" with unformatted bytes and report a false diff.
+          components: rustfmt
+
+      # crates/fsw-cli/src/update/install_control.rs is committed windows-bindgen
+      # output (docs/dependencies.md, "Adding a dependency", option 3).
+      # Regenerate it here and fail on any difference -- but only when this
+      # runner carries the exact SDK the file records, since a different
+      # Windows.winmd legitimately produces different bindings and diffing
+      # against it would be noise rather than a staleness signal.
+      - name: Check the vendored InstallControl bindings are current
+        run: |
+          $version = python tools/regen_install_control.py --print-winmd-version
+          if ($version -notmatch '^\d+(\.\d+)+$') { throw "regen_install_control.py did not report an SDK version (got '$version')" }
+          $winmd = "C:\Program Files (x86)\Windows Kits\10\UnionMetadata\$version\Windows.winmd"
+          if (-not (Test-Path -LiteralPath $winmd)) {
+            Write-Warning "Windows SDK $version metadata is not on this runner ($winmd); skipping the bindings regeneration check."
+            exit 0
+          }
+          python tools/regen_install_control.py
+          git diff --exit-code -- crates/fsw-cli/src/update/install_control.rs
+          if ($LASTEXITCODE -ne 0) { throw 'install_control.rs is stale: run python tools/regen_install_control.py' }
 
       - name: Test the CLI (adapter tests live in the bin, not a lib)
         run: cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc --locked

@@ -47,9 +47,80 @@ them, so they do not have to agree.
 |---|---|
 | `fsw-path` | **none — zero dependencies** |
 | `fsw-core` | `windows-registry` 0.6 + `windows-sys` 0.61 |
-| `fwdslash.exe` | `fsw-core` + `windows-sys` 0.61 |
+| `fwdslash.exe` | `fsw-core` + `windows-sys` 0.61 + **`windows` 0.62.2** |
 | `fswbroker.exe` | `windows` 0.62.2 |
 | `fswsettings.exe` | `windows-reactor` 0.100 + `fsw-core` |
+
+**`fwdslash.exe` joined the 0.62 island** for the self-update path. The Store
+query (`Windows.Services.Store.StoreContext`) and the Store install path
+(`AppInstallManager`, below) are WinRT, so the CLI now carries `windows` 0.62.2
+with the features `Services_Store`, `Foundation`, `Foundation_Collections`,
+`ApplicationModel` and `Win32_System_Com` — plus three companions the vendored
+bindings name directly:
+
+| Crate | Version | Why it is named directly |
+|---|---|---|
+| `windows-core` | 0.62.2 | `HSTRING`, `Result`, `Interface`, the vtable machinery every generated method uses |
+| `windows-future` | 0.3.2 | `IAsyncOperation<T>`, the return type of every `*Async` method |
+| `windows-collections` | 0.3.2 | `IVectorView<AppInstallItem>` |
+
+All three are exactly what `windows` 0.62.2 itself resolves to, and all three
+are in `tools/update-deps.py`'s `ISLAND_PINNED` with the reason
+"0.62 island — must match windows 0.62.2": bumping one alone would put a second
+`windows-core` in the binary, which is the collision this whole file exists to
+prevent. The `rust` job asserts it directly, the same way it does for
+`fswsettings` (step "Assert one windows-core version in fwdslash").
+
+`fsw-core` and `fsw-path` are untouched by this and stay island-free.
+
+### Vendored bindings: `Windows.ApplicationModel.Store.Preview.InstallControl`
+
+`crates/fsw-cli/src/update/install_control.rs` is committed `windows-bindgen`
+output — option 3 of "Adding a dependency" below, and the same arrangement as
+`crates/windows-reactor/`.
+
+It exists because **the published `windows` crate 0.62.2 contains no
+`Windows.ApplicationModel.Store` tree at all**, and that is where
+`AppInstallManager` lives: the API winget drives to install a Store product, and
+the only route that can update the Store flavor of this product without a user
+gesture. The types are in the Windows SDK's own metadata, so they are generated
+once and committed.
+
+| | |
+|---|---|
+| Namespace | `Windows.ApplicationModel.Store.Preview.InstallControl` |
+| Metadata | `C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0\Windows.winmd` |
+| Generator | `windows-bindgen` 0.62.1 |
+| Regenerate | `python3 tools/regen_install_control.py` (`--check` for CI mode) |
+| Size | ~95 KB, ~2.5k lines, no runtime cost when unused (the ARM64 release `fwdslash.exe` was byte-for-byte the same size before and after adding it: fat LTO drops what nothing calls) |
+
+Two things about the generator are not obvious:
+
+* **`windows-bindgen` is a library, not a binary.** `cargo install
+  windows-bindgen` fails with "can't be used with libraries", so the script
+  writes a five-line driver crate pinned at `=0.62.1` into a temporary directory
+  and calls `windows_bindgen::bindgen(args)` from there.
+* **It shells out to `rustfmt`**, and falls back to unformatted output *silently*
+  if it cannot find one. The script therefore forces `RUSTUP_TOOLCHAIN` to the
+  channel in `rust-toolchain.toml` and refuses to run when that rustfmt is
+  missing, so the committed bytes are reproducible.
+
+The arguments are recorded in the generated file's own header. The one that
+takes explaining is `--reference windows,skip-root,Windows.Foundation`: it points
+the four `TypedEventHandler` parameters at the `windows` crate rather than
+regenerating them, and it is deliberately the **only** reference.
+`Windows.System` and `Windows.Management.Deployment` are left unreferenced, so
+the generator skips the 15 `*ForUserAsync` / `PackageVolume` methods instead of
+forcing two more `windows` features into the binary for methods this product
+never calls. Their vtable slots survive as `usize` placeholders, so interface
+layout is unaffected — the same convention `crates/windows-reactor`'s bindings
+use for unimplemented slots.
+
+The `rust-windows` job regenerates the file and runs `git diff --exit-code`
+against it, but only when the runner carries the SDK version recorded above
+(a different `Windows.winmd` legitimately produces different bindings); it warns
+and skips otherwise. `.gitattributes` pins `*.rs` to `eol=lf` so that check is
+not defeated by a CRLF checkout.
 
 `fswbroker` stays on 0.62.2 for v1 because 0.100 dropped the three things its UI
 Automation path depends on: all 351 `UIA_*PropertyId`/`UIA_*PatternId` constants,
