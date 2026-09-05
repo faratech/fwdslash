@@ -24,6 +24,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -95,6 +97,15 @@ jobs:
       - name: Build the per-architecture ZIPs (signed executables)
         run: |
           .\tools\Build-ReleaseZips.ps1 -Version '${{ steps.version.outputs.short }}'
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        continue-on-error: true
+        with:
+          subject-path: |
+            out\msix\*.msix
+            out\msix\*.msixbundle
+            out\package\*.zip
 
       - name: Upload workflow artifacts (always, for inspection)
         uses: actions/upload-artifact@v4
