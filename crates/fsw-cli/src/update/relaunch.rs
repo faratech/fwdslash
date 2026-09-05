@@ -172,12 +172,14 @@ impl AttemptLock {
 /// storage sweep, preventing a fresh updater from acquiring a token between
 /// those destructive steps.
 #[cfg(windows)]
-pub struct UninstallUpdateGuard(AttemptMutex);
+pub struct UninstallUpdateGuard {
+    _mutex: AttemptMutex,
+}
 
 #[cfg(windows)]
 pub fn lock_update_storage_for_uninstall() -> Option<UninstallUpdateGuard> {
     let directory = fsw_core::update::update_directory_path()?;
-    AttemptMutex::acquire(&directory).map(UninstallUpdateGuard)
+    AttemptMutex::acquire(&directory).map(|mutex| UninstallUpdateGuard { _mutex: mutex })
 }
 
 /// The relaunch ceiling, in minutes, for the watchdog's poll loop.

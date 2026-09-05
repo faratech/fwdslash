@@ -656,6 +656,7 @@ fn watchdog_script_golden_none() {
         script,
         "@echo off\r\n\
          schtasks /delete /tn \"fwdslash-update\" /f >nul 2>&1\r\n\
+         del /q \"%~dpn0.xml\" >nul 2>&1\r\n\
          del /q \"%~f0\"\r\n"
     );
     assert!(powershell_line(&script).is_none());
