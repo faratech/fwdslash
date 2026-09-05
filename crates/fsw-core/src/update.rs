@@ -22,9 +22,10 @@
 //! check that finds the running version current, which is the proof it applied.
 //!
 //! Registry values `AutoUpdate`/`LastUpdateCheck`/`AvailableUpdate` live under
-//! the settings key and are read back only by the same packaged process, so
-//! MSIX virtualization of these writes is self-consistent — unlike
-//! `persist_disabled`, which must reach the real hive.
+//! the settings key, so — like every other value there — they are written
+//! through `crate::settings_write`, never with the in-process registry API
+//! (issue #52). Only that module knows a packaged write has to reach both the
+//! real hive and the package's private one.
 
 /// GitHub API endpoint for the latest release.
 pub const RELEASES_LATEST_URL: &str =
@@ -219,12 +220,8 @@ pub mod windows_impl {
     }
 
     pub fn set_auto_update_enabled(enabled: bool) -> Result<(), u32> {
-        let key = CURRENT_USER
-            .create(FSW_SETTINGS_KEY)
-            .map_err(|e| e.code().0 as u32)?;
         // Stored as the disabled flag (1 = auto-update off).
-        key.set_u32(AUTO_UPDATE_VALUE, u32::from(!enabled))
-            .map_err(|e| e.code().0 as u32)
+        crate::set_setting_u32(AUTO_UPDATE_VALUE, u32::from(!enabled))
     }
 
     /// The persisted newer-release tag, if any.
@@ -237,19 +234,11 @@ pub mod windows_impl {
     /// Clears the persisted update notice (user dismissed it, or a newer
     /// check found the running version current).
     pub fn dismiss_update() -> Result<(), u32> {
-        let key = CURRENT_USER
-            .open(FSW_SETTINGS_KEY)
-            .map_err(|e| e.code().0 as u32)?;
-        key.remove_value(AVAILABLE_UPDATE_VALUE)
-            .map_err(|e| e.code().0 as u32)
+        crate::delete_setting(AVAILABLE_UPDATE_VALUE)
     }
 
     pub fn clear_cached_update_tag() -> Result<(), u32> {
-        let key = CURRENT_USER
-            .open(FSW_SETTINGS_KEY)
-            .map_err(|e| e.code().0 as u32)?;
-        key.remove_value(AVAILABLE_UPDATE_VALUE)
-            .map_err(|e| e.code().0 as u32)
+        crate::delete_setting(AVAILABLE_UPDATE_VALUE)
     }
 
     /// Records that a check attempt happened, whatever the outcome: an
@@ -259,11 +248,7 @@ pub mod windows_impl {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let key = CURRENT_USER
-            .create(FSW_SETTINGS_KEY)
-            .map_err(|e| e.code().0 as u32)?;
-        key.set_u64(LAST_UPDATE_CHECK_VALUE, now)
-            .map_err(|e| e.code().0 as u32)
+        crate::set_setting_u64(LAST_UPDATE_CHECK_VALUE, now)
     }
 
     fn last_check_time() -> Option<u64> {
@@ -474,11 +459,7 @@ pub mod windows_impl {
     }
 
     fn set_cached_update_tag(tag: &str) -> Result<(), u32> {
-        let key = CURRENT_USER
-            .create(FSW_SETTINGS_KEY)
-            .map_err(|e| e.code().0 as u32)?;
-        key.set_string(AVAILABLE_UPDATE_VALUE, tag)
-            .map_err(|e| e.code().0 as u32)
+        crate::set_setting_string(AVAILABLE_UPDATE_VALUE, tag)
     }
 
     use std::os::windows::process::CommandExt;

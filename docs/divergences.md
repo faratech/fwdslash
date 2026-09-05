@@ -206,6 +206,35 @@ flavor. There is no tray balloon: the settings app has no tray icon. The C++ tre
 in docs/store-submission.md (the Store package performs no network
 connections).
 
+## Product behaviour (Rust-only): every settings write reaches both hives (#52)
+
+The C++ tree routes only `Disabled` through `reg.exe`; `BareSlashMode`,
+`BareSlashDistribution` and `BareSlashRoot` are written with the in-process
+registry API, so a packaged build files them in the package's private hive and
+the unpackaged shell adapters — which read the real hive — never see them. The
+measured symptom on a Store 0.0.3 install: the settings app said *default
+distribution* while `cd /` in PowerShell still listed the distributions.
+
+The Rust tree has one writer for that key, `fsw_core::settings_write`
+(`set_setting_u32` / `set_setting_u64` / `set_setting_string` /
+`delete_setting`), and nothing else may write it. Its decision is
+`write_plan(packaged)`: unpackaged, the in-process API *is* the real hive and
+one write is the whole job; packaged, the value goes to the real hive through a
+`reg.exe` child **and** to the package hive in-process — the second half
+matters because a stale private-hive copy shadows the real one for every
+packaged reader, so a real-hive-only write would simply invert the split.
+`sync_settings_to_real_hive()` repairs installs that already carry it: a
+packaged process compares its merged view (authoritative) against a child
+`reg.exe query` of the real hive and mirrors what differs, never deleting. It
+runs from the broker's startup sweep, the settings window's launch sweep and
+`fwdslash repair-adapters`, and logs `event=settings_synced` — category only.
+
+`Invoke-ForwardSlashWindowsSetLocation` also answers `cd ..` at a distribution's
+share root (`\\wsl.localhost\<Distro>`, or the `\\wsl$` spelling) with one
+line naming the distribution, instead of PowerShell's `Cannot find path
+'\\wsl.localhost'`. Every other path, and a paused product, keeps the native
+behaviour.
+
 ## Settings window (`fsw-settings`)
 
 The Rust settings app is built on `windows-reactor` rather than WinUI 3 XAML
@@ -446,8 +475,9 @@ three, and this section is the whole list.
   `Paused` = 2) or **0** when the change could not be honoured. The old
   unconditional `1` made a failed resume indistinguishable from a successful
   one. The hook is removed *before* the setting is persisted, and the write
-  itself is asynchronous — `persist_disabled` shells out to `reg.exe`, and a
-  process creation plus wait on the hook thread is exactly what must not happen.
+  itself is asynchronous — a packaged `persist_disabled` shells out to `reg.exe`
+  (`fsw_core::settings_write`, issue #52), and a process creation plus wait on
+  the hook thread is exactly what must not happen.
   A failed write surfaces later as a balloon plus
   `event=persist_disabled_failed`; a failed `install_hook` on resume shows the
   hook balloon and answers 0. The CLI turns that 0 into a specific message by
@@ -504,8 +534,8 @@ three, and this section is the whole list.
   `event=worker_start_failed`, `event=worker_detached`,
   `event=debug_uia_failed`, `event=debug_hook_failed`,
   `event=adapter_upgraded`, `event=adapter_upgrade_failed`,
-  `event=adapter_upgrade_skipped`. The C++'s `event=enter_handler_failed` has no
-  Rust counterpart.
+  `event=adapter_upgrade_skipped`, `event=settings_synced`. The C++'s
+  `event=enter_handler_failed` has no Rust counterpart.
 
 ## CLI (fwdslash)
 

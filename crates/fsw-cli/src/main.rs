@@ -1193,6 +1193,20 @@ fn cmd_integrations(json: bool) -> i32 {
     0
 }
 
+/// `fwdslash repair-adapters`: the settings mirror first, then the adapters'
+/// profile/AutoRun hygiene.
+///
+/// The mirror comes first because it is what the adapters *read* (issue #52).
+/// Run through the packaged identity — which is how the broker's startup sweep
+/// and the settings window's launch sweep invoke this — it copies the settings
+/// out of the package's private hive into the real one, where the unpackaged
+/// staged `fwdslash.exe` behind `cd /` can see them. Unpackaged it is a no-op,
+/// so the exit code stays the repair's.
+fn repair_adapters() -> i32 {
+    let _ = fsw_core::sync_settings_to_real_hive();
+    adapters::repair_all()
+}
+
 /// Prints each shell adapter's integration-hygiene line (#37): `healthy`, or a
 /// named problem such as `orphaned profile block for 0.0.1`. Read-only — the
 /// broker/settings `repair-adapters` sweep is what fixes them.
@@ -1363,7 +1377,7 @@ fn main() {
         // Repairs every shell adapter's hygiene. The broker startup sweep and
         // the settings launch sweep invoke this so orphaned/duplicate profile
         // blocks self-heal on the next run (#37).
-        "repair-adapters" if args.len() == 2 => adapters::repair_all(),
+        "repair-adapters" if args.len() == 2 => repair_adapters(),
         "pause" | "disable" if args.len() == 2 => set_paused(true),
         "resume" | "enable" if args.len() == 2 => set_paused(false),
         "driver" if args.len() == 3 && args[2] == "status" => {

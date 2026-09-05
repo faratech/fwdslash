@@ -1210,6 +1210,14 @@ fn notify_when_icon_ready(message: &str, flags: u32) {
 /// `fwdslash integration <id> enable`. The broker is the one component that
 /// starts at every logon and after every update, so the check belongs here.
 fn adapter_upgrade_sweep() {
+    // Before anything else: mirror the settings this packaged process holds
+    // into the real hive, because the adapters this sweep is about to look
+    // after read them from an unpackaged shell and would otherwise still see
+    // whatever the install started with (issue #52). A no-op unpackaged, and
+    // a no-op packaged once the hives agree. It logs `event=settings_synced`
+    // itself when it repairs something, so nothing is logged here.
+    let _ = sync_settings_to_real_hive();
+
     // Beside the broker, never from PATH: an appExecutionAlias or a stale
     // directory on PATH could resolve to a different install entirely.
     let Ok(directory) = executable_directory() else {

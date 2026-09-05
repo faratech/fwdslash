@@ -236,10 +236,69 @@ function Resolve-ForwardSlashWindowsLocationTarget {
     return $result
 }
 
+function Get-ForwardSlashWindowsDistributionRoot {
+    # The distribution whose share root is the current location, or $null.
+    # \\wsl.localhost\Ubuntu (and the \\wsl$ spelling) is a share root: above
+    # it is only the server name \\wsl.localhost, which no provider can enter.
+    $location = $null
+    try {
+        $location = (Get-Location).ProviderPath
+    } catch {
+        return $null
+    }
+    if ([string]::IsNullOrEmpty($location)) {
+        return $null
+    }
+    $trimmed = $location.TrimEnd('\')
+    if (-not $trimmed.StartsWith('\\')) {
+        return $null
+    }
+    # \\server\share splits into exactly two parts; anything deeper has a
+    # real parent directory and must keep the native behaviour.
+    $parts = $trimmed.Substring(2).Split('\')
+    if ($parts.Count -ne 2) {
+        return $null
+    }
+    if ($parts[0] -ne 'wsl.localhost' -and $parts[0] -ne 'wsl$') {
+        return $null
+    }
+    if ([string]::IsNullOrEmpty($parts[1])) {
+        return $null
+    }
+    return $parts[1]
+}
+
+function Test-ForwardSlashWindowsParentReference {
+    # Whether these arguments ask for the parent directory -- 'cd ..',
+    # 'cd ../', 'cd -Path ..'. Nothing else is this special case.
+    param([object[]]$Arguments = @())
+
+    foreach ($argument in $Arguments) {
+        if ($argument -is [string] -and
+            ($argument -eq '..' -or $argument -eq '../' -or $argument -eq '..\')) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Invoke-ForwardSlashWindowsSetLocation {
     $forward = @($args)
     $result = Resolve-ForwardSlashWindowsLocationTarget -Arguments $forward
     if ($null -eq $result) {
+        # 'cd ..' at a distribution's share root: PowerShell's own answer is
+        # "Cannot find path '\\wsl.localhost'", which reads like a broken
+        # install rather than "there is nothing above this". Both checks here
+        # are string work on arguments already in hand, and the registry read
+        # is only reached in that rare case, so an ordinary 'cd ..' still pays
+        # nothing. Paused, the native error is the honest answer.
+        if (Test-ForwardSlashWindowsParentReference -Arguments $forward) {
+            $distribution = Get-ForwardSlashWindowsDistributionRoot
+            if ($distribution -and -not (Test-ForwardSlashWindowsDisabled)) {
+                Write-Host "Already at the root of $distribution; a distribution share has no parent directory."
+                return
+            }
+        }
         Microsoft.PowerShell.Management\Set-Location @forward
         return
     }

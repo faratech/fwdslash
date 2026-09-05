@@ -220,7 +220,24 @@ global pause), `BareSlashMode` (DWORD, 0 = distribution list / 1 = default distr
 Rust only), and, in the GitHub flavor only, `AutoUpdate` / `LastUpdateCheck` /
 `AvailableUpdate`. Anything reading two or more of them should take
 `fsw_core::SettingsValues::read()`, which opens the key once; the single-value getters delegate
-to it. The key path and value names are defined once in
+to it.
+
+**Every write to that key goes through `fsw_core::settings_write`** —
+`set_setting_u32` / `set_setting_u64` / `set_setting_string` / `delete_setting` — and nothing
+else may call `windows_registry`'s `set_*`/`remove_value` on it (issue #52). The rule is the
+adapters' rule, for the same reason: a packaged process's own registry write is virtualized
+into the package's private hive, which the shell adapters — an *unpackaged* `fwdslash.exe` —
+cannot see, so the settings app could switch the bare-slash mode while `cd /` in PowerShell
+kept answering with the old one. `write_plan(packaged)` is the decision: unpackaged, the
+in-process API already *is* the real hive and one write is the whole job; packaged, the value
+goes to the real hive through `reg.exe` **and** to the package hive in-process, because a stale
+private-hive copy shadows the real one for every packaged reader and a real-hive-only write
+would just invert the split. `fsw_core::sync_settings_to_real_hive()` is the self-heal for
+installs that already carry it — the packaged process mirrors its merged view into the real
+hive (never deleting) — and it runs from the broker's startup sweep, the settings window's
+launch sweep and `fwdslash repair-adapters`, before the adapter work in each.
+
+The key path and value names are defined once in
 `include/fsw_user_protocol.h` (mirrored in `crates/fsw-core/src/lib.rs`) and shared by the
 core, broker and controller — **except**
 `shell/powershell/ForwardSlashWindows.psm1`, which hardcodes the same key path as a literal
