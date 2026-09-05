@@ -19,6 +19,22 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub const FSW_BROKER_WINDOW_CLASS: &str = "ForwardSlashWindows.Broker";
+
+/// The named mutex that serialises the shell-adapter sweep (issue #56).
+///
+/// Two components run the same sweep — the broker at startup and the settings
+/// window at launch — and an update that restarts the app does both at once.
+/// They then fight over one payload tree: the uninstall half of an upgrade
+/// deletes `%LOCALAPPDATA%\ForwardSlashWindows\<version>`, which the other
+/// sweep's child `fwdslash.exe` may be running out of, and the loser's
+/// transaction rolls back and reports failure.
+///
+/// Held for **existence**, not ownership: whoever creates it first keeps the
+/// handle open for the length of its sweep, and the other sees
+/// `ERROR_ALREADY_EXISTS` and skips — the same test the broker and settings
+/// singletons use, and safe across threads because no wait is involved.
+pub const FSW_ADAPTER_SWEEP_MUTEX: &str = "Local\\ForwardSlashWindows.AdapterSweep";
+
 pub const FSW_WM_QUERY_STATE: u32 = 0x8000 + 10; // WM_APP + 10
 pub const FSW_WM_SET_PAUSED: u32 = 0x8000 + 11; // WM_APP + 11
 pub const FSW_WM_SHOW_SETTINGS: u32 = 0x8000 + 12; // WM_APP + 12
