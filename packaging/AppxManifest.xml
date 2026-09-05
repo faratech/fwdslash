@@ -66,9 +66,9 @@
 </Capabilities>
 
   <Applications>
-    <!-- SupportsMultipleInstances is required by the console-subsystem alias below,
-         and matches how fswsettings.exe already behaves: it has no single-instance
-         lock, so each activation is its own process. -->
+    <!-- SupportsMultipleInstances is required by the console-subsystem execution
+         alias below. fswsettings.exe is single-instance by its own mutex (a second
+         activation raises the existing window and exits). -->
     <Application Id="App" Executable="fswsettings.exe" EntryPoint="Windows.FullTrustApplication"
                  desktop4:SupportsMultipleInstances="true">
       <uap:VisualElements

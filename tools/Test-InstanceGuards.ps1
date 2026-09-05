@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Drives the single-instance and tray-lifecycle scenarios against the Rust
+    Drives the single-instance and process-lifecycle scenarios against the Rust
     binaries (build them first: cargo build --release --target <triple>).
 
 .DESCRIPTION
@@ -9,8 +9,10 @@
       1. Two broker spawns -> exactly one broker process survives.
       2. A healthy running broker is NOT killed by `fwdslash start`.
       3. Paused broker: `fwdslash start` resumes it, never claims a broken hook.
-      4. Close-to-tray + relaunch -> still one process, window re-raised.
-      5. Windowless zombie (FSW_SIMULATE_WINDOWLESS) -> takeover by a relaunch.
+      4. Closing the settings window exits the process (there is no tray to
+         hide into: the broker owns the product's only notification icon).
+      5. Relaunching while the settings window is open -> still one process,
+         and it still has a visible window.
 
     Exits 0 when every scenario passes; 1 with a named failure otherwise.
     Never logs paths. Stops the broker/settings processes it started.
@@ -81,62 +83,38 @@ $null = & (Join-Path $dir 'fwdslash.exe') enable 2>&1       # restore
 Assert-True ($output -match 'active' -or $output -match 'paused') `
     "paused broker handled with resume-or-paused message" "(out=$output, status=$state)"
 
-# --- 4. Close-to-tray + relaunch -> one process, window raised ---------------
+# --- 4. Closing the window exits the process --------------------------------
 Stop-AllFsw
+Add-Type -Namespace Fsw -Name Msg -MemberDefinition `
+    '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'
 $settings = Start-Process -FilePath (Join-Path $dir 'fswsettings.exe') -PassThru
 Start-Sleep -Seconds 4
 $settings.Refresh()
 $hadWindow = $settings.MainWindowHandle -ne 0
-# Simulate the user closing the window: WM_CLOSE hides it to the tray.
-Add-Type -Namespace Fsw -Name Msg -MemberDefinition `
-    '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'
-[Fsw.Msg]::PostMessage($settings.MainWindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # WM_CLOSE
-Start-Sleep -Seconds 2
-$firstPid = (Get-Process fswsettings -ErrorAction SilentlyContinue).Id
-# A second launch of the settings app hits the guard and must re-raise.
+Assert-True ($hadWindow) "settings window materialized" "(hwnd was 0)"
+# WM_CLOSE is the reactor's only exit route (Window.Closed -> exit_ui_thread).
+[Fsw.Msg]::PostMessage($settings.MainWindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+Start-Sleep -Seconds 3
+$afterClose = @(Get-Process fswsettings -ErrorAction SilentlyContinue)
+Assert-True ($afterClose.Count -eq 0) "closing the window exits the process" "(count=$($afterClose.Count))"
+
+# --- 5. Relaunch while open -> one process, window still visible -------------
+Stop-AllFsw
+$settings = Start-Process -FilePath (Join-Path $dir 'fswsettings.exe') -PassThru
+Start-Sleep -Seconds 4
+$settings.Refresh()
+$firstWindow = $settings.MainWindowHandle -ne 0
 Start-Process -FilePath (Join-Path $dir 'fswsettings.exe')
 Start-Sleep -Seconds 4
-$count = Get-FswCount fswsettings
+$alive = @(Get-Process fswsettings -ErrorAction SilentlyContinue)
 $stillVisible = $false
-foreach ($p in Get-Process fswsettings -ErrorAction SilentlyContinue) {
+foreach ($p in $alive) {
     $p.Refresh()
     if ($p.MainWindowHandle -ne 0) { $stillVisible = $true }
 }
-Assert-True ($hadWindow) "settings window materialized" "(hwnd was 0)"
-Assert-True ($count -eq 1) "relaunch against tray-hidden window stays single" "(count=$count)"
-Assert-True ($stillVisible) "relaunch re-raised the hidden window"
-
-# --- 5. Windowless zombie takeover ------------------------------------------
-Stop-AllFsw
-$env:FSW_SIMULATE_WINDOWLESS = '1'
-$zombie = Start-Process -FilePath (Join-Path $dir 'fswsettings.exe') -PassThru `
-    -WindowStyle Hidden
-Start-Sleep -Seconds 2
-$zombieCount = Get-FswCount fswsettings
-Remove-Item Env:\FSW_SIMULATE_WINDOWLESS
-# The takeover guard only kills peers older than 15 s (a young peer may be a
-# legitimate concurrent launch), so let the zombie age past the threshold.
-Start-Sleep -Seconds 14
-# The relaunch inherits the (now clean) environment and takes over.
-Start-Process -FilePath (Join-Path $dir 'fswsettings.exe')
-# Second instance: ~10 s activation poll, then the takeover scan, kill, mutex
-# acquisition, and WinUI window materialization. Give the whole path time.
-Start-Sleep -Seconds 17
-foreach ($p in Get-Process fswsettings -ErrorAction SilentlyContinue) {
-    Write-Host "    [diag] fswsettings pid=$($p.Id) hwnd=$($p.MainWindowHandle) start=$($p.StartTime.ToString('HH:mm:ss'))"
-}
-$alive = @(Get-Process fswsettings -ErrorAction SilentlyContinue)
-$zombieGone = $alive.Id -notcontains $zombie.Id
-$oneLeft = $alive.Count -eq 1
-$visible = $false
-foreach ($p in $alive) {
-    $p.Refresh()
-    if ($p.MainWindowHandle -ne 0) { $visible = $true }
-}
-Assert-True ($zombieCount -eq 1) "windowless holder started (test fixture)" "(count=$zombieCount)"
-Assert-True ($zombieGone) "zombie terminated by takeover" "(zombie pid=$($zombie.Id) alive=$($alive.Id -join ','))"
-Assert-True ($oneLeft) "exactly one instance after takeover" "(count=$($alive.Count))"
-Assert-True ($visible) "takeover instance has a visible window"
+Assert-True ($firstWindow) "first instance had a window before the relaunch" "(hwnd was 0)"
+Assert-True ($alive.Count -eq 1) "relaunch stays single-instance" "(count=$($alive.Count))"
+Assert-True ($stillVisible) "the surviving instance still has a visible window"
 
 Stop-AllFsw
 if ($script:failures -gt 0) {
