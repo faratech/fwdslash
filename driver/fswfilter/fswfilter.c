@@ -128,15 +128,35 @@ CONST FLT_REGISTRATION Registration = {
 #endif
 
 //
-//  Reads session id, user SID, integrity level and AppContainer state from the
-//  requestor's primary token in one reference.  Splitting this over two
-//  functions cost five token queries (and five pool allocations) on every
-//  create; this costs four, and only on a name that could actually match.
+//  Reads session id, user SID and integrity level from the requestor's
+//  primary token in one reference, and only on a name that could match.
 //
-//  The returned status covers the identity only.  A token whose integrity or
-//  AppContainer state cannot be read is reported as *not* eligible while the
-//  identity still succeeds, because FswPortConnect wants the identity and
-//  does not care about eligibility.
+//  SeQueryInformationToken does not hand back a uniform shape.  Its
+//  documented class table (ntifs.h / MS Learn) says:
+//
+//    * TokenUser yields a TOKEN_USER *structure* in a buffer the routine
+//      allocates from paged pool and the caller must release with ExFreePool.
+//    * TokenSessionId and TokenIntegrityLevel yield "a DWORD value (not a
+//      pointer to it)" - the out-parameter *is* the value.  There is no
+//      buffer to dereference, and none to free.
+//    * TokenIsAppContainer is not on the supported list at all, so it returns
+//      STATUS_INVALID_INFO_CLASS and never writes the out-parameter.
+//
+//  Treating all of them as pool-allocated pointers is what produced both
+//  faults on this path: issue #36 (0x3B, dereferencing a session id of 0 as a
+//  pointer) and issue #38 (0xC2 BAD_POOL_CALLER, freeing 0x3000 -
+//  SECURITY_MANDATORY_HIGH_RID, the integrity value itself - as a buffer).
+//  TokenUser is now the only class whose result is dereferenced or freed.
+//
+//  The AppContainer query is dropped rather than replaced.  No supported
+//  class reports container state, and none is needed: an app container's
+//  integrity level is always low, so the >= SECURITY_MANDATORY_MEDIUM_RID
+//  test below already excludes every app container and every LPAC.
+//
+//  The returned status covers the identity only.  A token whose integrity
+//  cannot be read is reported as *not* eligible while the identity still
+//  succeeds, because FswPortConnect wants the identity and does not care
+//  about eligibility.
 //
 _Must_inspect_result_
 _IRQL_requires_max_(PASSIVE_LEVEL)
@@ -147,13 +167,10 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
   PACCESS_TOKEN token;
   PVOID userInformation = NULL;
   PVOID integrityInformation = NULL;
-  PVOID appContainerInformation = NULL;
   PTOKEN_USER tokenUser;
-  PTOKEN_MANDATORY_LABEL label;
   ULONG sessionId = 0;
-  ULONG integrityLevel = 0;
+  ULONG integrityLevel;
   ULONG sidLength;
-  UCHAR subAuthorityCount;
   NTSTATUS status;
 
   PAGED_CODE();
@@ -161,11 +178,11 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
   *Eligible = FALSE;
 
   token = PsReferencePrimaryToken(Process);
-  //  SeQuerySessionIdToken writes the session id by value, so there is no
-  //  out-buffer to allocate, free, or null-check.  The older
-  //  SeQueryInformationToken(token, TokenSessionId, ...) path returned
-  //  STATUS_SUCCESS yet left the out-pointer NULL on Windows 11 ARM64, so the
-  //  *(PULONG) read faulted at address 0 (issue #36).
+  //  SeQuerySessionIdToken writes the session id into a caller-supplied ULONG,
+  //  so there is no out-value to reinterpret.  The older
+  //  SeQueryInformationToken(token, TokenSessionId, ...) path returned the
+  //  session id *by value* in the out-parameter, which the old code read as a
+  //  pointer - session 0 therefore faulted at address 0 (issue #36).
   status = SeQuerySessionIdToken(token, &sessionId);
   if (NT_SUCCESS(status)) {
     status = SeQueryInformationToken(token, TokenUser, &userInformation);
@@ -190,31 +207,23 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
       }
     }
   }
+  //
+  //  TokenIntegrityLevel returns the mandatory RID by value; integrityInformation
+  //  is that RID, not a TOKEN_MANDATORY_LABEL, and must be neither dereferenced
+  //  nor freed.  Anything that does not fit the documented RID range is treated
+  //  as unreadable - and therefore not eligible - rather than trusted, so a
+  //  build that handed back a pointer here could not read as "above medium".
+  //
   if (NT_SUCCESS(status) &&
       NT_SUCCESS(SeQueryInformationToken(token, TokenIntegrityLevel,
-                                         &integrityInformation)) &&
-      integrityInformation != NULL &&
-      NT_SUCCESS(SeQueryInformationToken(token, TokenIsAppContainer,
-                                         &appContainerInformation)) &&
-      appContainerInformation != NULL) {
-    label = (PTOKEN_MANDATORY_LABEL)integrityInformation;
-    if (RtlValidSid(label->Label.Sid)) {
-      subAuthorityCount = *RtlSubAuthorityCountSid(label->Label.Sid);
-      if (subAuthorityCount != 0) {
-        integrityLevel = *RtlSubAuthoritySid(label->Label.Sid,
-                                             (ULONG)(subAuthorityCount - 1));
-      }
-    }
-    if (integrityLevel >= SECURITY_MANDATORY_MEDIUM_RID &&
-        *(PULONG)appContainerInformation == 0 && Identity->SessionId != 0) {
+                                         &integrityInformation))) {
+    integrityLevel = (ULONG)(ULONG_PTR)integrityInformation;
+    if ((ULONG_PTR)integrityLevel == (ULONG_PTR)integrityInformation &&
+        integrityLevel >= SECURITY_MANDATORY_MEDIUM_RID &&
+        integrityLevel <= SECURITY_MANDATORY_PROTECTED_PROCESS_RID &&
+        Identity->SessionId != 0) {
       *Eligible = TRUE;
     }
-  }
-  if (appContainerInformation != NULL) {
-    ExFreePool(appContainerInformation);
-  }
-  if (integrityInformation != NULL) {
-    ExFreePool(integrityInformation);
   }
   if (userInformation != NULL) {
     ExFreePool(userInformation);
@@ -576,7 +585,7 @@ FswPreCreate(_Inout_ PFLT_CALLBACK_DATA Data,
 
   //
   //  Stage 2 - the name.  This runs before any token work: a token reference
-  //  plus four SeQueryInformationToken allocations on every create was the
+  //  plus a SeQueryInformationToken allocation on every create was the
   //  filter's whole cost on paths it never touches.
   //
   status = FltGetFileNameInformation(Data,
