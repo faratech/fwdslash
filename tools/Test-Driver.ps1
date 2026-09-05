@@ -112,6 +112,9 @@ $script:StartTime = Get-Date
 $script:AliasRoot = "C:\$Distribution"
 $script:UncRoot = "\\wsl.localhost\$Distribution"
 $script:AliasNativeBaseline = $false
+# Set by the -FakeShare Lxss seeding in step a (issue #39 follow-up); removed
+# again in step h. $null when -FakeShare was not given or seeding was skipped.
+$script:FakeLxssGuid = $null
 
 # ---------------------------------------------------------------- reporting --
 
@@ -182,6 +185,57 @@ function Invoke-Native {
         $code = -1
     }
     return [pscustomobject]@{ ExitCode = $code; Output = $output }
+}
+
+# Like Invoke-Native, but enforces a hard wall-clock timeout and kills the
+# child instead of blocking forever. The identity-rules step (below) launches
+# scheduled tasks FROM INSIDE the harness's own outer interactive scheduled
+# task ('FswGate' when the gate launches this way) - a task-launching-a-task
+# situation. In practice `schtasks /run` for a nested task has been observed
+# to block indefinitely instead of returning immediately the way it normally
+# does, hanging the whole run for 40+ minutes with no further output. Every
+# native call in that step that can nest a nested task goes through this
+# instead of Invoke-Native, so a task that never starts becomes a
+# SKIPPED/FAILED line, never a silent hang.
+function Invoke-NativeBounded {
+    # A background-job wrapper around the same "&amp; $FilePath @Arguments"
+    # invocation Invoke-Native uses, so multi-word arguments (a /tr command
+    # string with embedded quotes and spaces, for example) get PowerShell's
+    # normal correct native-argument marshaling - Start-Process -ArgumentList
+    # naively space-joins a string[] without quoting each element itself,
+    # which silently splits a multi-word /tr value into separate argv
+    # entries and was tried here first; it broke schtasks parsing ('/c' read
+    # as its own switch) rather than bounding anything. The job is only for
+    # the timeout: Wait-Job -Timeout lets a hung child be abandoned instead of
+    # blocking this step forever, at the cost of a possible orphaned child
+    # process in the guest - harmless, since the checkpoint restore afterward
+    # wipes it anyway.
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [int]$TimeoutSeconds = 20
+    )
+    $job = Start-Job -ScriptBlock {
+        param($exe, $exeArgs)
+        $out = (& $exe @exeArgs 2>&1 | Out-String).Trim()
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out }
+    } -ArgumentList $FilePath, $Arguments
+    $finished = Wait-Job -Job $job -Timeout $TimeoutSeconds
+    if ($null -eq $finished) {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{
+            ExitCode = -1
+            Output   = "TIMEOUT after ${TimeoutSeconds}s (nested scheduled task never returned): $FilePath $($Arguments -join ' ')"
+            TimedOut = $true
+        }
+    }
+    $result = Receive-Job -Job $job -ErrorAction SilentlyContinue
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    if ($null -eq $result) {
+        return [pscustomobject]@{ ExitCode = -1; Output = 'Invoke-NativeBounded job produced no output'; TimedOut = $false }
+    }
+    return [pscustomobject]@{ ExitCode = $result.ExitCode; Output = $result.Output; TimedOut = $false }
 }
 
 function Test-Elevated {
@@ -390,6 +444,14 @@ if ($FakeShare) {
     Write-Host 'Mode: -FakeShare (loopback SMB share, not a real WSL distribution).'
 }
 
+if ([System.Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0) {
+    throw 'This process is running in session 0. The gate must run in an interactive ' +
+        'session: FswPortConnect refuses session-0 connections by design (a security ' +
+        'property under test, not a bug), so every broker-publish step would fail for a ' +
+        'lab-plumbing reason that looks like a driver regression but is not. Launch this ' +
+        'script via an interactive scheduled task (LogonType Interactive against the ' +
+        'console user), not via PowerShell Direct/Start-Process, which lands in session 0.'
+}
 if (-not (Test-Elevated)) {
     throw 'Run this from an elevated PowerShell inside the lab guest.'
 }
@@ -431,6 +493,54 @@ Invoke-Step 'preflight' {
     try { $uncReachable = Test-Path -LiteralPath $script:UncRoot } catch { $uncReachable = $false }
     if (-not (Assert-True $uncReachable "UNC target $($script:UncRoot) is reachable" '(nothing can pass while the reparse target is dead)')) {
         throw 'The UNC target is unreachable; the rest of the run would fail for the wrong reason.'
+    }
+
+    if ($FakeShare) {
+        # Bootstrap-DriverLabGuest.ps1 -FakeShare provisions the SMB share and
+        # the shadow directory tree so \\wsl.localhost\$Distribution is
+        # reachable, but it never touches the registry. The broker enumerates
+        # registered distributions from HKCU\...\Lxss
+        # (crates/fsw-core/src/lib.rs, distributions_from_lxss), so without a
+        # registration it publishes an EMPTY mapping - the driver's pre-create
+        # then correctly declines every alias under $Distribution, because it
+        # was never told that name is a distribution at all. That is the
+        # driver behaving as designed, not a defect, but it means -FakeShare
+        # runs never actually exercised the reparse path. Seed a synthetic WSL
+        # registration here so the broker has something real to publish, and
+        # remove it again in step h. (This lives here rather than in
+        # Bootstrap-DriverLabGuest.ps1 because that script only runs once, at
+        # checkpoint-creation time; Test-Driver.ps1 is what gets re-pushed and
+        # re-run against the restored 'bootstrapped' checkpoint every gate
+        # run, so seeding here survives every restore without needing a new
+        # checkpoint.)
+        $lxssKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+        $existingFake = $null
+        if (Test-Path -LiteralPath $lxssKeyPath) {
+            $existingFake = Get-ChildItem -LiteralPath $lxssKeyPath -ErrorAction SilentlyContinue | Where-Object {
+                (Get-ItemProperty -LiteralPath $_.PSPath -Name 'FswLabFakeDistribution' -ErrorAction SilentlyContinue) -and
+                (Get-ItemProperty -LiteralPath $_.PSPath -Name 'DistributionName' -ErrorAction SilentlyContinue).DistributionName -eq $Distribution
+            }
+        }
+        if ($existingFake) {
+            # Left over from a prior run that did not restore the checkpoint
+            # in between (e.g. -KeepInstalled). Reuse it rather than creating
+            # a duplicate distribution entry with the same name.
+            $script:FakeLxssGuid = Split-Path -Leaf $existingFake[0].PSPath
+            Write-Host "   FakeShare: reusing existing synthetic Lxss registration $($script:FakeLxssGuid) for '$Distribution'"
+        } else {
+            $script:FakeLxssGuid = '{' + [guid]::NewGuid().ToString() + '}'
+            New-Item -Path $lxssKeyPath -Force | Out-Null
+            $fakeSubkey = New-Item -Path (Join-Path $lxssKeyPath $script:FakeLxssGuid) -Force
+            New-ItemProperty -LiteralPath $fakeSubkey.PSPath -Name 'DistributionName' -PropertyType String -Value $Distribution -Force | Out-Null
+            # Marker only - not read by the broker - so step h and a re-run
+            # can tell a lab-seeded entry apart from a real WSL registration.
+            New-ItemProperty -LiteralPath $fakeSubkey.PSPath -Name 'FswLabFakeDistribution' -PropertyType DWord -Value 1 -Force | Out-Null
+            Write-Host "   FakeShare: seeded Lxss registration $($script:FakeLxssGuid) -> DistributionName=$Distribution"
+        }
+        # Harmless on this guest: -FakeShare is only ever used where there is
+        # no real WSL install (confirmed for this lab: no Lxss key existed at
+        # all before this run), so there is no genuine default to clobber.
+        New-ItemProperty -LiteralPath $lxssKeyPath -Name 'DefaultDistribution' -PropertyType String -Value $script:FakeLxssGuid -Force | Out-Null
     }
 
     if (Test-Path -LiteralPath $unpacked) { Remove-Item -LiteralPath $unpacked -Recurse -Force }
@@ -792,6 +902,17 @@ Invoke-Step 'identity rules' {
     $selfLabel = if ($elevated) { 'elevated (high integrity)' } else { 'standard (medium integrity)' }
     Assert-True $selfRedirected "the harness's own $selfLabel process is redirected" | Out-Null
 
+    # NOTE: every sub-test below launches a scheduled task (or, for
+    # AppContainer, an app-container activation) FROM INSIDE the harness's own
+    # outer interactive scheduled task. That nested-task-inside-a-task shape
+    # is fragile - `schtasks /run` for the inner task has been observed to
+    # block indefinitely here instead of returning immediately - so every
+    # wait in this block is bounded: schtasks calls go through
+    # Invoke-NativeBounded (kills the child on timeout) and the
+    # Invoke-CommandInDesktopPackage call runs in a background job with
+    # Wait-Job -Timeout. A nested task that never starts must become a
+    # SKIPPED/FAILED line, never a hang that eats the rest of the run.
+
     # -- the other integrity level ------------------------------------------
     $otherFile = Join-Path $identityOutput 'other-integrity.txt'
     if (Test-Path -LiteralPath $otherFile) { Remove-Item -LiteralPath $otherFile -Force }
@@ -802,20 +923,28 @@ Invoke-Step 'identity rules' {
         $taskName = 'FswLabStandardProbe'
         $command = "cmd.exe /c dir `"$($script:AliasRoot)`" > `"$otherFile`" 2>&1"
         $user = "$env:USERDOMAIN\$env:USERNAME"
-        $create = Invoke-Native -FilePath 'schtasks.exe' -Arguments @(
-            '/create', '/tn', $taskName, '/tr', $command, '/sc', 'once', '/st', '00:00',
+        # /st must be in the future or schtasks warns "Task may not run
+        # because /ST is earlier than current time" and returns a non-zero
+        # exit even though /run below still starts it on demand - a fixed
+        # 00:00 loses that race whenever the local time is already past
+        # midnight, so compute a couple of minutes out instead.
+        $standardSt = (Get-Date).AddMinutes(2).ToString('HH:mm')
+        $create = Invoke-NativeBounded -TimeoutSeconds 20 -FilePath 'schtasks.exe' -Arguments @(
+            '/create', '/tn', $taskName, '/tr', $command, '/sc', 'once', '/st', $standardSt,
             '/ru', $user, '/it', '/rl', 'LIMITED', '/f')
         if ($create.ExitCode -ne 0) {
             Add-Skip 'a standard-integrity process is redirected' "schtasks /create returned $($create.ExitCode): $($create.Output)"
         } else {
-            Invoke-Native -FilePath 'schtasks.exe' -Arguments @('/run', '/tn', $taskName) | Out-Null
-            if (Wait-ForFile -Path $otherFile -TimeoutSeconds 30) {
+            $run = Invoke-NativeBounded -TimeoutSeconds 20 -FilePath 'schtasks.exe' -Arguments @('/run', '/tn', $taskName)
+            if ($run.TimedOut) {
+                Add-Skip 'a standard-integrity process is redirected' $run.Output
+            } elseif (Wait-ForFile -Path $otherFile -TimeoutSeconds 30) {
                 $text = Get-Content -LiteralPath $otherFile -Raw
                 Assert-True ($text -notmatch '(?i)File Not Found|cannot find|Not Found') 'a standard-integrity process is redirected' "($($text.Trim()))" | Out-Null
             } else {
                 Add-Skip 'a standard-integrity process is redirected' 'the LIMITED task produced no output (is an interactive user logged on?)'
             }
-            Invoke-Native -FilePath 'schtasks.exe' -Arguments @('/delete', '/tn', $taskName, '/f') | Out-Null
+            Invoke-NativeBounded -TimeoutSeconds 20 -FilePath 'schtasks.exe' -Arguments @('/delete', '/tn', $taskName, '/f') | Out-Null
         }
     } else {
         Add-Skip 'an elevated process is redirected' 'the harness is not elevated; re-run elevated, or launch the matrix with Start-Process -Verb RunAs and compare by hand'
@@ -847,19 +976,37 @@ Invoke-Step 'identity rules' {
         if ($null -eq $package -or [string]::IsNullOrWhiteSpace($appId)) {
             Add-Skip 'an AppContainer process is NOT redirected' 'no packaged application with an Id was found to host the probe'
         } else {
-            try {
-                Invoke-CommandInDesktopPackage -PackageFamilyName $package.PackageFamilyName -AppId $appId `
-                    -Command 'cmd.exe' -Args "/c dir `"$($script:AliasRoot)`" > `"$appContainerFile`" 2>&1" -ErrorAction Stop
-                if (Wait-ForFile -Path $appContainerFile -TimeoutSeconds 20) {
+            # Invoke-CommandInDesktopPackage has no built-in timeout and can
+            # itself block on activation from inside a nested scheduled task
+            # (see the NOTE above) - run it in a background job so a stuck
+            # activation becomes a bounded SKIP instead of a hang.
+            $icdpJob = Start-Job -ScriptBlock {
+                # NOTE: the third param must not be named $args - that shadows
+                # the scriptblock's own automatic $args variable and silently
+                # turns the value into an empty string, which is exactly what
+                # broke this the first time (Invoke-CommandInDesktopPackage
+                # then rejected '' for -Args).
+                param($pfn, $appId, $cmdArgs)
+                Invoke-CommandInDesktopPackage -PackageFamilyName $pfn -AppId $appId -Command 'cmd.exe' -Args $cmdArgs -ErrorAction Stop
+            } -ArgumentList $package.PackageFamilyName, $appId, "/c dir `"$($script:AliasRoot)`" > `"$appContainerFile`" 2>&1"
+            $icdpDone = Wait-Job -Job $icdpJob -Timeout 20
+            if ($null -eq $icdpDone) {
+                Stop-Job -Job $icdpJob -ErrorAction SilentlyContinue
+                Add-Skip 'an AppContainer process is NOT redirected' 'Invoke-CommandInDesktopPackage timed out after 20s (nested activation never completed)'
+            } else {
+                $icdpError = $null
+                try { Receive-Job -Job $icdpJob -ErrorAction Stop | Out-Null } catch { $icdpError = $_.Exception.Message }
+                if ($null -ne $icdpError) {
+                    Add-Skip 'an AppContainer process is NOT redirected' "Invoke-CommandInDesktopPackage failed: $icdpError"
+                } elseif (Wait-ForFile -Path $appContainerFile -TimeoutSeconds 20) {
                     $text = Get-Content -LiteralPath $appContainerFile -Raw
                     $notRedirected = ($text -match '(?i)File Not Found|cannot find|Not Found') -or ($script:AliasNativeBaseline)
                     Assert-True $notRedirected 'an AppContainer process is NOT redirected' "($($text.Trim()))" | Out-Null
                 } else {
                     Add-Skip 'an AppContainer process is NOT redirected' 'the package context produced no output (it may be denied write access to the work directory)'
                 }
-            } catch {
-                Add-Skip 'an AppContainer process is NOT redirected' "Invoke-CommandInDesktopPackage failed: $($_.Exception.Message)"
             }
+            Remove-Job -Job $icdpJob -Force -ErrorAction SilentlyContinue
         }
     }
 
@@ -868,21 +1015,24 @@ Invoke-Step 'identity rules' {
     if (Test-Path -LiteralPath $systemFile) { Remove-Item -LiteralPath $systemFile -Force }
     $systemTask = 'FswLabSystemProbe'
     $systemCommand = "cmd.exe /c dir `"$($script:AliasRoot)`" > `"$systemFile`" 2>&1"
-    $createSystem = Invoke-Native -FilePath 'schtasks.exe' -Arguments @(
-        '/create', '/tn', $systemTask, '/tr', $systemCommand, '/sc', 'once', '/st', '00:00',
+    $systemSt = (Get-Date).AddMinutes(2).ToString('HH:mm')
+    $createSystem = Invoke-NativeBounded -TimeoutSeconds 20 -FilePath 'schtasks.exe' -Arguments @(
+        '/create', '/tn', $systemTask, '/tr', $systemCommand, '/sc', 'once', '/st', $systemSt,
         '/ru', 'SYSTEM', '/rl', 'HIGHEST', '/f')
     if ($createSystem.ExitCode -ne 0) {
         Add-Skip 'a SYSTEM process is NOT redirected' "schtasks /create returned $($createSystem.ExitCode): $($createSystem.Output)"
     } else {
-        Invoke-Native -FilePath 'schtasks.exe' -Arguments @('/run', '/tn', $systemTask) | Out-Null
-        if (Wait-ForFile -Path $systemFile -TimeoutSeconds 30) {
+        $runSystem = Invoke-NativeBounded -TimeoutSeconds 20 -FilePath 'schtasks.exe' -Arguments @('/run', '/tn', $systemTask)
+        if ($runSystem.TimedOut) {
+            Add-Skip 'a SYSTEM process is NOT redirected' $runSystem.Output
+        } elseif (Wait-ForFile -Path $systemFile -TimeoutSeconds 30) {
             $text = Get-Content -LiteralPath $systemFile -Raw
             $notRedirected = ($text -match '(?i)File Not Found|cannot find|Not Found') -or ($script:AliasNativeBaseline)
             Assert-True $notRedirected 'a SYSTEM process is NOT redirected' "($($text.Trim()))" | Out-Null
         } else {
             Add-Skip 'a SYSTEM process is NOT redirected' 'the SYSTEM task produced no output'
         }
-        Invoke-Native -FilePath 'schtasks.exe' -Arguments @('/delete', '/tn', $systemTask, '/f') | Out-Null
+        Invoke-NativeBounded -TimeoutSeconds 20 -FilePath 'schtasks.exe' -Arguments @('/delete', '/tn', $systemTask, '/f') | Out-Null
     }
 }
 
@@ -1084,6 +1234,19 @@ Invoke-Step 'teardown' {
     } else {
         $delete = Invoke-Native -FilePath 'pnputil.exe' -Arguments @('/delete-driver', $script:PublishedName, '/uninstall', '/force')
         Assert-True ($delete.ExitCode -eq 0) "pnputil /delete-driver $($script:PublishedName) /uninstall /force" "(exit $($delete.ExitCode): $($delete.Output))" | Out-Null
+    }
+
+    if ($null -ne $script:FakeLxssGuid) {
+        $lxssKeyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+        $fakeSubkeyPath = Join-Path $lxssKeyPath $script:FakeLxssGuid
+        if (Test-Path -LiteralPath $fakeSubkeyPath) {
+            Remove-Item -LiteralPath $fakeSubkeyPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $default = (Get-ItemProperty -LiteralPath $lxssKeyPath -Name 'DefaultDistribution' -ErrorAction SilentlyContinue)
+        if ($null -ne $default -and $default.DefaultDistribution -eq $script:FakeLxssGuid) {
+            Remove-ItemProperty -LiteralPath $lxssKeyPath -Name 'DefaultDistribution' -ErrorAction SilentlyContinue
+        }
+        Write-Host "   FakeShare: removed synthetic Lxss registration $($script:FakeLxssGuid)"
     }
 
     # Nothing else is restored on purpose: the guest checkpoint is the undo.

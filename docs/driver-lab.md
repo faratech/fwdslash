@@ -68,18 +68,29 @@ Boot off and test signing on will load any unsigned kernel code presented to it.
 .\tools\New-DriverLabVm.ps1 -IsoPath D:\iso\Win11_ARM64.iso -ExposeVirtualization
 ```
 
-Then, following what the script prints:
+There is no interactive Setup/OOBE step and `vmconnect` is never needed: the
+script builds the VHDX directly (applies `install.wim`, runs `bcdboot`) and
+stamps it with an unattend.xml before the VM ever boots, so first boot goes
+straight to a ready desktop. The account it provisions (`fswlab` by default,
+`-GuestAccountName` to change it), its Administrators membership, the local
+account token-filter policy, and autologon are all set imperatively in the
+unattend's **specialize** pass — the equivalent declarative elements
+(`<UserAccounts>`/`<Group>`/`<AdministratorPassword>`/`<FirstLogonCommands>`
+in `oobeSystem`) silently no-op on this DISM-apply + bcdboot boot path; the
+script's own header comment has the full story. Once the VM is created and
+started, the script itself polls PowerShell Direct until the unattended first
+boot succeeds and then takes the `clean-os` checkpoint — there is no OOBE step
+left for an operator to finish first. Credentials land in
+`out\lab\guest-credentials.txt`.
 
-```powershell
-Start-VM -Name fwdslash-lab-arm64
-vmconnect.exe localhost fwdslash-lab-arm64
-# ... install Windows, finish OOBE, sign in ...
-Get-VMDvdDrive -VMName fwdslash-lab-arm64 | Set-VMDvdDrive -Path $null
-Checkpoint-VM -Name fwdslash-lab-arm64 -SnapshotName clean-os
-```
+`-DryRunUnattend` generates the same unattend.xml (with a real, freshly
+generated password, so the quoting/escaping path is exercised for real),
+validates that it parses, and writes it to `out\lab\preview-unattend.xml` —
+without touching Hyper-V, DISM, any disk, or requiring elevation or
+`-IsoPath`. Use it to audit the provisioning commands or as a smoke test after
+editing the script.
 
-`clean-os` is the baseline every run starts from. Take it *after* OOBE, not
-before: a checkpoint of Windows Setup is useless.
+`clean-os` is the baseline every run starts from.
 
 ### Host, per package
 
@@ -97,7 +108,7 @@ Copy the package and the two guest scripts in. Guest Service Interface is
 enabled by `New-DriverLabVm.ps1`, so no network share is needed:
 
 ```powershell
-$vm = 'fwdslash-lab-arm64'
+$vm = 'fswlab-arm64'
 Copy-VMFile -Name $vm -SourcePath .\out\driver\arm64\fwdslash-filter-0.0.3.0-arm64.zip `
     -DestinationPath C:\FswLab\fwdslash-filter.zip -CreateFullPath -FileSource Host
 Copy-VMFile -Name $vm -SourcePath .\tools\Bootstrap-DriverLabGuest.ps1 `
@@ -183,7 +194,7 @@ driver from the driver store, but the test-signing flag, the trusted publisher,
 the Verifier settings and the fake share all remain.
 
 ```powershell
-Restore-VMSnapshot -VMName fwdslash-lab-arm64 -Name clean-os -Confirm:$false
+Restore-VMSnapshot -VMName fswlab-arm64 -Name clean-os -Confirm:$false
 ```
 
 ## The FakeShare trick, and its limits
@@ -262,7 +273,7 @@ a normal machine, and every item has external lead time.
 
 | Path | Runs on | Purpose |
 |---|---|---|
-| `tools/New-DriverLabVm.ps1` | host, elevated | creates the Gen 2 guest |
+| `tools/New-DriverLabVm.ps1` | host, elevated (`-DryRunUnattend`: unprivileged) | builds the VHDX unattended and creates the Gen 2 guest |
 | `tools/Package-Driver.ps1` | host | zips and optionally test-signs the package |
 | `tools/Bootstrap-DriverLabGuest.ps1` | guest, elevated | test signing, certificate, Verifier, fake share |
 | `tools/Test-Driver.ps1` | guest, elevated | the release-gate harness |
