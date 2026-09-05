@@ -462,6 +462,40 @@ invocation on the UI thread. Both differ here:
   `installed, not loaded` / `loaded, not connected` / `connected`, the same
   four states `fwdslash driver status` prints. The About page no longer carries
   the production-gated sentence at all.
+- **Update controls, for both flavors.** The C++ app has no update surface at
+  all; the Rust app's used to be GitHub-only. Now, for any packaged build:
+  - The **Automatic updates** switch is shown for both flavors (`state.packaged`
+    alone). The Store text is "Let fwdslash install Store updates in the
+    background. Off by default; the Store still updates the app on its own
+    schedule."; the GitHub text is unchanged. The default the switch reads
+    when nothing is stored is the flavor's (`default_auto_update`), and the
+    stored inverted DWORD is untouched, so nobody's recorded "off" flips.
+  - A **Check now** button on General runs `fwdslash update check --force
+    --json` off the UI thread and always answers on screen ("Up to date",
+    "Update available", or "Could not check for updates"), while the launch
+    check — the same verb without `--force`, gated by
+    `update_check_allowed(has_package_identity(), read_auto_update_enabled())` —
+    stays silent unless it found something. Both go through the CLI now rather
+    than calling `fsw_core::update::run_update_check` in-process, because the
+    CLI is the only component that knows the Store routes.
+  - The install banner appears when `packaged && (update_bundle_ready ||
+    update_available.is_some())`, labelled **Install now** for the Store flavor
+    and **Restart to update** for the GitHub one. It runs `update install
+    --force --relaunch app --json`, after `close_broker_window()` so the broker
+    removes its own notification icon rather than leaving a ghost. Exit 0 closes
+    the window (the install is about to force the package down and the CLI's
+    watchdog brings it back); 10, 11 and 12 each leave a bar, and 11 — "the
+    Store has to finish this" — is the one notice with an action button,
+    **Open Microsoft Store**, on `ms-windows-store://pdp/?productid=<STORE_PRODUCT_ID>`.
+  - The About Components card gains `Last update check: <never | just now |
+    N minutes/hours/days ago>` and, when one is recorded, `Update available:
+    <version>`.
+  - A **Repair integrations** button on the Terminals page runs `fwdslash
+    repair-adapters` (#56). It exists because the broker's failure balloon told
+    the user to "Open Settings to retry" when there was nothing to press — the
+    retry only happened by accident, in the launch sweep. It takes the same
+    cross-process sweep lock the launch sweep does and reports "Integrations are
+    already being updated" rather than fighting the broker for the payload tree.
 
 ## Broker (fsw-broker)
 
@@ -576,9 +610,63 @@ three, and this section is the whole list.
   upgraded automatically after a product update. The result is reported in a
   single balloon: `"Terminal integrations were updated to <version>: <names>."`
   or `"Some terminal integrations could not be updated automatically. Open
-  Settings to retry."` The settings window repeats the sweep on launch
-  (Settings §6) and `fwdslash integration <id> enable` remains the manual
-  fallback. The C++ broker does nothing of the kind.
+  Settings and choose Repair integrations."` The settings window repeats the
+  sweep on launch (Settings §6) and `fwdslash integration <id> enable` remains
+  the manual fallback. The C++ broker does nothing of the kind.
+- **A failed adapter upgrade is retried once, and a transient one is never
+  announced** (#56). The first failure is followed by a 5 s pause and one
+  retry. `adapter_outcome(first, retry)` then classifies: success either time is
+  `Upgraded`; two attempts that never produced an exit code at all — the child
+  could not be spawned, or blew the 90 s budget and was killed — are `Deferred`,
+  logged `event=adapter_upgrade_deferred` and **silent**, because the marker key
+  still reads the old version and the next broker start or settings launch tries
+  again; only a retry that *ran and refused* is `NeedsUser` and earns the
+  warning balloon. The whole sweep is serialised against the settings window's
+  launch sweep by the named mutex `Local\ForwardSlashWindows.AdapterSweep`
+  (`fsw_core::FSW_ADAPTER_SWEEP_MUTEX`, held for existence rather than
+  ownership, exactly like the two singleton mutexes): whoever finds it already
+  held logs `event=adapter_sweep_busy` and stands down, because the holder is
+  running the identical work. Before this, an update that restarted the app
+  started both sweeps within seconds and the loser deleted a payload tree the
+  winner's child was running out of, which is the transient failure the balloon
+  was reporting as terminal.
+- **The broker drives the self-update.** The C++ has no updater at all, and
+  before this the check only ran when the settings window opened. `health_tick`
+  now calls `maybe_start_update_cycle()` once a minute, which starts a cycle
+  only when all four of `!UPDATE_RUNNING`, an age of at least
+  `UPDATE_CONSIDER_INTERVAL_MS` (6 h; the CLI enforces the real 24 h cadence),
+  `!WORKER_BUSY` and
+  `fsw_core::update::update_check_allowed(has_package_identity(),
+  read_auto_update_enabled())` hold — `update_cycle_due`, a pure function, is
+  the whole truth table. The first cycle of a process is held off for
+  `UPDATE_FIRST_DELAY_MS` (5 min) after startup: logon is the busiest moment on
+  the machine, the adapter sweep is already running, and an update that
+  force-closes the package seconds after the user signed in is the worst
+  possible one. `WORKER_BUSY` is raised around **both** worker messages
+  (`PROCESS_ENTER` and `WORKER_OPEN_PATH`) by an RAII guard, so an install can
+  never terminate the process mid-rewrite of an address bar.
+  The cycle itself always runs on a thread named `fsw-update` — never inline,
+  the same rule as the adapter sweep, because this thread owns the low-level
+  keyboard hook; a spawn failure logs `event=update_cycle_skipped` and waits for
+  the next tick, and a `Drop` guard clears `UPDATE_RUNNING` however the cycle
+  ends. It runs `fwdslash update check --json` (120 s ceiling) against the
+  `fwdslash.exe` **beside the broker**, never one from PATH, and on exit 10 goes
+  on to `fwdslash update install --relaunch broker --json` (300 s) — no
+  `--force`, so the CLI's own moment gate still declines while a settings window
+  is open, and `broker` because what has to come back afterwards is the resident
+  daemon, not a window nobody asked for. `run_cli_bounded` is the shared child
+  runner underneath this and both adapter verbs; it returns `Option<i32>`, where
+  `None` means "never answered" (spawn failure, wait error, or killed at the
+  deadline) rather than "failed".
+  Balloons are rationed: install exit 11 → `NIIF_INFO` "An update to fwdslash is
+  available in the Microsoft Store. Open Settings to install it."; two
+  consecutive install exit 1 **on the Store flavor only** → `NIIF_WARNING`
+  "fwdslash could not update itself automatically." (the GitHub flavor's failed
+  install leaves the downloaded bundle in place and applies it at the next
+  logon, so there is nothing to ask the user for); exits 0, 10 and 12 are
+  silent. Both go through `notify_when_icon_ready` and are deduplicated against
+  `cached_update_tag()`, so one available version produces one balloon however
+  many six-hour cycles see it.
 - **New diagnostic categories** (category-only, per `PRIVACY.md`):
   `event=enter_dropped_foreground_changed`, `event=surface_rejected`,
   `event=hook_rearmed`, `event=persist_disabled_failed`,
@@ -587,8 +675,14 @@ three, and this section is the whole list.
   `event=debug_uia_failed`, `event=debug_hook_failed`,
   `event=adapter_upgraded`, `event=adapter_upgrade_failed`,
   `event=adapter_upgrade_skipped`, `event=settings_synced`,
-  `event=state_changed`, `event=hook_unavailable`. The C++'s
-  `event=enter_handler_failed` has no Rust counterpart.
+  `event=state_changed`, `event=hook_unavailable`, and — new with the
+  self-update and #56 — `event=adapter_upgrade_retry`,
+  `event=adapter_upgrade_deferred`, `event=adapter_sweep_busy`,
+  `event=update_cycle_started`, `event=update_available`,
+  `event=update_installing`, `event=update_cycle_failed`,
+  `event=update_cycle_skipped`. The C++'s `event=enter_handler_failed` has no
+  Rust counterpart. None of them carries a version, a path or anything the user
+  typed.
 - **It re-reads the settings on a state-changed broadcast** (#55). The tray
   tooltip, the keyboard hook and the published mapping all derive from state
   another process can change; before this they caught up at the next health

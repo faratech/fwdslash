@@ -97,6 +97,36 @@ const ADAPTER_UPGRADE_POLL_MS: u64 = 250;
 /// Balloon retry spacing and count (~10 s) for the sweep's one notification.
 const ADAPTER_UPGRADE_NOTIFY_INTERVAL_MS: u64 = 500;
 const ADAPTER_UPGRADE_NOTIFY_ATTEMPTS: u32 = 20;
+/// Pause before the sweep's single retry of a failed adapter (issue #56).
+///
+/// The failures this sweep sees right after an MSIX update are timing: the old
+/// payload tree still has a `fwdslash.exe` open in a console that just ran a
+/// `doskey` macro, or the copy out of `WindowsApps` was still being staged.
+/// Both clear in seconds, and a retry that lands is a balloon the user never
+/// has to read.
+const ADAPTER_RETRY_DELAY_MS: u64 = 5_000;
+
+/// How often the broker even *considers* an update cycle. The real cadence is
+/// the CLI's (`check_is_due`, 24 h): this only decides how often it is asked,
+/// so a machine that is up for a week still checks daily and one that is up
+/// for an hour costs nothing.
+const UPDATE_CONSIDER_INTERVAL_MS: u64 = 6 * 60 * 60 * 1_000;
+/// Nothing update-related happens for the first five minutes of a broker's
+/// life. Logon is the busiest moment on the machine, the adapter sweep is
+/// already running, and an update that force-closes the package seconds after
+/// the user signed in is the worst possible moment for one.
+const UPDATE_FIRST_DELAY_MS: u64 = 5 * 60 * 1_000;
+/// Ceiling on `fwdslash update check`. A Store round trip on a bad network,
+/// or `curl.exe` against GitHub, both answer or give up well inside this.
+const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Ceiling on `fwdslash update install`. The child only *starts* the install —
+/// the Store's own download runs in the Store's service, and the relaunch is a
+/// scheduled task — so this bounds a handful of WinRT calls, not a download.
+const UPDATE_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Consecutive `update install` errors before the broker says so out loud.
+/// One is noise (the Store was mid-something); two in a row is a state the
+/// user's own click can get out of.
+const UPDATE_FAILURES_BEFORE_BALLOON: u32 = 2;
 /// `CREATE_NO_WINDOW`. `fwdslash.exe` is a console binary, and the sweep runs
 /// unattended at logon: without this every outdated adapter flashes a console
 /// window on the user's desktop.
@@ -230,6 +260,25 @@ static ADAPTER_UPGRADE_STARTED: AtomicBool = AtomicBool::new(false);
 static HEALTH_INTERVAL_MS: AtomicU32 = AtomicU32::new(HEALTH_INTERVAL_IDLE_MS);
 /// `GetTickCount64` of the last tray/hook maintenance pass.
 static LAST_MAINTENANCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// `GetTickCount64` when this broker started, so the first update cycle can be
+/// held off for [`UPDATE_FIRST_DELAY_MS`] without a second timer.
+static BROKER_START_MS: AtomicU64 = AtomicU64::new(0);
+/// `GetTickCount64` of the last update cycle's *start*; `0` means none has run
+/// in this process.
+static LAST_UPDATE_TICK_MS: AtomicU64 = AtomicU64::new(0);
+/// An update cycle is on the `fsw-update` thread right now. Cleared by
+/// [`UpdateCycleGuard`], so no early return can strand it.
+static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+/// The Enter worker is inside a request. An install that force-closes the
+/// package while the worker is rewriting an address bar would take the user's
+/// keystroke with it, so the update cycle never starts while this is set.
+static WORKER_BUSY: AtomicBool = AtomicBool::new(false);
+/// The version the last update balloon was about, so one available update
+/// produces one balloon however many cycles see it.
+static UPDATE_NOTIFIED_TAG: Mutex<Option<String>> = Mutex::new(None);
+/// Consecutive `update install` failures; any other outcome resets it.
+static UPDATE_INSTALL_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 /// The distribution list the "Open distribution" submenu was built from, so a
 /// click resolves to the name that was on screen rather than to a re-read of
@@ -1132,32 +1181,38 @@ fn adapter_upgrade_targets() -> [(&'static str, &'static str, String); 3] {
     ]
 }
 
-/// Runs one `fwdslash integration <id> enable` to completion, bounded by
-/// [`ADAPTER_UPGRADE_TIMEOUT`]. Reports whether the CLI exited successfully.
+/// Runs one `fwdslash.exe` invocation to completion, bounded by `timeout`, and
+/// reports the exit code it finished with.
 ///
-/// The CLI does the transactional uninstall+install itself and is idempotent
-/// once the recorded version already matches, so racing a manual enable from
-/// the settings app costs at worst a redundant reinstall.
-fn run_adapter_upgrade(cli: &Path, id: &str) -> bool {
+/// `None` is deliberately *not* "failed": it means the child never got to
+/// answer — it could not be spawned, the wait itself errored, or it blew the
+/// deadline and was killed. Every caller here treats that differently from a
+/// child that ran and refused, because the first retries itself for free (the
+/// marker key still reads the old version, the update cadence comes round
+/// again) and the second needs a person.
+///
+/// Never call this on the hook thread or the window thread: it parks the
+/// calling thread for as long as the child takes.
+fn run_cli_bounded(cli: &Path, args: &[&str], timeout: std::time::Duration) -> Option<i32> {
     let spawned = std::process::Command::new(cli)
-        .arg("integration")
-        .arg(id)
-        .arg("enable")
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
     let Ok(mut child) = spawned else {
-        return false;
+        return None;
     };
 
-    let deadline = std::time::Instant::now() + ADAPTER_UPGRADE_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            // `code()` is `None` only for a signal, which Windows has no
+            // concept of; the fallback keeps it total.
+            Ok(Some(status)) => return Some(status.code().unwrap_or(1)),
             Ok(None) => {}
-            Err(_) => return false,
+            Err(_) => return None,
         }
         if std::time::Instant::now() >= deadline {
             // Half-applied is the transaction's problem, not ours: the CLI
@@ -1165,10 +1220,20 @@ fn run_adapter_upgrade(cli: &Path, id: &str) -> bool {
             // old version, so the next launch tries again.
             let _ = child.kill();
             let _ = child.wait();
-            return false;
+            return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(ADAPTER_UPGRADE_POLL_MS));
     }
+}
+
+/// Runs one `fwdslash integration <id> enable`, bounded by
+/// [`ADAPTER_UPGRADE_TIMEOUT`].
+///
+/// The CLI does the transactional uninstall+install itself and is idempotent
+/// once the recorded version already matches, so racing a manual enable from
+/// the settings app costs at worst a redundant reinstall.
+fn run_adapter_upgrade(cli: &Path, id: &str) -> Option<i32> {
+    run_cli_bounded(cli, &["integration", id, "enable"], ADAPTER_UPGRADE_TIMEOUT)
 }
 
 /// Runs one `fwdslash repair-adapters` to completion, bounded by
@@ -1176,30 +1241,7 @@ fn run_adapter_upgrade(cli: &Path, id: &str) -> bool {
 /// out just retries next launch, and the guarded profile block means an
 /// un-repaired orphan is silent, never a red shell error (#37).
 fn run_adapter_repair(cli: &Path) {
-    let spawned = std::process::Command::new(cli)
-        .arg("repair-adapters")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
-    let Ok(mut child) = spawned else {
-        return;
-    };
-    let deadline = std::time::Instant::now() + ADAPTER_UPGRADE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            Err(_) => return,
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(ADAPTER_UPGRADE_POLL_MS));
-    }
+    let _ = run_cli_bounded(cli, &["repair-adapters"], ADAPTER_UPGRADE_TIMEOUT);
 }
 
 /// `show_notification` silently drops a balloon while the shell has not
@@ -1218,6 +1260,81 @@ fn notify_when_icon_ready(message: &str, flags: u32) {
     show_notification(message, flags);
 }
 
+/// What the sweep decided about one adapter, after up to two attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdapterOutcome {
+    /// The payload is now on this build's version.
+    Upgraded,
+    /// Neither attempt got an answer out of the CLI — the child could not
+    /// start, or blew its budget and was killed. The marker key still reads
+    /// the old version, so the next broker start or settings launch tries
+    /// again. Silent by design: nothing the user does changes this.
+    Deferred,
+    /// The CLI ran and refused. A third-party-modified profile, a missing
+    /// `pwsh.exe`, a Controlled Folder Access block — the failures that stay
+    /// failed until somebody acts.
+    NeedsUser,
+}
+
+/// Classifies one adapter from its two attempts' exit codes (issue #56).
+///
+/// `None` means the attempt never produced an exit code (see
+/// [`run_cli_bounded`]); `Some(0)` is success and any other `Some` is a
+/// refusal. The retry is only consulted when the first attempt did not
+/// succeed, which is also why the caller may pass `None` for it unconditionally
+/// when the first attempt already won.
+#[must_use]
+fn adapter_outcome(first: Option<i32>, retry: Option<i32>) -> AdapterOutcome {
+    if first == Some(0) {
+        return AdapterOutcome::Upgraded;
+    }
+    match retry {
+        Some(0) => AdapterOutcome::Upgraded,
+        // Two attempts, neither of which the CLI answered: transient by every
+        // available signal. Balloon nothing.
+        None => AdapterOutcome::Deferred,
+        Some(_) => AdapterOutcome::NeedsUser,
+    }
+}
+
+/// Holds [`FSW_ADAPTER_SWEEP_MUTEX`] for the length of a sweep.
+///
+/// `None` from [`SweepLock::acquire`] means the settings window is already
+/// sweeping (issue #56): skip rather than fight it for the payload tree, since
+/// whoever holds it is running the identical work.
+struct SweepLock(HANDLE);
+
+impl SweepLock {
+    fn acquire() -> Option<Self> {
+        let name = to_u16_vec(FSW_ADAPTER_SWEEP_MUTEX);
+        // SAFETY: a named mutex with a static, NUL-terminated name; the handle
+        // is closed exactly once, in `Drop`.
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+            if handle.is_null() {
+                // Nobody can tell whether a sweep is running; err toward doing
+                // the work, which is idempotent, rather than never doing it.
+                return Some(Self(std::ptr::null_mut()));
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                CloseHandle(handle);
+                return None;
+            }
+            Some(Self(handle))
+        }
+    }
+}
+
+impl Drop for SweepLock {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: the handle came from `CreateMutexW` above and is closed
+            // once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
 /// Brings every installed shell adapter whose recorded payload version is not
 /// this build's back up to date, with no click from the user.
 ///
@@ -1227,6 +1344,16 @@ fn notify_when_icon_ready(message: &str, flags: u32) {
 /// `fwdslash integration <id> enable`. The broker is the one component that
 /// starts at every logon and after every update, so the check belongs here.
 fn adapter_upgrade_sweep() {
+    // One sweeper at a time (issue #56). The settings window runs the same
+    // work at launch, and an update that restarts the app starts both within
+    // seconds of each other; the loser of that race deletes a payload
+    // directory the winner's child is running out of and reports a failure
+    // that was never real.
+    let Some(_lock) = SweepLock::acquire() else {
+        log_diagnostic("event=adapter_sweep_busy");
+        return;
+    };
+
     // Before anything else: mirror the settings this packaged process holds
     // into the real hive, because the adapters this sweep is about to look
     // after read them from an unpackaged shell and would otherwise still see
@@ -1258,26 +1385,44 @@ fn adapter_upgrade_sweep() {
         .collect();
     if !outdated.is_empty() {
         let mut upgraded: Vec<&'static str> = Vec::new();
-        let mut failed = false;
+        let mut needs_user = false;
         for (id, label) in outdated {
-            if run_adapter_upgrade(&cli, id) {
-                log_diagnostic("event=adapter_upgraded");
-                upgraded.push(label);
+            let first = run_adapter_upgrade(&cli, id);
+            // One retry, after a pause (issue #56). Right after an MSIX update
+            // the first attempt fails for reasons that are gone seconds later:
+            // a console still holding the old payload's `fwdslash.exe`, a copy
+            // out of `WindowsApps` competing with the package still being
+            // staged.
+            let retry = if first == Some(0) {
+                None
             } else {
-                log_diagnostic("event=adapter_upgrade_failed");
-                failed = true;
+                log_diagnostic("event=adapter_upgrade_retry");
+                std::thread::sleep(std::time::Duration::from_millis(ADAPTER_RETRY_DELAY_MS));
+                run_adapter_upgrade(&cli, id)
+            };
+            match adapter_outcome(first, retry) {
+                AdapterOutcome::Upgraded => {
+                    log_diagnostic("event=adapter_upgraded");
+                    upgraded.push(label);
+                }
+                AdapterOutcome::Deferred => log_diagnostic("event=adapter_upgrade_deferred"),
+                AdapterOutcome::NeedsUser => {
+                    log_diagnostic("event=adapter_upgrade_failed");
+                    needs_user = true;
+                }
             }
         }
 
         // Exactly one balloon, whatever the mix: a per-adapter notification
         // would stack three toasts on top of a logon the user did not ask
-        // about.
-        if failed {
+        // about. A deferral alone is silent — it retries itself.
+        if needs_user {
             notify_when_icon_ready(
-                "Some terminal integrations could not be updated automatically. Open Settings to retry.",
+                "Some terminal integrations could not be updated automatically. \
+                 Open Settings and choose Repair integrations.",
                 NIIF_WARNING,
             );
-        } else {
+        } else if !upgraded.is_empty() {
             notify_when_icon_ready(
                 &format!(
                     "Terminal integrations were updated to {FSW_VERSION}: {}.",
@@ -1315,6 +1460,212 @@ fn start_adapter_upgrade() {
         // the keyboard hook for as long as three CLI transactions take, so the
         // upgrade waits for the next launch instead.
         log_diagnostic("event=adapter_upgrade_skipped");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The update cycle
+// ---------------------------------------------------------------------------
+
+/// Exit codes of `fwdslash update`, mirrored from `crates/fsw-cli/src/update`.
+/// Named here too, because a bare `10` in a match arm reads as nothing.
+const UPDATE_EXIT_AVAILABLE: i32 = 10;
+const UPDATE_EXIT_NEEDS_USER: i32 = 11;
+const UPDATE_EXIT_ERROR: i32 = 1;
+
+/// Clears [`UPDATE_RUNNING`] however [`update_cycle`] ends.
+struct UpdateCycleGuard;
+
+impl Drop for UpdateCycleGuard {
+    fn drop(&mut self) {
+        UPDATE_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+/// How old the update cycle is at `now`, in milliseconds.
+///
+/// Before the first cycle of this process (`last == 0`) the age is a step
+/// function of uptime rather than a duration: nothing until the broker has been
+/// up [`UPDATE_FIRST_DELAY_MS`], a full interval after that. It keeps the two
+/// thresholds — the first delay and the recurring interval — from needing two
+/// timers or a signed clock.
+#[must_use]
+fn update_cycle_age_ms(now: u64, start: u64, last: u64) -> u64 {
+    if last == 0 {
+        if now.saturating_sub(start) >= UPDATE_FIRST_DELAY_MS {
+            UPDATE_CONSIDER_INTERVAL_MS
+        } else {
+            0
+        }
+    } else {
+        now.saturating_sub(last)
+    }
+}
+
+/// Whether an update cycle may start. Pure, so the four gates are one truth
+/// table instead of four early returns spread through a side-effecting
+/// function.
+///
+/// `allowed` is `fsw_core::update::update_check_allowed(packaged, auto_update)`:
+/// an unpackaged build has nothing it could install, and the Automatic updates
+/// switch is the user's answer for both flavors.
+#[must_use]
+fn update_cycle_due(running: bool, age_ms: u64, worker_busy: bool, allowed: bool) -> bool {
+    !running && age_ms >= UPDATE_CONSIDER_INTERVAL_MS && !worker_busy && allowed
+}
+
+/// Whether a balloon about `tag` is new information, given the version the last
+/// balloon was about.
+///
+/// One available update produces one balloon, however many six-hour cycles see
+/// it. A cycle that cannot name a version at all (the CLI answered but the
+/// registry had no tag) is announced once and then stays quiet, rather than
+/// once per cycle forever.
+#[must_use]
+fn should_balloon_update(tag: Option<&str>, notified: Option<&str>) -> bool {
+    match (tag, notified) {
+        (Some(current), Some(last)) => current != last,
+        (Some(_), None) | (None, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
+/// Whether repeated install failures have earned the warning balloon.
+///
+/// Store flavor only: the GitHub flavor's failed install leaves the downloaded
+/// bundle in place and applies it at the next logon on its own, so telling the
+/// user about it would be asking for a click that changes nothing.
+#[must_use]
+fn should_balloon_install_failure(consecutive_failures: u32, store_flavor: bool) -> bool {
+    store_flavor && consecutive_failures >= UPDATE_FAILURES_BEFORE_BALLOON
+}
+
+/// Shows one update balloon, at most once per version.
+///
+/// The dedupe key is whatever `cached_update_tag()` holds *now* — the value the
+/// CLI just wrote — so a second update replacing the first is announced again.
+fn notify_update_once(message: &str, flags: u32) {
+    let tag = update::cached_update_tag();
+    let Ok(mut notified) = UPDATE_NOTIFIED_TAG.lock() else {
+        return;
+    };
+    if !should_balloon_update(tag.as_deref(), notified.as_deref()) {
+        return;
+    }
+    *notified = tag;
+    // The lock is held across a call that can park for ~10 s waiting for the
+    // shell to accept the icon. Nothing else ever takes it except another
+    // cycle, and `UPDATE_RUNNING` already makes those mutually exclusive.
+    drop(notified);
+    notify_when_icon_ready(message, flags);
+}
+
+/// One check, and — when the CLI says there is something to install — one
+/// install. Runs on the `fsw-update` thread and nowhere else: every step is a
+/// child process wait.
+fn update_cycle() {
+    let _guard = UpdateCycleGuard;
+    log_diagnostic("event=update_cycle_started");
+
+    // Beside the broker, never from PATH: an appExecutionAlias or a stale
+    // directory on PATH could resolve to a different install entirely.
+    let Ok(directory) = executable_directory() else {
+        log_diagnostic("event=update_cycle_failed");
+        return;
+    };
+    let cli = directory.join("fwdslash.exe");
+    if !cli.is_file() {
+        log_diagnostic("event=update_cycle_failed");
+        return;
+    }
+
+    let Some(code) = run_cli_bounded(&cli, &["update", "check", "--json"], UPDATE_CHECK_TIMEOUT)
+    else {
+        log_diagnostic("event=update_cycle_failed");
+        return;
+    };
+    if code != UPDATE_EXIT_AVAILABLE {
+        // Up to date, not due, disabled, or a check that could not run: all
+        // silent, all retried at the next cycle.
+        return;
+    }
+    log_diagnostic("event=update_available");
+
+    // `--relaunch broker` and no `--force`: the CLI's own moment gate declines
+    // while a settings window is open, and what has to come back afterwards is
+    // the resident broker, not a window nobody asked for.
+    log_diagnostic("event=update_installing");
+    let Some(code) = run_cli_bounded(
+        &cli,
+        &["update", "install", "--relaunch", "broker", "--json"],
+        UPDATE_INSTALL_TIMEOUT,
+    ) else {
+        log_diagnostic("event=update_cycle_failed");
+        return;
+    };
+
+    match code {
+        UPDATE_EXIT_NEEDS_USER => {
+            UPDATE_INSTALL_FAILURES.store(0, Ordering::Relaxed);
+            notify_update_once(
+                "An update to fwdslash is available in the Microsoft Store. \
+                 Open Settings to install it.",
+                NIIF_INFO,
+            );
+        }
+        UPDATE_EXIT_ERROR => {
+            let failures = UPDATE_INSTALL_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            log_diagnostic("event=update_cycle_failed");
+            if should_balloon_install_failure(failures, is_store_flavor()) {
+                notify_update_once("fwdslash could not update itself automatically.", NIIF_WARNING);
+            }
+        }
+        // 0 (install started), 10 (deferred — a settings window is open, or
+        // the download is still coming) and 12 (nothing to install) are all
+        // silent: the next cycle picks the story up.
+        _ => UPDATE_INSTALL_FAILURES.store(0, Ordering::Relaxed),
+    }
+}
+
+/// Starts an update cycle if this is a moment to have one. Called from the
+/// health tick, on the window thread, so it may do nothing but read atomics,
+/// read two registry values and spawn.
+fn maybe_start_update_cycle() {
+    // SAFETY: no preconditions.
+    let now = unsafe { GetTickCount64() };
+    let age = update_cycle_age_ms(
+        now,
+        BROKER_START_MS.load(Ordering::Relaxed),
+        LAST_UPDATE_TICK_MS.load(Ordering::Relaxed),
+    );
+    let allowed = update::update_check_allowed(
+        has_package_identity(),
+        update::read_auto_update_enabled(),
+    );
+    if !update_cycle_due(
+        UPDATE_RUNNING.load(Ordering::Acquire),
+        age,
+        WORKER_BUSY.load(Ordering::Acquire),
+        allowed,
+    ) {
+        return;
+    }
+
+    // Claim the slot before spawning, so a tick that arrives while the thread
+    // is still starting cannot start a second one.
+    if UPDATE_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    LAST_UPDATE_TICK_MS.store(now, Ordering::Relaxed);
+    if std::thread::Builder::new()
+        .name("fsw-update".to_owned())
+        .spawn(update_cycle)
+        .is_err()
+    {
+        // Never inline: this thread owns the low-level keyboard hook, and
+        // Windows silently removes a hook whose thread stops pumping.
+        UPDATE_RUNNING.store(false, Ordering::Release);
+        log_diagnostic("event=update_cycle_skipped");
     }
 }
 
@@ -1609,6 +1960,8 @@ fn health_tick(window: HWND) {
     LAST_MAINTENANCE_MS.store(now, Ordering::Relaxed);
     ensure_tray_icon(window);
     rearm_hook(window);
+    // Last, and only ever a spawn: the cycle itself waits on child processes.
+    maybe_start_update_cycle();
 }
 
 /// Asks the worker to quit, waits ~500 ms for it to signal that it has, and
@@ -1659,6 +2012,23 @@ fn stop_worker() {
     drop(handle);
 }
 
+/// Raises [`WORKER_BUSY`] for the length of one worker request and lowers it
+/// again however the handler returns.
+struct WorkerBusy;
+
+impl WorkerBusy {
+    fn mark() -> Self {
+        WORKER_BUSY.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for WorkerBusy {
+    fn drop(&mut self) {
+        WORKER_BUSY.store(false, Ordering::Release);
+    }
+}
+
 unsafe extern "system" fn worker_proc(
     window: HWND,
     message: u32,
@@ -1667,10 +2037,18 @@ unsafe extern "system" fn worker_proc(
 ) -> LRESULT {
     match message {
         PROCESS_ENTER => {
+            // `WORKER_BUSY` is the update cycle's veto: an install that
+            // force-closes the package while this handler is mid-rewrite would
+            // take the user's keystroke down with it.
+            let _busy = WorkerBusy::mark();
             process_enter_request(SurfaceKind::from_wparam(wparam), lparam as HWND);
             0
         }
         WORKER_OPEN_PATH => {
+            // The tail of the same request: `request_open_path` posts this from
+            // inside `process_enter_request`, and the shell navigation it runs
+            // is exactly as bad a moment to be terminated in.
+            let _busy = WorkerBusy::mark();
             if lparam != 0 {
                 // Ownership was handed over by `request_open_path`.
                 let path = unsafe { Box::from_raw(lparam as *mut String) };
@@ -1980,7 +2358,10 @@ fn main() {
         start_worker();
         let hook_installed = PAUSED.load(Ordering::Relaxed) || install_hook();
         update_tray_tooltip(broker_wnd);
-        LAST_MAINTENANCE_MS.store(GetTickCount64(), Ordering::Relaxed);
+        let start_tick = GetTickCount64();
+        LAST_MAINTENANCE_MS.store(start_tick, Ordering::Relaxed);
+        // The update cycle measures its first delay from here, not from boot.
+        BROKER_START_MS.store(start_tick, Ordering::Relaxed);
         SetTimer(broker_wnd, HEALTH_TIMER, HEALTH_INTERVAL_IDLE_MS, None);
         // Switches the timer to 5 s if a driver actually answers.
         publish_filter_mappings(true);
@@ -2000,5 +2381,148 @@ fn main() {
 
         CoUninitialize();
         CloseHandle(mutex);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// Only the pure decisions are covered here: everything else in this binary is
+// a Win32 call, a child process or a thread, and none of those has a meaning
+// outside a running broker. The cost of getting one of these three wrong is a
+// balloon at every logon, an update that never runs, or one that runs while
+// the user is typing in an address bar.
+#[cfg(test)]
+mod tests {
+    use super::{
+        AdapterOutcome, UPDATE_CONSIDER_INTERVAL_MS, UPDATE_FIRST_DELAY_MS, adapter_outcome,
+        should_balloon_install_failure, should_balloon_update, update_cycle_age_ms,
+        update_cycle_due,
+    };
+
+    // -- the cycle gate ----------------------------------------------------
+
+    #[test]
+    fn a_due_idle_allowed_broker_starts_a_cycle() {
+        assert!(update_cycle_due(
+            false,
+            UPDATE_CONSIDER_INTERVAL_MS,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn each_gate_alone_stops_the_cycle() {
+        // Already running.
+        assert!(!update_cycle_due(
+            true,
+            UPDATE_CONSIDER_INTERVAL_MS,
+            false,
+            true
+        ));
+        // Not due yet.
+        assert!(!update_cycle_due(
+            false,
+            UPDATE_CONSIDER_INTERVAL_MS - 1,
+            false,
+            true
+        ));
+        // The Enter worker is mid-request.
+        assert!(!update_cycle_due(
+            false,
+            UPDATE_CONSIDER_INTERVAL_MS,
+            true,
+            true
+        ));
+        // Unpackaged, or Automatic updates off.
+        assert!(!update_cycle_due(
+            false,
+            UPDATE_CONSIDER_INTERVAL_MS,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn the_first_cycle_waits_out_the_startup_delay() {
+        // Ticks are ms since boot; a broker started an hour in.
+        const START: u64 = 3_600_000;
+        assert_eq!(update_cycle_age_ms(START, START, 0), 0);
+        assert_eq!(
+            update_cycle_age_ms(START + UPDATE_FIRST_DELAY_MS - 1, START, 0),
+            0
+        );
+        assert_eq!(
+            update_cycle_age_ms(START + UPDATE_FIRST_DELAY_MS, START, 0),
+            UPDATE_CONSIDER_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn later_cycles_are_a_full_interval_apart() {
+        const START: u64 = 3_600_000;
+        let last = START + UPDATE_FIRST_DELAY_MS;
+        assert_eq!(update_cycle_age_ms(last, START, last), 0);
+        assert_eq!(
+            update_cycle_age_ms(last + UPDATE_CONSIDER_INTERVAL_MS, START, last),
+            UPDATE_CONSIDER_INTERVAL_MS
+        );
+        // A tick count that went backwards must not read as an enormous age.
+        assert_eq!(update_cycle_age_ms(last - 1_000, START, last), 0);
+    }
+
+    // -- balloon dedupe ----------------------------------------------------
+
+    #[test]
+    fn one_version_produces_one_balloon() {
+        assert!(should_balloon_update(Some("0.0.5"), None));
+        assert!(!should_balloon_update(Some("0.0.5"), Some("0.0.5")));
+        // A second update replacing the first is news again.
+        assert!(should_balloon_update(Some("0.0.6"), Some("0.0.5")));
+    }
+
+    #[test]
+    fn a_nameless_update_is_announced_once() {
+        assert!(should_balloon_update(None, None));
+        assert!(!should_balloon_update(None, Some("0.0.5")));
+    }
+
+    #[test]
+    fn only_the_store_flavor_reports_a_failed_install_and_only_on_the_second() {
+        assert!(!should_balloon_install_failure(1, true));
+        assert!(should_balloon_install_failure(2, true));
+        assert!(should_balloon_install_failure(7, true));
+        // The GitHub flavor's bundle applies itself at the next logon.
+        assert!(!should_balloon_install_failure(2, false));
+    }
+
+    // -- #56: retry and deferral ------------------------------------------
+
+    #[test]
+    fn a_first_pass_success_never_retries() {
+        // The caller passes `None` for the retry it did not run.
+        assert_eq!(adapter_outcome(Some(0), None), AdapterOutcome::Upgraded);
+    }
+
+    #[test]
+    fn a_retry_that_lands_is_silent_success() {
+        assert_eq!(adapter_outcome(Some(1), Some(0)), AdapterOutcome::Upgraded);
+        assert_eq!(adapter_outcome(None, Some(0)), AdapterOutcome::Upgraded);
+    }
+
+    #[test]
+    fn two_unanswered_attempts_defer_instead_of_ballooning() {
+        // Killed at the deadline, or never spawned: the marker key still reads
+        // the old version, so the next launch tries again.
+        assert_eq!(adapter_outcome(None, None), AdapterOutcome::Deferred);
+        assert_eq!(adapter_outcome(Some(1), None), AdapterOutcome::Deferred);
+    }
+
+    #[test]
+    fn a_second_refusal_is_the_one_the_user_must_see() {
+        assert_eq!(adapter_outcome(Some(1), Some(1)), AdapterOutcome::NeedsUser);
+        assert_eq!(adapter_outcome(None, Some(2)), AdapterOutcome::NeedsUser);
     }
 }

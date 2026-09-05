@@ -12,11 +12,12 @@
 
 use fsw_core::{
     BrokerState, CMD_ADAPTER_KEY, FSW_BROKER_WINDOW_CLASS, FSW_VERSION, FilterServiceState,
-    POWERSHELL_ADAPTER_ROOT, SettingsValues, adapter_installed, adapter_outdated, adapter_version,
-    broker_state, broker_window_exists, ensure_broker_running, executable_available,
-    executable_directory, filter_port_available, filter_service_state, get_default_distribution,
-    has_package_identity, is_store_flavor, list_registered_distributions, package_architecture,
-    package_version, sync_settings_to_real_hive, update, windows_integration_installed,
+    POWERSHELL_ADAPTER_ROOT, STORE_PRODUCT_ID, SettingsValues, adapter_installed,
+    adapter_outdated, adapter_version, broker_state, broker_window_exists, ensure_broker_running,
+    executable_available, executable_directory, filter_port_available, filter_service_state,
+    get_default_distribution, has_package_identity, is_store_flavor,
+    list_registered_distributions, package_architecture, package_version,
+    sync_settings_to_real_hive, update, windows_integration_installed,
 };
 use fsw_core::update::UpdateOutcome;
 use fsw_path::{BareSlashMode, eq_ignore_case, is_valid_windows_root};
@@ -44,6 +45,33 @@ const ROOT_ACTION: &str = "Bare slash opens the chosen folder";
 /// `ControllerFinished` matches on it to advance the upgrade queue, so it never
 /// reaches `show_result` -- the upgrade reports itself once, when the queue drains.
 const UPGRADE_ACTION: &str = "Terminal integration upgrade";
+
+/// The `pending` phrase for an explicit "Check now". It only disables the
+/// controls and shows the ProgressRing; the answer arrives as
+/// `Msg::UpdateCheckFinished`, never as `ControllerFinished`.
+const CHECK_ACTION: &str = "Update check";
+
+/// The `pending` phrase while `update install` runs.
+const INSTALL_ACTION: &str = "Update install";
+
+/// The `show_result` phrase for the manual Repair integrations button (#56).
+const REPAIR_ACTION: &str = "Integrations repaired";
+
+/// `fwdslash update` exit codes, mirrored from `crates/fsw-cli/src/update`.
+/// The contract between the two binaries is exactly these numbers plus the
+/// one-line JSON, so name them here rather than match on bare integers.
+const UPDATE_EXIT_OK: i32 = 0;
+const UPDATE_EXIT_AVAILABLE: i32 = 10;
+const UPDATE_EXIT_NEEDS_USER: i32 = 11;
+const UPDATE_EXIT_NOTHING: i32 = 12;
+
+/// The Store product page for this app. `ms-windows-store:` is the shell
+/// protocol the Store registers; `ShellExecuteW` on it opens the Store app.
+/// The product id comes from `fsw_core` so nothing here can drift from what
+/// the CLI's Store routes address.
+fn store_product_uri() -> String {
+    format!("ms-windows-store://pdp/?productid={STORE_PRODUCT_ID}")
+}
 
 // ---------------------------------------------------------------------------
 // Sections
@@ -218,7 +246,12 @@ struct State {
     root: Option<String>,
     store_flavor: bool,
     auto_update: bool,
+    /// The version the last check found, from `AvailableUpdate`. This is the
+    /// plan's `update_available`; it already existed under this name.
     update_tag: Option<String>,
+    /// Unix time of the last check attempt, whatever it concluded. Rendered
+    /// through `format_last_check` on the About page.
+    last_check: Option<u64>,
     distributions: Vec<String>,
     wsl_default: Option<String>,
     broker: BrokerState,
@@ -274,6 +307,7 @@ impl State {
             store_flavor: is_store_flavor(),
             auto_update: update::read_auto_update_enabled(),
             update_tag: update::cached_update_tag(),
+            last_check: update::last_update_check(),
             distributions,
             wsl_default,
             // 250 ms so a wedged broker cannot stall a refresh (main.cpp:827
@@ -353,6 +387,27 @@ impl State {
     /// General page's status text shows.
     fn driver_component_line(&self) -> String {
         format!("Filesystem driver: {}", self.driver.label())
+    }
+
+    /// The About page's "when did this last look for an update" line.
+    ///
+    /// Always shown, including when the answer is "never": a switch that
+    /// claims to check daily and a page that says nothing about it is how a
+    /// silently broken updater stays silent.
+    fn last_check_line(&self) -> String {
+        format!(
+            "Last update check: {}",
+            update::format_last_check(now_unix(), self.last_check)
+        )
+    }
+
+    /// The About page's "there is a newer version" line, or `None`.
+    fn update_available_line(&self) -> Option<String> {
+        let tag = self.update_tag.as_deref()?;
+        Some(format!(
+            "Update available: {}",
+            tag.strip_prefix('v').unwrap_or(tag)
+        ))
     }
 
     /// Which of the two package flavors is running, or neither.
@@ -457,18 +512,46 @@ enum Msg {
     RootTextChanged(String),
     ApplyRoot,
     BrowseRoot,
-    UpdateCheckFinished(update::UpdateOutcome),
+    /// A `fwdslash update check` finished. `explicit` marks the one the user
+    /// pressed Check now for: that one always reports, while the launch check
+    /// is silent unless it found something.
+    UpdateCheckFinished {
+        outcome: update::UpdateOutcome,
+        explicit: bool,
+    },
+    /// The Check now button.
+    CheckForUpdates,
     SetAutoUpdate(bool),
     SelectDistribution(Option<usize>),
     ToggleIntegration(Integration, bool),
     OpenWslRoot,
     RefreshStatus,
     DismissNotice,
-    /// Register the downloaded bundle now instead of waiting for the next logon.
-    RestartToUpdate,
+    /// Install whatever the CLI can install now: the Store's update for the
+    /// Store flavor, the downloaded bundle for the GitHub one.
+    InstallUpdate,
+    /// `fwdslash update install` finished, with the contract's exit code and
+    /// the child's two streams.
+    UpdateInstallFinished {
+        code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    /// The notice's action button; only the Store link uses it today.
+    OpenStorePage,
+    /// The manual Repair integrations button (#56) — what the broker's balloon
+    /// tells the user to press.
+    RepairIntegrations,
+    /// The manual repair finished, or never started because the broker was
+    /// already sweeping.
+    RepairFinished(RepairOutcome),
     /// A background `State::read()` completed. Every refresh is off-thread: the
     /// read touches the registry, the broker window and the update directory.
     StateLoaded(State),
+    /// The launch adapter sweep — the upgrade queue and the repair after it —
+    /// finished. Carries the state read that followed it, and is the one
+    /// message that releases the cross-process sweep lock (#56).
+    LaunchSweepFinished(State),
     /// One turn of the external-change watch ended (issue #55): either a
     /// component broadcast that it changed something, or the safety poll.
     /// Carries no state — the read it may start is a separate task.
@@ -491,6 +574,63 @@ enum Msg {
         /// generic "failed" (#37).
         detail: String,
     },
+}
+
+/// What the manual Repair integrations button ended up doing (#56).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RepairOutcome {
+    Repaired,
+    /// The broker's startup sweep holds the adapter-sweep mutex: the same work
+    /// is already running, so the button did nothing on purpose.
+    Busy,
+    /// `repair-adapters` refused; the string is its stderr.
+    Failed(String),
+}
+
+/// An action a notice offers beyond dismissal.
+///
+/// Reactor's `InfoBar` has no action-button slot, so `banners()` renders it as
+/// a `Button` directly beneath the bar. It lives inside [`Notice`] rather than
+/// beside it so that replacing the notice can never leave a stale button
+/// pointing at the previous message's action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoticeAction {
+    /// "Open Microsoft Store" — the last rung of the install ladder, where
+    /// the only thing left is for the user to press Update in the Store.
+    OpenStore,
+}
+
+impl NoticeAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenStore => "Open Microsoft Store",
+        }
+    }
+}
+
+/// The single dismissible bar at the top of the window.
+#[derive(Clone, Debug, PartialEq)]
+struct Notice {
+    severity: InfoBarSeverity,
+    title: &'static str,
+    message: String,
+    action: Option<NoticeAction>,
+}
+
+impl Notice {
+    fn new(severity: InfoBarSeverity, title: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity,
+            title,
+            message: message.into(),
+            action: None,
+        }
+    }
+
+    fn with_action(mut self, action: NoticeAction) -> Self {
+        self.action = Some(action);
+        self
+    }
 }
 
 /// The automatic shell-adapter upgrade in flight.
@@ -526,7 +666,7 @@ struct SettingsModel {
     /// The current notice is the update-available notice: dismissing it must
     /// also clear the persisted AvailableUpdate value.
     notice_is_update: bool,
-    notice: Option<(InfoBarSeverity, &'static str, String)>,
+    notice: Option<Notice>,
     /// The `show_result` phrase of the controller invocation in flight, or
     /// `None`. Every control that mutates state is disabled while it is set,
     /// so a second request can never race the first.
@@ -540,6 +680,10 @@ struct SettingsModel {
     /// Guards the one-shot detect-and-repair sweep (#37) so it runs once per
     /// window, after any upgrade queue has drained.
     repair_started: bool,
+    /// This process holds the cross-process adapter-sweep lock (#56), taken
+    /// for the whole launch sweep — the upgrade queue *and* the repair that
+    /// follows it — and released when the repair reports back.
+    sweep_held: bool,
     /// Keeps the external-change watch (#55) down to one state read at a time,
     /// however many notifications a burst of writes produces.
     external_reads: state_watch::ReadCoalescer,
@@ -590,7 +734,7 @@ impl SettingsModel {
                 message.push_str(detail);
             }
         }
-        self.notice = Some((
+        self.notice = Some(Notice::new(
             if succeeded {
                 InfoBarSeverity::Success
             } else {
@@ -643,6 +787,14 @@ impl SettingsModel {
         queue.reverse();
         let Some(current) = queue.pop() else { return };
         self.upgrade_attempted = true;
+        // The broker runs this identical sweep at startup, and an update that
+        // restarts the app starts both within seconds of each other (#56).
+        // Whoever loses that race deletes a payload directory the winner's
+        // child is running out of. Stand down: the holder is doing this work.
+        if !sweep_lock::acquire() {
+            return;
+        }
+        self.sweep_held = true;
         self.upgrade = Some(Upgrade {
             current,
             queue,
@@ -687,11 +839,11 @@ impl SettingsModel {
             return;
         }
         self.notice = Some(if upgrade.failed {
-            (
+            Notice::new(
                 InfoBarSeverity::Error,
                 "Some terminal integrations could not be updated",
-                "Turn the affected integration off and on again on the Terminals page."
-                    .to_string(),
+                "Turn the affected integration off and on again on the Terminals page, \
+                 or press Repair integrations.",
             )
         } else {
             let names: Vec<&str> = upgrade
@@ -700,7 +852,7 @@ impl SettingsModel {
                 .map(|integration| integration.display_name())
                 .collect();
             let verb = if names.len() == 1 { "is" } else { "are" };
-            (
+            Notice::new(
                 InfoBarSeverity::Success,
                 "Terminal integrations updated",
                 format!("{} {verb} now on {FSW_VERSION}", names.join(", ")),
@@ -723,9 +875,18 @@ impl SettingsModel {
             return;
         }
         self.repair_started = true;
+        // The upgrade queue already holds the sweep lock when it hands over to
+        // this; when there was no queue, take it here. Either way the launch
+        // sweep runs under one lock from end to end (#56).
+        if !self.sweep_held {
+            if !sweep_lock::acquire() {
+                return;
+            }
+            self.sweep_held = true;
+        }
         context.spawn_background(|_| {
             let _ = run_controller(["repair-adapters"]);
-            Msg::StateLoaded(State::read())
+            Msg::LaunchSweepFinished(State::read())
         });
     }
 }
@@ -750,12 +911,20 @@ impl Component for SettingsModel {
             ensure_broker_running();
             Msg::BrokerProbed
         });
-        // Daily GitHub update check (GitHub flavor only; the gate inside
-        // `run_update_check` no-ops for the Store flavor and unpackaged
-        // builds). Off the UI thread so the curl timeouts cannot stall the
-        // window.
+        // The daily update check, for both flavors now: the CLI owns every
+        // route, asks the Store for the Store build and the releases API for
+        // the GitHub one, and enforces the 24 h cadence itself (no `--force`
+        // here). Off the UI thread, because a Store round trip or a `curl.exe`
+        // timeout would otherwise stall the first frame. Silent unless it
+        // finds something — see `Msg::UpdateCheckFinished`.
         if update::update_check_allowed(has_package_identity(), update::read_auto_update_enabled()) {
-            context.spawn_background(|_| Msg::UpdateCheckFinished(update::run_update_check(false)));
+            context.spawn_background(|_| {
+                let (code, stdout, _) = run_controller_code(["update", "check", "--json"]);
+                Msg::UpdateCheckFinished {
+                    outcome: check_outcome(code, &stdout),
+                    explicit: false,
+                }
+            });
         }
         let mut model = Self {
             section: *input,
@@ -772,6 +941,7 @@ impl Component for SettingsModel {
             upgrade: None,
             upgrade_attempted: false,
             repair_started: false,
+            sweep_held: false,
             external_reads: state_watch::ReadCoalescer::default(),
         };
         // Listen for state this window did not change (#55): the CLI, the
@@ -908,11 +1078,10 @@ impl Component for SettingsModel {
                     return;
                 }
                 if !is_valid_windows_root(candidate) {
-                    self.notice = Some((
+                    self.notice = Some(Notice::new(
                         InfoBarSeverity::Error,
                         "Could not set the folder root",
-                        "Use an absolute path like C:\\code or \\\\wsl.localhost\\Ubuntu\\home\\me."
-                            .to_string(),
+                        "Use an absolute path like C:\\code or \\\\wsl.localhost\\Ubuntu\\home\\me.",
                     ));
                     return;
                 }
@@ -967,54 +1136,177 @@ impl Component for SettingsModel {
                 Self::refresh(context);
                 self.show_result(true, "Status refreshed", false, "");
             }
-            Msg::UpdateCheckFinished(outcome) => {
-                let UpdateOutcome::Ready(tag) = outcome else {
+            Msg::CheckForUpdates => {
+                if self.pending.is_some() {
                     return;
-                };
-                let short = tag.strip_prefix('v').unwrap_or(&tag).to_string();
-                self.notice = Some((
-                    InfoBarSeverity::Informational,
-                    "Update available",
-                    format!(
-                        "Version {short} was downloaded. It applies after you sign out and \
-                         back in, or restart Forward Slash Windows now."
-                    ),
-                ));
-                self.notice_is_update = true;
-                // The bundle only exists once the check has downloaded it, so
-                // the "Restart to update" action appears with this refresh.
+                }
+                // `--force` bypasses the CLI's 24 h cadence: the user pressed a
+                // button labelled "Check now" and deserves a round trip rather
+                // than yesterday's answer.
+                self.pending = Some(CHECK_ACTION);
+                context.spawn_background(|_| {
+                    let (code, stdout, _) =
+                        run_controller_code(["update", "check", "--force", "--json"]);
+                    Msg::UpdateCheckFinished {
+                        outcome: check_outcome(code, &stdout),
+                        explicit: true,
+                    }
+                });
+            }
+            Msg::UpdateCheckFinished { outcome, explicit } => {
+                if explicit {
+                    self.pending = None;
+                }
+                match outcome {
+                    UpdateOutcome::Ready(tag) => {
+                        let short = tag.strip_prefix('v').unwrap_or(&tag);
+                        self.notice = Some(Notice::new(
+                            InfoBarSeverity::Informational,
+                            "Update available",
+                            if self.state.store_flavor {
+                                format!(
+                                    "Version {short} is available in the Microsoft Store. \
+                                     Install it now, or let the Store install it on its own \
+                                     schedule."
+                                )
+                            } else {
+                                format!(
+                                    "Version {short} was downloaded. It applies after you sign \
+                                     out and back in, or restart Forward Slash Windows now."
+                                )
+                            },
+                        ));
+                        self.notice_is_update = true;
+                    }
+                    // Everything else is silent unless the user asked: the
+                    // launch check is background work they did not request.
+                    UpdateOutcome::UpToDate | UpdateOutcome::NotDue if explicit => {
+                        self.notice = Some(Notice::new(
+                            InfoBarSeverity::Success,
+                            "Up to date",
+                            format!("Forward Slash Windows {FSW_VERSION} is the latest version."),
+                        ));
+                        self.notice_is_update = false;
+                    }
+                    UpdateOutcome::Unavailable if explicit => {
+                        self.notice = Some(Notice::new(
+                            InfoBarSeverity::Informational,
+                            "Could not check for updates",
+                            "The update service could not be reached. The check runs again on \
+                             its own.",
+                        ));
+                        self.notice_is_update = false;
+                    }
+                    // A silent check that concluded nothing: no bar, but the
+                    // refresh below still runs.
+                    _ => {}
+                }
+                // The CLI wrote LastUpdateCheck and AvailableUpdate, and a
+                // GitHub check may have downloaded the bundle: everything the
+                // About card and the install banner render just changed. This
+                // happens whatever the outcome, including the silent ones —
+                // "Last update check" is exactly the line a check that found
+                // nothing has to move.
                 Self::refresh(context);
             }
-            Msg::RestartToUpdate => {
-                // Presence only: the CLI resolves the bundle itself now, so
-                // this is just "is there anything to apply?".
-                if update::pending_bundle_path().is_none() {
-                    self.notice = Some((
-                        InfoBarSeverity::Error,
-                        "Could not start the update",
-                        "The update could not be started.".to_string(),
-                    ));
+            Msg::InstallUpdate => {
+                if self.pending.is_some() {
                     return;
                 }
-                // Ask the broker to close first so it removes its notification
-                // icon itself; a forced shutdown by the installer would leave a
-                // ghost icon behind.
-                close_broker_window();
-                // The apply itself moved into the CLI: it stages the
-                // identity-less helper, registers the relaunch watchdog and
-                // only then lets the registration force this package down.
-                // `--force` because the user just asked for it explicitly.
-                if run_controller(["update", "install", "--force", "--relaunch", "app"]) {
-                    // Exit through the window's own close path: the reactor's
-                    // only process-exit route is WinUI's `Window.Closed`.
+                self.pending = Some(INSTALL_ACTION);
+                context.spawn_background(|_| {
+                    // Ask the broker to close first so it removes its
+                    // notification icon itself; a forced shutdown by the
+                    // installer would leave a ghost icon behind. It waits up to
+                    // 3 s, which is one reason this is off the UI thread.
+                    close_broker_window();
+                    // The apply itself lives in the CLI: it stages the
+                    // identity-less helper, registers the relaunch watchdog and
+                    // only then lets the install force this package down.
+                    // `--force` because the user just asked for it explicitly.
+                    let (code, stdout, stderr) = run_controller_code([
+                        "update", "install", "--force", "--relaunch", "app", "--json",
+                    ]);
+                    Msg::UpdateInstallFinished {
+                        code,
+                        stdout,
+                        stderr,
+                    }
+                });
+            }
+            Msg::UpdateInstallFinished {
+                code,
+                stdout,
+                stderr,
+            } => {
+                self.pending = None;
+                // The JSON line is the CLI's own record; the exit code is the
+                // contract this window acts on.
+                let _ = stdout;
+                let Some(notice) = install_notice(code, &stderr) else {
+                    // The install is under way and will force this package
+                    // down. Leave through the window's own close path, the
+                    // reactor's only process-exit route, so the watchdog's
+                    // relaunch is not racing a half-closed window.
                     request_close();
-                } else {
-                    self.notice = Some((
-                        InfoBarSeverity::Error,
-                        "Could not start the update",
-                        "The update could not be started.".to_string(),
-                    ));
+                    return;
+                };
+                self.notice = Some(notice);
+                self.notice_is_update = false;
+                Self::refresh(context);
+            }
+            Msg::OpenStorePage => {
+                if !shell_open(&store_product_uri()) {
+                    self.show_result(false, "Opening the Microsoft Store", false, "");
                 }
+            }
+            Msg::RepairIntegrations => {
+                if self.pending.is_some() {
+                    return;
+                }
+                self.pending = Some(REPAIR_ACTION);
+                context.spawn_background(|_| {
+                    // Serialised against the broker's own sweep (#56): the two
+                    // would otherwise delete a payload tree out from under each
+                    // other's child process.
+                    let Some(_lock) = sweep_lock::acquire_guard() else {
+                        return Msg::RepairFinished(RepairOutcome::Busy);
+                    };
+                    let (succeeded, detail) = run_controller_detailed(["repair-adapters"]);
+                    Msg::RepairFinished(if succeeded {
+                        RepairOutcome::Repaired
+                    } else {
+                        RepairOutcome::Failed(detail)
+                    })
+                });
+            }
+            Msg::RepairFinished(outcome) => {
+                self.pending = None;
+                self.notice = Some(match outcome {
+                    RepairOutcome::Repaired => Notice::new(
+                        InfoBarSeverity::Success,
+                        "Integrations repaired",
+                        "Terminal integrations were checked and brought up to date. Reopen \
+                         affected terminals.",
+                    ),
+                    RepairOutcome::Busy => Notice::new(
+                        InfoBarSeverity::Informational,
+                        "Integrations are already being updated",
+                        "A background update of the terminal integrations is running. Try \
+                         again in a moment.",
+                    ),
+                    RepairOutcome::Failed(detail) => Notice::new(
+                        InfoBarSeverity::Error,
+                        "Could not repair integrations",
+                        if detail.trim().is_empty() {
+                            "The integrations could not be repaired.".to_string()
+                        } else {
+                            detail.trim().to_string()
+                        },
+                    ),
+                });
+                self.notice_is_update = false;
+                Self::refresh(context);
             }
             Msg::SetAutoUpdate(enabled) => {
                 if enabled == update::read_auto_update_enabled() {
@@ -1031,6 +1323,10 @@ impl Component for SettingsModel {
                     false,
                     "",
                 );
+                // Deterministic, rather than waiting on the broadcast the write
+                // just fired (#55): the switch renders `state.auto_update`, and
+                // a failed write must leave it showing what is actually stored.
+                Self::refresh(context);
             }
             Msg::DismissNotice => {
                 if self.notice_is_update {
@@ -1060,6 +1356,15 @@ impl Component for SettingsModel {
                 Self::refresh(context);
             }
             Msg::StateLoaded(state) => {
+                self.state = state;
+                self.maybe_start_upgrade(context);
+            }
+            Msg::LaunchSweepFinished(state) => {
+                // The whole launch sweep is over; let the broker have the lock.
+                if self.sweep_held {
+                    sweep_lock::release();
+                    self.sweep_held = false;
+                }
                 self.state = state;
                 self.maybe_start_upgrade(context);
             }
@@ -1189,10 +1494,10 @@ impl SettingsModel {
     /// (`src/settings/main.cpp:410-422`).
     fn surface(&self, context: &mut ViewContext<Self>) -> View {
         let notice: View = match &self.notice {
-            Some((severity, title, message)) => InfoBar::new()
-                .title(*title)
-                .message(message)
-                .severity(*severity)
+            Some(notice) => InfoBar::new()
+                .title(notice.title)
+                .message(&notice.message)
+                .severity(notice.severity)
                 .is_open(true)
                 .is_closable(true)
                 .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
@@ -1238,10 +1543,21 @@ impl SettingsModel {
     /// Reactor's `InfoBar` exposes no action-button slot, so each action is a
     /// `Button` rendered directly beneath its bar.
     fn banners(&self, context: &mut ViewContext<Self>) -> View {
-        // The GitHub flavor only: the Store updates through the Store.
-        let restartable =
-            self.state.packaged && !self.state.store_flavor && self.state.update_bundle_ready;
-        if self.upgrade.is_none() && !restartable && self.pending.is_none() {
+        // Both flavors now: the Store build drives the Store's own installer
+        // through the CLI, the GitHub build registers the bundle it already
+        // downloaded.
+        let install_label = install_banner_label(
+            self.state.packaged,
+            self.state.store_flavor,
+            self.state.update_bundle_ready,
+            self.state.update_tag.is_some(),
+        );
+        let notice_action = self.notice.as_ref().and_then(|notice| notice.action);
+        if self.upgrade.is_none()
+            && install_label.is_none()
+            && notice_action.is_none()
+            && self.pending.is_none()
+        {
             return View::empty();
         }
 
@@ -1260,14 +1576,24 @@ impl SettingsModel {
                 .into(),
             None => View::empty(),
         };
-        let restart_action: View = if restartable {
-            Button::new()
+        let install_action: View = match install_label {
+            Some(label) => Button::new()
                 .is_enabled(self.controls_enabled())
                 .horizontal_alignment(HorizontalAlignment::Left)
-                .on_click(context.message(Msg::RestartToUpdate))
-                .content("Restart to update")
-        } else {
-            View::empty()
+                .on_click(context.message(Msg::InstallUpdate))
+                .content(label)
+                .into(),
+            None => View::empty(),
+        };
+        // Reactor's InfoBar has no action slot, so the notice's action is a
+        // button of its own directly under the bar.
+        let notice_action: View = match notice_action {
+            Some(action @ NoticeAction::OpenStore) => Button::new()
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .on_click(context.message(Msg::OpenStorePage))
+                .content(action.label())
+                .into(),
+            None => View::empty(),
         };
         let progress: View = if self.pending.is_some() {
             ProgressRing::new()
@@ -1285,7 +1611,7 @@ impl SettingsModel {
             .spacing(8.0)
             .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
             .grid_row(1)
-            .children((upgrade_notice, restart_action, progress))
+            .children((upgrade_notice, notice_action, install_action, progress))
     }
 
     fn view_general(&self, context: &mut ViewContext<Self>) -> View {
@@ -1403,12 +1729,21 @@ impl SettingsModel {
                     picker,
                     folder_picker,
                 ))),
-                // Automatic updates: GitHub flavor only. The Store build
-                // updates through the Store; its updater never runs.
-                if state.packaged && !state.store_flavor {
-                    toggle_card(
+                // Automatic updates: both flavors, for any packaged build. The
+                // Store build asks the Store for its own update instead of
+                // GitHub, and is off by default — the Store already updates
+                // the app on its own schedule, so driving it from in here is
+                // something the user opts into.
+                if state.packaged {
+                    toggle_card_detail(
                         "Automatic updates",
-                        "Check GitHub daily and install new versions automatically.",
+                        if state.store_flavor {
+                            "Let fwdslash install Store updates in the background. Off by \
+                             default; the Store still updates the app on its own schedule."
+                        } else {
+                            "Check GitHub daily and install new versions automatically."
+                        },
+                        Some(state.last_check_line()),
                         ToggleSwitch::new()
                             .is_on(state.auto_update)
                             .is_enabled(self.controls_enabled())
@@ -1430,6 +1765,19 @@ impl SettingsModel {
                         Button::new()
                             .on_click(context.message(Msg::RefreshStatus))
                             .content("Refresh status"),
+                        // Independent of the Automatic updates switch: asking
+                        // once, now, is not the same decision as checking every
+                        // day. Hidden only where there is no package to update.
+                        if state.packaged {
+                            Button::new()
+                                .is_enabled(self.controls_enabled())
+                                .automation_name("Check for updates now")
+                                .on_click(context.message(Msg::CheckForUpdates))
+                                .content("Check now")
+                                .into()
+                        } else {
+                            View::empty()
+                        },
                     )),
                 body(state.status_text()).foreground(ThemeBrush::TextSecondary),
             ))
@@ -1513,6 +1861,24 @@ impl SettingsModel {
                 )
                 .foreground(ThemeBrush::TextSecondary)
                 .margin(Thickness::new(0.0, 4.0, 0.0, 0.0)),
+                // The button the broker's "could not be updated automatically"
+                // balloon points at (#56). Before this the balloon said "Open
+                // Settings to retry" and there was nothing to press: the retry
+                // happened by accident, in the launch sweep.
+                card(StackPanel::new().spacing(8.0).children((
+                    strong("Repair integrations"),
+                    body(
+                        "Re-applies each installed adapter and cleans up an orphaned or \
+                         duplicated block left by an interrupted update.",
+                    )
+                    .foreground(ThemeBrush::TextSecondary),
+                    Button::new()
+                        .is_enabled(self.controls_enabled())
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .automation_name("Repair integrations")
+                        .on_click(context.message(Msg::RepairIntegrations))
+                        .content("Repair integrations"),
+                ))),
             ))
     }
 
@@ -1546,6 +1912,11 @@ impl SettingsModel {
             body(format!("Package: {}", Self::package_label()))
                 .foreground(ThemeBrush::TextSecondary),
             body(state.flavor_component_line()).foreground(ThemeBrush::TextSecondary),
+            body(state.last_check_line()).foreground(ThemeBrush::TextSecondary),
+            match state.update_available_line() {
+                Some(line) => body(line).foreground(ThemeBrush::TextSecondary).into(),
+                None => View::empty(),
+            },
         )))
     }
 
@@ -1609,6 +1980,78 @@ impl SettingsModel {
 // ---------------------------------------------------------------------------
 // Shared builders, mirroring the helpers at src/settings/main.cpp:221-298
 // ---------------------------------------------------------------------------
+
+/// What one `fwdslash update install` exit code means on screen.
+///
+/// `None` is the one outcome with nothing to show: the install started, it is
+/// about to force this package down, and the window closes instead. Everything
+/// else — including "there was nothing to install after all" — leaves the user
+/// a sentence, because they pressed a button and are waiting for an answer.
+#[must_use]
+fn install_notice(code: i32, stderr: &str) -> Option<Notice> {
+    Some(match code {
+        UPDATE_EXIT_OK => return None,
+        UPDATE_EXIT_AVAILABLE => Notice::new(
+            InfoBarSeverity::Informational,
+            "Update downloaded",
+            "It installs the next time fwdslash restarts.",
+        ),
+        UPDATE_EXIT_NEEDS_USER => Notice::new(
+            InfoBarSeverity::Informational,
+            "Finish the update in the Microsoft Store",
+            "This update has to be installed from the Store on this computer.",
+        )
+        .with_action(NoticeAction::OpenStore),
+        UPDATE_EXIT_NOTHING => Notice::new(
+            InfoBarSeverity::Success,
+            "Already up to date",
+            format!("Forward Slash Windows {FSW_VERSION} is the latest version."),
+        ),
+        // Anything else is the CLI's error exit, a usage or context error, or
+        // a controller that could not be started at all. Its stderr explains an
+        // actionable failure the way `ControllerFinished` does.
+        _ => {
+            let detail = stderr.trim();
+            Notice::new(
+                InfoBarSeverity::Error,
+                "Could not start the update",
+                if detail.is_empty() {
+                    "The update could not be started.".to_string()
+                } else {
+                    format!("The update could not be started. {detail}")
+                },
+            )
+        }
+    })
+}
+
+/// The install banner's button label, or `None` when no banner belongs on
+/// screen.
+///
+/// Unpackaged builds never show it — there is nothing they could install, and
+/// a dev build must not offer to replace itself. `bundle_ready` is the GitHub
+/// flavor's downloaded `.msixbundle`; `update_available` is the version the
+/// last check recorded, which is all the Store flavor ever has locally. Either
+/// one is enough: the CLI decides what "install" actually means.
+#[must_use]
+fn install_banner_label(
+    packaged: bool,
+    store_flavor: bool,
+    bundle_ready: bool,
+    update_available: bool,
+) -> Option<&'static str> {
+    if !packaged || !(bundle_ready || update_available) {
+        return None;
+    }
+    // The Store's installer force-closes the app and the Store's own restart
+    // brings it back; the GitHub bundle is registered over a running package,
+    // which is a restart the user is agreeing to.
+    Some(if store_flavor {
+        "Install now"
+    } else {
+        "Restart to update"
+    })
+}
 
 fn body(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
@@ -1730,8 +2173,25 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    let (code, _stdout, stderr) = run_controller_code(arguments);
+    (code == 0, stderr)
+}
+
+/// Runs the controller and returns `(exit code, stdout, stderr)`.
+///
+/// The `update` verbs are the reason this exists: their contract is a set of
+/// exit codes (0/10/11/12/1/2/20) plus one JSON line on stdout, and neither of
+/// the two wrappers above can carry either. `-1` is "the controller could not
+/// be started at all", which is deliberately not one of the CLI's codes.
+///
+/// Blocks until the child exits — every caller runs it on the thread pool.
+fn run_controller_code<I, S>(arguments: I) -> (i32, String, String)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let Some(controller) = controller_path() else {
-        return (false, String::new());
+        return (-1, String::new(), String::new());
     };
     let mut command = Command::new(controller);
     for argument in arguments {
@@ -1744,29 +2204,94 @@ where
         command.creation_flags(CREATE_NO_WINDOW);
     }
     match command.output() {
-        Ok(output) => {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            (output.status.success(), detail)
-        }
-        Err(_) => (false, String::new()),
+        Ok(output) => (
+            // `code()` is `None` only for a signal, which Windows has no
+            // concept of.
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ),
+        Err(_) => (-1, String::new(), String::new()),
     }
+}
+
+/// The value of one string field of the CLI's one-line update JSON, or `None`
+/// when the field is absent or `null`.
+///
+/// Hand-rolled on purpose: there is no serde anywhere in this workspace, and
+/// this reads exactly two fields of a line the CLI renders from a fixed
+/// `format!`. It understands the shape that `render_json` produces —
+/// `"key":"value"` or `"key":null`, no whitespace, `\"` and `\\` escapes — and
+/// answers `None` for anything else rather than guessing.
+#[must_use]
+fn json_string_field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let start = line.find(&needle)? + needle.len();
+    let rest = line.get(start..)?;
+    let mut characters = rest.chars();
+    if characters.next()? != '"' {
+        return None; // `null`, a number, or a shape this does not parse.
+    }
+    let mut value = String::new();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => return Some(value),
+            '\\' => value.push(characters.next()?),
+            other => value.push(other),
+        }
+    }
+    // An unterminated string is malformed, not an empty value.
+    None
+}
+
+/// Maps one `fwdslash update check --json` answer onto the outcome the window
+/// already knows how to render.
+///
+/// The exit code carries the decision and the JSON carries the version, which
+/// is why both are needed: exit 10 without an `available` field is a check
+/// that found something it could not name, and that is not something to
+/// announce.
+#[must_use]
+fn check_outcome(code: i32, stdout: &str) -> UpdateOutcome {
+    let line = stdout.lines().next_back().unwrap_or_default();
+    if code == UPDATE_EXIT_AVAILABLE {
+        return match json_string_field(line, "available") {
+            Some(tag) if !tag.is_empty() => UpdateOutcome::Ready(tag),
+            _ => UpdateOutcome::Unavailable,
+        };
+    }
+    match json_string_field(line, "state").as_deref() {
+        Some("upToDate") => UpdateOutcome::UpToDate,
+        Some("notDue") => UpdateOutcome::NotDue,
+        // `disabled` (no package identity), `unavailable` (the service could
+        // not be reached) and anything this build does not recognise all mean
+        // the same thing to the window: no answer worth acting on.
+        _ => UpdateOutcome::Unavailable,
+    }
+}
+
+/// Seconds since the Unix epoch, for `format_last_check`.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Opens the WSL provider root through the shell, as `main.cpp:561-563` does.
 fn open_wsl_root() -> bool {
+    shell_open(WSL_ROOT)
+}
+
+/// `ShellExecuteW("open", target)`. Used for the WSL provider root and for the
+/// `ms-windows-store:` product page.
+fn shell_open(target: &str) -> bool {
     #[cfg(windows)]
     unsafe {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::UI::Shell::ShellExecuteW;
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-        let wide = |value: &str| -> Vec<u16> {
-            let mut buffer: Vec<u16> = std::ffi::OsStr::new(value).encode_wide().collect();
-            buffer.push(0);
-            buffer
-        };
-        let verb = wide("open");
-        let target = wide(WSL_ROOT);
+        let verb = to_wide("open");
+        let target = to_wide(target);
         let result = ShellExecuteW(
             std::ptr::null_mut(),
             verb.as_ptr(),
@@ -1780,7 +2305,97 @@ fn open_wsl_root() -> bool {
     }
     #[cfg(not(windows))]
     {
+        let _ = target;
         false
+    }
+}
+
+/// The cross-process lock that keeps the broker's adapter sweep and this
+/// window's repair from running at the same time (issue #56).
+///
+/// Existence, not ownership: whoever creates the named mutex first keeps the
+/// handle for the length of its work, and the other sees `ERROR_ALREADY_EXISTS`
+/// and stands down. No wait is ever performed, so the guard is not tied to the
+/// thread that took it — which matters here, because it is taken on the thread
+/// pool.
+/// The lock is held by the *process*, not by a scope: the launch sweep spans
+/// several messages and several thread-pool tasks, so the handle lives in a
+/// static and [`Guard`] is a zero-sized token that only decides *when* the
+/// release happens. That also keeps it `Send`, which a raw `HANDLE` is not.
+mod sweep_lock {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    /// The named mutex handle while this process holds the lock; `0` when it
+    /// does not. `-1` records "the lock could not be evaluated", which is
+    /// treated as held-by-us so the work still runs.
+    static HELD: AtomicIsize = AtomicIsize::new(0);
+
+    /// Takes the cross-process sweep lock. `false` means somebody else is
+    /// sweeping — the broker at startup, or this process not having released
+    /// its own yet.
+    pub(crate) fn acquire() -> bool {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{
+                CloseHandle, ERROR_ALREADY_EXISTS, GetLastError,
+            };
+            use windows_sys::Win32::System::Threading::CreateMutexW;
+
+            if HELD.load(Ordering::Acquire) != 0 {
+                return false;
+            }
+            let name = super::to_wide(fsw_core::FSW_ADAPTER_SWEEP_MUTEX);
+            // SAFETY: a named mutex with a NUL-terminated name; the handle is
+            // either closed here or parked in `HELD` until `release`.
+            unsafe {
+                let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+                if handle.is_null() {
+                    // Unknowable rather than held: do the work, which is
+                    // idempotent, rather than never do it.
+                    HELD.store(-1, Ordering::Release);
+                    return true;
+                }
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    CloseHandle(handle);
+                    return false;
+                }
+                HELD.store(handle as isize, Ordering::Release);
+                true
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            HELD.store(-1, Ordering::Release);
+            true
+        }
+    }
+
+    /// Releases the lock. A no-op when this process does not hold it.
+    pub(crate) fn release() {
+        let handle = HELD.swap(0, Ordering::AcqRel);
+        #[cfg(windows)]
+        if handle > 0 {
+            // SAFETY: the handle came from `CreateMutexW` in `acquire` and is
+            // closed exactly once, because the swap took it out of the static.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle as _) };
+        }
+        #[cfg(not(windows))]
+        let _ = handle;
+    }
+
+    /// Releases the lock when it goes out of scope — for the one-shot manual
+    /// repair, which begins and ends inside a single thread-pool task.
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            release();
+        }
+    }
+
+    /// [`acquire`] with an RAII release.
+    pub(crate) fn acquire_guard() -> Option<Guard> {
+        acquire().then_some(Guard)
     }
 }
 
@@ -2043,6 +2658,216 @@ fn show_startup_error(message: &str) {
             to_wide(message).as_ptr(),
             to_wide(WINDOW_TITLE).as_ptr(),
             MB_ICONERROR | MB_OK | MB_SETFOREGROUND,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// The pure decisions only: which banner the window offers, how a CLI answer
+// becomes an outcome, and what an install exit code means on screen. Every one
+// of them is a place where a wrong answer is invisible until a user is looking
+// at it.
+#[cfg(test)]
+mod tests {
+    use super::{
+        InfoBarSeverity, NoticeAction, UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NEEDS_USER,
+        UPDATE_EXIT_NOTHING, UPDATE_EXIT_OK, UpdateOutcome, check_outcome, install_banner_label,
+        install_notice, json_string_field, store_product_uri,
+    };
+
+    /// A line in the exact shape `render_json` produces.
+    fn json_line(state: &str, available: &str) -> String {
+        format!(
+            "{{\"flavor\":\"store\",\"state\":\"{state}\",\"available\":{available},\
+             \"autoUpdate\":true,\"lastUpdateCheck\":1730000000,\"route\":null,\
+             \"action\":null,\"detail\":null}}"
+        )
+    }
+
+    // -- the JSON extractor ------------------------------------------------
+
+    #[test]
+    fn a_string_field_is_read_to_its_closing_quote() {
+        let line = json_line("available", "\"0.0.5\"");
+        assert_eq!(json_string_field(&line, "state").as_deref(), Some("available"));
+        assert_eq!(json_string_field(&line, "available").as_deref(), Some("0.0.5"));
+        assert_eq!(json_string_field(&line, "flavor").as_deref(), Some("store"));
+    }
+
+    #[test]
+    fn null_and_absent_and_numeric_fields_are_all_none() {
+        let line = json_line("upToDate", "null");
+        assert_eq!(json_string_field(&line, "available"), None);
+        assert_eq!(json_string_field(&line, "route"), None);
+        assert_eq!(json_string_field(&line, "nosuchfield"), None);
+        // A number is not a string, and guessing at one would be worse.
+        assert_eq!(json_string_field(&line, "lastUpdateCheck"), None);
+    }
+
+    #[test]
+    fn escapes_survive_the_extractor() {
+        let line = r#"{"detail":"C:\\Users\\me said \"no\"","state":"error"}"#;
+        assert_eq!(
+            json_string_field(line, "detail").as_deref(),
+            Some(r#"C:\Users\me said "no""#)
+        );
+        assert_eq!(json_string_field(line, "state").as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn a_malformed_line_never_yields_a_half_value() {
+        assert_eq!(json_string_field("", "state"), None);
+        assert_eq!(json_string_field("not json at all", "state"), None);
+        // Unterminated string.
+        assert_eq!(json_string_field(r#"{"state":"upToDa"#, "state"), None);
+    }
+
+    // -- check answers -----------------------------------------------------
+
+    #[test]
+    fn exit_ten_with_a_version_is_the_only_ready() {
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "\"0.0.5\"")),
+            UpdateOutcome::Ready("0.0.5".to_string())
+        );
+        // Exit 10 that cannot name a version is nothing to announce.
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "null")),
+            UpdateOutcome::Unavailable
+        );
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "\"\"")),
+            UpdateOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn the_state_field_decides_the_rest() {
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_OK, &json_line("upToDate", "null")),
+            UpdateOutcome::UpToDate
+        );
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_OK, &json_line("notDue", "null")),
+            UpdateOutcome::NotDue
+        );
+        // `disabled` is an unpackaged build; `unavailable` is an unreachable
+        // service. Neither is worth a word on screen.
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_OK, &json_line("disabled", "null")),
+            UpdateOutcome::Unavailable
+        );
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_OK, &json_line("unavailable", "null")),
+            UpdateOutcome::Unavailable
+        );
+        // A controller that could not be started prints nothing at all.
+        assert_eq!(check_outcome(-1, ""), UpdateOutcome::Unavailable);
+    }
+
+    #[test]
+    fn only_the_last_line_of_stdout_is_the_json() {
+        // Nothing writes to stdout before the JSON today; if something ever
+        // does, the contract line is still the last one.
+        let stdout = format!("a stray line\n{}\n", json_line("upToDate", "null"));
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_OK, &stdout),
+            UpdateOutcome::UpToDate
+        );
+    }
+
+    // -- the install banner matrix ----------------------------------------
+
+    #[test]
+    fn an_unpackaged_build_never_offers_to_install() {
+        assert_eq!(install_banner_label(false, false, true, true), None);
+        assert_eq!(install_banner_label(false, true, true, true), None);
+    }
+
+    #[test]
+    fn nothing_to_install_means_no_banner() {
+        assert_eq!(install_banner_label(true, true, false, false), None);
+        assert_eq!(install_banner_label(true, false, false, false), None);
+    }
+
+    #[test]
+    fn each_flavor_labels_the_button_for_what_it_does() {
+        // Store: a recorded available version is all it ever has locally.
+        assert_eq!(
+            install_banner_label(true, true, false, true),
+            Some("Install now")
+        );
+        // GitHub: the downloaded bundle, and the check that found it.
+        assert_eq!(
+            install_banner_label(true, false, true, false),
+            Some("Restart to update")
+        );
+        assert_eq!(
+            install_banner_label(true, false, true, true),
+            Some("Restart to update")
+        );
+    }
+
+    // -- install exit code to what the window shows ------------------------
+
+    #[test]
+    fn a_started_install_leaves_no_notice_because_the_window_closes() {
+        assert!(install_notice(UPDATE_EXIT_OK, "").is_none());
+    }
+
+    #[test]
+    fn only_the_store_hand_off_carries_an_action_button() {
+        assert_eq!(
+            install_notice(UPDATE_EXIT_NEEDS_USER, "").map(|notice| notice.action),
+            Some(Some(NoticeAction::OpenStore))
+        );
+        for code in [UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NOTHING, 1] {
+            assert_eq!(
+                install_notice(code, "").map(|notice| notice.action),
+                Some(None),
+                "code {code} must not offer an action"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_failure_is_an_error_bar() {
+        assert_eq!(
+            install_notice(1, "").map(|notice| notice.severity),
+            Some(InfoBarSeverity::Error)
+        );
+        assert_eq!(
+            install_notice(UPDATE_EXIT_NOTHING, "").map(|notice| notice.severity),
+            Some(InfoBarSeverity::Success)
+        );
+        assert_eq!(
+            install_notice(UPDATE_EXIT_AVAILABLE, "").map(|notice| notice.severity),
+            Some(InfoBarSeverity::Informational)
+        );
+    }
+
+    #[test]
+    fn a_failure_carries_the_controllers_own_explanation() {
+        assert_eq!(
+            install_notice(1, "  ").map(|notice| notice.message),
+            Some("The update could not be started.".to_string())
+        );
+        assert_eq!(
+            install_notice(1, "The Store refused (0x80070005).\n").map(|notice| notice.message),
+            Some("The update could not be started. The Store refused (0x80070005).".to_string())
+        );
+    }
+
+    // -- the Store link ----------------------------------------------------
+
+    #[test]
+    fn the_store_link_addresses_this_product() {
+        assert_eq!(
+            store_product_uri(),
+            "ms-windows-store://pdp/?productid=9P51CM0MTMK2"
         );
     }
 }
