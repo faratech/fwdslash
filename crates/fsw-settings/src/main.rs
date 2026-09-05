@@ -16,7 +16,7 @@ use fsw_core::{
     broker_state, broker_window_exists, ensure_broker_running, executable_available,
     executable_directory, filter_port_available, filter_service_state, get_default_distribution,
     has_package_identity, is_store_flavor, list_registered_distributions, package_architecture,
-    package_version, update, windows_integration_installed,
+    package_version, sync_settings_to_real_hive, update, windows_integration_installed,
 };
 use fsw_core::update::UpdateOutcome;
 use fsw_path::{BareSlashMode, eq_ignore_case, is_valid_windows_root};
@@ -712,6 +712,13 @@ impl Component for SettingsModel {
         // broker. Without this a Store install does nothing at all. Off the UI
         // thread: the probe spins for up to 2 s waiting for the broker window.
         context.spawn_background(|_| {
+            // The launch sweep's first job (issue #52): a packaged app writes
+            // HKCU into its own private hive, which the shell adapters — an
+            // unpackaged fwdslash.exe — cannot see. Mirror what this install
+            // holds into the real hive before the broker starts reading it.
+            // Unpackaged, and packaged once the hives agree, this does
+            // nothing.
+            let _ = sync_settings_to_real_hive();
             ensure_broker_running();
             Msg::BrokerProbed
         });

@@ -7,7 +7,13 @@ use fsw_path::{
     BareSlashMode, Context, RenderBuf, ResolveError, Resolved, eq_ignore_case,
     is_valid_distribution_name, is_valid_windows_root, resolve, resolve_under_root,
 };
+pub mod settings_write;
 pub mod update;
+
+pub use settings_write::{
+    WritePlan, delete_setting, set_setting_string, set_setting_u32, set_setting_u64,
+    sync_settings_to_real_hive, write_plan,
+};
 
 use std::fmt;
 use std::path::PathBuf;
@@ -17,6 +23,15 @@ pub const FSW_WM_QUERY_STATE: u32 = 0x8000 + 10; // WM_APP + 10
 pub const FSW_WM_SET_PAUSED: u32 = 0x8000 + 11; // WM_APP + 11
 pub const FSW_WM_SHOW_SETTINGS: u32 = 0x8000 + 12; // WM_APP + 12
 
+/// The settings key, and every value name under it.
+///
+/// **Writes to this key go through [`settings_write`] and nowhere else** —
+/// `set_setting_u32` / `set_setting_u64` / `set_setting_string` /
+/// `delete_setting`. No other code may call `windows_registry`'s
+/// `set_*`/`remove_value` on it: a packaged process's own write is virtualized
+/// into the package hive, where the unpackaged shell adapters can never read
+/// it, which is what issue #52 was. `settings_write` is the one place that
+/// knows to write both hives.
 pub const FSW_SETTINGS_KEY: &str = r"Software\ForwardSlashWindows\Settings";
 pub const FSW_DISABLED_VALUE: &str = "Disabled";
 pub const FSW_BARE_SLASH_MODE_VALUE: &str = "BareSlashMode";
@@ -445,90 +460,41 @@ pub fn is_disabled() -> bool {
 /// Sets the disabled state in HKCU\Software\ForwardSlashWindows\Settings.
 /// Persists the global pause flag.
 ///
-/// The write goes through `reg.exe` (a System32 child, i.e. a process without
-/// package identity) because a packaged process's own registry writes are
-/// virtualized into the package's private hive — and the PowerShell module
-/// reads this flag from an unpackaged shell, where virtualized writes are
-/// invisible (verified 2026-09-04; see docs/compatibility.md). The BareSlash*
-/// settings are deliberately NOT routed this way: they are only ever read
-/// back by packaged components, so their virtualized writes are
-/// self-consistent.
+/// Like every other settings write it goes through [`settings_write`], which
+/// reaches the real hive with `reg.exe` when this process is packaged: the
+/// PowerShell module reads this flag from an unpackaged shell, where a
+/// virtualized write is invisible (verified 2026-09-04; see
+/// docs/compatibility.md). Issue #52 is the same fault for the BareSlash*
+/// values, which used to be written in-process only.
 pub fn persist_disabled(disabled: bool) -> Result<(), u32> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use std::process::Command;
-
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let value = if disabled { "1" } else { "0" };
-        let status = Command::new("reg.exe")
-            .args([
-                "add",
-                &format!("HKCU\\{FSW_SETTINGS_KEY}"),
-                "/v",
-                FSW_DISABLED_VALUE,
-                "/t",
-                "REG_DWORD",
-                "/d",
-                value,
-                "/f",
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .map_err(|e| e.raw_os_error().unwrap_or(u32::MAX as i32) as u32)?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(status.code().unwrap_or(u32::MAX as i32) as u32)
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = disabled;
-        Ok(())
-    }
+    set_setting_u32(FSW_DISABLED_VALUE, u32::from(disabled))
 }
 
 /// Updates bare slash settings in HKCU.
+///
+/// One write per value through [`settings_write`], so a packaged settings app
+/// and an unpackaged shell adapter agree about what `/` means (issue #52).
+/// Every value is attempted even after a failure — a half-applied mode with a
+/// stale pin is worse than a reported error.
 pub fn write_bare_slash_settings(
     default_mode: bool,
     pinned_distribution: &str,
     root: Option<&str>,
 ) -> Result<(), u32> {
-    #[cfg(windows)]
-    {
-        use windows_registry::CURRENT_USER;
+    let mode = set_setting_u32(FSW_BARE_SLASH_MODE_VALUE, u32::from(default_mode));
 
-        let key = CURRENT_USER
-            .create(FSW_SETTINGS_KEY)
-            .map_err(|e| e.code().0 as u32)?;
-        let val = if default_mode { 1u32 } else { 0u32 };
-        key.set_u32(FSW_BARE_SLASH_MODE_VALUE, val)
-            .map_err(|e| e.code().0 as u32)?;
+    let pinned = if default_mode && !pinned_distribution.is_empty() {
+        set_setting_string(FSW_BARE_SLASH_DISTRIBUTION_VALUE, pinned_distribution)
+    } else {
+        delete_setting(FSW_BARE_SLASH_DISTRIBUTION_VALUE)
+    };
 
-        if default_mode && !pinned_distribution.is_empty() {
-            key.set_string(FSW_BARE_SLASH_DISTRIBUTION_VALUE, pinned_distribution)
-                .map_err(|e| e.code().0 as u32)?;
-        } else {
-            let _ = key.remove_value(FSW_BARE_SLASH_DISTRIBUTION_VALUE);
-        }
+    let configured_root = match root {
+        Some(path) if !path.is_empty() => set_setting_string(FSW_BARE_SLASH_ROOT_VALUE, path),
+        _ => delete_setting(FSW_BARE_SLASH_ROOT_VALUE),
+    };
 
-        match root {
-            Some(path) if !path.is_empty() => {
-                key.set_string(FSW_BARE_SLASH_ROOT_VALUE, path)
-                    .map_err(|e| e.code().0 as u32)?;
-            }
-            _ => {
-                let _ = key.remove_value(FSW_BARE_SLASH_ROOT_VALUE);
-            }
-        }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (default_mode, pinned_distribution, root);
-        Ok(())
-    }
+    mode.and(pinned).and(configured_root)
 }
 
 /// Resolves a forward-slash path against the live user registry configuration.
@@ -595,6 +561,10 @@ pub enum DiagEvent {
     BrokerPaused,
     BrokerResumed,
     IntegrationsQueried,
+    /// The packaged app mirrored one or more settings into the real hive so
+    /// the unpackaged shell adapters can read them (issue #52). Category
+    /// only: never which value, never what it said.
+    SettingsSynced,
 }
 
 impl fmt::Display for DiagEvent {
@@ -612,6 +582,7 @@ impl fmt::Display for DiagEvent {
             Self::BrokerPaused => "event=broker_paused",
             Self::BrokerResumed => "event=broker_resumed",
             Self::IntegrationsQueried => "event=integrations_queried",
+            Self::SettingsSynced => "event=settings_synced",
         };
         write!(f, "{name}")
     }
