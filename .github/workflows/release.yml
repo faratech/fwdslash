@@ -113,7 +113,7 @@ jobs:
           $packages = @(Get-ChildItem 'out\msix' -Recurse -Include '*.msix', '*.msixbundle' |
               ForEach-Object { $_.FullName })
           if ($packages.Count -eq 0) { throw 'No MSIX artifacts were produced.' }
-          .\signing\sign.ps1 @packages `
+          .\signing\sign.ps1 -Path $packages `
               -Description 'Forward Slash Windows' `
               -DescriptionUrl 'https://github.com/faratech/fwdslash'
 
