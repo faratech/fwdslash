@@ -206,10 +206,34 @@ here but resembles a keylogger to an automated scan, so state plainly:
 > In every other case the keystroke is replayed unmodified.
 >
 > No keystroke content is recorded, stored, or transmitted. Diagnostics log event
-> categories only, never user-entered or resolved paths. The Store package makes
-> no network connections: its self-update code path is gated to the
-> GitHub-distributed flavor at runtime (package-family comparison) and cannot
-> execute in the Store package.
+> categories only, never user-entered or resolved paths.
+>
+> The package's **only** network use is an update path that is opt-in and **off
+> by default** in this flavor, and it talks exclusively to Microsoft's own Store
+> update service. Nothing else in the package opens a socket. The default is
+> decided at runtime from the package family, so a Store install ships with the
+> **Automatic updates** switch off and performs no check until the user turns it
+> on.
+>
+> With it on, the app asks `Windows.Services.Store.StoreContext` — at most once
+> a day — whether a newer version of this product has been published. It
+> installs one only through the Store, and only for its own product id
+> (`9P51CM0MTMK2`, a constant in the binary): first
+> `AppInstallManager.StartProductInstallWithOptionsAsync`, the same sequence
+> Windows Package Manager uses, called in-process from the packaged app and, if
+> that call is refused, from an identity-less copy of the app's own signed
+> executable; if that route is unavailable at all it degrades to `StoreContext`'s
+> own silent download and install, and below that to
+> `winget upgrade --id 9P51CM0MTMK2 --source msstore`, which is the same service
+> again. If none of those can run, the app only tells the user there is an
+> update and offers to open the Store listing.
+>
+> It downloads no code from anywhere but the Store, installs no third-party
+> software, and carries no mechanism to install any product other than this one.
+> A single registry value (`HKCU\Software\ForwardSlashWindows\Settings`,
+> `UpdateRoute`) pins or disables individual routes without a rebuild, so the
+> `AppInstallManager` route can be turned off in a servicing update if it is ever
+> found objectionable.
 >
 > UI Automation is used to read and rewrite the focused address/filename control
 > in those same four surfaces — this is how a typed `/etc/apt` becomes
@@ -225,6 +249,15 @@ here but resembles a keylogger to an automated scan, so state plainly:
 > settings app, and is removed entirely when the feature is disabled.
 >
 > Full source: https://github.com/faratech/fwdslash (MIT).
+
+**The update path needs the published version to increase.** The Store already
+requires that of each submission, and the app's own update depends on it twice
+over: `StoreContext` reports an update only for a higher published version, and
+the watchdog that brings the app back after an install waits for
+`Get-AppxPackage` to report a version greater than the one that was running.
+**0.0.5 is the first release that carries this feature** — a 0.0.4 or earlier
+Store install has no update code path at all, so the first self-update anyone
+can observe is a 0.0.5 install being offered 0.0.6.
 
 ## 4. Listing requirements not satisfied by the package
 

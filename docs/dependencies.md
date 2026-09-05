@@ -54,9 +54,17 @@ them, so they do not have to agree.
 **`fwdslash.exe` joined the 0.62 island** for the self-update path. The Store
 query (`Windows.Services.Store.StoreContext`) and the Store install path
 (`AppInstallManager`, below) are WinRT, so the CLI now carries `windows` 0.62.2
-with the features `Services_Store`, `Foundation`, `Foundation_Collections`,
-`ApplicationModel` and `Win32_System_Com` — plus three companions the vendored
-bindings name directly:
+with six features, each earning its place:
+
+| Feature | Why |
+|---|---|
+| `Services_Store` | `StoreContext` — the sanctioned update query, and route 2's silent download and install |
+| `Foundation`, `Foundation_Collections` | the `TypedEventHandler` and collection types the vendored InstallControl bindings reference |
+| `ApplicationModel` | the `Package` a `StorePackageUpdate` names, so a check can report the version it would install |
+| `Networking_Connectivity` | `NetworkInformation::GetInternetConnectionProfile()` and its `GetConnectionCost()` — the metered-network probe that suppresses the winget route, which downloads regardless of the user's data settings |
+| `Win32_System_Com` | the one `CoInitializeEx(MTA)`/`CoUninitialize` pair the update verbs need. COM is initialised **only** inside `crates/fsw-cli/src/update/`, so the `cd /` hot path every `dir` spawns pays nothing for it |
+
+Plus three companions the vendored bindings name directly:
 
 | Crate | Version | Why it is named directly |
 |---|---|---|
@@ -92,7 +100,7 @@ once and committed.
 | Metadata | `C:\Program Files (x86)\Windows Kits\10\UnionMetadata\10.0.26100.0\Windows.winmd` |
 | Generator | `windows-bindgen` 0.62.1 |
 | Regenerate | `python3 tools/regen_install_control.py` (`--check` for CI mode) |
-| Size | ~95 KB, ~2.5k lines, no runtime cost when unused (the ARM64 release `fwdslash.exe` was byte-for-byte the same size before and after adding it: fat LTO drops what nothing calls) |
+| Size | ~95 KB, ~2.5k lines, almost no cost until it is called: adding the file moved the ARM64 release `fwdslash.exe` by 1,536 bytes, because fat LTO drops what nothing calls. Calling it is what the +43 KB in `docs/size-baseline.md` measures |
 
 Two things about the generator are not obvious:
 
@@ -121,6 +129,17 @@ against it, but only when the runner carries the SDK version recorded above
 (a different `Windows.winmd` legitimately produces different bindings); it warns
 and skips otherwise. `.gitattributes` pins `*.rs` to `eol=lf` so that check is
 not defeated by a CRLF checkout.
+
+**The vendored bindings are never edited by hand.** They are generator output,
+and CI compares the committed bytes against a fresh generation, so a hand edit
+shows up as drift and fails the job. Everything that would otherwise be an edit
+has another home: `#[rustfmt::skip]` sits on the `pub mod install_control;`
+declaration rather than in the file, the lint allows are scoped to the module,
+and an API the current filter excludes is a change to
+`tools/regen_install_control.py` followed by a regeneration. The same rule holds
+for `crates/windows-reactor/`, with one deliberate difference — that crate *is*
+patched locally (`docs/divergences.md` lists each patch), because it is vendored
+source rather than regenerable output.
 
 `fswbroker` stays on 0.62.2 for v1 because 0.100 dropped the three things its UI
 Automation path depends on: all 351 `UIA_*PropertyId`/`UIA_*PatternId` constants,

@@ -190,6 +190,12 @@ Three user-mode binaries share one static core and cooperate at runtime:
   upgrades it in place (uninstall transaction, then install transaction) — and that upgrade is
   **automatic**: the broker sweeps every installed adapter at startup and the settings window
   sweeps again on launch, so `fwdslash integration <id> enable` is only the manual fallback.
+  It also owns the **whole** self-update pipeline: `update check|install|status`, plus the two
+  helper-only verbs (`apply-store`, `apply-bundle`) that are absent from `usage()` and exit 20
+  under package identity. The broker and the settings window contain no update logic — they run
+  `fwdslash update` and key on its exit code (`0` up to date / install started, `10` available
+  or deferred, `11` needs the user, `12` nothing to install, `1` error, `2` usage, `20` wrong
+  context) or its one JSON line. See Dual-track distribution below.
 - **`fswsettings.exe`** — Rust desktop app on the vendored `windows-reactor` crate (Windows App
   Runtime **2.x**). It has **no tray icon and no watchdog**: closing the window exits the
   process, and the broker keeps the icon. Controller calls and state reads run on the thread
@@ -228,8 +234,14 @@ distribution always wins over a same-named directory.
 Runtime settings live under `HKCU\Software\ForwardSlashWindows\Settings` — `Disabled` (DWORD,
 global pause), `BareSlashMode` (DWORD, 0 = distribution list / 1 = default distribution),
 `BareSlashDistribution` (string, the pin), `BareSlashRoot` (string, the custom folder root —
-Rust only), and, in the GitHub flavor only, `AutoUpdate` / `LastUpdateCheck` /
-`AvailableUpdate`. Anything reading two or more of them should take
+Rust only), and — in **both** flavors — `AutoUpdate` / `LastUpdateCheck` / `AvailableUpdate`,
+plus the read-only `UpdateRoute` override (`auto|appinstall|store|winget|notify`, never written
+by the product). `AutoUpdate` is the one value whose *absent* meaning depends on the flavor:
+`fsw_core::update::default_auto_update(store_flavor) = !store_flavor`, so nothing stored means
+on for the GitHub build and off for the Store build, while the stored encoding stays the
+inverted DWORD it always was (`1` = off) so an explicit "off" never flips. The gate itself,
+`update_check_allowed(packaged, auto_update)`, no longer knows about flavors at all.
+Anything reading two or more of them should take
 `fsw_core::SettingsValues::read()`, which opens the key once; the single-value getters delegate
 to it.
 
@@ -374,15 +386,44 @@ workspace-aware dependency updater and enforces the island pins listed in its `I
 
 Two package flavors ship from the same tree: the **Store** build (Identity
 publisher `CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4`, family
-`32827MikeFara.fwdslash_t6j5qexy2jpp2`, updated by the Store) and the
-**GitHub** build (publisher `CN=Mike Fara, O=Mike Fara, …`, Trusted
-Signing-signed by `.github/workflows/release.yml`, self-updating via
-`crates/fsw-core/src/update.rs` — daily GitHub check, `Add-AppxPackage` of the
-downloaded bundle, gated by `packaged && !is_store_flavor() && AutoUpdate`).
-Flavor is always detected at runtime by package family (`is_store_flavor`),
-never at build time. `signing/` holds the Azure Trusted Signing kit
-(credentials live in GitHub Secrets); `tools/Install-fwdslash.ps1` refuses to
-install the GitHub build over a Store install unless `-Force`.
+`32827MikeFara.fwdslash_t6j5qexy2jpp2`) and the **GitHub** build (publisher
+`CN=Mike Fara, O=Mike Fara, …`, Trusted Signing-signed by
+`.github/workflows/release.yml`). Flavor is always detected at runtime by
+package family (`is_store_flavor`), never at build time. `signing/` holds the
+Azure Trusted Signing kit (credentials live in GitHub Secrets);
+`tools/Install-fwdslash.ps1` refuses to install the GitHub build over a Store
+install unless `-Force`.
+
+**Both flavors now update themselves**, under one `AutoUpdate` switch — on by
+default for GitHub, **off by default for the Store** (opt-in by decision; the
+Store keeps updating a Store install on its own schedule regardless). The GitHub
+route is unchanged in shape (`crates/fsw-core/src/update.rs`: daily
+`api.github.com` check, download, `Add-AppxPackage`); the Store route asks the
+Store itself. **All of it is in the CLI**, `crates/fsw-cli/src/update/` — the
+broker calls `fwdslash update` from its health timer and the settings window
+from its button, and neither carries update logic of its own. The install ladder
+is `appinstall` (winget's `AppInstallManager` sequence, tried in-process first
+and then from the helper) → `store` (`StoreContext` silent install) → `winget`
+(`--source msstore`, skipped on a metered network) → `notify`; `route_for` is
+the pure function that picks, and the `UpdateRoute` value or `--route` pins one
+rung without a rebuild.
+
+Two pieces of that are easy to break. The **helper**,
+`%LOCALAPPDATA%\ForwardSlashWindows\update\fwdslash-helper.exe`, is a
+byte-identical copy of `fwdslash.exe` run **without** package identity, because
+that is the only context in which the Store will replace the calling package and
+`Add-AppxPackage` can register over a running one — and it **never writes
+HKCU** (its writes would land in the real hive that the packaged app does not
+read; it reports through `update\last-result.txt`, which the next packaged
+`check`/`status` folds in and deletes). The **watchdog** is one per-user
+scheduled task, `fwdslash-update`, registered *before* the install because a
+force-closed process cannot relaunch itself; it polls `Get-AppxPackage` until
+the version advances and then starts the broker through the app-execution alias
+(`--relaunch app|broker|none`). Its script must contain no `%` and no `"` —
+`cmd.exe` would eat both — and every literal spliced into it is checked by
+`is_safe_task_literal` first. `docs/divergences.md` has the full section,
+`docs/store-submission.md` §3 the certification wording, `PRIVACY.md` what
+leaves the machine.
 
 One `release.yml` run produces **both**: it signs the GitHub flavor, then
 packages the tree again with the packager's default (Partner Center) identity
