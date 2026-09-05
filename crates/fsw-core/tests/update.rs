@@ -4,8 +4,9 @@
 //! verification matrix.
 
 use fsw_core::update::{
-    check_is_due, extract_bundle_url, extract_tag_name, is_newer_version, normalize_running_version,
-    parse_version, update_check_allowed, UpdateOutcome,
+    auto_update_from_value, check_is_due, default_auto_update, extract_bundle_url, extract_tag_name,
+    format_last_check, is_newer_version, normalize_running_version, parse_version,
+    update_check_allowed, UpdateOutcome,
 };
 use fsw_core::{
     package_family_from_full_name, package_version_from_full_name,
@@ -166,14 +167,58 @@ fn check_is_due_respects_the_daily_cadence() {
 
 #[test]
 fn update_check_allowed_truth_table() {
-    // GitHub flavor, packaged, auto-update on.
-    assert!(update_check_allowed(true, false, true));
-    // Never: unpackaged.
-    assert!(!update_check_allowed(false, false, true));
-    // Never: the Store flavor.
-    assert!(!update_check_allowed(true, true, true));
-    // Never: auto-update switched off.
-    assert!(!update_check_allowed(true, false, false));
+    // The gate is two booleans now: the flavor moved out of it, because both
+    // flavors check (through different services). Exhaustive, all four rows.
+    assert!(update_check_allowed(true, true));
+    assert!(!update_check_allowed(true, false));
+    assert!(!update_check_allowed(false, true));
+    assert!(!update_check_allowed(false, false));
+}
+
+#[test]
+fn auto_update_defaults_by_flavor() {
+    // GitHub: this is its only update route, so on.
+    assert!(default_auto_update(false));
+    // Store: the Store already updates on its own schedule; driving it from
+    // inside the app is opt-in by decision.
+    assert!(!default_auto_update(true));
+}
+
+#[test]
+fn stored_auto_update_value_keeps_its_inverted_meaning() {
+    // The stored DWORD is the DISABLED flag: 1 means off, 0 means on. That
+    // encoding predates the Store flavor joining the switch and must not
+    // change, or every recorded "off" would silently flip to "on".
+    for store_flavor in [false, true] {
+        assert!(auto_update_from_value(Some(0), store_flavor));
+        assert!(!auto_update_from_value(Some(1), store_flavor));
+        // Any other nonzero is still "off": the value is a flag, not an enum.
+        assert!(!auto_update_from_value(Some(7), store_flavor));
+    }
+    // Only the absent case consults the flavor.
+    assert!(auto_update_from_value(None, false));
+    assert!(!auto_update_from_value(None, true));
+}
+
+#[test]
+fn format_last_check_reads_as_an_age() {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    let now = 1_000 * DAY;
+
+    assert_eq!(format_last_check(now, None), "never");
+    assert_eq!(format_last_check(now, Some(now)), "just now");
+    assert_eq!(format_last_check(now, Some(now - 59)), "just now");
+    assert_eq!(format_last_check(now, Some(now - MINUTE)), "1 minute ago");
+    assert_eq!(format_last_check(now, Some(now - 2 * MINUTE)), "2 minutes ago");
+    assert_eq!(format_last_check(now, Some(now - HOUR)), "1 hour ago");
+    assert_eq!(format_last_check(now, Some(now - 23 * HOUR)), "23 hours ago");
+    assert_eq!(format_last_check(now, Some(now - DAY)), "1 day ago");
+    assert_eq!(format_last_check(now, Some(now - 9 * DAY)), "9 days ago");
+    // A clock that moved backwards reads as "just now", never as a negative
+    // age: saturating_sub, not a wrapping one.
+    assert_eq!(format_last_check(now, Some(now + DAY)), "just now");
 }
 
 #[test]

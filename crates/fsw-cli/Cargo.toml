@@ -30,7 +30,10 @@ windows-sys = { workspace = true, features = [
 ] }
 # The self-update path only. `Services_Store` is StoreContext (the sanctioned
 # update query); `Foundation` covers the `TypedEventHandler` the vendored
-# InstallControl bindings reference; `Win32_System_Com` is the one
+# InstallControl bindings reference; `ApplicationModel` is the `Package` a
+# `StorePackageUpdate` names, so a check can report the version it would
+# install; `Networking_Connectivity` is the metered-network probe that
+# suppresses the winget route; `Win32_System_Com` is the one
 # `CoInitializeEx` the update verbs need and nothing else in this binary does.
 # This puts fwdslash.exe on the 0.62 island alongside fswbroker.exe --
 # docs/dependencies.md.
@@ -39,6 +42,7 @@ windows = { workspace = true, features = [
     "Foundation",
     "Foundation_Collections",
     "ApplicationModel",
+    "Networking_Connectivity",
     "Win32_System_Com",
 ] }
 # What crates/fsw-cli/src/update/install_control.rs is generated against.

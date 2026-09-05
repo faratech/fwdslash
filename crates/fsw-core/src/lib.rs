@@ -70,6 +70,20 @@ pub const STORE_IDENTITY_NAME: &str = "32827MikeFara.fwdslash";
 pub const STORE_PUBLISHER: &str = "CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4";
 pub const STORE_PACKAGE_FAMILY: &str = "32827MikeFara.fwdslash_t6j5qexy2jpp2";
 
+/// The Store **product id** (the `9P…` Store ID assigned in Partner Center),
+/// as distinct from the package family. Both self-update routes that talk to
+/// the Store — `AppInstallManager` and `winget --source msstore` — address the
+/// product by this, never by family name.
+pub const STORE_PRODUCT_ID: &str = "9P51CM0MTMK2";
+
+/// The settings window's caption and owning process image: the pair that
+/// identifies it, because the caption alone is not unique (`fsw-settings`
+/// learned that the hard way, and keeps its own private copies of these two
+/// for its single-instance guard). The update path needs them here so it can
+/// answer "would installing now close a window the user is looking at?".
+pub const FSW_SETTINGS_WINDOW_TITLE: &str = "Forward Slash Windows";
+pub const FSW_SETTINGS_IMAGE_NAME: &str = "fswsettings.exe";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(isize)]
 pub enum BrokerState {
@@ -727,6 +741,104 @@ pub fn broker_window_exists() -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+/// Whether a settings window of *this product* is open on this desktop.
+///
+/// A caption match alone is not enough: the broker owns a never-shown top-level
+/// window and anything else may use the same caption, so the owning process
+/// image has to be `fswsettings.exe` as well — the same test
+/// `find_settings_window` in `crates/fsw-settings/src/main.rs` makes for its
+/// single-instance guard. Unlike that one this enumerates *every* process's
+/// windows, because the caller is a different process by construction.
+///
+/// The self-updater's "is this a good moment?" gate: an install that force
+/// closes the package must not happen underneath a window the user is using.
+#[must_use]
+pub fn settings_window_exists() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+        };
+
+        struct Search {
+            title: Vec<u16>,
+            found: bool,
+        }
+
+        unsafe extern "system" fn on_window(window: HWND, lparam: isize) -> i32 {
+            unsafe {
+                let state = &mut *(lparam as *mut Search);
+                let length = GetWindowTextLengthW(window);
+                if length <= 0 {
+                    return 1;
+                }
+                let mut text = vec![0u16; (length as usize) + 1];
+                GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32);
+                // `title` carries its NUL; compare the caption against the rest.
+                if text.get(..length as usize) != state.title.get(..state.title.len() - 1) {
+                    return 1;
+                }
+                let mut owner = 0u32;
+                GetWindowThreadProcessId(window, &raw mut owner);
+                if owner != 0 && process_image_is(owner, FSW_SETTINGS_IMAGE_NAME) {
+                    state.found = true;
+                    return 0;
+                }
+                1
+            }
+        }
+
+        let mut state = Search {
+            title: to_wide(FSW_SETTINGS_WINDOW_TITLE),
+            found: false,
+        };
+        // SAFETY: the callback only touches the `Search` this pointer names,
+        // and that outlives the enumeration.
+        unsafe { EnumWindows(Some(on_window), (&raw mut state) as isize) };
+        state.found
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Whether `pid` runs an image whose basename is `image_name`, compared
+/// case-insensitively. An unreadable process is never a match.
+#[cfg(windows)]
+fn process_image_is(pid: u32, image_name: &str) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+
+    // SAFETY: every handle opened here is closed before the value is read, and
+    // the buffer length is passed in and back by the API itself.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut image = [0u16; 1024];
+        let mut length = image.len() as u32;
+        let queried =
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, image.as_mut_ptr(), &mut length);
+        CloseHandle(handle);
+        if queried == 0 {
+            return false;
+        }
+        let Some(slice) = image.get(..length as usize) else {
+            return false;
+        };
+        String::from_utf16_lossy(slice)
+            .rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(image_name))
     }
 }
 
