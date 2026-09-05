@@ -517,11 +517,11 @@ FswInstanceSetup(_In_ PCFLT_RELATED_OBJECTS FltObjects,
 //
 //    1. not an IRP-based create, kernel-mode requestor, or IRQL above
 //       PASSIVE_LEVEL                                    -> pass through
-//    2. paging-file open, volume open, open-by-file-id, or a target-directory
-//       open (SL_OPEN_TARGET_DIRECTORY - the IRP-level spelling of the
-//       rename/link "FILE_OPEN_TARGET_DIRECTORY" create; the caller wants the
-//       parent directory back, and reparsing it would retarget the rename)
+//    2. paging-file open, volume open, or open-by-file-id
 //                                                        -> pass through
+//       A target-directory open (SL_OPEN_TARGET_DIRECTORY, the IRP-level
+//       spelling of the rename/hard-link "FILE_OPEN_TARGET_DIRECTORY" create)
+//       is deliberately NOT on this list; see the note below.
 //    3. relative open (RelatedFileObject != NULL).  STATUS_REPARSE hands the
 //       object manager an absolute `\??\UNC\...` name, but a relative open
 //       re-parses it against the related object, which yields a nonsense path.
@@ -548,6 +548,32 @@ FswInstanceSetup(_In_ PCFLT_RELATED_OBJECTS FltObjects,
 //  checked build, and none of the conditions above is a driver bug.  Nothing
 //  on this path logs, and no path text ever leaves kernel memory.
 //
+//  Target-directory opens (issue #40).  A rename or hard link is two IRPs: the
+//  I/O manager first issues a create carrying SL_OPEN_TARGET_DIRECTORY for the
+//  target, then a set-information (FileRenameInformation / FileLinkInformation)
+//  on the source file object naming that opened parent.  The name on that
+//  create is the FULL target path - the "give me the parent" semantics live in
+//  the flag, which is part of the create parameters and survives a reparse - so
+//  the open is run through exactly the pipeline an ordinary create takes.  This
+//  filter used to exclude it, which left the target parent resolving against
+//  the native C:\<distro> while the source lived on the redirected volume, and
+//  every rename or link through the alias failed with directory-not-found.
+//
+//  It cannot produce a cross-volume rename: source and target go through the
+//  same first-component, identity and eligibility gate on the same create path,
+//  so a target under a distribution the caller owns is redirected exactly when
+//  its source was, and both file objects land on the same \Device\Mup volume.
+//  A target under a name that does NOT match (or a caller that is not eligible)
+//  is left alone and the filesystem returns STATUS_NOT_SAME_DEVICE - the honest
+//  answer, since the alias really is a different volume, and the answer callers
+//  such as MoveFileEx already handle by copy-and-delete.
+//
+//  It cannot loop, either: the replacement name is \??\UNC\wsl.localhost\...,
+//  which resolves onto \Device\Mup, and FswInstanceSetup attaches only to
+//  FILE_DEVICE_DISK_FILE_SYSTEM volumes, so the filter has no instance on the
+//  path the reparse lands on and never sees the re-issued create.  Phase a of
+//  tools/Test-Driver.ps1 asserts that attach set directly.
+//
 FLT_PREOP_CALLBACK_STATUS
 FswPreCreate(_Inout_ PFLT_CALLBACK_DATA Data,
              _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -572,8 +598,7 @@ FswPreCreate(_Inout_ PFLT_CALLBACK_DATA Data,
   //
   if (!FLT_IS_IRP_OPERATION(Data) || Data->RequestorMode != UserMode ||
       KeGetCurrentIrql() != PASSIVE_LEVEL ||
-      FlagOn(Data->Iopb->OperationFlags,
-             SL_OPEN_PAGING_FILE | SL_OPEN_TARGET_DIRECTORY) ||
+      FlagOn(Data->Iopb->OperationFlags, SL_OPEN_PAGING_FILE) ||
       FlagOn(Data->Iopb->TargetFileObject->Flags, FO_VOLUME_OPEN) ||
       FlagOn(Data->Iopb->Parameters.Create.Options, FILE_OPEN_BY_FILE_ID)) {
     return FLT_PREOP_SUCCESS_NO_CALLBACK;

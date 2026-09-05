@@ -122,7 +122,8 @@ that produces its evidence. `docs/driver-lab.md` is the operator runbook.
 |---|---|---|
 | Unsigned/test-signed installation only in a checkpointed Hyper-V guest | a | ARM64 guest, Win 26200.9278, FakeShare, Verifier `0x93B`, 2026-09-05: PASS |
 | Alias-versus-UNC parity for create, read, write, enumerate, metadata, long and Unicode paths | c | ARM64 guest, FakeShare, Verifier `0x93B`, 2026-09-05 (post-#39 fix, reproduced across two clean runs): PASS for create, read, write, enumerate, metadata, long paths (up to 276/289 characters), Unicode names, trailing-dot/trailing-space names, and PowerShell/.NET/Win32/cmd access — alias and UNC agree in every case |
-| Rename and delete through the alias | c | **FAIL, by design — issue #40.** `Rename-Item`/`Remove-Item` through `C:\Ubuntu` throw `DirectoryNotFoundException`; `New-Item` and every other mutation work. Root cause in `driver/fswfilter/fswfilter.c` (`FswPreCreate` fail-open list, item 2): the driver deliberately does not redirect `SL_OPEN_TARGET_DIRECTORY` opens (what a rename's target-directory lookup uses) "the caller wants the parent directory back, and reparsing it would retarget the rename". Since the alias root has no real parent on disk, that lookup fails. Reproduced identically on two consecutive runs. Use the UNC path for rename/delete until #40 is triaged; not a harness defect |
+| Delete through the alias | c | ARM64 guest, FakeShare, Verifier `0x93B`, 2026-09-05 (post-#40 fix): **PASS.** `Remove-Item` through `C:\Ubuntu` removes the file and the UNC path agrees. It had been recorded as a failure only because it shared a try block with the rename below; each mutation now has its own block and its own file |
+| Rename, move and hard link through the alias | c | **FAIL — issue #49** (issue #40's specific defect is fixed). With `SL_OPEN_TARGET_DIRECTORY` creates now reparsed like any other create, the target-directory open resolves onto the redirected volume — `Rename-Item`'s `DirectoryNotFoundException` became a real filesystem status — but the operation still does not complete: rename returns `NTSTATUS 0xC0000022 STATUS_ACCESS_DENIED` (surfacing as `UnauthorizedAccessException`, `ERROR_ACCESS_DENIED` from `MoveFileExW`, `IOException` from `File.Move`) and hard link returns `0xC0000035 STATUS_OBJECT_NAME_COLLISION` (`ERROR_ALREADY_EXISTS` from `CreateHardLinkW`/`New-Item -ItemType HardLink`). **The UNC control passes**: the harness now runs the identical user-mode strategy (`NtSetInformationFile` with `FileRenameInformation`/`FileLinkInformation`, null `RootDirectory`, full NT target path — what `MoveFileEx` and `CreateHardLink` issue) against `\\wsl.localhost\Ubuntu\...` and gets `nt=0x00000000` for both, so the gap is the filter's reparse of that create, not the backing share. Use the UNC path for rename, move and hard link |
 | Standard and elevated callers redirected; AppContainer and SYSTEM not | d | ARM64 guest, FakeShare, 2026-09-05: PASS for elevated, standard-integrity and SYSTEM (all three correctly redirected/not-redirected, each via a nested nested `schtasks` probe). AppContainer still pending: `Invoke-CommandInDesktopPackage` times out after 20 s when the harness itself runs inside the interactive `FswGate` scheduled task (nested-task-inside-a-task; a harness/launch-path limitation, not evidence about the driver) — re-run this one case from a plain elevated console to clear the cell |
 | ARM64 native, x64 emulated and x86 emulated callers; native x64 in an x64 VM | c (re-run per lab) | VM gate pending; x64 lab not stood up |
 | Two concurrent users and sessions with different WSL registrations | not automated | VM gate pending |
@@ -139,11 +140,13 @@ that produces its evidence. `docs/driver-lab.md` is the operator runbook.
 | Applicable HLK filter/filesystem playlists and Microsoft production signing | out of scope of the lab | Deferred (Tier 3: altitude allocation, Partner Center, attestation signing) |
 
 **Driver gate status 2026-09-05 (ARM64 guest, Win 26200.9278, FakeShare,
-Driver Verifier `0x93B`).** Six runs total, two kernel faults found and fixed,
-one lab-plumbing defect found and fixed, one architectural driver limitation
-newly surfaced. The harness now runs the whole matrix through teardown twice
-in a row with the port actually connected: `63 passed / 2 failed / 4 skipped`,
-identical on both runs.
+Driver Verifier `0x93B`).** Eight runs total, two kernel faults found and
+fixed, one lab-plumbing defect found and fixed, one driver limitation found,
+partly fixed and re-scoped. The harness runs the whole matrix through teardown
+with the port connected on every run since the #39 fix. Latest:
+`64 passed / 7 failed / 4 skipped`, no bugcheck — the failures are the
+rename/move/hard-link family tracked by #49, and the count rose because the
+run before it (`63 passed / 2 failed`) had only two of these rows at all.
 
 - **Fixed (issue #36).** The guest bugchecked `0x0000003B`
   `SYSTEM_SERVICE_EXCEPTION` (param 1 `0xC0000005`) on the broker's first
@@ -195,11 +198,33 @@ identical on both runs.
   through a bounded (job + `Wait-Job -Timeout`) wrapper, and the `/st` value
   is computed in the future instead of a fixed `00:00`.
 
-- **New (issue #40) — a driver behavior, not touched.** `Rename-Item` and
-  `Remove-Item` through the alias fail with `DirectoryNotFoundException`,
-  reproduced identically across two clean runs. The driver's own source
-  comment explains this is deliberate (see the table row above and #40) —
-  logged for review rather than patched blind.
+- **Fixed (issue #40), partly — remainder is issue #49.** `FswPreCreate` had
+  `SL_OPEN_TARGET_DIRECTORY` in its fail-open list, so the create the I/O
+  manager issues for a rename or hard-link target's **parent directory** was
+  never reparsed: it resolved against the native `C:\<distro>` while the source
+  file object lived on the redirected volume, and every rename through the
+  alias failed with `DirectoryNotFoundException`. That exclusion is gone; the
+  create now runs the ordinary pipeline (the name on it is the full target
+  path, and the parent-open semantics live in the flag, which survives the
+  reparse). It cannot cause a cross-volume rename — source and target pass the
+  same first-component/identity/eligibility gate, so they redirect together,
+  and a non-matching target correctly yields `STATUS_NOT_SAME_DEVICE` — and it
+  cannot loop, because the replacement name lands on `\Device\Mup` and
+  `FswInstanceSetup` attaches only to `FILE_DEVICE_DISK_FILE_SYSTEM` volumes
+  (step a asserts exactly that). Verified: `Remove-Item` through the alias
+  passes and the rename's error moved from path resolution to the filesystem.
+  The operation still does not complete — `STATUS_ACCESS_DENIED` for rename,
+  `STATUS_OBJECT_NAME_COLLISION` for hard link, while the new UNC control
+  succeeds — which is **issue #49**.
+
+- **New harness coverage for this family.** Every mutation row now has its own
+  try block and its own file (a rename failure used to abort the sequence and
+  report the delete as a failure that was never attempted), and rename/move/
+  hard link are each measured through the UNC path first as a **control**,
+  using `NtSetInformationFile` directly so the transcript carries the raw
+  NTSTATUS instead of the Win32 error the shell APIs collapse it into. A
+  control that fails skips its alias row with the reason instead of blaming
+  the driver for a limitation of the backing filesystem.
 
 Rows covered by steps that do not need a published mapping — a, f, g, h — were
 already recorded from the 2026-09-05 post-#38 run and are unchanged. Steps b

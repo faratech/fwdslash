@@ -20,7 +20,9 @@
          fltmc load, altitude 371120, instances on disk volumes only
       b  broker publish: fwdslash start, driverConnected true within 10 s
       c  alias-versus-UNC parity for the operation matrix, through the
-         PowerShell provider, .NET, Win32 CreateFileW, cmd.exe and python
+         PowerShell provider, .NET, Win32 CreateFileW, cmd.exe and python,
+         including the rename / move / hard-link mutations that open the
+         target's parent directory (SL_OPEN_TARGET_DIRECTORY, issue #40)
       d  identity rules: standard and elevated redirected; AppContainer and
          SYSTEM not redirected
       e  broker lifecycle: stop, crash, restart, malformed messages, slot reuse
@@ -276,6 +278,7 @@ if (-not ('FswLab.Native' -as [type])) {
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace FswLab {
   public static class Native {
@@ -286,12 +289,26 @@ namespace FswLab {
     private static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetFileAttributesW(string name);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool MoveFileExW(string existing, string replacement, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateHardLinkW(string link, string existing, IntPtr sa);
+    [DllImport("ntdll.dll")]
+    private static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb,
+                                                   IntPtr info, uint length, int infoClass);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IoStatusBlock { public IntPtr Status; public IntPtr Information; }
 
     private const uint GenericRead = 0x80000000;
+    private const uint Delete = 0x00010000;
+    private const uint Synchronize = 0x00100000;
     private const uint ShareAll = 0x00000007;
     private const uint OpenExisting = 3;
     private const uint BackupSemantics = 0x02000000;
     private static readonly IntPtr Invalid = new IntPtr(-1);
+    private const int FileRenameInformation = 10;
+    private const int FileLinkInformation = 11;
 
     // 0 on success, else the Win32 error. Comparing the error code as well as
     // success is what makes an alias-versus-UNC comparison meaningful.
@@ -304,6 +321,65 @@ namespace FswLab {
     }
 
     public static uint Attributes(string path) { return GetFileAttributesW(path); }
+
+    // 0 on success, else the Win32 error. The flags are deliberately 0: with
+    // MOVEFILE_COPY_ALLOWED a cross-volume rename silently degrades into a
+    // copy-and-delete, which would hide exactly the STATUS_NOT_SAME_DEVICE
+    // failure this row exists to catch (issue #40).
+    public static int MoveStatus(string existing, string replacement) {
+      if (MoveFileExW(existing, replacement, 0)) { return 0; }
+      return Marshal.GetLastWin32Error();
+    }
+
+    // 0 on success, else the Win32 error. A hard link is the other operation
+    // whose target parent is opened with SL_OPEN_TARGET_DIRECTORY.
+    public static int HardLinkStatus(string link, string existing) {
+      if (CreateHardLinkW(link, existing, IntPtr.Zero)) { return 0; }
+      return Marshal.GetLastWin32Error();
+    }
+
+    // \??\ form of a Win32 path, the shape MoveFileEx and CreateHardLink put
+    // in the rename/link information they hand NtSetInformationFile.
+    private static string ToNtPath(string path) {
+      if (path.StartsWith(@"\\")) { return @"\??\UNC" + path.Substring(1); }
+      return @"\??\" + path;
+    }
+
+    // The rename/link primitive itself, with the raw NTSTATUS instead of the
+    // Win32 error the shell APIs collapse it into. A full NT target path with a
+    // null RootDirectory is what makes the I/O manager open the target's PARENT
+    // directory with SL_OPEN_TARGET_DIRECTORY - the create issue #40 is about -
+    // so this is the narrowest observation of that path there is. Run against
+    // the UNC name it is a control: identical user-mode strategy, but a path
+    // the filter never sees.
+    private static string SetNameInformation(string source, string target, int infoClass) {
+      IntPtr handle = CreateFileW(source, GenericRead | Delete | Synchronize, ShareAll,
+                                  IntPtr.Zero, OpenExisting, BackupSemantics, IntPtr.Zero);
+      if (handle == Invalid) { return "open-failed:" + Marshal.GetLastWin32Error(); }
+      try {
+        byte[] name = Encoding.Unicode.GetBytes(ToNtPath(target));
+        int size = 20 + name.Length;
+        IntPtr buffer = Marshal.AllocHGlobal(size);
+        try {
+          for (int i = 0; i < size; i++) { Marshal.WriteByte(buffer, i, 0); }
+          Marshal.WriteByte(buffer, 0, 0);              // ReplaceIfExists = FALSE
+          Marshal.WriteIntPtr(buffer, 8, IntPtr.Zero);  // RootDirectory = NULL
+          Marshal.WriteInt32(buffer, 16, name.Length);  // FileNameLength, in bytes
+          Marshal.Copy(name, 0, new IntPtr(buffer.ToInt64() + 20), name.Length);
+          IoStatusBlock iosb;
+          int status = NtSetInformationFile(handle, out iosb, buffer, (uint)size, infoClass);
+          return "nt=0x" + unchecked((uint)status).ToString("X8");
+        } finally { Marshal.FreeHGlobal(buffer); }
+      } finally { CloseHandle(handle); }
+    }
+
+    public static string RenameStatus(string source, string target) {
+      return SetNameInformation(source, target, FileRenameInformation);
+    }
+
+    public static string LinkStatus(string existing, string link) {
+      return SetNameInformation(existing, link, FileLinkInformation);
+    }
 
     public static double MeasureCreateMilliseconds(string path, int iterations) {
       for (int warm = 0; warm < 200; warm++) {
@@ -786,23 +862,142 @@ Invoke-Step 'parity matrix' {
     }
     Assert-True $wroteThrough '[ps] Set-Content through the alias is visible through the UNC path' | Out-Null
 
-    # New-Item / Rename-Item / Remove-Item through the alias, observed through
-    # the UNC path.
-    $created = $false; $renamed = $false; $removed = $false
+    # Mutations through the alias, observed through the UNC path. Every row
+    # gets its own try block and its own file: the single shared sequence used
+    # to abort at the first throw, so a rename failure reported the remove as a
+    # failure that was never actually attempted (issue #40).
+    $created = $false
     try {
         New-Item -ItemType File -Path (Join-Path $aliasDirectory 'created.txt') -Force | Out-Null
         $created = Test-Path -LiteralPath (Join-Path $uncDirectory 'created.txt')
-        Rename-Item -LiteralPath (Join-Path $aliasDirectory 'created.txt') -NewName 'renamed.txt'
-        $renamed = (Test-Path -LiteralPath (Join-Path $uncDirectory 'renamed.txt')) -and
-                   (-not (Test-Path -LiteralPath (Join-Path $uncDirectory 'created.txt')))
-        Remove-Item -LiteralPath (Join-Path $aliasDirectory 'renamed.txt') -Force
-        $removed = -not (Test-Path -LiteralPath (Join-Path $uncDirectory 'renamed.txt'))
     } catch {
-        Write-Host "   note: mutation sequence threw: $($_.Exception.GetType().Name)"
+        Write-Host "   note: New-Item threw: $($_.Exception.GetType().Name)"
     }
     Assert-True $created '[ps] New-Item through the alias' | Out-Null
-    Assert-True $renamed '[ps] Rename-Item through the alias' | Out-Null
+
+    # -- rename and hard link (SL_OPEN_TARGET_DIRECTORY, issue #40) ---------
+    #
+    # A rename or hard link with a full target path makes the I/O manager open
+    # the TARGET's parent directory with SL_OPEN_TARGET_DIRECTORY; issue #40 is
+    # about whether the filter reparses that create like any other. Every row
+    # below is therefore measured through the UNC path FIRST, as a control:
+    # the control runs the identical user-mode strategy against a name the
+    # filter never sees, so if it fails, the limitation belongs to the backing
+    # filesystem - on a -FakeShare run that is an SMB loopback share, not 9P -
+    # and the alias row is SKIPPED instead of being blamed on the driver.
+    #
+    # The controls use NtSetInformationFile directly so the transcript carries
+    # the raw NTSTATUS rather than the Win32 error the shell APIs collapse it
+    # into (STATUS_NOT_SAME_DEVICE and STATUS_ACCESS_DENIED are very different
+    # findings and both reach PowerShell as an exception type).
+    Set-Content -LiteralPath (Join-Path $uncDirectory 'nt-rename-control.txt') -Value 'nt-rename' -NoNewline -Encoding ascii
+    $ntRenameControl = [FswLab.Native]::RenameStatus((Join-Path $uncDirectory 'nt-rename-control.txt'),
+                                                     (Join-Path $uncDirectory 'nt-renamed-control.txt'))
+    Set-Content -LiteralPath (Join-Path $uncDirectory 'nt-rename-alias.txt') -Value 'nt-rename' -NoNewline -Encoding ascii
+    $ntRenameAlias = [FswLab.Native]::RenameStatus((Join-Path $aliasDirectory 'nt-rename-alias.txt'),
+                                                   (Join-Path $aliasDirectory 'nt-renamed-alias.txt'))
+    Write-Host "   NtSetInformationFile(FileRenameInformation): unc control $ntRenameControl, through the alias $ntRenameAlias"
+    $renameSupported = ($ntRenameControl -ceq 'nt=0x00000000')
+    if (-not $renameSupported) {
+        $renameSkipReason = "the UNC control cannot rename either ($ntRenameControl) - the backing filesystem, not the driver"
+        Add-Skip 'rename through the alias (NtSetInformationFile)' $renameSkipReason
+    } else {
+        Assert-True ($ntRenameAlias -ceq 'nt=0x00000000') 'rename through the alias (NtSetInformationFile, full NT target path)' "(alias $ntRenameAlias, unc control $ntRenameControl)" | Out-Null
+    }
+
+    $renamed = $false
+    if (-not $renameSupported) {
+        Add-Skip '[ps] Rename-Item through the alias' $renameSkipReason
+    } else {
+        try {
+            Rename-Item -LiteralPath (Join-Path $aliasDirectory 'created.txt') -NewName 'renamed.txt' -ErrorAction Stop
+            $renamed = (Test-Path -LiteralPath (Join-Path $uncDirectory 'renamed.txt')) -and
+                       (-not (Test-Path -LiteralPath (Join-Path $uncDirectory 'created.txt')))
+        } catch {
+            Write-Host "   note: Rename-Item threw: $($_.Exception.GetType().Name)"
+        }
+        Assert-True $renamed '[ps] Rename-Item through the alias' | Out-Null
+    }
+
+    # Its own file, created through the UNC path, so this row stands whether or
+    # not the rename above worked.
+    $removeName = 'remove-me.txt'
+    Set-Content -LiteralPath (Join-Path $uncDirectory $removeName) -Value 'remove-me' -NoNewline -Encoding ascii
+    $removed = $false
+    try {
+        Remove-Item -LiteralPath (Join-Path $aliasDirectory $removeName) -Force -ErrorAction Stop
+        $removed = -not (Test-Path -LiteralPath (Join-Path $uncDirectory $removeName))
+    } catch {
+        Write-Host "   note: Remove-Item threw: $($_.Exception.GetType().Name)"
+    }
     Assert-True $removed '[ps] Remove-Item through the alias' | Out-Null
+
+    # .NET System.IO.File.Move and Win32 MoveFileExW: the same rename one and
+    # two layers below the provider. MoveFileExW passes no
+    # MOVEFILE_COPY_ALLOWED on purpose - with it a cross-volume answer would
+    # silently degrade into a copy-and-delete and hide the very thing this row
+    # exists to catch.
+    if (-not $renameSupported) {
+        Add-Skip '[net] File.Move through the alias' $renameSkipReason
+        Add-Skip '[win32] MoveFileExW through the alias' $renameSkipReason
+    } else {
+        Set-Content -LiteralPath (Join-Path $uncDirectory 'net-move-src.txt') -Value 'net-move' -NoNewline -Encoding ascii
+        $netMoved = $false
+        try {
+            [System.IO.File]::Move((Join-Path $aliasDirectory 'net-move-src.txt'),
+                                   (Join-Path $aliasDirectory 'net-move-dst.txt'))
+            $netMoved = (Test-Path -LiteralPath (Join-Path $uncDirectory 'net-move-dst.txt')) -and
+                        (-not (Test-Path -LiteralPath (Join-Path $uncDirectory 'net-move-src.txt')))
+        } catch {
+            Write-Host "   note: File.Move threw: $($_.Exception.GetType().Name)"
+        }
+        Assert-True $netMoved '[net] File.Move alias -> alias, observed through the UNC path' | Out-Null
+
+        Set-Content -LiteralPath (Join-Path $uncDirectory 'win32-move-src.txt') -Value 'win32-move' -NoNewline -Encoding ascii
+        $moveStatus = [FswLab.Native]::MoveStatus((Join-Path $aliasDirectory 'win32-move-src.txt'),
+                                                  (Join-Path $aliasDirectory 'win32-move-dst.txt'))
+        $win32Moved = ($moveStatus -eq 0) -and
+                      (Test-Path -LiteralPath (Join-Path $uncDirectory 'win32-move-dst.txt')) -and
+                      (-not (Test-Path -LiteralPath (Join-Path $uncDirectory 'win32-move-src.txt')))
+        Assert-True $win32Moved '[win32] MoveFileExW alias -> alias, observed through the UNC path' "(error $moveStatus)" | Out-Null
+    }
+
+    # Hard link, the other SL_OPEN_TARGET_DIRECTORY operation, with the same
+    # UNC control - and the same raw-NTSTATUS pair, because CreateHardLinkW
+    # reports STATUS_OBJECT_NAME_COLLISION and a failed target-directory open
+    # as the same ERROR_ALREADY_EXISTS.
+    Set-Content -LiteralPath (Join-Path $uncDirectory 'link-target.txt') -Value 'link-target' -NoNewline -Encoding ascii
+    $ntLinkControl = [FswLab.Native]::LinkStatus((Join-Path $uncDirectory 'link-target.txt'),
+                                                 (Join-Path $uncDirectory 'nt-link-control.txt'))
+    $ntLinkAlias = [FswLab.Native]::LinkStatus((Join-Path $aliasDirectory 'link-target.txt'),
+                                               (Join-Path $aliasDirectory 'nt-link-alias.txt'))
+    Write-Host "   NtSetInformationFile(FileLinkInformation): unc control $ntLinkControl, through the alias $ntLinkAlias"
+    $uncLinkStatus = [FswLab.Native]::HardLinkStatus((Join-Path $uncDirectory 'link-from-unc.txt'),
+                                                     (Join-Path $uncDirectory 'link-target.txt'))
+    if ($ntLinkControl -cne 'nt=0x00000000' -or $uncLinkStatus -ne 0) {
+        $linkSkipReason = "the UNC control cannot hard link either (nt $ntLinkControl, Win32 error $uncLinkStatus) - the backing filesystem, not the driver"
+        Add-Skip 'hard link through the alias (NtSetInformationFile)' $linkSkipReason
+        Add-Skip '[win32] CreateHardLinkW through the alias' $linkSkipReason
+        Add-Skip '[ps] New-Item -ItemType HardLink through the alias' $linkSkipReason
+    } else {
+        Assert-True ($ntLinkAlias -ceq 'nt=0x00000000') 'hard link through the alias (NtSetInformationFile, full NT target path)' "(alias $ntLinkAlias, unc control $ntLinkControl)" | Out-Null
+
+        $aliasLinkStatus = [FswLab.Native]::HardLinkStatus((Join-Path $aliasDirectory 'link-from-alias.txt'),
+                                                          (Join-Path $aliasDirectory 'link-target.txt'))
+        $linked = ($aliasLinkStatus -eq 0) -and
+                  (Test-Path -LiteralPath (Join-Path $uncDirectory 'link-from-alias.txt'))
+        Assert-True $linked '[win32] CreateHardLinkW through the alias, observed through the UNC path' "(error $aliasLinkStatus)" | Out-Null
+
+        $psLinked = $false
+        try {
+            New-Item -ItemType HardLink -Path (Join-Path $aliasDirectory 'link-from-ps.txt') `
+                     -Value (Join-Path $aliasDirectory 'link-target.txt') -ErrorAction Stop | Out-Null
+            $psLinked = Test-Path -LiteralPath (Join-Path $uncDirectory 'link-from-ps.txt')
+        } catch {
+            Write-Host "   note: New-Item -ItemType HardLink threw: $($_.Exception.GetType().Name)"
+        }
+        Assert-True $psLinked '[ps] New-Item -ItemType HardLink through the alias' | Out-Null
+    }
 
     # -- (ii) .NET System.IO -------------------------------------------------
     Test-Parity -Method 'net' -Name 'Directory.Exists' -AliasPath $aliasDirectory -UncPath $uncDirectory -Body $probeNetDirExists | Out-Null
