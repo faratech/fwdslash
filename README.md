@@ -98,6 +98,8 @@ It fetches the latest signed `.msixbundle`, installs the [Windows App Runtime 2.
 
 Pick one flavor. Both register the same startup task and `fwdslash` alias, so only one broker survives a logon with both installed; the script refuses to install over a Store install unless you pass `-Force`.
 
+Each release also carries a `fwdslash-<version>-store-unsigned.msixbundle`. **That one is not installable** — it is the Microsoft Store submission artifact: the same binaries under the Partner Center package identity, left unsigned because the Store re-signs what it accepts, and published only so the Store submission is reproducible from the release. Install the plain `.msixbundle`, or get the Store build from the listing above.
+
 ### Build from source
 
 ```powershell

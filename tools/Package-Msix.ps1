@@ -33,6 +33,14 @@ param(
     [ValidateSet('Cpp', 'Rust')]
     [string]$BinarySource = 'Cpp',
 
+    # Where the packed .msix / .msixbundle (and the staging directories and PRI
+    # dumps that produce them) land. Defaults to out\msix. The release workflow
+    # packages the tree twice — the GitHub flavor it signs, and the unsigned
+    # Store flavor — and the two bundles have the same file name, so the second
+    # run is given a root of its own instead of overwriting the first. A
+    # relative path is resolved against the repository root.
+    [string]$OutputRoot,
+
     [switch]$SkipBuild
 )
 
@@ -44,7 +52,14 @@ $packagingRoot = Join-Path $repo 'packaging'
 $manifestTemplate = Join-Path $packagingRoot 'AppxManifest.xml'
 $priConfig = Join-Path $packagingRoot 'priconfig.xml'
 $assetSource = Join-Path $packagingRoot 'Assets'
-$outputRoot = Join-Path $repo 'out\msix'
+# PowerShell variable names are case-insensitive, so the $OutputRoot parameter
+# and the $outputRoot the rest of this script reads are one and the same
+# variable. Resolve it in place rather than pretending there are two.
+if (-not $OutputRoot) {
+    $OutputRoot = Join-Path $repo 'out\msix'
+} elseif (-not [IO.Path]::IsPathRooted($OutputRoot)) {
+    $OutputRoot = Join-Path $repo $OutputRoot
+}
 
 foreach ($required in $manifestTemplate, $priConfig) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {

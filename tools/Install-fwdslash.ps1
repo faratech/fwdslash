@@ -55,11 +55,14 @@ if ($Version -eq 'latest') {
     $release = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/tags/v$Version"
 }
 
+# Every release carries two bundles: this signed GitHub-flavor one, and the
+# unsigned Store submission artifact, which carries the Partner Center identity
+# and no signature at all — Add-AppxPackage would reject it.
 $asset = $release.assets |
-    Where-Object { $_.name -like '*.msixbundle' } |
+    Where-Object { $_.name -like '*.msixbundle' -and $_.name -notlike '*-store-unsigned.msixbundle' } |
     Select-Object -First 1
 if (-not $asset) {
-    throw 'The release does not contain an MSIX bundle.'
+    throw 'The release does not contain a signed MSIX bundle.'
 }
 
 $outFile = Join-Path $env:TEMP $asset.name

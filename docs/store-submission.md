@@ -45,6 +45,90 @@ Add-AppxPackage out\msix\fwdslash-<version>.msixbundle
 Upload `out\msix\fwdslash-<version>.msixbundle` **unsigned**. The Store re-signs
 it; a self-signature would be discarded.
 
+## 1a. Automatic publishing
+
+Since 0.0.4 a release publishes itself to the Store. Nothing here has to be
+done by hand for a normal version bump — tag, and the submission goes out.
+
+### The flow
+
+1. `.github/workflows/release.yml` builds both architectures, packages and
+   Trusted Signing-signs the **GitHub flavor**, then packages the tree a second
+   time with the packager's default identity — the **Store flavor** — into
+   `out\msix-store`, leaves it unsigned, and renames it
+   `fwdslash-<version>-store-unsigned.msixbundle`.
+2. `tools/Test-StoreBundle.ps1` validates that bundle before it is attached:
+   Identity `Name`/`Publisher`/`Version`, both `x64` and `arm64` packages, the
+   full runtime payload including the `shell\` adapters, `runFullTrust` and
+   *not* `unvirtualizedResources`, no `AppxSignature.p7x`, and nothing with a
+   `.sys`/`.pdb`/`.inf` extension. Run it locally after `Package-Msix.ps1`
+   whenever the payload changes.
+3. Both bundles and the ZIPs are attached to the GitHub release, and the
+   release body gains a `## Downloads` table saying which is which.
+4. The `publish-to-store` job dispatches `publish-to-store.yml` with the short
+   version. It downloads **only** the `*-store-unsigned.msixbundle` asset,
+   configures `msstore`, derives the Store "What's new" from the release body,
+   uploads with `--noCommit`, sets the release notes on every listing, then
+   commits and polls the submission.
+
+The Store artifact is deliberately not installable. Both the GitHub installer
+(`tools/Install-fwdslash.ps1`) and the in-app updater
+(`extract_bundle_url` in `crates/fsw-core/src/update.rs`) skip any asset ending
+in `-store-unsigned.msixbundle`, so the second bundle on a release cannot be
+mistaken for the signed one.
+
+A dry run (`workflow_dispatch` with `dry_run` left at its default) still builds
+and validates the Store bundle and uploads it as a workflow artifact, but
+creates no release and dispatches no publish — the Store job is gated on the
+same condition as the release step.
+
+### Secrets
+
+Names only; the values live in Settings > Secrets and variables > Actions.
+
+| Secret | Used by | What it is |
+|---|---|---|
+| `AZURE_TENANT_ID` | release, publish-to-store, check-store-submission | The Azure AD tenant of the app registration authorized on Partner Center. Already present — it is the Trusted Signing service principal. |
+| `AZURE_CLIENT_ID` | same | Same application. |
+| `AZURE_CLIENT_SECRET` | same | Same application. |
+| `STORE_SELLER_ID` | publish-to-store | The Partner Center **seller ID** (Account settings > Organization profile > Legal info). Not the Store ID, and not public. **This one still has to be added**; `publish-to-store.yml` fails its first step with a message naming it until it is. |
+
+The Store ID `9P51CM0MTMK2` is public (it is in the README and the Store URL),
+so it is a workflow `env:` constant, not a secret.
+
+### Publishing an existing release by hand
+
+Actions > **Publish to Microsoft Store** > Run workflow, with the short version
+(`0.0.4`, no `v`). The release must already carry a
+`*-store-unsigned.msixbundle`. Optionally paste `release_notes` to override the
+Store "What's new"; leave it blank to derive it from the release body.
+
+From the CLI:
+
+```bash
+gh workflow run publish-to-store.yml -f version=0.0.4
+```
+
+Re-running is safe: `msstore publish` deletes the pending submission and
+creates a fresh one. What is *not* safe is re-publishing a version the Store
+already has — every submission's version must be strictly higher than the last
+published one, so a rerun for a shipped version is rejected by Partner Center.
+
+### When a submission is stuck
+
+`msstore publish` deletes any existing pending submission before creating its
+own. That delete has been seen to 504 after ~80 s and return an HTML error
+page, which crashes the CLI mid-parse; the workflow retries three times with a
+60 s backoff and then fails with a message saying so. When that happens the
+pending submission is wedged and every retry will fail the same way.
+
+Run Actions > **Check Microsoft Store Submission** with the submission ID to
+see what Partner Center believes the state is, and tick `cancel_submission` to
+clear it. The cancel refuses unless Partner Center itself reports that ID as
+the active *pending* submission, so it cannot touch the live listing. Cancelling
+from the Partner Center portal works too. Once the pending pointer is clear,
+re-run **Publish to Microsoft Store** for the same version.
+
 ## 2. Capabilities (resolved — none beyond runFullTrust)
 
 The package previously declared the restricted `unvirtualizedResources`

@@ -334,6 +334,19 @@ never at build time. `signing/` holds the Azure Trusted Signing kit
 (credentials live in GitHub Secrets); `tools/Install-fwdslash.ps1` refuses to
 install the GitHub build over a Store install unless `-Force`.
 
+One `release.yml` run produces **both**: it signs the GitHub flavor, then
+packages the tree again with the packager's default (Partner Center) identity
+into `out\msix-store` — deliberately unsigned, because the Store re-signs —
+validates it with `tools/Test-StoreBundle.ps1`, attaches it as
+`fwdslash-<version>-store-unsigned.msixbundle`, and dispatches
+`.github/workflows/publish-to-store.yml` to upload it through `msstore`. That
+suffix is load-bearing: `Install-fwdslash.ps1` and `extract_bundle_url` in
+`crates/fsw-core/src/update.rs` both skip it so the unsigned bundle is never
+mistaken for the installable one. `check-store-submission.yml` inspects or
+cancels a stuck Partner Center submission. `docs/store-submission.md` §1a has
+the flow, the secret names (`STORE_SELLER_ID` is the one not yet set) and the
+manual-publish recipe.
+
 ### Shell adapters
 
 `cmd` and PowerShell support are optional adapters installed natively by `fwdslash`

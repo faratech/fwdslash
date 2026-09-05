@@ -1,0 +1,242 @@
+# Publishes an existing GitHub release to the Microsoft Store.
+#
+# `release.yml` triggers this automatically once a real (non-dry-run) release
+# exists, and it can also be dispatched by hand for any release that already
+# carries a `*-store-unsigned.msixbundle` asset.
+#
+# The asset it uploads is the Store flavor: the Partner Center package identity
+# (`32827MikeFara.fwdslash` / `CN=ABDB6B3F-…`) and no signature, because
+# Partner Center re-signs the bundle itself. The signed `.msixbundle` on the
+# same release is the GitHub flavor and must never be uploaded here — the
+# `*-store-unsigned` suffix is what keeps the two apart.
+#
+# The Store requires every submission's version to be strictly higher than the
+# last published one. 0.0.3.0 is already live, so the first run of this
+# workflow will be for the next version bump; re-publishing a version the Store
+# already has is rejected by Partner Center, not by anything here.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the Azure AD
+#     application authorized on the Partner Center account.
+#   STORE_SELLER_ID — the Partner Center seller ID (Account settings >
+#     Organization profile > Legal info). Not the Store ID; this one is not
+#     public, which is why it is a secret and not a workflow constant.
+
+name: Publish to Microsoft Store
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g. 0.0.4) — must have an existing GitHub release with a *-store-unsigned.msixbundle asset'
+        required: true
+      release_notes:
+        description: 'Store "What''s new" text (optional — defaults to the GitHub release body, plain-texted and truncated to the Store limit)'
+        required: false
+        default: ''
+
+env:
+  # Store ID for fwdslash. Public (it is in the README and the Store URL), so
+  # it lives here rather than in a secret.
+  STORE_APP_ID: 9P51CM0MTMK2
+
+permissions:
+  contents: read
+
+concurrency:
+  group: microsoft-store-submission
+  cancel-in-progress: false
+
+jobs:
+  publish-to-store:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # Fail before touching Partner Center rather than halfway through a
+      # submission: msstore reconfigure accepts an empty --sellerId and then
+      # every later call 401s with an opaque message.
+      - name: Check the Store credentials are configured
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          STORE_SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
+        run: |
+          $missing = @()
+          foreach ($name in 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'STORE_SELLER_ID') {
+              if (-not [Environment]::GetEnvironmentVariable($name)) { $missing += $name }
+          }
+          if ($missing.Count -gt 0) {
+              $names = $missing -join ', '
+              throw "Missing repository secret(s): $names. Add them under Settings > Secrets and variables > Actions. STORE_SELLER_ID is the Partner Center seller ID from Account settings > Organization profile > Legal info."
+          }
+          Write-Host 'Store credentials are present.'
+
+      # Deliberately no actions/checkout: msstore CLI probes the working
+      # directory for a project to infer the app from, and a repository full of
+      # manifests confuses it. An empty directory plus --appId is unambiguous.
+      - name: Download the unsigned Store bundle from the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = '${{ github.event.inputs.version }}'
+          Write-Host "Downloading the Store submission asset from release v$version..."
+
+          # Only the *-store-unsigned bundle. The other .msixbundle on the
+          # release is Trusted Signing-signed with the GitHub flavor's
+          # publisher and would be rejected by Partner Center.
+          gh release download "v$version" --repo ${{ github.repository }} --pattern '*-store-unsigned.msixbundle'
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed for v$version." }
+
+          $downloaded = @(Get-ChildItem -Filter '*-store-unsigned.msixbundle')
+          if ($downloaded.Count -ne 1) {
+              throw ("Expected exactly one *-store-unsigned.msixbundle on release v$version; found " +
+                     "$($downloaded.Count). The release job attaches it as " +
+                     "fwdslash-<version>.0-store-unsigned.msixbundle.")
+          }
+          Write-Host "Downloaded: $($downloaded[0].Name) ($($downloaded[0].Length) bytes)"
+
+      - name: Setup Microsoft Store CLI
+        uses: microsoft/setup-msstore-cli@v1
+
+      - name: Configure Store credentials
+        run: |
+          msstore reconfigure `
+            --tenantId ${{ secrets.AZURE_TENANT_ID }} `
+            --sellerId ${{ secrets.STORE_SELLER_ID }} `
+            --clientId ${{ secrets.AZURE_CLIENT_ID }} `
+            --clientSecret ${{ secrets.AZURE_CLIENT_SECRET }}
+          if ($LASTEXITCODE -ne 0) { throw 'msstore reconfigure failed.' }
+
+      - name: Prepare Store release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES_INPUT: ${{ github.event.inputs.release_notes }}
+        run: |
+          $version = '${{ github.event.inputs.version }}'
+          $notes = $env:NOTES_INPUT
+
+          if (-not $notes) {
+            # Default: the GitHub release body, converted to Store-friendly
+            # plain text. The body is GitHub's own --generate-notes output — a
+            # "## What's Changed" list of markdown links to PRs and commits,
+            # plus the "## Downloads" table release.yml appends.
+            #
+            # PowerShell captures a multi-line external command's stdout as an
+            # ARRAY of lines, not one string — -join forces a real single
+            # string (a no-op if gh already returned one) so IndexOf/Substring
+            # below are unambiguous String operations, not IList.IndexOf
+            # (which matches whole array ELEMENTS, not a text offset).
+            $bodyRaw = gh release view "v$version" --repo ${{ github.repository }} --json body -q .body
+            $body = $bodyRaw -join "`n"
+            if ($body) {
+              # Drop the asset guide release.yml appends — Store "What's new"
+              # should be the changelog, and half of that table is about
+              # artifacts a Store user will never see. Ordinal comparison is
+              # required: the default culture-aware IndexOf can return an index
+              # that disagrees with Substring's UTF-16 code-unit counting once
+              # the text has em-dashes, curly quotes or bullets, throwing
+              # "Index and length must refer to a location within the string."
+              foreach ($marker in @('## Downloads', '**Full Changelog**')) {
+                $idx = $body.IndexOf($marker, [StringComparison]::Ordinal)
+                if ($idx -ge 0) { $body = $body.Substring(0, $idx) }
+              }
+              $notes = $body -replace '\[([^\]]+)\]\([^)]+\)', '$1'   # links -> text
+              $notes = ($notes -split "`n" | Where-Object {
+                $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*---\s*$'
+              }) -join "`n"
+              $notes = $notes -replace '\*\*', '' -replace '`', ''
+              $notes = ($notes -replace "(\r?\n){3,}", "`n`n").Trim()
+            }
+          }
+          if (-not $notes) { $notes = 'Bug fixes and improvements.' }
+
+          # Partner Center caps release notes at 1500 characters
+          if ($notes.Length -gt 1490) { $notes = $notes.Substring(0, 1490) + "…" }
+
+          $notes | Out-File -Encoding utf8 store-release-notes.txt
+          Write-Host "Store release notes ($($notes.Length) chars):"
+          Write-Host $notes
+
+      - name: Upload package to draft submission
+        run: |
+          $bundleFile = Get-ChildItem -Filter '*-store-unsigned.msixbundle' | Select-Object -First 1
+          if (-not $bundleFile) { throw 'No unsigned Store bundle found!' }
+
+          Write-Host "Bundle file: $($bundleFile.FullName)"
+
+          # Use the bundle file as the positional argument (pathOrUrl); the
+          # --appId flag bypasses project detection. --noCommit keeps the
+          # submission in draft so the next step can set the release notes.
+          #
+          # When a pending submission already exists, msstore CLI deletes it
+          # server-side before creating a fresh one. That delete call has been
+          # observed to 504 after 80s and return an HTML error page, which
+          # crashes the CLI with an unhandled JSON parse exception instead of
+          # a clean non-zero exit. Retry a few times with backoff — this is a
+          # transient Partner Center gateway issue, not something the CLI or
+          # this workflow can fix directly. If it keeps failing, the pending
+          # submission is likely stuck and needs to be cancelled manually in
+          # the Partner Center portal (or with check-store-submission.yml)
+          # before any retry here can succeed.
+          $maxAttempts = 3
+          $succeeded = $false
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "msstore publish attempt $attempt of $maxAttempts..."
+            # --uploadTimeout is REQUIRED since msstore CLI v0.4.0: omitting it
+            # defaults the Azure SDK network timeout to 0 seconds
+            # (microsoft/msstore-cli#162), so every blob upload dies at 1%
+            # with "Error while uploading the application package." Passing
+            # the flag explicitly engages the option parser and sets a real
+            # timeout on v0.4.x, and remains harmless on versions that gain
+            # the corrected default.
+            msstore publish "$($bundleFile.FullName)" --appId ${{ env.STORE_APP_ID }} --noCommit --uploadTimeout 600
+            if ($LASTEXITCODE -eq 0) { $succeeded = $true; break }
+            Write-Warning "msstore publish failed (exit $LASTEXITCODE)."
+            if ($attempt -lt $maxAttempts) {
+              Write-Host 'Retrying in 60s...'
+              Start-Sleep -Seconds 60
+            }
+          }
+          if (-not $succeeded) {
+            throw "msstore publish --noCommit failed after $maxAttempts attempts. If this keeps happening, a pending submission on Partner Center is likely stuck (undeletable via API) and needs to be cancelled — run check-store-submission.yml with cancel_submission, or cancel it from the Store portal — before retrying."
+          }
+
+      - name: Set release notes on draft submission
+        run: |
+          # Best-effort: release notes are cosmetic — a failure here must not
+          # block the release, the commit step below still ships the package.
+          try {
+            $raw = (msstore submission get ${{ env.STORE_APP_ID }} | Out-String)
+            $start = $raw.IndexOf('{')
+            $end = $raw.LastIndexOf('}')
+            if ($start -lt 0 -or $end -le $start) { throw "No JSON in 'submission get' output" }
+            $submission = $raw.Substring($start, $end - $start + 1) | ConvertFrom-Json
+
+            $notes = (Get-Content -Raw store-release-notes.txt).Trim()
+            $langs = @($submission.listings.PSObject.Properties.Name)
+            if ($langs.Count -eq 0) { throw 'Submission has no listings' }
+            foreach ($lang in $langs) {
+              $submission.listings.$lang.baseListing.releaseNotes = $notes
+            }
+
+            # The packaged-app update API REPLACES the submission body, so the
+            # full get -> patch -> update round-trip is required (per msstore
+            # CLI docs) — never send a partial JSON here.
+            $json = $submission | ConvertTo-Json -Depth 64 -Compress
+            msstore submission update ${{ env.STORE_APP_ID }} $json --skipInitialPolling
+            if ($LASTEXITCODE -ne 0) { throw 'msstore submission update failed' }
+            Write-Host "Release notes applied to $($langs.Count) listing(s): $($langs -join ', ')"
+          } catch {
+            Write-Warning "Could not set Store release notes (continuing with release): $_"
+          }
+
+      - name: Commit submission to the Store
+        run: |
+          msstore submission publish ${{ env.STORE_APP_ID }}
+          if ($LASTEXITCODE -ne 0) { throw 'msstore submission publish failed' }
+          msstore submission poll ${{ env.STORE_APP_ID }}

@@ -102,10 +102,14 @@ fn is_newer_version_never_triggers_on_pre_release_or_garbage() {
     assert!(!is_newer_version("also-garbage", "0.0.3"));
 }
 
+// The asset list a release actually carries. The unsigned Store submission
+// bundle is deliberately listed FIRST: the resolver scans in document order,
+// and the GitHub API does not promise which asset comes back first.
 const RELEASE_JSON: &str = r#"{
   "tag_name": "v0.0.3",
   "assets": [
     { "name": "fwdslash-0.0.3.0-arm64.msix", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0-arm64.msix" },
+    { "name": "fwdslash-0.0.3.0-store-unsigned.msixbundle", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0-store-unsigned.msixbundle" },
     { "name": "fwdslash-0.0.3.0.msixbundle", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0.msixbundle" },
     { "name": "forward-slash-windows-0.0.3-arm64.zip", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/forward-slash-windows-0.0.3-arm64.zip" }
   ]
@@ -140,6 +144,16 @@ fn extract_bundle_url_picks_the_msixbundle() {
 #[test]
 fn extract_bundle_url_ignores_zips() {
     let json = r#"{"browser_download_url":"https://example.com/tool.zip"}"#;
+    assert_eq!(extract_bundle_url(json), None);
+}
+
+#[test]
+fn extract_bundle_url_skips_the_unsigned_store_bundle() {
+    // Every release since 0.0.4 carries the Microsoft Store submission
+    // artifact alongside the signed one. It has the Partner Center identity
+    // and no signature at all, so Add-AppxPackage would reject it — the
+    // updater must never pick it, even when it is the only bundle present.
+    let json = r#"{"browser_download_url":"https://example.com/fwdslash-0.0.4.0-store-unsigned.msixbundle"}"#;
     assert_eq!(extract_bundle_url(json), None);
 }
 
