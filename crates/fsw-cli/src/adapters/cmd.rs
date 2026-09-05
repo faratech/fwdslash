@@ -182,10 +182,8 @@ fn begin_install(controller: &Path) -> Result<InstallState, AdapterError> {
             None => (false, String::new(), super::reg::RegKind::Sz.marker_label().to_string()),
         };
     let original_value = state::strip_fwdslash_autorun(&raw_value);
-    // "Present" now means there is genuine third-party content to restore; a
-    // value that was purely our hook is treated as absent so uninstall deletes
-    // AutoRun rather than restoring an empty string.
-    let original_present = raw_present && !original_value.is_empty();
+    // Preserve empty originals and their kind, but discard orphaned hook-only values.
+    let original_present = state::original_autorun_present(raw_present, &raw_value, &original_value);
     state.original_present = original_present;
     state.original_value = original_value.clone();
     state.original_kind = original_kind.clone();

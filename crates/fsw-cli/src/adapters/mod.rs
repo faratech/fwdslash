@@ -555,7 +555,12 @@ pub fn cleanup_script_body(payload_dir: &str, task_name: &str) -> String {
     format!(
         "@echo off\r\n\
          ping -n 3 127.0.0.1 >nul\r\n\
-         rd /s /q \"{payload_dir}\"\r\n\
+         reg query HKCU\\Software\\ForwardSlashWindows\\CmdAdapter >nul 2>&1 && goto done\r\n\
+         reg query HKCU\\Software\\ForwardSlashWindows\\PowerShellAdapter\\WindowsPowerShell >nul 2>&1 && goto done\r\n\
+         reg query HKCU\\Software\\ForwardSlashWindows\\PowerShellAdapter\\PowerShell >nul 2>&1 && goto done\r\n\
+         rd /s /q \"{payload_dir}\\cmd\"\r\n\
+         rd /s /q \"{payload_dir}\\PowerShell\"\r\n\
+         :done\r\n\
          schtasks /delete /tn \"{task_name}\" /f >nul 2>&1\r\n\
          del /q \"%~f0\"\r\n"
     )
@@ -615,7 +620,10 @@ fn spawn_detached_delete(payload: &Path) {
 
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     let system32 = Path::new(&system_root).join("System32");
-    let command = format!("ping -n 3 127.0.0.1 >nul & rd /s /q \"{}\"", payload.display());
+    let command = format!(
+        "ping -n 3 127.0.0.1 >nul & rd /s /q \"{}\\cmd\" & rd /s /q \"{}\\PowerShell\"",
+        payload.display(), payload.display()
+    );
     for flags in [
         CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
         CREATE_NO_WINDOW | DETACHED_PROCESS,
@@ -652,12 +660,32 @@ fn any_adapter_marker_present() -> bool {
             .is_ok()
 }
 
-/// Belt and braces for a deferred delete that never completed: when no adapter
-/// marker references it at all, the whole `%LOCALAPPDATA%\ForwardSlashWindows`
-/// tree is stale and goes before anything new is staged into it. Best effort
-/// and silent; never touches a tree any marker still names.
+/// The parent is shared with the updater. Delete only adapter-owned children.
+#[cfg(windows)]
+fn prune_adapter_directories(payload: &Path) {
+    let Ok(entries) = std::fs::read_dir(payload) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("PowerShell")
+            || name.starts_with(".cmd-staging-") || name.starts_with(".cmd-rollback-")
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Stop old parent-wide deletion tasks before a new adapter is staged.
 #[cfg(windows)]
 pub fn prune_orphaned_payload_tree() {
+    let _ = Command::new("schtasks.exe")
+        .args(["/end", "/tn", CLEANUP_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = crate::scheduled_task::delete_task(CLEANUP_TASK_NAME);
     if any_adapter_marker_present() {
         return;
     }
@@ -666,7 +694,7 @@ pub fn prune_orphaned_payload_tree() {
     };
     let payload = local_app_data.join("ForwardSlashWindows");
     if is_payload_tree(&payload, &local_app_data) && payload.is_dir() {
-        let _ = std::fs::remove_dir_all(&payload);
+        prune_adapter_directories(&payload);
     }
     // The task that was going to do this is stale for the same reason, and it
     // is not harmless: its `rd /s /q` names the tree we are about to stage a

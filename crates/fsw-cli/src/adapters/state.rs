@@ -135,6 +135,11 @@ pub fn strip_fwdslash_autorun(current: &str) -> String {
     kept.join(" & ")
 }
 
+/// Existence and registry kind survive even when the original value is empty.
+pub fn original_autorun_present(present: bool, raw: &str, cleaned: &str) -> bool {
+    present && (raw.is_empty() || !cleaned.is_empty())
+}
+
 /// Whether an AutoRun value routes through a fwdslash hook at all — the cheap
 /// classifier `fwdslash doctor` and the self-clean probe use.
 #[must_use]
