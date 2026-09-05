@@ -15,6 +15,11 @@ use std::time::{Duration, Instant};
 
 const MARKER_ROOT: &str = "Software\\ForwardSlashWindows\\PowerShellAdapter";
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
+/// The policy probe runs a single cmdlet in a `-NoProfile` shell, so it is
+/// bounded by process start-up alone. Shorter than the verification budget on
+/// purpose: it runs before anything has been written, and a hung probe must
+/// fall through to the old behaviour rather than stall an install.
+const POLICY_TIMEOUT: Duration = Duration::from_secs(10);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Installs the adapter for `edition`. `controller` is the running
@@ -25,6 +30,15 @@ pub fn install(edition: Edition, controller: &Path) -> Result<(), AdapterError> 
             "fwdslash.exe was not found: {}",
             controller.display()
         )));
+    }
+    // Preflight: a Restricted (or AllSigned) machine can never load the block
+    // we are about to write, so refuse before touching the profile, the module
+    // directory or the marker — there is nothing to roll back and the message
+    // carries the one-line fix (#45). A shell that cannot be started at all
+    // falls through to the pre-existing behaviour rather than adding a new way
+    // to fail.
+    if let Some(error) = execution_policy_refusal(edition) {
+        return Err(error);
     }
     let mut transaction = match begin_install(edition)? {
         Some(transaction) => transaction,
@@ -593,23 +607,99 @@ fn reinstall(edition: Edition, controller: &Path) -> Result<(), AdapterError> {
     install(edition, controller)
 }
 
+/// The executable that *is* `edition`, for both the alias verification and the
+/// execution-policy probe. `None` only for PowerShell 7 when `pwsh.exe` is not
+/// on PATH.
+fn shell_path(edition: Edition) -> Option<String> {
+    match edition {
+        Edition::PowerShell => search_path("pwsh.exe"),
+        Edition::WindowsPowerShell => {
+            let system_root =
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            Some(
+                Path::new(&system_root)
+                    .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+                    .display()
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// The execution policy `edition`'s own shell reports as effective, or `None`
+/// when the shell is absent, refuses to start, or does not answer in time.
+///
+/// Deliberately spawned **without** `-ExecutionPolicy`: the whole point is to
+/// observe the policy the user's own sessions get, including a process-scope
+/// `PSExecutionPolicyPreference` this process inherited, which is exactly what
+/// `verify_aliases` runs under. `Get-ExecutionPolicy` is a cmdlet, not a
+/// script, so it answers even under Restricted.
+pub fn effective_execution_policy(edition: Edition) -> Option<String> {
+    use std::io::Read;
+
+    let shell = shell_path(edition)?;
+    let mut child = Command::new(&shell)
+        .args(["-NoProfile", "-NonInteractive", "-Command", "Get-ExecutionPolicy"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + POLICY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+
+    // The process has exited and the answer is one short word, so the pipe
+    // buffer already holds all of it.
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
+}
+
+/// The policy verdict for `edition`, with the string the shell reported.
+/// `None` when the shell could not be asked at all.
+pub fn execution_policy_verdict(edition: Edition) -> Option<(String, state::PolicyVerdict)> {
+    let reported = effective_execution_policy(edition)?;
+    let verdict = state::classify_execution_policy(edition, &reported);
+    Some((reported, verdict))
+}
+
+/// The install-time refusal for a blocking policy, or `None` when the policy
+/// allows scripts or could not be read.
+fn execution_policy_refusal(edition: Edition) -> Option<AdapterError> {
+    let (_, verdict) = execution_policy_verdict(edition)?;
+    let block = verdict.blocked()?;
+    Some(AdapterError::new(&state::policy_install_error(block)))
+}
+
 /// Spawns the edition's shell and confirms both aliases resolve to the
 /// adapter function. Fifteen-second budget; kill and report on timeout.
 fn verify_aliases(edition: Edition) -> Result<(), AdapterError> {
-    let shell = match edition {
-        Edition::PowerShell => {
-            let Some(path) = search_path("pwsh.exe") else {
-                return Err(AdapterError::new("pwsh.exe could not be located for verification."));
-            };
-            path
-        }
-        Edition::WindowsPowerShell => {
-            let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-            Path::new(&system_root)
-                .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-                .display()
-                .to_string()
-        }
+    let Some(shell) = shell_path(edition) else {
+        return Err(AdapterError::new(
+            "pwsh.exe could not be located for verification.",
+        ));
     };
 
     let encoded = profile::base64_utf16le(profile::VERIFY_SCRIPT);
@@ -627,6 +717,20 @@ fn verify_aliases(edition: Edition) -> Result<(), AdapterError> {
             Ok(Some(status)) => {
                 if status.success() {
                     return Ok(());
+                }
+                // Exit 42 is the script's own catch block: the profile threw
+                // rather than loading the wrong aliases. A blocking execution
+                // policy is the usual cause and the generic message says
+                // nothing useful about it, so re-ask the shell and explain
+                // (#45). The preflight normally gets here first; this covers a
+                // policy that changed mid-install or differs by scope.
+                if status.code() == Some(42) {
+                    if let Some(block) = execution_policy_verdict(edition)
+                        .as_ref()
+                        .and_then(|(_, verdict)| verdict.blocked())
+                    {
+                        return Err(AdapterError::new(&state::policy_verify_error(block)));
+                    }
                 }
                 return Err(AdapterError::new(&format!(
                     "{} did not load the Forward Slash Windows profile adapter. The installation was rolled back.",

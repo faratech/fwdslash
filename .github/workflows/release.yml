@@ -112,6 +112,27 @@ jobs:
       - name: Restore the Trusted Signing dlib
         run: .\signing\install-dlib.ps1
 
+      # signtool signs a .psm1 through the PowerShell SIP: the Authenticode
+      # signature is appended to the file itself as a `# SIG #` comment block,
+      # so it survives every byte-for-byte copy downstream. This must run
+      # BEFORE packaging — Package-Msix.ps1 and Build-ReleaseZips.ps1 both
+      # stage shell\powershell straight out of the repo tree, so one signature
+      # here reaches the MSIX bundle and both ZIPs. (Signing is integrity only:
+      # it does not make the adapter work under Restricted, where nothing runs
+      # at all, nor under AllSigned, where the user's own profile.ps1 would
+      # need a signature too — see docs/compatibility.md, #45.)
+      - name: Sign the PowerShell module (before it is staged into any package)
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          $module = 'shell\powershell\ForwardSlashWindows.psm1'
+          .\signing\sign.ps1 -Path $module -Description 'Forward Slash Windows'
+          if ($LASTEXITCODE -ne 0) { throw "Signing failed for $module." }
+          $signature = Get-AuthenticodeSignature $module
+          Write-Host "$module signature status: $($signature.Status)"
+
       - name: Package the MSIX bundle (unsigned through makeappx)
         run: |
           .\tools\Package-Msix.ps1 -BinarySource Rust `

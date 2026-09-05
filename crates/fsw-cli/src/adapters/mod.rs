@@ -233,11 +233,22 @@ pub fn health_report() -> Vec<(String, String)> {
     #[cfg(windows)]
     {
         let mut lines = vec![("Command Prompt".to_string(), cmd_health_status())];
+        let policies = execution_policy_statuses();
         for (label, edition) in [
             ("Windows PowerShell", state::Edition::WindowsPowerShell),
             ("PowerShell 7", state::Edition::PowerShell),
         ] {
             lines.push((label.to_string(), ps_health_status(edition)));
+            // The policy is a property of the edition, not of the install, so
+            // it is reported whether or not the adapter is on: it is the
+            // difference between "installed and doing nothing" and "installed
+            // and working" (#45).
+            if let Some(status) = policies.iter().find(|status| status.edition == edition) {
+                lines.push((
+                    format!("{label} execution policy"),
+                    status.status_line().to_string(),
+                ));
+            }
         }
         lines
     }
@@ -245,6 +256,50 @@ pub fn health_report() -> Vec<(String, String)> {
     {
         Vec::new()
     }
+}
+
+/// One edition's effective execution policy, for the health lines and for
+/// `fwdslash integrations --json` (#45).
+#[cfg(windows)]
+pub struct PolicyStatus {
+    pub edition: state::Edition,
+    /// What `Get-ExecutionPolicy` printed in that edition's own shell.
+    pub reported: String,
+    pub blocked: bool,
+    /// The fix, empty unless `blocked`.
+    pub remedy: String,
+    /// The rendered `doctor` / `integrations` line.
+    status: String,
+}
+
+#[cfg(windows)]
+impl PolicyStatus {
+    pub fn status_line(&self) -> &str {
+        &self.status
+    }
+}
+
+/// Probes each PowerShell edition's effective execution policy. One child
+/// shell per edition, skipped entirely when the edition is not installed on
+/// the machine (no `pwsh.exe`), and never fatal: an edition that cannot be
+/// asked is simply absent from the result.
+#[cfg(windows)]
+pub fn execution_policy_statuses() -> Vec<PolicyStatus> {
+    let mut statuses = Vec::new();
+    for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+        let Some((reported, verdict)) = powershell::execution_policy_verdict(edition) else {
+            continue;
+        };
+        let status = state::policy_health_status(&reported, &verdict);
+        statuses.push(PolicyStatus {
+            edition,
+            reported: reported.trim().to_string(),
+            blocked: verdict.is_blocked(),
+            remedy: verdict.blocked().map(|block| block.remedy.clone()).unwrap_or_default(),
+            status,
+        });
+    }
+    statuses
 }
 
 #[cfg(windows)]
@@ -844,6 +899,13 @@ pub fn real_make_dir(path: &Path) -> Result<(), AdapterError> {
 /// Copies one file through `cmd.exe` (real process — see `real_make_dir`).
 /// Sources may live in the package's WindowsApps directory (readable by path);
 /// destinations land in the real file system.
+///
+/// The size is compared afterwards: `copy` is binary for a file-to-file copy,
+/// but the deployed `ForwardSlashWindows.psm1` carries an Authenticode
+/// `# SIG #` block in the signed builds, and a copy that ended early — an
+/// ASCII-mode truncation at a `Ctrl+Z` byte, a full disk — would deploy a
+/// module whose bytes no longer match its signature. Refusing beats deploying
+/// a partial payload (#45).
 #[cfg(windows)]
 pub fn real_copy_file(source: &Path, destination_dir: &Path) -> Result<(), AdapterError> {
     let file_name = source
@@ -857,6 +919,16 @@ pub fn real_copy_file(source: &Path, destination_dir: &Path) -> Result<(), Adapt
         .output()
         .map_err(|error| AdapterError::new(&format!("copy could not be started ({error}).")))?;
     if output.status.success() && destination_dir.join(file_name).is_file() {
+        let copied = std::fs::metadata(destination_dir.join(file_name)).map(|data| data.len());
+        let original = std::fs::metadata(source).map(|data| data.len());
+        if let (Ok(copied), Ok(original)) = (copied, original) {
+            if copied != original {
+                return Err(AdapterError::new(&format!(
+                    "{} was deployed incompletely ({copied} of {original} bytes)",
+                    file_name.to_string_lossy()
+                )));
+            }
+        }
         return Ok(());
     }
     let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();

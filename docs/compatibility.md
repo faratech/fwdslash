@@ -39,6 +39,46 @@ Blank or pending entries are unverified and must not be advertised as working.
 - Each PowerShell profile adapter: fresh-process alias/path tests, byte-exact
   rollback, interrupted-transaction recovery, external-change refusal, and
   graceful Controlled Folder Access failure.
+- Execution-policy preflight: a Restricted or AllSigned edition refuses before
+  any write and names the fix.
+
+**PowerShell execution policy.** The adapters install a guarded block into
+`profile.ps1`, so the edition's *effective* policy decides whether they do
+anything at all. Windows PowerShell 5.1 ships **Restricted** on Windows client
+editions, which is the default most users have.
+
+| Effective policy | PowerShell adapter | 0.0.3 behaviour |
+|---|---|---|
+| `RemoteSigned`, `Unrestricted`, `Bypass` | Works | Installs and verifies normally |
+| `Restricted` | Blocked | Refused **before any write** with the one-line fix |
+| `Undefined` | Blocked (Windows PowerShell treats it as Restricted) | Same refusal, wording says so |
+| `AllSigned` | Unsupported | Refused; the user's own `profile.ps1` would need a signature |
+| Anything else | Treated as allowing scripts | Never refused on a parse failure; reported with a note |
+
+The fix is `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, run in the
+edition being enabled — the policy is per edition, so fixing Windows PowerShell
+from a `pwsh` window changes the wrong one. The preflight runs the edition's own
+shell with `-NoProfile -NonInteractive -Command Get-ExecutionPolicy` and **no**
+`-ExecutionPolicy` flag, so a process-scope `PSExecutionPolicyPreference` is
+honoured exactly as the alias verification honours it; a shell that cannot be
+started falls through to the pre-existing behaviour rather than adding a failure
+mode. The same text reaches the settings InfoBar through the controller's
+stderr, and `fwdslash doctor` / `fwdslash integrations` report each edition's
+effective policy (`integrations --json` adds
+`windowsPowerShellExecutionPolicy` / `PolicyBlocked` / `PolicyRemedy` and the
+`powerShell7` equivalents without renaming any existing field).
+
+**Signing `ForwardSlashWindows.psm1` does not change any of the above.**
+`signtool` does sign `.psm1` through the PowerShell SIP — verified locally with
+a self-signed certificate on the 0.0.3 dev host: `signtool sign /fd SHA256`
+appended a `# SIG # Begin signature block` comment and `signtool verify /pa`
+reported it valid — so `release.yml` signs the module with the Trusted Signing
+kit before packaging, and the signature travels byte-for-byte into the MSIX
+bundle, the ZIPs and the deployed copy. It is integrity only: under `Restricted`
+nothing runs at all, and under `AllSigned` the user's own `profile.ps1` remains
+unsigned. The Store bundle, which is built locally from the same repo tree,
+carries the signed module only when it is built from a tree where that step ran;
+an unsigned module there changes nothing functional.
 
 **Controlled Folder Access.** With CFA in Block mode the adapters' writes into
 `Documents` are refused, and the block does **not** always arrive as

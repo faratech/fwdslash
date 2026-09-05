@@ -135,6 +135,22 @@ fwdslash integration powershell enable
 
 Each adapter records what it replaced, restores it byte-for-byte when turned off, and refuses to overwrite anything another program changed since. Open a **new** shell afterwards.
 
+**PowerShell execution policy.** The PowerShell adapters work by adding a guarded block to your `profile.ps1`, so the edition's execution policy has to let local scripts run. Windows PowerShell 5.1 ships **Restricted** on Windows client editions; PowerShell 7 ships RemoteSigned.
+
+| Effective policy | PowerShell adapter |
+|---|---|
+| `RemoteSigned`, `Unrestricted`, `Bypass` | works |
+| `Restricted`, `Undefined` | blocked — `fwdslash` refuses **before changing anything** and prints the one-line fix |
+| `AllSigned` | unsupported — your own `profile.ps1` would need an Authenticode signature that no installer can give it |
+
+The fix, run in the edition you are enabling (the policy is per edition):
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+`fwdslash doctor` and `fwdslash integrations` report each edition's effective policy, and the settings app shows the same guidance when an enable fails. The module the adapter deploys is Authenticode-signed in the release builds, but that is integrity only: it does not change the Restricted case (nothing runs at all there) and does not make AllSigned usable.
+
 With an adapter on, `dir`/`ls` and `cd` both take slash paths:
 
 ```text
