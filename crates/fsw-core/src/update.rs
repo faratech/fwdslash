@@ -11,12 +11,20 @@
 //! -DeferRegistrationWhenPackagesAreInUse`. MSIX deployment is transactional:
 //! the running version keeps running and the next launch is the new one.
 //!
+//! The download directory holds at most one bundle: a new download prunes any
+//! other `*.msixbundle` first, and `sweep_update_directory` (called by
+//! `fwdslash uninstall`) removes the directory outright. A registered bundle
+//! is deliberately KEPT — deferred registration only applies at the next
+//! launch, and `pending_bundle_path` + `restart_to_update` are the apply-now
+//! path for it: the settings app's "Restart to update", which registers with
+//! `-ForceApplicationShutdown` because the broker is resident and the deferred
+//! registration would otherwise never land. The bundle is deleted by the first
+//! check that finds the running version current, which is the proof it applied.
+//!
 //! Registry values `AutoUpdate`/`LastUpdateCheck`/`AvailableUpdate` live under
 //! the settings key and are read back only by the same packaged process, so
 //! MSIX virtualization of these writes is self-consistent — unlike
 //! `persist_disabled`, which must reach the real hive.
-
-use crate::FSW_SETTINGS_KEY;
 
 /// GitHub API endpoint for the latest release.
 pub const RELEASES_LATEST_URL: &str =
@@ -59,6 +67,31 @@ pub fn parse_version(text: &str) -> Option<Version> {
         minor: parse_group(minor)?,
         patch: parse_group(patch)?,
     })
+}
+
+/// Normalizes the running version to the three-part shape [`parse_version`]
+/// accepts, by dropping a four-part version's trailing group.
+///
+/// `package_version()` reports the MSIX version, which is always four parts
+/// (`0.0.2.0`), while release tags are three (`v0.0.3`). Comparing them
+/// directly made [`is_newer_version`] answer `false` for every packaged
+/// install, so the GitHub flavor could never see a release. A three-part
+/// input is returned unchanged.
+#[must_use]
+pub fn normalize_running_version(version: &str) -> String {
+    let mut groups = version.split('.');
+    match (
+        groups.next(),
+        groups.next(),
+        groups.next(),
+        groups.next(),
+        groups.next(),
+    ) {
+        (Some(major), Some(minor), Some(patch), Some(_), None) => {
+            format!("{major}.{minor}.{patch}")
+        }
+        _ => version.to_string(),
+    }
 }
 
 /// Strictly-greater comparison; equal or older is never an update.
@@ -147,11 +180,11 @@ pub enum UpdateOutcome {
 #[cfg(windows)]
 pub mod windows_impl {
     use super::{
-        check_is_due, extract_bundle_url, extract_tag_name, is_newer_version, update_check_allowed,
-        UpdateOutcome, AUTO_UPDATE_VALUE, AVAILABLE_UPDATE_VALUE, LAST_UPDATE_CHECK_VALUE,
-        RELEASES_LATEST_URL,
+        extract_bundle_url, extract_tag_name, is_newer_version, update_check_allowed, UpdateOutcome,
+        AUTO_UPDATE_VALUE, AVAILABLE_UPDATE_VALUE, LAST_UPDATE_CHECK_VALUE, RELEASES_LATEST_URL,
     };
     use crate::{FSW_SETTINGS_KEY, is_store_flavor, package_version};
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows_registry::CURRENT_USER;
@@ -243,12 +276,113 @@ pub mod windows_impl {
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    fn download_bundle(url: &str, tag: &str) -> Option<std::path::PathBuf> {
-        let update_dir = std::env::var_os("LOCALAPPDATA")
-            .map(std::path::PathBuf::from)
-            .map(|dir| dir.join("ForwardSlashWindows").join("update"))?;
+    /// `%LOCALAPPDATA%\ForwardSlashWindows\update`, the only place a
+    /// downloaded bundle is ever written.
+    fn update_directory() -> Option<PathBuf> {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .map(|dir| dir.join("ForwardSlashWindows").join("update"))
+    }
+
+    fn bundle_name(tag: &str) -> String {
+        format!("fwdslash-{tag}.msixbundle")
+    }
+
+    /// Deletes every `*.msixbundle` in the update directory except `keep`.
+    /// One release's bundle is ~10 MB and nothing else prunes them.
+    /// `keep = None` deletes all of them.
+    fn prune_bundles(directory: &Path, keep: Option<&std::ffi::OsStr>) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_bundle = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("msixbundle"));
+            if is_bundle && path.file_name() != keep {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    /// Deletes every downloaded bundle, keeping the (empty) directory.
+    /// Called once the running version has caught up: whatever was downloaded
+    /// has been applied, so no bundle is worth its ~10 MB any more.
+    fn discard_downloaded_bundles() {
+        if let Some(directory) = update_directory() {
+            prune_bundles(&directory, None);
+        }
+    }
+
+    /// Removes the whole update directory. Called by `fwdslash uninstall`, so
+    /// an uninstall leaves no downloaded bundle behind. An absent directory
+    /// is success.
+    pub fn sweep_update_directory() -> Result<(), u32> {
+        let Some(directory) = update_directory() else {
+            return Ok(());
+        };
+        match std::fs::remove_dir_all(&directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.raw_os_error().unwrap_or(-1).cast_unsigned()),
+        }
+    }
+
+    /// The downloaded bundle for the cached update tag, when it is still on
+    /// disk. The settings app offers "Restart to update" only for this.
+    #[must_use]
+    pub fn pending_bundle_path() -> Option<PathBuf> {
+        let tag = cached_update_tag()?;
+        let bundle = update_directory()?.join(bundle_name(&tag));
+        bundle.is_file().then_some(bundle)
+    }
+
+    /// Hands the update to a detached PowerShell that outlives this process:
+    /// wait for the app to exit, register the bundle with
+    /// `-ForceApplicationShutdown` (the broker is resident, so deferred
+    /// registration would never apply), then relaunch the packaged app.
+    ///
+    /// Returns whether the helper was spawned — not whether the update
+    /// succeeded, which happens after this process is gone. Always `false`
+    /// for an unpackaged build, which has no app to relaunch.
+    #[must_use]
+    pub fn restart_to_update(bundle: &Path) -> bool {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+        let Some(family) = crate::package_family() else {
+            return false;
+        };
+        // Single-quoted PowerShell strings escape a quote by doubling it.
+        let quoted = bundle.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "Start-Sleep -Seconds 2; \
+             Add-AppxPackage -Path '{quoted}' -ForceApplicationShutdown; \
+             Start-Process 'shell:AppsFolder\\{family}!App'"
+        );
+        Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &script,
+            ])
+            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+
+    fn download_bundle(url: &str, tag: &str) -> Option<PathBuf> {
+        let update_dir = update_directory()?;
         std::fs::create_dir_all(&update_dir).ok()?;
-        let destination = update_dir.join(format!("fwdslash-{tag}.msixbundle"));
+        let destination = update_dir.join(bundle_name(tag));
+        // Whatever an earlier release left here is dead weight.
+        prune_bundles(&update_dir, destination.file_name());
         let status = Command::new("curl.exe")
             .args(["-fsSL", "-o"])
             .arg(&destination)
@@ -263,7 +397,7 @@ pub mod windows_impl {
         }
     }
 
-    fn register_bundle(path: &std::path::Path) -> bool {
+    fn register_bundle(path: &Path) -> bool {
         // -DeferRegistrationWhenPackagesAreInUse: this process is part of the
         // package being updated; registration defers to the next launch.
         let command = format!(
@@ -301,20 +435,32 @@ pub mod windows_impl {
         let Some(tag) = extract_tag_name(&release_json) else {
             return UpdateOutcome::Unavailable;
         };
-        let running_version = package_version().unwrap_or_else(|| crate::FSW_VERSION.to_string());
+        // `package_version()` is the four-part MSIX version; release tags are
+        // three-part, and `parse_version` rejects four groups.
+        let running_version = super::normalize_running_version(
+            &package_version().unwrap_or_else(|| crate::FSW_VERSION.to_string()),
+        );
         if !is_newer_version(&running_version, tag) {
-            // A stale notice from an older check is no longer relevant.
+            // A stale notice from an older check is no longer relevant, and a
+            // bundle still on disk has either been applied (this process IS
+            // the version it delivered) or names a release we are already past
+            // — either way nothing can register it again.
             let _ = clear_cached_update_tag();
+            discard_downloaded_bundles();
             return UpdateOutcome::UpToDate;
         }
 
-        if auto_update {
-            if let Some(url) = extract_bundle_url(&release_json) {
-                if download_bundle(url, tag).is_some() && register_bundle(std::path::Path::new(&download_path(tag))) {
-                    let _ = set_cached_update_tag(tag);
-                    return UpdateOutcome::Ready(tag.to_string());
-                }
-            }
+        if auto_update
+            && let Some(url) = extract_bundle_url(&release_json)
+            && let Some(bundle) = download_bundle(url, tag)
+            && register_bundle(&bundle)
+        {
+            // The bundle stays on disk: registration was deferred (this
+            // process is part of the package it updates), so `restart_to_update`
+            // still needs the file to force it through. The next check that
+            // finds the running version current deletes it.
+            let _ = set_cached_update_tag(tag);
+            return UpdateOutcome::Ready(tag.to_string());
         }
         let _ = set_cached_update_tag(tag);
         UpdateOutcome::Ready(tag.to_string())
@@ -328,18 +474,36 @@ pub mod windows_impl {
             .map_err(|e| e.code().0 as u32)
     }
 
-    fn download_path(tag: &str) -> String {
-        format!(
-            "{}\\ForwardSlashWindows\\update\\fwdslash-{tag}.msixbundle",
-            std::env::var("LOCALAPPDATA").unwrap_or_default()
-        )
-    }
-
     use std::os::windows::process::CommandExt;
 }
 
 #[cfg(windows)]
 pub use windows_impl::{
-    cached_update_tag, dismiss_update, read_auto_update_enabled, run_update_check,
-    set_auto_update_enabled,
+    cached_update_tag, dismiss_update, pending_bundle_path, read_auto_update_enabled,
+    restart_to_update, run_update_check, set_auto_update_enabled, sweep_update_directory,
 };
+
+// Non-Windows stand-ins for the three entry points other crates call
+// unconditionally, so `fwdslash uninstall` and the settings app's update card
+// compile on every host. There is no update pipeline off Windows.
+
+/// No update directory exists off Windows; sweeping one is a no-op success.
+#[cfg(not(windows))]
+pub fn sweep_update_directory() -> Result<(), u32> {
+    Ok(())
+}
+
+/// Never a pending bundle off Windows.
+#[cfg(not(windows))]
+#[must_use]
+pub fn pending_bundle_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Nothing to restart into off Windows.
+#[cfg(not(windows))]
+#[must_use]
+pub fn restart_to_update(bundle: &std::path::Path) -> bool {
+    let _ = bundle;
+    false
+}

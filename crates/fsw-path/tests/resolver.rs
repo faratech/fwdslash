@@ -268,12 +268,24 @@ fn explicit_distribution_root_without_slash_reports_no_trailing_separator() {
 
 #[test]
 fn win32_normalization_hazard_is_detected() {
+    // Only the LAST component can be lost: Win32 strips a trailing `.` or
+    // space at the end of a path, but preserves one that a separator follows.
     let mut buf = RenderBuf::new();
     for (input, hazard) in [
         ("/Ubuntu/secret ", true),
         ("/Ubuntu/foo.", true),
+        ("/Ubuntu/home/me/notes.", true),
         ("/Ubuntu/foo.txt", false),
         ("/Ubuntu/plain", false),
+        // Middle components survive normalization untouched.
+        ("/Ubuntu/secret /x", false),
+        ("/Ubuntu/dot./x", false),
+        // A trailing separator is exactly what protects the dot.
+        ("/Ubuntu/a./", false),
+        ("/Ubuntu/a /", false),
+        // The distribution root has no component at all.
+        ("/Ubuntu", false),
+        ("/Ubuntu/", false),
     ] {
         let Ok(Resolved::Distribution(path)) = resolve_strict(input, &REGISTERED, &mut buf) else {
             panic!("{input} should resolve");
@@ -284,7 +296,47 @@ fn win32_normalization_hazard_is_detected() {
             "hazard for {input:?} (linux {:?})",
             path.linux_path()
         );
+        let resolved = resolve_strict(input, &REGISTERED, &mut buf);
+        assert_eq!(
+            resolved.map(|r| r.has_win32_normalization_hazard()),
+            Ok(hazard),
+            "Resolved-level hazard for {input:?}"
+        );
     }
+}
+
+#[test]
+fn win32_normalization_hazard_covers_folder_roots_and_never_the_provider_root() {
+    let mut buf = RenderBuf::new();
+    for (input, hazard) in [
+        ("/notes.", true),
+        ("/a/b ", true),
+        ("/a./b", false),
+        ("/a./", false),
+        ("/", false),
+    ] {
+        let Ok(Resolved::Folder(path)) = fsw_path::resolve_under_root(input, r"C:\code", &mut buf)
+        else {
+            panic!("{input} should resolve under a folder root");
+        };
+        assert_eq!(
+            path.has_win32_normalization_hazard(),
+            hazard,
+            "hazard for {input:?} (under-root {:?})",
+            path.under_root()
+        );
+    }
+    assert!(!Resolved::WslRoot.has_win32_normalization_hazard());
+}
+
+#[test]
+fn wsl_root_renders_without_a_trailing_separator() {
+    // A wire contract: `ForwardSlashWindows.psm1` compares the output of
+    // `fwdslash resolve /` against this exact literal. A trailing-separator
+    // spelling is never produced, so the module must not test for one.
+    assert_eq!(Resolved::WslRoot.unc_display(), r"\\wsl.localhost");
+    assert!(!Resolved::WslRoot.unc_display().ends_with('\\'));
+    assert_eq!(Resolved::WslRoot.linux_path(), "/");
 }
 
 #[test]
@@ -504,7 +556,16 @@ fn folder_root_still_rejects_backslash_and_double_slash() {
 #[test]
 fn windows_root_validation_table() {
     // Accepted.
-    for root in [r"C:", r"C:\", r"C:\code", r"C:\Users\me\stuff", r"\\server\share", r"\\wsl.localhost\Ubuntu"] {
+    for root in [
+        r"C:",
+        r"C:\",
+        r"C:\code",
+        r"C:\Users\me\stuff",
+        r"\\server\share",
+        r"\\server\share\dir",
+        r"\\wsl.localhost\Ubuntu",
+        r"\\wsl.localhost\Ubuntu\home\mike",
+    ] {
         assert!(fsw_path::is_valid_windows_root(root), "{root:?} should be valid");
     }
     // Rejected: relative, empty, separators of the other kind, device
@@ -512,4 +573,31 @@ fn windows_root_validation_table() {
     for root in ["", "code", r"relative\path", r"\\.\pipe\x", r"\\?\C:\x", r"\??\x", r"C:\a:b", r"\\server", "C:/code", "/tmp"] {
         assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
     }
+    // Rejected: drive-*relative*. Win32 resolves these against a hidden
+    // per-drive current directory, so they name no fixed folder.
+    for root in [r"C:code", r"C:Users\me", r"c:x"] {
+        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+    }
+    // Rejected: UNC with no share component.
+    for root in [r"\\server\", r"\\server\\share", r"\\\share"] {
+        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+    }
+    // Rejected: the provider root itself, however spelled. `unc_display`
+    // promises that literal belongs to `Resolved::WslRoot` alone.
+    for root in [r"\\wsl.localhost", r"\\wsl.localhost\", r"\\WSL.LOCALHOST\\", r"\\Wsl.LocalHost"] {
+        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+    }
+    // Rejected: wildcards name a pattern, not a folder.
+    for root in [r"C:\co*de", r"C:\wh?t", r"\\server\sh*re"] {
+        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+    }
+}
+
+#[test]
+fn a_bare_drive_root_resolves_to_the_drive_root() {
+    // `C:` is accepted, and `resolve_under_root` gives it the one separator
+    // that makes it absolute rather than drive-relative.
+    folder("/", "C:", r"C:\", "/");
+    folder("/", r"C:\", r"C:\", "/");
+    folder("/tmp", "C:", r"C:\tmp", "/tmp");
 }

@@ -85,27 +85,86 @@ pub struct Snapshot {
     pub disabled: bool,
 }
 
+/// Every value under `FSW_SETTINGS_KEY` the resolver needs, read through one
+/// key handle.
+///
+/// The single-value getters below remain for callers that want exactly one
+/// setting, but anything reading two or more (the broker's per-Enter snapshot,
+/// the settings window's refresh) should take this: opening the key is the
+/// expensive part, and `Snapshot::current` used to do it four times.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsValues {
+    pub disabled: bool,
+    pub bare_slash_mode: BareSlashMode,
+    /// The pinned distribution, or `None` when unset or empty.
+    pub bare_slash_pinned: Option<String>,
+    /// The custom bare-slash root, only when it is well-formed.
+    pub bare_slash_root: Option<String>,
+}
+
+impl Default for SettingsValues {
+    /// What an absent settings key means: nothing paused, nothing pinned.
+    fn default() -> Self {
+        Self {
+            disabled: false,
+            bare_slash_mode: BareSlashMode::DistributionList,
+            bare_slash_pinned: None,
+            bare_slash_root: None,
+        }
+    }
+}
+
+impl SettingsValues {
+    /// Reads all four values from one open key. An absent or unreadable key
+    /// yields [`Self::default`], and a malformed root is no root — the same
+    /// semantics as the single-value getters, which now delegate here.
+    #[must_use]
+    pub fn read() -> Self {
+        #[cfg(windows)]
+        {
+            use windows_registry::CURRENT_USER;
+
+            let Ok(key) = CURRENT_USER.open(FSW_SETTINGS_KEY) else {
+                return Self::default();
+            };
+            Self {
+                disabled: key.get_u32(FSW_DISABLED_VALUE).is_ok_and(|value| value != 0),
+                bare_slash_mode: match key.get_u32(FSW_BARE_SLASH_MODE_VALUE) {
+                    Ok(value) if value != 0 => BareSlashMode::DefaultDistribution,
+                    _ => BareSlashMode::DistributionList,
+                },
+                bare_slash_pinned: key
+                    .get_string(FSW_BARE_SLASH_DISTRIBUTION_VALUE)
+                    .ok()
+                    .filter(|value| !value.is_empty()),
+                bare_slash_root: key
+                    .get_string(FSW_BARE_SLASH_ROOT_VALUE)
+                    .ok()
+                    .filter(|value| is_valid_windows_root(value)),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Self::default()
+        }
+    }
+}
+
 impl Snapshot {
+    /// One pass over the registry: one Lxss handle for the distribution list
+    /// and the default, one settings handle for the four preferences.
+    #[must_use]
     pub fn current() -> Self {
-        let distributions = list_registered_distributions();
-        let default_distribution = get_default_distribution(&distributions);
-        let bare_slash_mode = get_bare_slash_mode();
-        let bare_slash_override = get_bare_slash_override();
-        let bare_slash_pinned = if bare_slash_override.is_empty() {
-            None
-        } else {
-            Some(bare_slash_override)
-        };
-        let bare_slash_root = get_bare_slash_root();
-        let disabled = is_disabled();
+        let (distributions, default_distribution) = read_lxss();
+        let settings = SettingsValues::read();
 
         Self {
             distributions,
             default_distribution,
-            bare_slash_mode,
-            bare_slash_pinned,
-            bare_slash_root,
-            disabled,
+            bare_slash_mode: settings.bare_slash_mode,
+            bare_slash_pinned: settings.bare_slash_pinned,
+            bare_slash_root: settings.bare_slash_root,
+            disabled: settings.disabled,
         }
     }
 
@@ -258,30 +317,77 @@ pub fn has_package_identity() -> bool {
 pub fn list_registered_distributions() -> Vec<String> {
     #[cfg(windows)]
     {
-        use windows_registry::CURRENT_USER;
-
-        let mut distros = Vec::new();
-        let lxss = match CURRENT_USER.open(LXSS_KEY) {
-            Ok(k) => k,
-            Err(_) => return distros,
+        let Ok(lxss) = windows_registry::CURRENT_USER.open(LXSS_KEY) else {
+            return Vec::new();
         };
-
-        if let Ok(keys) = lxss.keys() {
-            for subkey_name in keys {
-                if let Ok(subkey) = lxss.open(&subkey_name) {
-                    if let Ok(name) = subkey.get_string("DistributionName") {
-                        if is_valid_distribution_name(&name) {
-                            distros.push(name);
-                        }
-                    }
-                }
-            }
-        }
-        distros
+        distributions_from_lxss(&lxss)
     }
     #[cfg(not(windows))]
     {
         Vec::new()
+    }
+}
+
+/// The distribution list and the default, from a single Lxss key handle.
+///
+/// The two used to be separate public calls, each opening the key; the
+/// broker's per-Enter snapshot pays for both. The answers are identical to
+/// `list_registered_distributions()` + `get_default_distribution(&list)`.
+fn read_lxss() -> (Vec<String>, Option<String>) {
+    #[cfg(windows)]
+    {
+        let Ok(lxss) = windows_registry::CURRENT_USER.open(LXSS_KEY) else {
+            return (Vec::new(), None);
+        };
+        let distributions = distributions_from_lxss(&lxss);
+        let default = default_distribution_from_lxss(&lxss, &distributions)
+            .or_else(|| single_registered_distribution(&distributions));
+        (distributions, default)
+    }
+    #[cfg(not(windows))]
+    {
+        (Vec::new(), None)
+    }
+}
+
+#[cfg(windows)]
+fn distributions_from_lxss(lxss: &windows_registry::Key) -> Vec<String> {
+    let mut distros = Vec::new();
+    let Ok(keys) = lxss.keys() else {
+        return distros;
+    };
+    for subkey_name in keys {
+        if let Ok(subkey) = lxss.open(&subkey_name) {
+            if let Ok(name) = subkey.get_string("DistributionName") {
+                if is_valid_distribution_name(&name) {
+                    distros.push(name);
+                }
+            }
+        }
+    }
+    distros
+}
+
+/// The `DefaultDistribution` GUID resolved to a name, if it is registered.
+#[cfg(windows)]
+fn default_distribution_from_lxss(
+    lxss: &windows_registry::Key,
+    registered: &[String],
+) -> Option<String> {
+    let default_guid = lxss.get_string("DefaultDistribution").ok()?;
+    let name = lxss.open(&default_guid).ok()?.get_string("DistributionName").ok()?;
+    registered
+        .iter()
+        .any(|distro| eq_ignore_case(distro, &name))
+        .then_some(name)
+}
+
+/// With exactly one distribution registered, WSL's own default is that one
+/// whether or not the registry says so.
+fn single_registered_distribution(registered: &[String]) -> Option<String> {
+    match registered {
+        [only] => Some(only.clone()),
+        _ => None,
     }
 }
 
@@ -293,97 +399,47 @@ pub fn is_registered_distribution(candidate: &str) -> bool {
 }
 
 /// Determines the default WSL distribution.
+#[must_use]
 pub fn get_default_distribution(registered: &[String]) -> Option<String> {
     #[cfg(windows)]
     {
-        use windows_registry::CURRENT_USER;
-
-        if let Ok(lxss) = CURRENT_USER.open(LXSS_KEY) {
-            if let Ok(default_guid) = lxss.get_string("DefaultDistribution") {
-                if let Ok(sub) = lxss.open(&default_guid) {
-                    if let Ok(name) = sub.get_string("DistributionName") {
-                        if registered.iter().any(|d| eq_ignore_case(d, &name)) {
-                            return Some(name);
-                        }
-                    }
-                }
+        if let Ok(lxss) = windows_registry::CURRENT_USER.open(LXSS_KEY) {
+            if let Some(name) = default_distribution_from_lxss(&lxss, registered) {
+                return Some(name);
             }
         }
     }
 
-    if registered.len() == 1 {
-        return Some(registered[0].clone());
-    }
-
-    None
+    single_registered_distribution(registered)
 }
 
 /// Reads the user's bare-slash mode from HKCU.
+///
+/// Reading more than one setting? Take [`SettingsValues::read`] instead — each
+/// of these getters opens the key on its own.
+#[must_use]
 pub fn get_bare_slash_mode() -> BareSlashMode {
-    #[cfg(windows)]
-    {
-        use windows_registry::CURRENT_USER;
-
-        if let Ok(key) = CURRENT_USER.open(FSW_SETTINGS_KEY) {
-            if let Ok(val) = key.get_u32(FSW_BARE_SLASH_MODE_VALUE) {
-                return if val != 0 {
-                    BareSlashMode::DefaultDistribution
-                } else {
-                    BareSlashMode::DistributionList
-                };
-            }
-        }
-    }
-    BareSlashMode::DistributionList
+    SettingsValues::read().bare_slash_mode
 }
 
-/// Reads any pinned bare-slash distribution name from HKCU.
+/// Reads any pinned bare-slash distribution name from HKCU. Empty when unset.
+#[must_use]
 pub fn get_bare_slash_override() -> String {
-    #[cfg(windows)]
-    {
-        use windows_registry::CURRENT_USER;
-
-        if let Ok(key) = CURRENT_USER.open(FSW_SETTINGS_KEY) {
-            if let Ok(val) = key.get_string(FSW_BARE_SLASH_DISTRIBUTION_VALUE) {
-                return val;
-            }
-        }
-    }
-    String::new()
+    SettingsValues::read().bare_slash_pinned.unwrap_or_default()
 }
 
 /// Reads the custom bare-slash root. An absent, empty, or malformed value is
 /// no root at all — a bad stored value must degrade to today's behavior, not
 /// poison every resolve.
+#[must_use]
 pub fn get_bare_slash_root() -> Option<String> {
-    #[cfg(windows)]
-    {
-        use windows_registry::CURRENT_USER;
-
-        if let Ok(key) = CURRENT_USER.open(FSW_SETTINGS_KEY) {
-            if let Ok(val) = key.get_string(FSW_BARE_SLASH_ROOT_VALUE) {
-                if is_valid_windows_root(&val) {
-                    return Some(val);
-                }
-            }
-        }
-    }
-    None
+    SettingsValues::read().bare_slash_root
 }
 
 /// Returns whether forward-slash path resolution is globally paused/disabled.
+#[must_use]
 pub fn is_disabled() -> bool {
-    #[cfg(windows)]
-    {
-        use windows_registry::CURRENT_USER;
-
-        if let Ok(key) = CURRENT_USER.open(FSW_SETTINGS_KEY) {
-            if let Ok(val) = key.get_u32(FSW_DISABLED_VALUE) {
-                return val != 0;
-            }
-        }
-    }
-    false
+    SettingsValues::read().disabled
 }
 
 /// Sets the disabled state in HKCU\Software\ForwardSlashWindows\Settings.
@@ -497,7 +553,14 @@ pub fn resolve_user_slash_path<'b>(
         .as_deref()
         .filter(|root| is_valid_windows_root(root));
 
-    let first_segment = input[1..].split('/').next().unwrap_or_default();
+    // Shape check before any slicing: `input[1..]` panics on an empty input
+    // and on a multi-byte first character, and `panic = "abort"` would take
+    // the CLI (or the resident broker) down instead of reporting R1.
+    let Some(after_root) = input.strip_prefix('/') else {
+        return Err(ResolveError::NotASlashPath);
+    };
+
+    let first_segment = after_root.split('/').next().unwrap_or_default();
     let explicit_distro = !first_segment.is_empty()
         && snapshot
             .distributions
@@ -609,8 +672,35 @@ pub fn registry_string_equals(path: &str, name: &str, expected: &str) -> bool {
 }
 
 /// Whether a transactional adapter under `path` records `State = "installed"`.
+#[must_use]
 pub fn adapter_installed(path: &str) -> bool {
     registry_string_equals(path, "State", "installed")
+}
+
+/// The payload version recorded by an installed adapter, from the `Version`
+/// value under its marker key. `None` when the key or the value is absent —
+/// which is also what a pre-`Version` install looks like.
+#[must_use]
+pub fn adapter_version(marker_key_path: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows_registry::CURRENT_USER;
+        if let Ok(key) = CURRENT_USER.open(marker_key_path) {
+            if let Ok(version) = key.get_string("Version") {
+                return Some(version);
+            }
+        }
+    }
+    let _ = marker_key_path;
+    None
+}
+
+/// Whether an installed adapter's payload predates `current_version` and
+/// should be reinstalled. An adapter that is not installed is never outdated.
+#[must_use]
+pub fn adapter_outdated(marker_key_path: &str, current_version: &str) -> bool {
+    adapter_installed(marker_key_path)
+        && adapter_version(marker_key_path).as_deref() != Some(current_version)
 }
 
 /// Whether the Windows-surface integration is installed.

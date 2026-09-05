@@ -7,26 +7,51 @@
 //! reallocates (see its doc comment); this test pins that promise.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::cell::Cell;
 
 struct Counting;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Counted per *thread*, not per process: libtest runs this binary's
+    /// tests on parallel threads that all share one global allocator, so a
+    /// process-wide counter also measures whatever the other test — and the
+    /// harness's own result printing — allocates inside the measured window.
+    /// That made this suite fail roughly a third of the time. Each test only
+    /// ever resolves on its own thread, so per-thread counting is exact.
+    ///
+    /// `const`-initialized and `Drop`-free, so the TLS slot itself never
+    /// allocates and the allocator cannot recurse into it.
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `try_with`, never `with`: TLS is gone while a thread is being torn down,
+/// and a panic raised inside the allocator is unrecoverable.
+fn note_allocation() {
+    let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+}
+
+fn allocations() -> usize {
+    ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
+}
+
+fn reset_allocations() {
+    let _ = ALLOCATIONS.try_with(|count| count.set(0));
+}
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Relaxed);
+        note_allocation();
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Relaxed);
+        note_allocation();
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Relaxed);
+        note_allocation();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -54,12 +79,12 @@ fn steady_state_resolution_allocates_nothing() {
 
     // Measured pass. The corpus's longest render is far below the buffer's
     // 512-byte reservation, so no growth allocation is possible either.
-    ALLOCATIONS.store(0, Relaxed);
+    reset_allocations();
     for (input, ctx) in common::contexts() {
         let _ = std::hint::black_box(resolve(input, &ctx, &mut buf));
     }
     assert_eq!(
-        ALLOCATIONS.load(Relaxed),
+        allocations(),
         0,
         "steady-state resolution allocated; the broker's Enter path regressed"
     );
@@ -75,12 +100,12 @@ fn steady_state_resolution_allocates_nothing() {
         preferred: Some("Ubuntu"),
         wsl_default: Some("Ubuntu"),
     };
-    ALLOCATIONS.store(0, Relaxed);
+    reset_allocations();
     for _ in 0..10_000 {
         let _ = std::hint::black_box(resolve(hot, &ctx, &mut buf));
     }
     assert_eq!(
-        ALLOCATIONS.load(Relaxed),
+        allocations(),
         0,
         "hot-path resolution allocated across 10,000 resolves"
     );
@@ -100,14 +125,14 @@ fn folder_root_resolution_allocates_nothing() {
         }
     }
 
-    ALLOCATIONS.store(0, Relaxed);
+    reset_allocations();
     for root in roots {
         for input in inputs {
             let _ = std::hint::black_box(fsw_path::resolve_under_root(input, root, &mut buf));
         }
     }
     assert_eq!(
-        ALLOCATIONS.load(Relaxed),
+        allocations(),
         0,
         "folder-root resolution allocated; the broker's Enter path regressed"
     );

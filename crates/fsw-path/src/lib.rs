@@ -236,6 +236,19 @@ impl<'r> Resolved<'r> {
     pub const fn is_provider_root(&self) -> bool {
         matches!(self, Self::WslRoot)
     }
+
+    /// Whether opening [`Self::unc_display`] through Win32 would land on a
+    /// different file than the user named — see
+    /// [`DistributionPath::has_win32_normalization_hazard`]. The provider root
+    /// is a fixed literal, so it is never a hazard.
+    #[must_use]
+    pub fn has_win32_normalization_hazard(&self) -> bool {
+        match self {
+            Self::WslRoot => false,
+            Self::Distribution(path) => path.has_win32_normalization_hazard(),
+            Self::Folder(path) => path.has_win32_normalization_hazard(),
+        }
+    }
 }
 
 /// A path inside a single distribution.
@@ -271,15 +284,29 @@ impl<'r> DistributionPath<'r> {
     }
 
     /// True when Win32 path normalization would open a *different* file than
-    /// [`Self::linux_path`] names, because a component ends in `.` or a space
-    /// and Win32 strips those outside the `\\?\` namespace. On ext4 `secret `
-    /// and `secret` are distinct files.
+    /// [`Self::linux_path`] names, because the path's **last** component ends
+    /// in `.` or a space and Win32 strips those outside the `\\?\` namespace.
+    /// On ext4 `secret ` and `secret` are distinct files.
+    ///
+    /// Only the last component can be lost: Win32 preserves a trailing `.` or
+    /// space that is followed by a separator, so neither a middle component
+    /// nor a path written with a trailing separator is a hazard.
     #[must_use]
     pub fn has_win32_normalization_hazard(&self) -> bool {
-        self.linux_path
-            .split('/')
-            .any(|component| component.ends_with('.') || component.ends_with(' '))
+        last_component_is_win32_hazard(self.linux_path)
     }
+}
+
+/// Whether Win32 normalization would strip the final component's trailing `.`
+/// or space. `.` and `..` are normalized away by every path parser rather than
+/// truncated, so they are never hazards; nor is an empty final component,
+/// which is what a trailing separator produces.
+fn last_component_is_win32_hazard(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or_default();
+    if last == "." || last == ".." {
+        return false;
+    }
+    last.ends_with('.') || last.ends_with(' ')
 }
 
 /// A path under the user's custom bare-slash root — any Win32 location, a
@@ -309,6 +336,14 @@ impl<'r> FolderPath<'r> {
     #[must_use]
     pub const fn had_trailing_separator(&self) -> bool {
         self.had_trailing_separator
+    }
+
+    /// The [`DistributionPath::has_win32_normalization_hazard`] test, applied
+    /// to the tail below the root. A folder root can sit on ext4 too (a
+    /// `\\wsl.localhost\…` root), so the hazard is not distribution-only.
+    #[must_use]
+    pub fn has_win32_normalization_hazard(&self) -> bool {
+        last_component_is_win32_hazard(self.under_root)
     }
 }
 
@@ -406,10 +441,21 @@ pub fn resolve_under_root<'r>(
     }))
 }
 
-/// Whether `root` is a usable custom-root value: an absolute drive path
-/// (`C:`, `C:\Users\me`) or UNC (`\\server\share`, `\\wsl.localhost\Ubuntu\…`).
-/// Existence is deliberately not checked — a `\\wsl.localhost` root may be
-/// offline at set time.
+/// Whether `root` is a usable custom-root value: an **absolute** drive path
+/// (`C:`, `C:\`, `C:\Users\me`) or a UNC path naming at least a share
+/// (`\\server\share`, `\\wsl.localhost\Ubuntu\…`). Existence is deliberately
+/// not checked — a `\\wsl.localhost` root may be offline at set time.
+///
+/// Rejected, beyond the obvious relative and device-namespace forms:
+/// * drive-*relative* paths (`C:code`, `C:Users\me`), which Win32 resolves
+///   against a hidden per-drive current directory — not a fixed folder;
+/// * share-less UNC roots (`\\server`, `\\server\`, `\\server\\share`);
+/// * the WSL provider root itself (`\\wsl.localhost`, with or without
+///   trailing separators, in any casing). A root normalizes by having its
+///   trailing separators stripped, and [`Resolved::unc_display`] promises
+///   that literal identifies only [`Resolved::WslRoot`] — a
+///   [`Resolved::Folder`] must never be able to render it;
+/// * wildcards (`*`, `?`), which name a search pattern rather than a folder.
 #[must_use]
 pub fn is_valid_windows_root(root: &str) -> bool {
     if root.is_empty() || root.contains('/') || root.contains('\0') {
@@ -421,22 +467,40 @@ pub fn is_valid_windows_root(root: &str) -> bool {
             return false;
         }
     }
-    let forbidden = |byte: u8| matches!(byte, b'"' | b'<' | b'>' | b'|' | 0..=0x1F);
+    // `resolve_under_root` strips trailing separators before joining, so the
+    // provider-root test has to run on the same normalized form.
+    if eq_ignore_case(root.trim_end_matches('\\'), WSL_ROOT_UNC) {
+        return false;
+    }
+    let forbidden = |byte: u8| matches!(byte, b'"' | b'<' | b'>' | b'|' | b'*' | b'?' | 0..=0x1F);
 
     let bytes = root.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-        // Drive form; a second `:` (`C:\a:b`) would be a stream, not a folder.
+    let drive_letter = matches!(
+        (bytes.first(), bytes.get(1)),
+        (Some(letter), Some(b':')) if letter.is_ascii_alphabetic()
+    );
+    if drive_letter {
+        // `C:` and `C:\…` are absolute; `C:code` is drive-relative.
+        if !matches!(bytes.get(2), None | Some(b'\\')) {
+            return false;
+        }
+        // A second `:` (`C:\a:b`) would be a stream, not a folder.
         return root[2..].bytes().all(|byte| byte != b':' && !forbidden(byte));
     }
     if let Some(rest) = root.strip_prefix(r"\\") {
-        // UNC form: `\\server\share[\dir …]` — a bare `\\server` is not a
-        // folder, and UNC paths never carry a colon.
-        return match rest.find('\\') {
-            Some(share_start) if share_start > 0 => {
-                rest.bytes().all(|byte| byte != b':' && !forbidden(byte))
-            }
-            _ => false,
+        // UNC form: `\\server\share[\dir …]`. Both the server and the share
+        // component must be non-empty, and UNC paths never carry a colon.
+        let Some(share_start) = rest.find('\\') else {
+            return false;
         };
+        if share_start == 0 {
+            return false;
+        }
+        let after_server = rest.get(share_start + 1..).unwrap_or_default();
+        if after_server.split('\\').next().unwrap_or_default().is_empty() {
+            return false;
+        }
+        return rest.bytes().all(|byte| byte != b':' && !forbidden(byte));
     }
     false
 }
