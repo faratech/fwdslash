@@ -13,10 +13,10 @@ IDI_FSW_APP ICON "../../assets/fwdslash.ico"
 // whose defines never arrived at the last known-good version rather than at
 // 0.0.0 -- so they must be kept in step with Cargo.toml.
 #ifndef FSW_VER_COMMAS
-#define FSW_VER_COMMAS 0,0,3,0
+#define FSW_VER_COMMAS 0,0,4,0
 #endif
 #ifndef FSW_VER_STR
-#define FSW_VER_STR "0.0.3"
+#define FSW_VER_STR "0.0.4"
 #endif
 
 1 VERSIONINFO

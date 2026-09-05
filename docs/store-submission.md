@@ -207,7 +207,7 @@ here but resembles a keylogger to an automated scan, so state plainly:
   The `AutoRun` value, the PowerShell profile blocks and
   `%LOCALAPPDATA%\ForwardSlashWindows` survive package removal. Disable the
   integrations from the settings app before uninstalling.
-- **Version is `0.0.3.0`.** Each submission must increase it, and the fourth
+- **Version is `0.0.4.0`.** Each submission must increase it, and the fourth
   field is reserved by the Store (always `0`). It comes from
   `workspace.package.version`, and the statement above is one of the locations
   `tools/bump_version.py` rewrites — bump with `python3 tools/bump_version.py

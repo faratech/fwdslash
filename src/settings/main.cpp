@@ -697,7 +697,7 @@ class SettingsWindow {
 
   void BuildAbout(const Grid& surface) {
     StackPanel stack = PageStack();
-    stack.Children().Append(PageHeader(L"About", L"Forward Slash Windows 0.0.3"));
+    stack.Children().Append(PageHeader(L"About", L"Forward Slash Windows 0.0.4"));
     stack.Children().Append(Text(
         L"Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to "
         L"either the WSL distribution list or your default distribution, on "
