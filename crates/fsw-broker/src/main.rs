@@ -5,6 +5,7 @@ use fsw_path::{RenderBuf, eq_ignore_case};
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
@@ -36,9 +37,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, SendInput, VK_ESCAPE, VK_RETURN,
 };
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_WARNING, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW, SEE_MASK_ASYNCOK,
-    SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, Shell_NotifyIconW, ShellExecuteExW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_WARNING, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+    SEE_MASK_ASYNCOK, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, Shell_NotifyIconW, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -80,6 +81,26 @@ const HEALTH_INTERVAL_IDLE_MS: u32 = 60_000;
 /// the tick interval so a connected driver does not re-arm the hook every 5 s.
 const MAINTENANCE_INTERVAL_MS: u64 = 60_000;
 const REPLAY_MARKER: usize = 0x4653_572F;
+
+/// Shutdown grace for the Enter worker: 50 polls, 10 ms apart.
+const WORKER_STOP_ATTEMPTS: u32 = 50;
+const WORKER_STOP_POLL_MS: u64 = 10;
+
+/// Ceiling on one `fwdslash integration <id> enable` child. The transaction it
+/// runs is a directory copy plus a handful of registry writes; anything past
+/// this is a hang (a locked payload file, a wedged `reg.exe`), not slowness,
+/// and the sweep must not leave a child of the resident broker running for the
+/// rest of the session.
+const ADAPTER_UPGRADE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+/// `try_wait` spacing while an upgrade child runs.
+const ADAPTER_UPGRADE_POLL_MS: u64 = 250;
+/// Balloon retry spacing and count (~10 s) for the sweep's one notification.
+const ADAPTER_UPGRADE_NOTIFY_INTERVAL_MS: u64 = 500;
+const ADAPTER_UPGRADE_NOTIFY_ATTEMPTS: u32 = 20;
+/// `CREATE_NO_WINDOW`. `fwdslash.exe` is a console binary, and the sweep runs
+/// unattended at logon: without this every outdated adapter flashes a console
+/// window on the user's desktop.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const MENU_SETTINGS: u32 = 1001;
 const MENU_PAUSE: u32 = 1002;
@@ -188,6 +209,11 @@ static WORKER_JOIN: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None
 /// MSIX startup task launches us — and every later `NIM_MODIFY` (tooltip,
 /// balloon) is silently discarded until an add lands.
 static ICON_ADDED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the adapter-upgrade sweep has already been started. One pass per
+/// process: the broker is restarted by the logon task and by every product
+/// update, which is exactly when the payload can be stale.
+static ADAPTER_UPGRADE_STARTED: AtomicBool = AtomicBool::new(false);
 
 /// Current `SetTimer` interval, so the timer is only re-created when the
 /// wanted interval actually changes.
@@ -1070,6 +1096,164 @@ fn request_persist_disabled(disabled: bool) {
     }
 }
 
+/// The shell adapters, in the order the tray "Integrations" submenu lists
+/// them: the CLI verb id, the name a balloon may show, and the marker key
+/// that records the payload version currently deployed.
+fn adapter_upgrade_targets() -> [(&'static str, &'static str, String); 3] {
+    [
+        ("cmd", "Command Prompt", CMD_ADAPTER_KEY.to_owned()),
+        (
+            "windows-powershell",
+            "Windows PowerShell",
+            format!("{POWERSHELL_ADAPTER_ROOT}WindowsPowerShell"),
+        ),
+        (
+            "powershell",
+            "PowerShell 7",
+            format!("{POWERSHELL_ADAPTER_ROOT}PowerShell"),
+        ),
+    ]
+}
+
+/// Runs one `fwdslash integration <id> enable` to completion, bounded by
+/// [`ADAPTER_UPGRADE_TIMEOUT`]. Reports whether the CLI exited successfully.
+///
+/// The CLI does the transactional uninstall+install itself and is idempotent
+/// once the recorded version already matches, so racing a manual enable from
+/// the settings app costs at worst a redundant reinstall.
+fn run_adapter_upgrade(cli: &Path, id: &str) -> bool {
+    let spawned = std::process::Command::new(cli)
+        .arg("integration")
+        .arg(id)
+        .arg("enable")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return false;
+    };
+
+    let deadline = std::time::Instant::now() + ADAPTER_UPGRADE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            // Half-applied is the transaction's problem, not ours: the CLI
+            // rolls its own snapshot back, and the marker key still reads the
+            // old version, so the next launch tries again.
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(ADAPTER_UPGRADE_POLL_MS));
+    }
+}
+
+/// `show_notification` silently drops a balloon while the shell has not
+/// accepted `NIM_ADD`, and at logon the add can be waiting on the 60 s
+/// health tick to retry. Give the icon ~10 s to appear before spending the
+/// one balloon this sweep is allowed.
+fn notify_when_icon_ready(message: &str, flags: u32) {
+    for _ in 0..ADAPTER_UPGRADE_NOTIFY_ATTEMPTS {
+        if ICON_ADDED.load(Ordering::Relaxed) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(
+            ADAPTER_UPGRADE_NOTIFY_INTERVAL_MS,
+        ));
+    }
+    show_notification(message, flags);
+}
+
+/// Brings every installed shell adapter whose recorded payload version is not
+/// this build's back up to date, with no click from the user.
+///
+/// An adapter's payload — the scripts plus a private copy of `fwdslash.exe` —
+/// is copied into `%LOCALAPPDATA%` at install time, so after a product update
+/// the previous copy keeps serving every console until someone re-runs
+/// `fwdslash integration <id> enable`. The broker is the one component that
+/// starts at every logon and after every update, so the check belongs here.
+fn adapter_upgrade_sweep() {
+    let targets = adapter_upgrade_targets();
+    let outdated: Vec<(&'static str, &'static str)> = targets
+        .iter()
+        .filter(|(_, _, marker_key)| adapter_outdated(marker_key, FSW_VERSION))
+        .map(|&(id, label, _)| (id, label))
+        .collect();
+    if outdated.is_empty() {
+        return;
+    }
+
+    // Beside the broker, never from PATH: an appExecutionAlias or a stale
+    // directory on PATH could resolve to a different install entirely.
+    let Ok(directory) = executable_directory() else {
+        log_diagnostic("event=adapter_upgrade_skipped");
+        return;
+    };
+    let cli = directory.join("fwdslash.exe");
+    if !cli.is_file() {
+        log_diagnostic("event=adapter_upgrade_skipped");
+        return;
+    }
+
+    let mut upgraded: Vec<&'static str> = Vec::new();
+    let mut failed = false;
+    for (id, label) in outdated {
+        if run_adapter_upgrade(&cli, id) {
+            log_diagnostic("event=adapter_upgraded");
+            upgraded.push(label);
+        } else {
+            log_diagnostic("event=adapter_upgrade_failed");
+            failed = true;
+        }
+    }
+
+    // Exactly one balloon, whatever the mix: a per-adapter notification would
+    // stack three toasts on top of a logon the user did not ask about.
+    if failed {
+        notify_when_icon_ready(
+            "Some terminal integrations could not be updated automatically. Open Settings to retry.",
+            NIIF_WARNING,
+        );
+    } else {
+        notify_when_icon_ready(
+            &format!(
+                "Terminal integrations were updated to {FSW_VERSION}: {}.",
+                upgraded.join(", ")
+            ),
+            NIIF_INFO,
+        );
+    }
+}
+
+/// Starts the adapter-upgrade sweep on a thread of its own, once per process.
+///
+/// Fire-and-forget by design. The work is process creation plus a wait, both
+/// unbounded under load, so it may touch neither the hook/UI thread nor the
+/// Enter worker; and `WM_DESTROY` deliberately does not join it, because a
+/// child `fwdslash.exe` already mid-transaction owns its own rollback and
+/// finishes whether the broker is still there or not.
+fn start_adapter_upgrade() {
+    if ADAPTER_UPGRADE_STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("fsw-adapter-upgrade".to_owned())
+        .spawn(adapter_upgrade_sweep)
+        .is_err()
+    {
+        // Out of threads. Running it inline would park the thread that owns
+        // the keyboard hook for as long as three CLI transactions take, so the
+        // upgrade waits for the next launch instead.
+        log_diagnostic("event=adapter_upgrade_skipped");
+    }
+}
+
 /// Applies a pause/resume and reports the state the broker ended up in.
 ///
 /// `Err` means the resume could not arm the keyboard hook, i.e. the broker is
@@ -1311,11 +1495,14 @@ fn health_tick(window: HWND) {
     rearm_hook(window);
 }
 
-/// Asks the worker to quit and waits a bounded time for it.
+/// Asks the worker to quit, waits ~500 ms for it to signal that it has, and
+/// joins it only if it made that deadline.
 ///
-/// The worker may be inside a multi-second `ShellExecuteExW`; the process is
-/// on its way out either way, so an unbounded join would just hang the exit
-/// and leave the tray icon on screen.
+/// The worker may be parked inside a multi-second `ShellExecuteExW` — binding
+/// `\\wsl.localhost\<distro>` boots a stopped distribution — and this runs
+/// inside `WM_DESTROY`, ahead of the tray-icon removal and the process exit.
+/// An unbounded join would keep a ghost icon on screen for as long as the bind
+/// takes, so a worker that misses the deadline is detached on purpose.
 fn stop_worker() {
     let thread_id = WORKER_THREAD.swap(0, Ordering::Relaxed);
     if thread_id == 0 {
@@ -1324,20 +1511,36 @@ fn stop_worker() {
     unsafe {
         PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
     }
-    for _ in 0..50 {
+
+    let mut stopped = false;
+    for _ in 0..WORKER_STOP_ATTEMPTS {
         if WORKER_STOPPED.load(Ordering::Acquire) {
+            stopped = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(WORKER_STOP_POLL_MS));
     }
-    if !WORKER_STOPPED.load(Ordering::Acquire) {
+
+    // Take the handle either way: leaving it parked in the static is what
+    // makes the timeout path look like a leak.
+    let handle = WORKER_JOIN.lock().ok().and_then(|mut slot| slot.take());
+    let Some(handle) = handle else {
+        return;
+    };
+
+    if stopped {
+        // It is out of its message loop and past `CoUninitialize`, so the join
+        // is immediate and reaps the thread properly.
+        let _ = handle.join();
         return;
     }
-    if let Ok(mut handle) = WORKER_JOIN.lock() {
-        if let Some(handle) = handle.take() {
-            let _ = handle.join();
-        }
-    }
+
+    // Deliberate detach, not a dropped error: the worker is still inside
+    // something that cannot be interrupted, and the process is exiting anyway.
+    // The handle goes out of scope here, which detaches the thread and lets
+    // process teardown reap it — `WM_DESTROY` continues on to remove the icon.
+    log_diagnostic("event=worker_detached");
+    drop(handle);
 }
 
 unsafe extern "system" fn worker_proc(
@@ -1662,6 +1865,10 @@ fn main() {
                 NIIF_ERROR,
             );
         }
+
+        // Last, and off this thread: the icon and the hook are what the user
+        // notices missing, and the sweep may take minutes.
+        start_adapter_upgrade();
 
         pump_messages();
 

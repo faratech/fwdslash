@@ -165,7 +165,9 @@ Three user-mode binaries share one static core and cooperate at runtime:
   verbs it carries the shell-adapter contract: `cmd-list`, `cmd-cd` and `shell-resolve`, all
   three sharing one `shell_target` funnel, with **exit 3 meaning "run your own command
   unchanged"**. Installing an adapter whose recorded `Version` is older than `PAYLOAD_VERSION`
-  upgrades it in place (uninstall transaction, then install transaction).
+  upgrades it in place (uninstall transaction, then install transaction) — and that upgrade is
+  **automatic**: the broker sweeps every installed adapter at startup and the settings window
+  sweeps again on launch, so `fwdslash integration <id> enable` is only the manual fallback.
 - **`fswsettings.exe`** — Rust desktop app on the vendored `windows-reactor` crate (Windows App
   Runtime **2.x**). It has **no tray icon and no watchdog**: closing the window exits the
   process, and the broker keeps the icon. Controller calls and state reads run on the thread
@@ -353,8 +355,12 @@ would push onto the module's own location stack). A payload list lives in four p
 `tools/package_msix.py` — and adding a file means editing all four.
 
 The installed payload directory is named for `PAYLOAD_VERSION`, which now derives from
-`CARGO_PKG_VERSION`. A version bump therefore marks every deployed adapter outdated, and
-`fwdslash integration <name> enable` upgrades it in place.
+`CARGO_PKG_VERSION`. A version bump therefore marks every deployed adapter outdated, and the
+upgrade runs itself: `start_adapter_upgrade` in `crates/fsw-broker/src/main.rs` re-runs
+`fwdslash integration <id> enable` on a background thread at broker startup (90 s per adapter,
+one summary balloon), and the settings window repeats the sweep on launch, reporting through an
+InfoBar. Running `fwdslash integration <name> enable` by hand is the fallback, not the
+expected path, and the settings app has no button for it.
 
 ### Driver
 

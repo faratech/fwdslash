@@ -12,7 +12,8 @@
 
 use fsw_core::{
     BrokerState, CMD_ADAPTER_KEY, FSW_BROKER_WINDOW_CLASS, FSW_VERSION, POWERSHELL_ADAPTER_ROOT,
-    SettingsValues, adapter_installed, adapter_outdated, broker_state, broker_window_exists,
+    SettingsValues, adapter_installed, adapter_outdated, adapter_version, broker_state,
+    broker_window_exists,
     ensure_broker_running, executable_available, executable_directory, get_default_distribution,
     has_package_identity, is_store_flavor, list_registered_distributions, package_architecture,
     package_version, update, windows_integration_installed,
@@ -38,8 +39,10 @@ const IDI_FSW_APP: u16 = 101;
 /// that clears the pending folder selection.
 const ROOT_ACTION: &str = "Bare slash opens the chosen folder";
 
-/// The `show_result` action phrase for the bulk adapter upgrade.
-const UPDATE_INTEGRATIONS_ACTION: &str = "Terminal integrations updated";
+/// The action phrase reserved for one step of the automatic adapter upgrade.
+/// `ControllerFinished` matches on it to advance the upgrade queue, so it never
+/// reaches `show_result` -- the upgrade reports itself once, when the queue drains.
+const UPGRADE_ACTION: &str = "Terminal integration upgrade";
 
 // ---------------------------------------------------------------------------
 // Sections
@@ -102,9 +105,20 @@ impl Integration {
     fn installed(self, state: &State) -> bool {
         match self {
             Self::Windows => state.windows,
-            Self::Cmd => state.cmd,
-            Self::WindowsPowerShell => state.windows_powershell,
-            Self::PowerShell7 => state.powershell7,
+            // One source of truth: the adapter row read in `State::read`.
+            _ => state
+                .adapter(self)
+                .is_some_and(|adapter| adapter.installed),
+        }
+    }
+
+    /// The name the version and upgrade notices use for this adapter.
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Windows => "Windows surfaces",
+            Self::Cmd => "Command Prompt",
+            Self::WindowsPowerShell => "Windows PowerShell",
+            Self::PowerShell7 => "PowerShell 7",
         }
     }
 
@@ -132,6 +146,20 @@ impl Integration {
 // State
 // ---------------------------------------------------------------------------
 
+/// One shell adapter's deployed state: whether its marker key says `installed`,
+/// the payload version it recorded, and whether that predates this build.
+///
+/// `outdated` is `adapter_outdated`, which is already false for an adapter that
+/// is not installed; the pair is kept separate so the About page can tell
+/// "not installed" from "installed and current".
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdapterStatus {
+    integration: Integration,
+    installed: bool,
+    version: Option<String>,
+    outdated: bool,
+}
+
 /// Everything the window renders, read straight from HKCU and the broker window.
 ///
 /// Mirrors `RefreshState()` at `src/settings/main.cpp:754-841`. Reading in-process
@@ -143,9 +171,8 @@ struct State {
     disabled: bool,
     packaged: bool,
     windows: bool,
-    cmd: bool,
-    windows_powershell: bool,
-    powershell7: bool,
+    /// Cmd, Windows PowerShell and PowerShell 7, in that order.
+    adapters: Vec<AdapterStatus>,
     powershell7_available: bool,
     bare_mode: BareSlashMode,
     pinned: String,
@@ -157,9 +184,6 @@ struct State {
     wsl_default: Option<String>,
     broker: BrokerState,
     broker_window: bool,
-    /// Installed shell adapters whose payload predates this build. The CLI's
-    /// `integration <id> enable` performs the upgrade in place.
-    adapters_outdated: Vec<Integration>,
     /// A downloaded update bundle is waiting to be registered (GitHub flavor).
     update_bundle_ready: bool,
 }
@@ -183,24 +207,25 @@ impl State {
         let settings = SettingsValues::read();
         let windows_powershell_key = format!("{POWERSHELL_ADAPTER_ROOT}WindowsPowerShell");
         let powershell7_key = format!("{POWERSHELL_ADAPTER_ROOT}PowerShell");
-        let mut adapters_outdated = Vec::new();
-        for (integration, key) in [
+        let adapters = [
             (Integration::Cmd, CMD_ADAPTER_KEY),
             (Integration::WindowsPowerShell, windows_powershell_key.as_str()),
             (Integration::PowerShell7, powershell7_key.as_str()),
-        ] {
+        ]
+        .into_iter()
+        .map(|(integration, key)| AdapterStatus {
+            integration,
+            installed: adapter_installed(key),
+            version: adapter_version(key),
             // The adapter payload version is the crate version.
-            if adapter_outdated(key, FSW_VERSION) {
-                adapters_outdated.push(integration);
-            }
-        }
+            outdated: adapter_outdated(key, FSW_VERSION),
+        })
+        .collect();
         Self {
             disabled: settings.disabled,
             packaged: has_package_identity(),
             windows: windows_integration_installed(),
-            cmd: adapter_installed(CMD_ADAPTER_KEY),
-            windows_powershell: adapter_installed(&windows_powershell_key),
-            powershell7: adapter_installed(&powershell7_key),
+            adapters,
             powershell7_available: powershell7_available(),
             bare_mode: settings.bare_slash_mode,
             pinned: settings.bare_slash_pinned.unwrap_or_default(),
@@ -215,8 +240,81 @@ impl State {
             // waits on the result to repaint).
             broker: broker_state(250),
             broker_window: broker_window_exists(),
-            adapters_outdated,
             update_bundle_ready: update::pending_bundle_path().is_some(),
+        }
+    }
+
+    /// The adapter row for `integration`, or `None` for `Integration::Windows`,
+    /// which is not a shell adapter and carries no payload version.
+    fn adapter(&self, integration: Integration) -> Option<&AdapterStatus> {
+        self.adapters
+            .iter()
+            .find(|adapter| adapter.integration == integration)
+    }
+
+    /// Installed adapters whose payload predates this build, in page order.
+    /// `integration <id> enable` upgrades one in place.
+    fn outdated_adapters(&self) -> Vec<Integration> {
+        self.adapters
+            .iter()
+            .filter(|adapter| adapter.installed && adapter.outdated)
+            .map(|adapter| adapter.integration)
+            .collect()
+    }
+
+    /// The secondary line under a Terminals toggle: what is actually deployed.
+    fn adapter_detail(&self, integration: Integration) -> Option<String> {
+        let adapter = self.adapter(integration)?;
+        if !adapter.installed {
+            return None;
+        }
+        // A pre-`Version` install records no version at all, and is outdated
+        // by that fact alone.
+        let version = adapter.version.as_deref().unwrap_or("unknown");
+        Some(if adapter.outdated {
+            format!("Installed payload {version} \u{2014} updating to {FSW_VERSION}")
+        } else {
+            format!("Installed payload {version}")
+        })
+    }
+
+    /// The About page's line for one adapter.
+    fn adapter_component_line(&self, integration: Integration) -> String {
+        let label = integration.display_name();
+        let Some(adapter) = self.adapter(integration) else {
+            return format!("{label} adapter: not installed");
+        };
+        if !adapter.installed {
+            return format!("{label} adapter: not installed");
+        }
+        let version = adapter.version.as_deref().unwrap_or("unknown");
+        if adapter.outdated {
+            format!("{label} adapter: {version} (update pending)")
+        } else {
+            format!("{label} adapter: {version}")
+        }
+    }
+
+    /// The About page's broker line. Deliberately not `status_text`'s wording:
+    /// that string is a byte-for-byte port of `src/settings/main.cpp:832-838`
+    /// and says "disabled" where this says "paused".
+    fn broker_component_line(&self) -> &'static str {
+        match self.broker {
+            BrokerState::Active => "Broker: active",
+            BrokerState::Paused => "Broker: paused",
+            BrokerState::Unavailable if self.broker_window => "Broker: hook unavailable",
+            BrokerState::Unavailable => "Broker: stopped",
+        }
+    }
+
+    /// Which of the two package flavors is running, or neither.
+    fn flavor_component_line(&self) -> &'static str {
+        if !self.packaged {
+            "Flavor: unpackaged"
+        } else if self.store_flavor {
+            "Flavor: Microsoft Store"
+        } else {
+            "Flavor: GitHub"
         }
     }
 
@@ -314,8 +412,6 @@ enum Msg {
     OpenWslRoot,
     RefreshStatus,
     DismissNotice,
-    /// Reinstall every outdated shell adapter through the CLI.
-    UpdateIntegrations,
     /// Register the downloaded bundle now instead of waiting for the next logon.
     RestartToUpdate,
     /// A background `State::read()` completed. Every refresh is off-thread: the
@@ -331,6 +427,25 @@ enum Msg {
         terminal: bool,
         succeeded: bool,
     },
+}
+
+/// The automatic shell-adapter upgrade in flight.
+///
+/// The broker runs the same upgrade at logon, so by the time this window opens
+/// there is usually nothing to do; when there is, it happens without being
+/// asked. One `fwdslash integration <id> enable` per adapter, sequentially --
+/// the CLI transaction is per adapter, and two at once would race the shared
+/// payload directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Upgrade {
+    /// The adapter whose `integration <id> enable` is running now.
+    current: Integration,
+    /// Adapters still waiting, popped from the back.
+    queue: Vec<Integration>,
+    /// Adapters the CLI reported success for.
+    done: Vec<Integration>,
+    /// At least one step failed; the summary becomes an error.
+    failed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -352,6 +467,12 @@ struct SettingsModel {
     /// `None`. Every control that mutates state is disabled while it is set,
     /// so a second request can never race the first.
     pending: Option<&'static str>,
+    /// The running adapter upgrade, or `None` when none is in flight.
+    upgrade: Option<Upgrade>,
+    /// An upgrade has already been started (or found unnecessary) this process.
+    /// Every refresh re-reads the adapter versions, and a failed upgrade would
+    /// otherwise restart itself on every one of them.
+    upgrade_attempted: bool,
 }
 
 impl SettingsModel {
@@ -407,6 +528,91 @@ impl SettingsModel {
     fn refresh(context: &ComponentContext<Self>) {
         context.spawn_background(|_| Msg::StateLoaded(State::read()));
     }
+
+    /// Starts the automatic upgrade if any installed adapter is outdated.
+    ///
+    /// Called for every `State` the model accepts. Nothing is asked of the
+    /// user: an outdated payload is a bug to fix, not a decision to make.
+    fn maybe_start_upgrade(&mut self, context: &ComponentContext<Self>) {
+        if self.upgrade_attempted || self.upgrade.is_some() || self.pending.is_some() {
+            return;
+        }
+        let mut queue = self.state.outdated_adapters();
+        if queue.is_empty() {
+            return;
+        }
+        // Popped from the back, so reverse to keep page order.
+        queue.reverse();
+        let Some(current) = queue.pop() else { return };
+        self.upgrade_attempted = true;
+        self.upgrade = Some(Upgrade {
+            current,
+            queue,
+            done: Vec::new(),
+            failed: false,
+        });
+        self.start_upgrade_step(context, current);
+    }
+
+    /// `integration <id> enable` on an installed-but-outdated marker reinstalls
+    /// the payload, so one enable per adapter is the whole upgrade. It is
+    /// transactional and idempotent: if the broker already ran it at logon,
+    /// this exits 0 with nothing to do, which is a success.
+    fn start_upgrade_step(&mut self, context: &ComponentContext<Self>, integration: Integration) {
+        self.start_controller(
+            context,
+            UPGRADE_ACTION,
+            true,
+            vec![
+                "integration".to_string(),
+                integration.id().to_string(),
+                "enable".to_string(),
+            ],
+        );
+    }
+
+    /// Records one finished step and either starts the next or reports the
+    /// whole upgrade once.
+    fn advance_upgrade(&mut self, succeeded: bool, context: &ComponentContext<Self>) {
+        let Some(mut upgrade) = self.upgrade.take() else {
+            return;
+        };
+        if succeeded {
+            upgrade.done.push(upgrade.current);
+        } else {
+            upgrade.failed = true;
+        }
+        if let Some(next) = upgrade.queue.pop() {
+            upgrade.current = next;
+            self.upgrade = Some(upgrade);
+            self.start_upgrade_step(context, next);
+            return;
+        }
+        self.notice = Some(if upgrade.failed {
+            (
+                InfoBarSeverity::Error,
+                "Some terminal integrations could not be updated",
+                "Turn the affected integration off and on again on the Terminals page."
+                    .to_string(),
+            )
+        } else {
+            let names: Vec<&str> = upgrade
+                .done
+                .iter()
+                .map(|integration| integration.display_name())
+                .collect();
+            let verb = if names.len() == 1 { "is" } else { "are" };
+            (
+                InfoBarSeverity::Success,
+                "Terminal integrations updated",
+                format!("{} {verb} now on {FSW_VERSION}", names.join(", ")),
+            )
+        });
+        // Not the update-available notice, so dismissal must not clear the
+        // persisted AvailableUpdate value.
+        self.notice_is_update = false;
+        Self::refresh(context);
+    }
 }
 
 impl Component for SettingsModel {
@@ -433,7 +639,7 @@ impl Component for SettingsModel {
         ) {
             context.spawn_background(|_| Msg::UpdateCheckFinished(update::run_update_check()));
         }
-        Self {
+        let mut model = Self {
             section: *input,
             pane_open: false,
             color_scheme: ColorScheme::Dark,
@@ -445,7 +651,13 @@ impl Component for SettingsModel {
             notice_is_update: false,
             notice: None,
             pending: None,
-        }
+            upgrade: None,
+            upgrade_attempted: false,
+        };
+        // An outdated adapter is repaired on sight, at the first state the
+        // window ever sees.
+        model.maybe_start_upgrade(context);
+        model
     }
 
     fn update(&mut self, message: Self::Message, context: &ComponentContext<Self>) {
@@ -457,11 +669,10 @@ impl Component for SettingsModel {
                 }
                 self.section = section;
                 // Stands in for the C++ `window_.Activated` refresh, which reactor
-                // has no equivalent for. See docs/divergences.md. About shows
-                // nothing live, so it costs a registry sweep for nothing.
-                if section != Section::About {
-                    Self::refresh(context);
-                }
+                // has no equivalent for. See docs/divergences.md. Every page,
+                // About included -- its Components card is live state, and the
+                // read is off the UI thread.
+                Self::refresh(context);
             }
             // A cleared selection is WinUI normalizing, never a user choice.
             Msg::Navigate(None) => {}
@@ -615,33 +826,6 @@ impl Component for SettingsModel {
                 );
             }
 
-            Msg::UpdateIntegrations => {
-                // `integration <id> enable` on an installed-but-outdated marker
-                // reinstalls the payload, so one enable per outdated adapter is
-                // the whole upgrade.
-                let ids: Vec<&'static str> = self
-                    .state
-                    .adapters_outdated
-                    .iter()
-                    .map(|integration| integration.id())
-                    .collect();
-                if ids.is_empty() {
-                    return;
-                }
-                self.pending = Some(UPDATE_INTEGRATIONS_ACTION);
-                context.spawn_background(move |_| {
-                    let mut succeeded = true;
-                    for id in ids {
-                        succeeded &= run_controller(["integration", id, "enable"]);
-                    }
-                    Msg::ControllerFinished {
-                        action: UPDATE_INTEGRATIONS_ACTION,
-                        terminal: true,
-                        succeeded,
-                    }
-                });
-            }
-
             Msg::OpenWslRoot => {
                 if !open_wsl_root() {
                     self.show_result(false, "Opening the WSL root", false);
@@ -724,13 +908,21 @@ impl Component for SettingsModel {
                 succeeded,
             } => {
                 self.pending = None;
+                if action == UPGRADE_ACTION {
+                    // The upgrade reports itself once, when the queue drains.
+                    self.advance_upgrade(succeeded, context);
+                    return;
+                }
                 if succeeded && action == ROOT_ACTION {
                     self.folder_selected = false;
                 }
                 self.show_result(succeeded, action, terminal);
                 Self::refresh(context);
             }
-            Msg::StateLoaded(state) => self.state = state,
+            Msg::StateLoaded(state) => {
+                self.state = state;
+                self.maybe_start_upgrade(context);
+            }
             Msg::BrokerProbed => Self::refresh(context),
         }
     }
@@ -873,41 +1065,32 @@ impl SettingsModel {
     /// The second fixed row: standing notices and actions that are derived from
     /// state rather than from a single completed command, plus the in-flight
     /// indicator. Kept out of `self.notice` so a routine "Updated" result never
-    /// hides the outdated-adapter warning, and vice versa.
+    /// hides the adapter-upgrade progress, and vice versa.
     ///
     /// Reactor's `InfoBar` exposes no action-button slot, so each action is a
     /// `Button` rendered directly beneath its bar.
     fn banners(&self, context: &mut ViewContext<Self>) -> View {
-        let outdated = !self.state.adapters_outdated.is_empty();
         // The GitHub flavor only: the Store updates through the Store.
         let restartable =
             self.state.packaged && !self.state.store_flavor && self.state.update_bundle_ready;
-        if !outdated && !restartable && self.pending.is_none() {
+        if self.upgrade.is_none() && !restartable && self.pending.is_none() {
             return View::empty();
         }
 
-        let adapters_notice: View = if outdated {
-            InfoBar::new()
-                .title("Terminal integrations need updating")
-                .message(
-                    "Your installed shell integrations were deployed by an older version. \
-                     Update them to get the latest fixes.",
-                )
+        // Progress only -- there is no button, because there is no decision to
+        // make. The result lands in the dismissible notice above.
+        let upgrade_notice: View = match &self.upgrade {
+            Some(upgrade) => InfoBar::new()
+                .title("Updating terminal integrations\u{2026}")
+                .message(format!(
+                    "{} adapter \u{2192} {FSW_VERSION}",
+                    upgrade.current.display_name()
+                ))
                 .severity(InfoBarSeverity::Informational)
                 .is_open(true)
                 .is_closable(false)
-                .into()
-        } else {
-            View::empty()
-        };
-        let adapters_action: View = if outdated {
-            Button::new()
-                .is_enabled(self.controls_enabled())
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .on_click(context.message(Msg::UpdateIntegrations))
-                .content("Update integrations")
-        } else {
-            View::empty()
+                .into(),
+            None => View::empty(),
         };
         let restart_action: View = if restartable {
             Button::new()
@@ -934,7 +1117,7 @@ impl SettingsModel {
             .spacing(8.0)
             .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
             .grid_row(1)
-            .children((adapters_notice, adapters_action, restart_action, progress))
+            .children((upgrade_notice, restart_action, progress))
     }
 
     fn view_general(&self, context: &mut ViewContext<Self>) -> View {
@@ -1126,28 +1309,32 @@ impl SettingsModel {
                     "Terminal integrations",
                     "Each shell is independent and can be removed without changing the others.",
                 ),
-                toggle_card(
+                toggle_card_detail(
                     "Command Prompt",
                     "Adds reversible dir and ls DOSKEY adapters for new cmd.exe sessions.",
+                    state.adapter_detail(Integration::Cmd),
                     integration_toggle(Integration::Cmd, self, context)
                         .automation_name("Install Command Prompt integration"),
                 ),
-                toggle_card(
+                toggle_card_detail(
                     "Windows PowerShell 5.1",
                     "Adds a guarded profile import and preserves normal Get-ChildItem behavior.",
+                    state.adapter_detail(Integration::WindowsPowerShell),
                     integration_toggle(Integration::WindowsPowerShell, self, context)
                         .automation_name("Install Windows PowerShell integration"),
                 ),
-                toggle_card(
+                toggle_card_detail(
                     "PowerShell 7",
                     if state.powershell7_available {
                         "Adds the same reversible adapter to the PowerShell 7 profile."
                     } else {
                         "PowerShell 7 is not installed on this computer."
                     },
+                    state.adapter_detail(Integration::PowerShell7),
                     integration_toggle(Integration::PowerShell7, self, context)
                         .is_enabled(
-                            (state.powershell7_available || state.powershell7)
+                            (state.powershell7_available
+                                || Integration::PowerShell7.installed(state))
                                 && self.controls_enabled(),
                         )
                         .automation_name("Install PowerShell 7 integration"),
@@ -1161,20 +1348,43 @@ impl SettingsModel {
             ))
     }
 
+    /// The running package version (the MSIX identity when packaged, the crate
+    /// version otherwise) and the package architecture.
+    fn package_label() -> String {
+        format!(
+            "{} ({})",
+            package_version().as_deref().unwrap_or(FSW_VERSION),
+            package_architecture()
+                .unwrap_or_else(|| env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default()),
+        )
+    }
+
+    /// What is actually deployed on this machine, one line per component.
+    ///
+    /// Rendered from `State`, which `Msg::Navigate` refreshes for this page too:
+    /// the broker line and the three adapter versions are live.
+    fn components_card(&self) -> View {
+        let state = &self.state;
+        card(StackPanel::new().spacing(4.0).children((
+            strong("Components"),
+            body(state.broker_component_line()).foreground(ThemeBrush::TextSecondary),
+            body(state.adapter_component_line(Integration::Cmd))
+                .foreground(ThemeBrush::TextSecondary),
+            body(state.adapter_component_line(Integration::WindowsPowerShell))
+                .foreground(ThemeBrush::TextSecondary),
+            body(state.adapter_component_line(Integration::PowerShell7))
+                .foreground(ThemeBrush::TextSecondary),
+            body(format!("Package: {}", Self::package_label()))
+                .foreground(ThemeBrush::TextSecondary),
+            body(state.flavor_component_line()).foreground(ThemeBrush::TextSecondary),
+        )))
+    }
+
     // The only `expect`s in the crate: `navigate_uri` on a compile-time
     // constant string is infallible by construction.
     #[allow(clippy::expect_used)]
     fn view_about(&self) -> View {
-        // Dynamic subtitle: the running package version (the MSIX identity
-        // when packaged, the crate version otherwise) and the package
-        // architecture.
-        let subtitle = format!(
-            "Forward Slash Windows {} ({})",
-            package_version().as_deref().unwrap_or(fsw_core::FSW_VERSION),
-            package_architecture().unwrap_or_else(|| {
-                std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default()
-            }),
-        );
+        let subtitle = format!("Forward Slash Windows {}", Self::package_label());
         page_stack(16.0)
             .children((
                 // page_header demands &'static str; the subtitle is dynamic.
@@ -1186,6 +1396,7 @@ impl SettingsModel {
                         .text_wrapping(TextWrapping::Wrap),
                     body(&subtitle).foreground(ThemeBrush::TextSecondary),
                 )),
+                self.components_card(),
                 body(
                     "Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to either the \
                      WSL distribution list or your default distribution, on supported Windows \
@@ -1275,6 +1486,22 @@ fn card(content: impl Into<View>) -> View {
 }
 
 fn toggle_card(title: &'static str, description: &'static str, toggle: impl Into<View>) -> View {
+    toggle_card_detail(title, description, None, toggle)
+}
+
+/// `toggle_card` with a second, dynamic secondary line -- what the adapter
+/// actually has deployed. `toggle_card`'s descriptions are `&'static str`
+/// literals; this one is built per render from `State`.
+fn toggle_card_detail(
+    title: &'static str,
+    description: &'static str,
+    detail: Option<String>,
+    toggle: impl Into<View>,
+) -> View {
+    let detail: View = match detail {
+        Some(text) => body(text).foreground(ThemeBrush::TextSecondary).into(),
+        None => View::empty(),
+    };
     card(
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -1284,7 +1511,11 @@ fn toggle_card(title: &'static str, description: &'static str, toggle: impl Into
                     .grid_column(0)
                     .spacing(3.0)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .children((strong(title), body(description).foreground(ThemeBrush::TextSecondary))),
+                    .children((
+                        strong(title),
+                        body(description).foreground(ThemeBrush::TextSecondary),
+                        detail,
+                    )),
                 toggle,
             )),
     )

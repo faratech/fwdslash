@@ -157,8 +157,13 @@ New in 0.0.3, and the reason this section is a checklist rather than a record:
   `fwdslash integration cmd enable` produces a real `Command Processor AutoRun`
   value, and the staged payload under `%LOCALAPPDATA%\ForwardSlashWindows\cmd`
   contains `fsw-cd.cmd` and `fsw-pushd.cmd`.
-- **Adapter upgrade.** With a 0.0.2 adapter installed, the settings app shows
-  the "Terminal integrations need updating" bar and "Update integrations"
-  reinstalls the payload.
+- **Adapters auto-upgrade from a 0.0.1/0.0.2 payload.** With an older adapter
+  installed, starting the broker upgrades it on its own and reports
+  "Terminal integrations were updated to 0.0.3: …" in a balloon; opening the
+  settings window with one still outdated repairs it too ("Updating terminal
+  integrations…" → "Terminal integrations updated"). Neither needs a button.
+  Confirm afterwards that `fwdslash integrations` no longer prints
+  "(update available)" and that the payload directory is
+  `%LOCALAPPDATA%\ForwardSlashWindows\cmd\0.0.3`.
 
 Still unverified: the startup task firing at logon (needs a sign-out).

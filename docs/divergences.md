@@ -355,11 +355,19 @@ invocation on the UI thread. Both differ here:
   is a process-wide `OnceLock`, and navigating to About skips the refresh
   because it shows nothing live.
 - **Standing banners are Buttons, not InfoBar actions.** Reactor's `InfoBar`
-  exposes no action-button slot, so the "Terminal integrations need updating"
-  and "Restart to update" actions are ordinary `Button`s rendered directly
-  beneath their bar, in a second fixed grid row that is kept out of
-  `self.notice` — a routine "Updated" result must not hide a standing warning,
-  and vice versa.
+  exposes no action-button slot, so the "Restart to update" action is an
+  ordinary `Button` rendered directly beneath its bar, in a second fixed grid
+  row that is kept out of `self.notice` — a routine "Updated" result must not
+  hide a standing notice, and vice versa.
+- **Outdated shell adapters are upgraded automatically, with no button to
+  press.** The Rust app upgrades outdated shell adapters automatically on every
+  launch (one sequential `fwdslash integration <id> enable` per adapter,
+  reported by an InfoBar: "Updating terminal integrations…" → "Terminal
+  integrations updated" / "Some terminal integrations could not be updated")
+  and shows a Components card on About with broker state, per-adapter payload
+  versions, package version/architecture and package flavor — the C++ app has
+  neither. The broker does the same sweep at startup (Broker §2), so the
+  settings window is the second chance, not the only one.
 - **The tray tooltip is the broker's alone.** It reads
   `Forward Slash Windows — active` / `— paused` / `— hook unavailable`. The
   0.0.2 arrangement of two deliberately-different tooltips is gone with the
@@ -470,13 +478,25 @@ three, and this section is the whole list.
 - **Balloon text.** `"Windows could not open the location."` where the C++ says
   `"...WSL location."`: with a custom folder root the target need not be in WSL.
   The pause-write failure adds `"The pause setting could not be saved."`
+- **Shell adapters are upgraded at startup.** `start_adapter_upgrade` checks
+  each installed adapter's recorded payload version and, when it predates the
+  running build, silently re-runs `fwdslash integration <id> enable` on a
+  background thread (90 s ceiling per adapter), so terminal integrations are
+  upgraded automatically after a product update. The result is reported in a
+  single balloon: `"Terminal integrations were updated to <version>: <names>."`
+  or `"Some terminal integrations could not be updated automatically. Open
+  Settings to retry."` The settings window repeats the sweep on launch
+  (Settings §6) and `fwdslash integration <id> enable` remains the manual
+  fallback. The C++ broker does nothing of the kind.
 - **New diagnostic categories** (category-only, per `PRIVACY.md`):
   `event=enter_dropped_foreground_changed`, `event=surface_rejected`,
   `event=hook_rearmed`, `event=persist_disabled_failed`,
   `event=win32_normalization_hazard`, `event=tray_icon_add_failed`,
-  `event=worker_start_failed`, `event=debug_uia_failed`,
-  `event=debug_hook_failed`. The C++'s `event=enter_handler_failed` has no Rust
-  counterpart.
+  `event=worker_start_failed`, `event=worker_detached`,
+  `event=debug_uia_failed`, `event=debug_hook_failed`,
+  `event=adapter_upgraded`, `event=adapter_upgrade_failed`,
+  `event=adapter_upgrade_skipped`. The C++'s `event=enter_handler_failed` has no
+  Rust counterpart.
 
 ## CLI (fwdslash)
 
@@ -531,9 +551,10 @@ payload is frozen at install time. The Rust CLI adds:
   same rollback guarantees, and the PowerShell uninstall removes the module
   directory it actually created rather than the one this build would create.
   `fwdslash integrations` prints `installed (update available)` for such an
-  adapter and reports it in `--json`; the settings app offers "Update
-  integrations". Without this an updated product kept running a frozen copy of
-  the old payload and old `fwdslash.exe` forever.
+  adapter and reports it in `--json`. Nobody has to run it by hand: the broker
+  sweeps at startup and the settings window sweeps on launch, and the verb is
+  the manual fallback. Without this an updated product kept running a frozen
+  copy of the old payload and old `fwdslash.exe` forever.
 
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 

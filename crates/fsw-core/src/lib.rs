@@ -745,7 +745,7 @@ pub fn executable_available(name: &str) -> bool {
     }
 }
 
-/// Whether the broker's message-only window is present on this desktop.
+/// Whether the broker's never-shown top-level window is present on this desktop.
 pub fn broker_window_exists() -> bool {
     #[cfg(windows)]
     unsafe {

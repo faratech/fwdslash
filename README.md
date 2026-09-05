@@ -183,6 +183,8 @@ The product shows **one** notification-area icon, and the resident broker owns i
 
 The settings window itself is a plain window: no icon of its own, and closing it closes the app — the broker keeps running and keeps the tray icon. Every integration is independent, and turning one off runs its reversible uninstall. The General **Disable** switch pauses resolution without forgetting what you installed.
 
+Outdated shell integrations are upgraded automatically — the broker does it at every start, and the settings window repairs any adapter left behind by an older release as soon as it opens. The About page lists the live broker state, each adapter's deployed payload version, and the package version and flavor.
+
 Needs the [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) for your architecture. The Store and GitHub packages declare it as a dependency and pull it in; an unpackaged build from source needs it installed separately.
 
 ---
