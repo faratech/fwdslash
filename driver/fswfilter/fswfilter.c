@@ -145,12 +145,12 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
                           _Out_ PFSW_REQUESTOR_IDENTITY Identity,
                           _Out_ PBOOLEAN Eligible) {
   PACCESS_TOKEN token;
-  PVOID sessionInformation = NULL;
   PVOID userInformation = NULL;
   PVOID integrityInformation = NULL;
   PVOID appContainerInformation = NULL;
   PTOKEN_USER tokenUser;
   PTOKEN_MANDATORY_LABEL label;
+  ULONG sessionId = 0;
   ULONG integrityLevel = 0;
   ULONG sidLength;
   UCHAR subAuthorityCount;
@@ -161,31 +161,42 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
   *Eligible = FALSE;
 
   token = PsReferencePrimaryToken(Process);
-  status = SeQueryInformationToken(token, TokenSessionId, &sessionInformation);
+  //  SeQuerySessionIdToken writes the session id by value, so there is no
+  //  out-buffer to allocate, free, or null-check.  The older
+  //  SeQueryInformationToken(token, TokenSessionId, ...) path returned
+  //  STATUS_SUCCESS yet left the out-pointer NULL on Windows 11 ARM64, so the
+  //  *(PULONG) read faulted at address 0 (issue #36).
+  status = SeQuerySessionIdToken(token, &sessionId);
   if (NT_SUCCESS(status)) {
     status = SeQueryInformationToken(token, TokenUser, &userInformation);
   }
   if (NT_SUCCESS(status)) {
-    tokenUser = (PTOKEN_USER)userInformation;
-    if (!RtlValidSid(tokenUser->User.Sid)) {
+    if (userInformation == NULL) {
       status = STATUS_INVALID_SID;
     } else {
-      sidLength = RtlLengthSid(tokenUser->User.Sid);
-      if (sidLength > SECURITY_MAX_SID_SIZE) {
+      tokenUser = (PTOKEN_USER)userInformation;
+      if (!RtlValidSid(tokenUser->User.Sid)) {
         status = STATUS_INVALID_SID;
       } else {
-        Identity->SessionId = *(PULONG)sessionInformation;
-        Identity->SidLength = sidLength;
-        status = RtlCopySid(SECURITY_MAX_SID_SIZE, (PSID)Identity->Sid,
-                            tokenUser->User.Sid);
+        sidLength = RtlLengthSid(tokenUser->User.Sid);
+        if (sidLength > SECURITY_MAX_SID_SIZE) {
+          status = STATUS_INVALID_SID;
+        } else {
+          Identity->SessionId = sessionId;
+          Identity->SidLength = sidLength;
+          status = RtlCopySid(SECURITY_MAX_SID_SIZE, (PSID)Identity->Sid,
+                              tokenUser->User.Sid);
+        }
       }
     }
   }
   if (NT_SUCCESS(status) &&
       NT_SUCCESS(SeQueryInformationToken(token, TokenIntegrityLevel,
                                          &integrityInformation)) &&
+      integrityInformation != NULL &&
       NT_SUCCESS(SeQueryInformationToken(token, TokenIsAppContainer,
-                                         &appContainerInformation))) {
+                                         &appContainerInformation)) &&
+      appContainerInformation != NULL) {
     label = (PTOKEN_MANDATORY_LABEL)integrityInformation;
     if (RtlValidSid(label->Label.Sid)) {
       subAuthorityCount = *RtlSubAuthorityCountSid(label->Label.Sid);
@@ -207,9 +218,6 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
   }
   if (userInformation != NULL) {
     ExFreePool(userInformation);
-  }
-  if (sessionInformation != NULL) {
-    ExFreePool(sessionInformation);
   }
   PsDereferencePrimaryToken(token);
   return status;
