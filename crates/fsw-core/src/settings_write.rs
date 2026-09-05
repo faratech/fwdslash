@@ -524,7 +524,11 @@ mod imp {
                     } else {
                         MissingSettingEvidence::Malformed
                     };
-                    resolve_missing_setting_read(query_error, evidence).map(|absent| absent.then_some(None)).flatten()
+                    match resolve_missing_setting_read(query_error, evidence) {
+                        Ok(true) => Ok(None),
+                        Ok(false) => Err(query_error),
+                        Err(error) => Err(error),
+                    }
                 }
                 Err(REG_UNAVAILABLE) => Err(REG_UNAVAILABLE),
                 Err(_) => settings_key_is_proven_absent(&key, query_error)
