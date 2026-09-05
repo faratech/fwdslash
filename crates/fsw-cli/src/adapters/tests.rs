@@ -170,6 +170,41 @@ fn judge_autorun_accepts_installed_or_original() {
 }
 
 #[test]
+fn judge_autorun_tolerates_the_0_0_2_one_character_truncation() {
+    // 0.0.2 truncation compatibility rule: `installed` may be `current` plus
+    // exactly one trailing character, because that is the damage 0.0.2's
+    // byte-first NUL strip did to the value it read back.
+    let installed = "call \"C:\\fsw\\fsw-autorun.cmd\"";
+    let truncated = "call \"C:\\fsw\\fsw-autorun.cmd";
+    let original = "echo hi";
+    assert_eq!(
+        state::judge_autorun(true, truncated, installed, original),
+        state::AutorunVerdict::Matches,
+        "one missing trailing character is the known 0.0.2 damage"
+    );
+    // And no further. Two characters short is a real third-party edit.
+    assert_eq!(
+        state::judge_autorun(true, "call \"C:\\fsw\\fsw-autorun.cm", installed, original),
+        state::AutorunVerdict::Changed
+    );
+    // A one-character difference that is not a prefix is still Changed.
+    assert_eq!(
+        state::judge_autorun(true, "call \"C:\\fsw\\fsw-autorun.cmdX", installed, original),
+        state::AutorunVerdict::Changed
+    );
+    // An empty current value never counts as a truncation of anything.
+    assert_eq!(
+        state::judge_autorun(true, "", "x", original),
+        state::AutorunVerdict::Changed
+    );
+    // The tolerance is one-sided: `original` is still compared exactly.
+    assert_eq!(
+        state::judge_autorun(true, "echo h", installed, original),
+        state::AutorunVerdict::Changed
+    );
+}
+
+#[test]
 fn other_edition_swaps() {
     assert_eq!(
         state::other_edition(state::Edition::WindowsPowerShell),
@@ -182,9 +217,92 @@ fn other_edition_swaps() {
 }
 
 #[test]
-fn shared_module_removed_only_without_the_other_edition() {
-    assert!(!state::remove_shared_module(true));
-    assert!(state::remove_shared_module(false));
+fn shared_module_removed_unless_the_other_edition_pins_the_same_version() {
+    assert!(
+        state::remove_shared_module(None, "0.0.3"),
+        "the other edition has no marker: this directory is the last reference"
+    );
+    assert!(
+        !state::remove_shared_module(Some("0.0.3"), "0.0.3"),
+        "the other edition still loads this exact directory"
+    );
+    assert!(
+        state::remove_shared_module(Some("0.0.2"), "0.0.3"),
+        "the other edition names a different directory, so it cannot pin this one"
+    );
+    // The 0.0.2 bug in one line: keying on marker presence alone stranded
+    // every version directory whenever both editions were installed.
+    assert!(state::remove_shared_module(Some("0.0.1"), "0.0.2"));
+}
+
+// ---------------------------------------------------------------------------
+// reg.rs — REG_SZ / REG_EXPAND_SZ decoding (the 0.0.2 truncation)
+// ---------------------------------------------------------------------------
+
+/// A `RegGetValueW` buffer: UTF-16LE plus `terminators` trailing NUL units.
+#[cfg(windows)]
+fn reg_bytes(text: &str, terminators: usize) -> Vec<u8> {
+    let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    for _ in 0..terminators {
+        bytes.extend_from_slice(&[0x00, 0x00]);
+    }
+    bytes
+}
+
+#[cfg(windows)]
+#[test]
+fn decode_reg_string_keeps_a_trailing_ascii_character() {
+    // The exact shape that blocked the upgrade: 0.0.2 popped the zero high
+    // byte of the closing quote and then dropped the orphaned low byte.
+    let value = r#"call "C:\Users\me\AppData\Local\ForwardSlashWindows\cmd\fsw-autorun.cmd""#;
+    assert_eq!(super::reg::decode_reg_string(&reg_bytes(value, 1)), value);
+    assert!(super::reg::decode_reg_string(&reg_bytes(value, 1)).ends_with('"'));
+}
+
+#[cfg(windows)]
+#[test]
+fn decode_reg_string_handles_every_terminator_count() {
+    for terminators in [0, 1, 2, 3] {
+        assert_eq!(
+            super::reg::decode_reg_string(&reg_bytes("echo hi", terminators)),
+            "echo hi",
+            "{terminators} terminator(s)"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn decode_reg_string_decodes_an_empty_value() {
+    assert_eq!(super::reg::decode_reg_string(&[]), "");
+    assert_eq!(super::reg::decode_reg_string(&[0x00, 0x00]), "");
+    assert_eq!(super::reg::decode_reg_string(&[0x00, 0x00, 0x00, 0x00]), "");
+}
+
+#[cfg(windows)]
+#[test]
+fn decode_reg_string_preserves_a_non_ascii_last_character() {
+    // U+00E9 is E9 00 in UTF-16LE — the same zero high byte, same 0.0.2 loss.
+    assert_eq!(super::reg::decode_reg_string(&reg_bytes("caf\u{e9}", 1)), "caf\u{e9}");
+    // A code unit with a non-zero high byte was never affected; still exact.
+    assert_eq!(super::reg::decode_reg_string(&reg_bytes("\u{65e5}", 1)), "\u{65e5}");
+}
+
+#[cfg(windows)]
+#[test]
+fn decode_reg_string_leaves_expand_sz_references_verbatim() {
+    // RRF_NOEXPAND data: the %VAR% must survive into the AutoRun snapshot.
+    let value = r"%SystemRoot%\System32\x.cmd";
+    assert_eq!(super::reg::decode_reg_string(&reg_bytes(value, 1)), value);
+}
+
+#[cfg(windows)]
+#[test]
+fn decode_reg_string_ignores_a_trailing_odd_byte() {
+    // A malformed size can leave half a code unit; drop it rather than pad it.
+    let mut bytes = reg_bytes("hi", 0);
+    bytes.push(0x41);
+    assert_eq!(super::reg::decode_reg_string(&bytes), "hi");
 }
 
 // ---------------------------------------------------------------------------

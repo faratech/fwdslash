@@ -14,8 +14,6 @@ use std::os::windows::process::CommandExt;
 use std::time::{Duration, Instant};
 
 const MARKER_ROOT: &str = "Software\\ForwardSlashWindows\\PowerShellAdapter";
-/// Registry value kind stored in the marker for the restore.
-const KIND_STRING: &str = "String";
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -277,17 +275,17 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
         std::fs::remove_dir_all(&state_root)?;
     }
 
-    // The shared module directory goes away with the last edition. Its name
-    // is the payload version this install deployed, not the one this build
-    // ships: an upgrade removes the directory it actually created.
-    let other = state::other_edition(edition);
-    let other_marker = marker_key(other);
-    if state::remove_shared_module(read_marker(&other_marker)?.is_some()) {
-        let deployed_version = if values.version.is_empty() {
-            super::PAYLOAD_VERSION
-        } else {
-            &values.version
-        };
+    // The shared module directory goes away with this edition unless the
+    // other edition's marker records the SAME version. Its name is the payload
+    // version this install deployed, not the one this build ships: an upgrade
+    // removes the directory it actually created.
+    let deployed_version = marker_version(&values);
+    let other_marker = marker_key(state::other_edition(edition));
+    let other_version = read_marker(&other_marker)?
+        .as_ref()
+        .map(marker_version)
+        .map(str::to_owned);
+    if state::remove_shared_module(other_version.as_deref(), deployed_version) {
         let module_root = super::local_app_data()?
             .join("ForwardSlashWindows")
             .join("PowerShell")
@@ -296,6 +294,9 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
             std::fs::remove_dir_all(&module_root)?;
         }
     }
+    // Belt and braces: a version directory no marker names must never survive
+    // an uninstall or an upgrade.
+    prune_orphaned_module_dirs();
     println!(
         "Forward Slash Windows removed from {}. Already-open sessions retain loaded aliases until closed.",
         edition.display_name()
@@ -305,6 +306,75 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
 
 fn marker_key(edition: Edition) -> String {
     format!("{MARKER_ROOT}\\{}", edition.registry_leaf())
+}
+
+/// The payload version a marker deployed. Markers written before the `Version`
+/// value existed read as empty; those installs predate the shared-directory
+/// scheme's only other name, so they are treated as this build's payload.
+fn marker_version(values: &MarkerValues) -> &str {
+    if values.version.is_empty() {
+        super::PAYLOAD_VERSION
+    } else {
+        &values.version
+    }
+}
+
+/// Deletes every `%LOCALAPPDATA%\ForwardSlashWindows\PowerShell\<version>`
+/// directory that no live adapter marker names, plus `PowerShell\state` once
+/// it is empty.
+///
+/// Upgrading both editions in turn used to strand one directory per release
+/// (0.0.1, 0.0.2 and 0.0.3 were all observed side by side), and nothing ever
+/// came back for them. This runs at the end of every uninstall, after every
+/// successful PowerShell `enable` — including the already-at-this-version
+/// no-op, which is the only thing an already-upgraded machine still reaches —
+/// and from the `fwdslash uninstall` sweep.
+///
+/// Best effort throughout: an absent tree is not an error, every failure is
+/// ignored, and nothing is printed. No path is ever logged (`PRIVACY.md`).
+pub fn prune_orphaned_module_dirs() {
+    let Ok(local_app_data) = super::local_app_data() else {
+        return;
+    };
+    let install_root = local_app_data
+        .join("ForwardSlashWindows")
+        .join("PowerShell");
+    if !install_root.is_dir() {
+        return;
+    }
+
+    // Versions a marker still points at. A marker that cannot be read counts
+    // as absent, which is the same conservative answer uninstall uses.
+    let mut referenced: Vec<String> = Vec::new();
+    for edition in [Edition::WindowsPowerShell, Edition::PowerShell] {
+        if let Ok(Some(values)) = read_marker(&marker_key(edition)) {
+            referenced.push(marker_version(&values).to_string());
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir(&install_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name == "state" {
+            // The per-edition state directories are removed by uninstall; the
+            // parent goes only when the last one is gone.
+            if std::fs::read_dir(&path).is_ok_and(|mut dir| dir.next().is_none()) {
+                let _ = std::fs::remove_dir(&path);
+            }
+            continue;
+        }
+        if referenced.iter().any(|version| version == name) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
 
 fn read_marker(key: &str) -> Result<Option<MarkerValues>, AdapterError> {

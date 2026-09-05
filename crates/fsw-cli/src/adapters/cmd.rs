@@ -14,7 +14,6 @@ use std::os::windows::process::CommandExt;
 const COMMAND_PROCESSOR: &str = r"Software\Microsoft\Command Processor";
 const MARKER_KEY: &str = fsw_core::CMD_ADAPTER_KEY;
 const AUTORUN_VALUE: &str = "AutoRun";
-/// Registry value kind stored in the marker for the restore.
 
 fn payload_source_dir() -> Result<PathBuf, AdapterError> {
     super::payload_source_dir("cmd")

@@ -574,3 +574,12 @@ before the milestone that lands it can close.
   the worker abandons and replays would bound that; if one lands,
   `docs/compatibility.md`'s "No lost, duplicated, or delayed Enter behavior"
   gate needs restating with the number.
+
+- The Rust CLI decodes `REG_SZ`/`REG_EXPAND_SZ` data into UTF-16 code units *before* stripping NUL
+  terminators (0.0.2 stripped zero bytes first and lost the final ASCII character of every value it
+  read), and tolerates exactly one missing trailing character when comparing the live AutoRun
+  against the marker's `InstalledAutoRun`, so 0.0.2-era installs can still be upgraded. The shared
+  `PowerShell\<version>` module directory is keyed on the version each edition's marker records, and
+  orphaned version directories are pruned on uninstall, on the `fwdslash uninstall` sweep, and after
+  every successful PowerShell `enable`.
+

@@ -113,6 +113,27 @@ pub enum AutorunVerdict {
     Changed,
 }
 
+/// The **0.0.2 truncation compatibility rule**. 0.0.2's registry reader
+/// stripped trailing zero *bytes* before pairing them into UTF-16 code units,
+/// so every value it read came back one character short whenever the last
+/// character was ASCII (see `reg::decode_reg_string`). A hive/marker pair left
+/// in that shape must still be upgradable, so `current` also counts as
+/// matching `installed` when `installed` is `current` plus **exactly one**
+/// more trailing character. One character and no more: any longer divergence
+/// is a genuine third-party edit and is still refused. `original` is compared
+/// exactly — the tolerance exists only for the value we wrote ourselves.
+fn matches_installed(current: &str, installed: &str) -> bool {
+    if current == installed {
+        return true;
+    }
+    if current.is_empty() {
+        return false;
+    }
+    installed
+        .strip_prefix(current)
+        .is_some_and(|tail| tail.chars().count() == 1)
+}
+
 pub fn judge_autorun(
     current_present: bool,
     current: &str,
@@ -122,7 +143,7 @@ pub fn judge_autorun(
     if !current_present {
         return AutorunVerdict::Matches;
     }
-    if current == installed || current == original {
+    if matches_installed(current, installed) || current == original {
         AutorunVerdict::Matches
     } else {
         AutorunVerdict::Changed
@@ -172,8 +193,17 @@ pub fn other_edition(edition: Edition) -> Edition {
     }
 }
 
-/// Whether the shared `PowerShell\<version>` module directory should be
-/// removed: only when the other edition has no marker key.
-pub fn remove_shared_module(other_marker_present: bool) -> bool {
-    !other_marker_present
+/// Whether the shared `PowerShell\<version>` module directory that *this*
+/// marker deployed should be removed.
+///
+/// The unit of sharing is a **version directory**, not the tree: two editions
+/// only collide when both markers name the same version. Keying the decision
+/// on "the other edition has a marker at all" (what 0.0.2 did) meant that
+/// upgrading both editions one after the other left each old directory pinned
+/// by the edition that had not been upgraded yet, and nothing ever came back
+/// for it — hence the observed `PowerShell\0.0.1`, `0.0.2` and `0.0.3` all
+/// living side by side. `other_marker_version` is `None` when the other
+/// edition has no marker.
+pub fn remove_shared_module(other_marker_version: Option<&str>, this_version: &str) -> bool {
+    other_marker_version != Some(this_version)
 }

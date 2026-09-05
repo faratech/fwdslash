@@ -120,6 +120,13 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
             }
             let installed_version = fsw_core::adapter_version(&marker_key);
             if installed_version.as_deref() == Some(PAYLOAD_VERSION) {
+                // Already current, so nothing else runs today — but a machine
+                // upgraded before the prune existed still has stranded
+                // `PowerShell\<version>` directories and this no-op is the
+                // only path the broker ever reaches for it.
+                if edition.is_some() {
+                    powershell::prune_orphaned_module_dirs();
+                }
                 return 0;
             }
             println!(
@@ -148,7 +155,14 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
         });
 
         match result {
-            Ok(()) => 0,
+            Ok(()) => {
+                // Every successful PowerShell enable sweeps the stranded
+                // version directories too; uninstall already prunes its own.
+                if enabled && edition.is_some() {
+                    powershell::prune_orphaned_module_dirs();
+                }
+                0
+            }
             Err(error) => {
                 eprintln!("{error}");
                 1
@@ -192,6 +206,12 @@ pub fn sweep_uninstall() -> i32 {
             worst = 1;
         }
     }
+    // With both editions gone, nothing references the shared module tree any
+    // more: drop the leftover version directories and the empty state folder.
+    // Unconditional, so an install that never had a marker to remove still
+    // clears directories a previous release stranded.
+    #[cfg(windows)]
+    powershell::prune_orphaned_module_dirs();
     worst
 }
 
