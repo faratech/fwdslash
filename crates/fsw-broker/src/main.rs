@@ -2553,6 +2553,7 @@ mod tests {
         drain_persist_queue, request_target_is_current, should_balloon_install_failure,
         should_balloon_update, should_swallow_enter, update_cycle_age_ms, update_cycle_due,
     };
+    use windows_sys::Win32::Foundation::HWND;
 
     // -- the cycle gate ----------------------------------------------------
 
