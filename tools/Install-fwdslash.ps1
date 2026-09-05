@@ -11,14 +11,30 @@ param(
     [string]$Version = 'latest',
 
     # Install the GitHub build even when the Microsoft Store version is
-    # already present (the two coexist side-by-side; the 'fwdslash' alias and
-    # protocol route to whichever registered last).
+    # already present.
+    #
+    # The two packages install side by side, but they are NOT independent:
+    # both register the same windows.startupTask and the same 'fwdslash'
+    # appExecutionAlias, and both brokers take the single-instance mutex
+    # Local\ForwardSlashWindows.Broker. At logon Windows starts both startup
+    # tasks and only one broker survives the race -- which one is not
+    # predictable, and the alias and the fwdslash:// protocol likewise route to
+    # whichever package registered last. Keep one flavor unless you are
+    # deliberately testing both.
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = 'faratech/fwdslash'
 $storePublisher = 'CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4'
+
+# The Windows App Runtime 2.x redistributable the manifest depends on
+# (Microsoft.WindowsAppRuntime.2, MinVersion 2.0.0.0). Microsoft rewrites the
+# aka.ms redirector target with each servicing release, so RE-VERIFY THIS URL
+# whenever the Windows App SDK dependency in packaging\AppxManifest.xml moves:
+# it is a redirector, and a wrong channel installs a runtime the package still
+# refuses to run against.
+$runtimeInstallerUrl = 'https://aka.ms/windowsappsdk/2.0/latest/windowsappruntimeinstall-{0}.exe'
 
 $storeInstall = Get-AppxPackage -Name '32827MikeFara.fwdslash' -ErrorAction SilentlyContinue |
     Where-Object { $_.Publisher -eq $storePublisher }
@@ -28,6 +44,10 @@ if ($storeInstall -and -not $Force) {
     Write-Host 'To install the GitHub build side-by-side anyway, rerun with -Force.'
     exit 1
 }
+
+# A tag is 'v0.0.3'; accepting both that and '0.0.3' avoids building
+# releases/tags/vv0.0.3, which is a 404.
+$Version = $Version.TrimStart('v', 'V')
 
 if ($Version -eq 'latest') {
     $release = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
@@ -45,6 +65,39 @@ if (-not $asset) {
 $outFile = Join-Path $env:TEMP $asset.name
 Write-Host "Downloading $($asset.name)..."
 Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $outFile
+
+# The settings app is a Windows App SDK application: without the framework
+# package present, Add-AppxPackage fails with 0x80073CF3 (dependency missing)
+# and, if it were installed anyway, the app would refuse to start. The Store
+# flavor gets this resolved for it; a bare Add-AppxPackage does not.
+if (-not (Get-AppxPackage -Name 'Microsoft.WindowsAppRuntime.2*' -ErrorAction SilentlyContinue)) {
+    $runtimeArchitecture = switch ($env:PROCESSOR_ARCHITECTURE) {
+        'ARM64' { 'arm64' }
+        default { 'x64' }
+    }
+    $runtimeUrl = $runtimeInstallerUrl -f $runtimeArchitecture
+    $runtimeFile = Join-Path $env:TEMP "WindowsAppRuntimeInstall-$runtimeArchitecture.exe"
+    Write-Host "Installing the Windows App Runtime 2.x ($runtimeArchitecture); this is a one-time prerequisite..."
+    try {
+        Invoke-WebRequest -Uri $runtimeUrl -OutFile $runtimeFile
+        $runtimeProcess = Start-Process -FilePath $runtimeFile -ArgumentList '--quiet' -Wait -PassThru
+        if ($runtimeProcess.ExitCode -ne 0) {
+            throw "the installer exited with $($runtimeProcess.ExitCode)"
+        }
+    } catch {
+        Remove-Item $runtimeFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $outFile -Force -ErrorAction SilentlyContinue
+        Write-Host ''
+        Write-Host 'The Windows App Runtime 2.x could not be installed automatically:'
+        Write-Host "  $($_.Exception.Message)"
+        Write-Host ''
+        Write-Host 'Install it by hand and rerun this script:'
+        Write-Host "  $runtimeUrl"
+        Write-Host 'Without it, Forward Slash Windows cannot be installed (0x80073CF3).'
+        exit 1
+    }
+    Remove-Item $runtimeFile -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host 'Installing...'
 Add-AppxPackage -Path $outFile

@@ -34,9 +34,11 @@ pub use state::Edition;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The adapter payload directory version. One of the product's `0.0.2`
-/// copies — bump it together with the other version strings (CLAUDE.md).
-pub const PAYLOAD_VERSION: &str = "0.0.2";
+/// The adapter payload directory version. Derived from the crate version, so
+/// a product bump moves the payload directory and marks every deployed
+/// adapter as outdated — which is what drives the upgrade in
+/// [`set_integration`].
+pub const PAYLOAD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A user-facing adapter failure. The message is shown verbatim.
 #[derive(Debug, Clone)]
@@ -93,40 +95,74 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
             return 1;
         }
 
-        let controller = std::env::current_exe().unwrap_or_default();
-        let result = match edition {
-            None => {
-                if fsw_core::adapter_installed(fsw_core::CMD_ADAPTER_KEY) == enabled {
-                    return 0;
-                }
-                if enabled {
-                    cmd::install(&controller)
-                } else {
-                    cmd::uninstall()
-                }
-            }
-            Some(edition) => {
-                // Idempotence: an enable/disable that matches the stored
-                // marker is a silent no-op, exactly like the script flow.
-                let key = format!(
-                    "Software\\ForwardSlashWindows\\PowerShellAdapter\\{}",
-                    edition.registry_leaf()
-                );
-                if fsw_core::adapter_installed(&key) == enabled {
-                    return 0;
-                }
-                if enabled {
-                    powershell::install(edition, &controller)
-                } else {
-                    powershell::uninstall(edition)
-                }
-            }
-            #[allow(unreachable_patterns)]
-            Some(_) => return 2,
+        let marker_key = match edition {
+            None => fsw_core::CMD_ADAPTER_KEY.to_string(),
+            Some(edition) => format!(
+                "{}{}",
+                fsw_core::POWERSHELL_ADAPTER_ROOT,
+                edition.registry_leaf()
+            ),
+        };
+        let label = match edition {
+            None => "cmd",
+            Some(edition) => edition.display_name(),
         };
 
+        // Idempotence: an enable/disable that matches the stored marker is a
+        // silent no-op, exactly like the script flow — except for an
+        // `installed` marker naming an older payload than this build ships.
+        // That is the upgrade path: the same transactional uninstall, then
+        // the same transactional install, so a failure still rolls back.
+        let mut upgrading = false;
+        if fsw_core::adapter_installed(&marker_key) == enabled {
+            if !enabled {
+                return 0;
+            }
+            let installed_version = fsw_core::adapter_version(&marker_key);
+            if installed_version.as_deref() == Some(PAYLOAD_VERSION) {
+                // Already current, so nothing else runs today — but a machine
+                // upgraded before the prune existed still has stranded
+                // `PowerShell\<version>` directories and this no-op is the
+                // only path the broker ever reaches for it.
+                if edition.is_some() {
+                    powershell::prune_orphaned_module_dirs();
+                }
+                return 0;
+            }
+            println!(
+                "Upgrading the {label} adapter from {} to {PAYLOAD_VERSION}.",
+                installed_version.as_deref().unwrap_or("an earlier version")
+            );
+            upgrading = true;
+        }
+
+        let controller = std::env::current_exe().unwrap_or_default();
+        // An upgrade is the old payload's uninstall followed by this one's
+        // install; `upgrading` is only ever set on the enable path.
+        let removal = if upgrading {
+            match edition {
+                None => cmd::uninstall(),
+                Some(edition) => powershell::uninstall(edition),
+            }
+        } else {
+            Ok(())
+        };
+        let result = removal.and_then(|()| match (edition, enabled) {
+            (None, true) => cmd::install(&controller),
+            (None, false) => cmd::uninstall(),
+            (Some(edition), true) => powershell::install(edition, &controller),
+            (Some(edition), false) => powershell::uninstall(edition),
+        });
+
         match result {
-            Ok(()) => 0,
+            Ok(()) => {
+                // Every successful PowerShell enable sweeps the stranded
+                // version directories too; uninstall already prunes its own.
+                if enabled && edition.is_some() {
+                    powershell::prune_orphaned_module_dirs();
+                }
+                0
+            }
             Err(error) => {
                 eprintln!("{error}");
                 1
@@ -170,6 +206,12 @@ pub fn sweep_uninstall() -> i32 {
             worst = 1;
         }
     }
+    // With both editions gone, nothing references the shared module tree any
+    // more: drop the leftover version directories and the empty state folder.
+    // Unconditional, so an install that never had a marker to remove still
+    // clears directories a previous release stranded.
+    #[cfg(windows)]
+    powershell::prune_orphaned_module_dirs();
     worst
 }
 

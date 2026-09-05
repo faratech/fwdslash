@@ -1,7 +1,13 @@
 # Binary size baseline
 
-Measured, not estimated. These are the numbers the Rust port has to beat, and
-the source for the CI size-budget gate.
+Measured, not estimated. These are the numbers the Rust port has to beat.
+
+There is **no size gate in CI**. The `rust-windows` job in
+`.github/workflows/build.yml` builds the workspace in release for
+`x86_64-pc-windows-msvc` and prints the three executable sizes ("Report binary
+sizes"), so a regression is visible in the log and in a PR's checks, but nothing
+fails on a number. Comparing against the table below is a human step, and
+re-measuring it is required whenever `rust-toolchain.toml` moves.
 
 Measured 2026-09-03 from `tools/Build-UserMode.ps1 -Configuration Release` on
 VS 18 (MSVC 14.51.36231), Windows SDK 10.0.28000. Both architectures built with

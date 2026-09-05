@@ -1,9 +1,9 @@
-//! The cmd adapter: installs `fsw-autorun.cmd` + `fsw-dir.cmd` + a copy of
-//! the controller into `%LOCALAPPDATA%\ForwardSlashWindows\cmd` and appends
-//! the AutoRun hook to `Command Processor`. A faithful port of the retired
-//! `tools/Install-CmdAdapter.ps1` / `Uninstall-CmdAdapter.ps1`, with every
-//! registry write routed through `reg.exe` (real hive) and every read
-//! through the merged view.
+//! The cmd adapter: installs `fsw-autorun.cmd` + the DIR/CD/PUSHD helpers +
+//! a copy of the controller into `%LOCALAPPDATA%\ForwardSlashWindows\cmd`
+//! and appends the AutoRun hook to `Command Processor`. A faithful port of
+//! the retired `tools/Install-CmdAdapter.ps1` / `Uninstall-CmdAdapter.ps1`,
+//! with every registry write routed through `reg.exe` (real hive) and every
+//! read through the merged view.
 
 use super::{reg, state, AdapterError};
 use std::path::{Path, PathBuf};
@@ -14,7 +14,6 @@ use std::os::windows::process::CommandExt;
 const COMMAND_PROCESSOR: &str = r"Software\Microsoft\Command Processor";
 const MARKER_KEY: &str = fsw_core::CMD_ADAPTER_KEY;
 const AUTORUN_VALUE: &str = "AutoRun";
-/// Registry value kind stored in the marker for the restore.
 
 fn payload_source_dir() -> Result<PathBuf, AdapterError> {
     super::payload_source_dir("cmd")
@@ -144,7 +143,14 @@ fn begin_install(controller: &Path) -> Result<InstallState, AdapterError> {
     let source = payload_source_dir()?;
     super::real_make_dir(&install_parent)?;
     super::real_make_dir(&state.staging)?;
-    for file in ["fsw-autorun.cmd", "fsw-dir.cmd"] {
+    // Every file the AutoRun macros call. Keep in step with the payload
+    // lists in tools/Package.ps1 and tools/Package-Msix.ps1.
+    for file in [
+        "fsw-autorun.cmd",
+        "fsw-cd.cmd",
+        "fsw-dir.cmd",
+        "fsw-pushd.cmd",
+    ] {
         super::real_copy_file(&source.join(file), &state.staging)?;
     }
     super::real_copy_file(controller, &state.staging)?;

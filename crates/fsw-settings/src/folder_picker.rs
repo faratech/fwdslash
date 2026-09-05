@@ -74,14 +74,75 @@ struct IShellItemVtbl {
 
 type HWND = *mut core::ffi::c_void;
 
-/// Opens the modal picker owned by `parent` (the settings window). Returns the
+/// Discovers this process's own top-level window by title.
+///
+/// Enumerates top-level windows of the **current process only** and matches the
+/// title exactly: a bare `FindWindowW(NULL, title)` can return *another*
+/// instance's window (a leftover dev build, or the second instance racing the
+/// first), and a cross-process HWND is useless as a dialog owner. Returns 0
+/// when the reactor has not materialized the window yet.
+pub(crate) fn current_process_window() -> isize {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+        };
+
+        struct Match {
+            process_id: u32,
+            title: Vec<u16>,
+            found: isize,
+        }
+        unsafe extern "system" fn on_window(
+            window: windows_sys::Win32::Foundation::HWND,
+            lparam: isize,
+        ) -> i32 {
+            unsafe {
+                let state = &mut *(lparam as *mut Match);
+                let mut owner = 0u32;
+                GetWindowThreadProcessId(window, &raw mut owner);
+                if owner != state.process_id {
+                    return 1;
+                }
+                let length = GetWindowTextLengthW(window);
+                if length <= 0 {
+                    return 1;
+                }
+                let mut text = vec![0u16; (length as usize) + 1];
+                GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32);
+                // `title` is NUL-terminated; compare the text without it.
+                if text.get(..length as usize) == state.title.get(..state.title.len() - 1) {
+                    state.found = window as isize;
+                    return 0;
+                }
+                1
+            }
+        }
+
+        let mut state = Match {
+            process_id: GetCurrentProcessId(),
+            title: crate::to_wide(crate::WINDOW_TITLE),
+            found: 0,
+        };
+        EnumWindows(Some(on_window), (&raw mut state) as isize);
+        state.found
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// Opens the modal picker owned by this process's settings window. Returns the
 /// chosen filesystem folder, or `None` on cancel or any COM failure — a
 /// broken picker must never fabricate a root.
-pub fn pick_folder(parent: HWND) -> Option<String> {
+pub fn pick_folder() -> Option<String> {
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
+        let parent: HWND = current_process_window() as HWND;
         let mut dialog: *mut core::ffi::c_void = std::ptr::null_mut();
         let hr = CoCreateInstance(
             &CLSID_FILE_OPEN_DIALOG,
@@ -101,7 +162,6 @@ pub fn pick_folder(parent: HWND) -> Option<String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = parent;
         None
     }
 }

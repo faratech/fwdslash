@@ -2,10 +2,12 @@
 <!--
   Indexes packaging\Assets so the scale-* and targetsize-* qualifiers in the
   filenames resolve to the unqualified names the manifest references
-  (Assets\Square150x150Logo.png and so on).
-
-  The settings app ships its own fswsettings.pri built by MSBuild; that file is
-  excluded here so makepri does not try to re-index it.
+  (Assets\Square150x150Logo.png and so on). That is the whole job for the
+  shipping (Rust) payload: it carries no PRI of its own and no App.xbf, because
+  the Rust settings app builds its UI in code and embeds its one bitmap with
+  include_bytes! rather than resolving ms-appx:/// URIs. The index still has to
+  exist and still has to be named after Identity/Name, or the manifest's own
+  logo qualifiers do not resolve.
 -->
 <resources targetOsVersion="10.0.0" majorVersion="1">
   <index root="\" startIndexAt="\">
@@ -24,9 +26,12 @@
       <qualifier name="Custom" value="" />
     </default>
     <!--
-      Folder indexing only. The settings app ships its own fswsettings.pri built
-      by MSBuild; parsing it here as well makes both indexers claim
-      Files/App.xbf and makepri fails with PRI277 "conflicting values".
+      Folder indexing only, with no "resfiles"/"priinfo" indexer. The Rust
+      payload has nothing else to index; the C++ payload
+      (Package-Msix.ps1 -BinarySource Cpp) additionally stages an MSBuild-built
+      fswsettings.pri, and parsing that here as well would make both indexers
+      claim Files/App.xbf, which makepri rejects with PRI277 "conflicting
+      values".
     -->
     <indexer-config type="folder" foldernameAsQualifier="true" filenameAsQualifier="true" qualifierDelimiter="." />
   </index>

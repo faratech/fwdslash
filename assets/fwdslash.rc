@@ -4,8 +4,8 @@
 IDI_FSW_APP ICON "fwdslash.ico"
 
 1 VERSIONINFO
- FILEVERSION 0,0,1,0
- PRODUCTVERSION 0,0,1,0
+ FILEVERSION 0,0,3,0
+ PRODUCTVERSION 0,0,3,0
  FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -22,12 +22,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Fara Technologies LLC\0"
             VALUE "FileDescription", "Forward Slash Windows\0"
-            VALUE "FileVersion", "0.0.2\0"
+            VALUE "FileVersion", "0.0.3\0"
             VALUE "InternalName", "Forward Slash Windows\0"
             VALUE "LegalCopyright", "Copyright (c) 2026 Mike Fara, Fara Technologies LLC\0"
             VALUE "OriginalFilename", "Forward Slash Windows\0"
             VALUE "ProductName", "Forward Slash Windows\0"
-            VALUE "ProductVersion", "0.0.2\0"
+            VALUE "ProductVersion", "0.0.3\0"
         END
     END
     BLOCK "VarFileInfo"

@@ -11,11 +11,12 @@
 //! on purpose belongs in `docs/divergences.md`.
 
 use fsw_core::{
-    BrokerState, CMD_ADAPTER_KEY, POWERSHELL_ADAPTER_ROOT, adapter_installed, broker_state,
-    broker_window_exists, ensure_broker_running, executable_available, executable_directory,
-    get_bare_slash_mode, get_bare_slash_override, get_bare_slash_root, get_default_distribution,
-    has_package_identity, is_disabled, is_store_flavor, list_registered_distributions,
-    package_architecture, package_version, update, windows_integration_installed, FSW_VERSION,
+    BrokerState, CMD_ADAPTER_KEY, FSW_BROKER_WINDOW_CLASS, FSW_VERSION, FilterServiceState,
+    POWERSHELL_ADAPTER_ROOT, SettingsValues, adapter_installed, adapter_outdated, adapter_version,
+    broker_state, broker_window_exists, ensure_broker_running, executable_available,
+    executable_directory, filter_port_available, filter_service_state, get_default_distribution,
+    has_package_identity, is_store_flavor, list_registered_distributions, package_architecture,
+    package_version, update, windows_integration_installed,
 };
 use fsw_core::update::UpdateOutcome;
 use fsw_path::{BareSlashMode, eq_ignore_case, is_valid_windows_root};
@@ -25,8 +26,6 @@ use std::process::Command;
 use windows_reactor::*;
 
 mod folder_picker;
-mod tray;
-mod watchdog;
 
 /// The WSL provider root. Bare `/` may resolve elsewhere depending on bare-slash mode,
 /// so "Open WSL root" targets this literally, as `src/settings/main.cpp:562` does.
@@ -34,6 +33,16 @@ const WSL_ROOT: &str = r"\\wsl.localhost";
 
 /// Icon resource id from app.rc, kept in step with `include/fsw_resources.h`.
 const IDI_FSW_APP: u16 = 101;
+
+/// The `show_result` action phrase for a folder-root change. `ControllerFinished`
+/// carries the phrase, so it is also how the handler recognizes the one action
+/// that clears the pending folder selection.
+const ROOT_ACTION: &str = "Bare slash opens the chosen folder";
+
+/// The action phrase reserved for one step of the automatic adapter upgrade.
+/// `ControllerFinished` matches on it to advance the upgrade queue, so it never
+/// reaches `show_result` -- the upgrade reports itself once, when the queue drains.
+const UPGRADE_ACTION: &str = "Terminal integration upgrade";
 
 // ---------------------------------------------------------------------------
 // Sections
@@ -96,9 +105,20 @@ impl Integration {
     fn installed(self, state: &State) -> bool {
         match self {
             Self::Windows => state.windows,
-            Self::Cmd => state.cmd,
-            Self::WindowsPowerShell => state.windows_powershell,
-            Self::PowerShell7 => state.powershell7,
+            // One source of truth: the adapter row read in `State::read`.
+            _ => state
+                .adapter(self)
+                .is_some_and(|adapter| adapter.installed),
+        }
+    }
+
+    /// The name the version and upgrade notices use for this adapter.
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Windows => "Windows surfaces",
+            Self::Cmd => "Command Prompt",
+            Self::WindowsPowerShell => "Windows PowerShell",
+            Self::PowerShell7 => "PowerShell 7",
         }
     }
 
@@ -126,6 +146,58 @@ impl Integration {
 // State
 // ---------------------------------------------------------------------------
 
+/// One shell adapter's deployed state: whether its marker key says `installed`,
+/// the payload version it recorded, and whether that predates this build.
+///
+/// `outdated` is `adapter_outdated`, which is already false for an adapter that
+/// is not installed; the pair is kept separate so the About page can tell
+/// "not installed" from "installed and current".
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdapterStatus {
+    integration: Integration,
+    installed: bool,
+    version: Option<String>,
+    outdated: bool,
+}
+
+/// The optional filesystem minifilter, as both pages report it.
+///
+/// The four states are the ones `fwdslash driver status` prints; `fsw-core`
+/// exposes the two probes (`filter_port_available`, `filter_service_state`),
+/// not the wording, so the mapping lives here and in `driver_state()` in
+/// `crates/fsw-cli/src/main.rs`. Keep the two in step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverStatus {
+    NotInstalled,
+    InstalledNotLoaded,
+    LoadedNotConnected,
+    Connected,
+}
+
+impl DriverStatus {
+    /// A port that answers outranks whatever the SCM says; otherwise the
+    /// service decides. Both probes are read-only and never elevate.
+    fn read() -> Self {
+        if filter_port_available() {
+            return Self::Connected;
+        }
+        match filter_service_state() {
+            FilterServiceState::NotInstalled => Self::NotInstalled,
+            FilterServiceState::Stopped => Self::InstalledNotLoaded,
+            FilterServiceState::Running => Self::LoadedNotConnected,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not installed",
+            Self::InstalledNotLoaded => "installed, not loaded",
+            Self::LoadedNotConnected => "loaded, not connected",
+            Self::Connected => "connected",
+        }
+    }
+}
+
 /// Everything the window renders, read straight from HKCU and the broker window.
 ///
 /// Mirrors `RefreshState()` at `src/settings/main.cpp:754-841`. Reading in-process
@@ -137,9 +209,8 @@ struct State {
     disabled: bool,
     packaged: bool,
     windows: bool,
-    cmd: bool,
-    windows_powershell: bool,
-    powershell7: bool,
+    /// Cmd, Windows PowerShell and PowerShell 7, in that order.
+    adapters: Vec<AdapterStatus>,
     powershell7_available: bool,
     bare_mode: BareSlashMode,
     pinned: String,
@@ -151,33 +222,146 @@ struct State {
     wsl_default: Option<String>,
     broker: BrokerState,
     broker_window: bool,
+    /// The optional filesystem minifilter, probed live.
+    driver: DriverStatus,
+    /// A downloaded update bundle is waiting to be registered (GitHub flavor).
+    update_bundle_ready: bool,
+}
+
+/// `pwsh.exe` availability, resolved once per process.
+///
+/// `executable_available` is a PATH-wide `SearchPathW`; a PATH entry on an
+/// offline share made every page click wait for the SMB timeout. Whether
+/// PowerShell 7 is installed cannot change usefully while the window is open.
+fn powershell7_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| executable_available("pwsh.exe"))
 }
 
 impl State {
     fn read() -> Self {
         let distributions = list_registered_distributions();
         let wsl_default = get_default_distribution(&distributions);
+        // One open of the settings key for all four preferences, instead of
+        // four single-value getters.
+        let settings = SettingsValues::read();
+        let windows_powershell_key = format!("{POWERSHELL_ADAPTER_ROOT}WindowsPowerShell");
+        let powershell7_key = format!("{POWERSHELL_ADAPTER_ROOT}PowerShell");
+        let adapters = [
+            (Integration::Cmd, CMD_ADAPTER_KEY),
+            (Integration::WindowsPowerShell, windows_powershell_key.as_str()),
+            (Integration::PowerShell7, powershell7_key.as_str()),
+        ]
+        .into_iter()
+        .map(|(integration, key)| AdapterStatus {
+            integration,
+            installed: adapter_installed(key),
+            version: adapter_version(key),
+            // The adapter payload version is the crate version.
+            outdated: adapter_outdated(key, FSW_VERSION),
+        })
+        .collect();
         Self {
-            disabled: is_disabled(),
+            disabled: settings.disabled,
             packaged: has_package_identity(),
             windows: windows_integration_installed(),
-            cmd: adapter_installed(CMD_ADAPTER_KEY),
-            windows_powershell: adapter_installed(&format!(
-                "{POWERSHELL_ADAPTER_ROOT}WindowsPowerShell"
-            )),
-            powershell7: adapter_installed(&format!("{POWERSHELL_ADAPTER_ROOT}PowerShell")),
-            powershell7_available: executable_available("pwsh.exe"),
-            bare_mode: get_bare_slash_mode(),
-            pinned: get_bare_slash_override(),
-            root: get_bare_slash_root(),
+            adapters,
+            powershell7_available: powershell7_available(),
+            bare_mode: settings.bare_slash_mode,
+            pinned: settings.bare_slash_pinned.unwrap_or_default(),
+            root: settings.bare_slash_root,
             store_flavor: is_store_flavor(),
             auto_update: update::read_auto_update_enabled(),
             update_tag: update::cached_update_tag(),
             distributions,
             wsl_default,
-            // 750 ms so a wedged broker cannot stall a refresh (main.cpp:827).
-            broker: broker_state(750),
+            // 250 ms so a wedged broker cannot stall a refresh (main.cpp:827
+            // used 750; this runs off the UI thread now, but the window still
+            // waits on the result to repaint).
+            broker: broker_state(250),
             broker_window: broker_window_exists(),
+            driver: DriverStatus::read(),
+            update_bundle_ready: update::pending_bundle_path().is_some(),
+        }
+    }
+
+    /// The adapter row for `integration`, or `None` for `Integration::Windows`,
+    /// which is not a shell adapter and carries no payload version.
+    fn adapter(&self, integration: Integration) -> Option<&AdapterStatus> {
+        self.adapters
+            .iter()
+            .find(|adapter| adapter.integration == integration)
+    }
+
+    /// Installed adapters whose payload predates this build, in page order.
+    /// `integration <id> enable` upgrades one in place.
+    fn outdated_adapters(&self) -> Vec<Integration> {
+        self.adapters
+            .iter()
+            .filter(|adapter| adapter.installed && adapter.outdated)
+            .map(|adapter| adapter.integration)
+            .collect()
+    }
+
+    /// The secondary line under a Terminals toggle: what is actually deployed.
+    fn adapter_detail(&self, integration: Integration) -> Option<String> {
+        let adapter = self.adapter(integration)?;
+        if !adapter.installed {
+            return None;
+        }
+        // A pre-`Version` install records no version at all, and is outdated
+        // by that fact alone.
+        let version = adapter.version.as_deref().unwrap_or("unknown");
+        Some(if adapter.outdated {
+            format!("Installed payload {version} \u{2014} updating to {FSW_VERSION}")
+        } else {
+            format!("Installed payload {version}")
+        })
+    }
+
+    /// The About page's line for one adapter.
+    fn adapter_component_line(&self, integration: Integration) -> String {
+        let label = integration.display_name();
+        let Some(adapter) = self.adapter(integration) else {
+            return format!("{label} adapter: not installed");
+        };
+        if !adapter.installed {
+            return format!("{label} adapter: not installed");
+        }
+        let version = adapter.version.as_deref().unwrap_or("unknown");
+        if adapter.outdated {
+            format!("{label} adapter: {version} (update pending)")
+        } else {
+            format!("{label} adapter: {version}")
+        }
+    }
+
+    /// The About page's broker line. Deliberately not `status_text`'s wording:
+    /// that string is a byte-for-byte port of `src/settings/main.cpp:832-838`
+    /// and says "disabled" where this says "paused".
+    fn broker_component_line(&self) -> &'static str {
+        match self.broker {
+            BrokerState::Active => "Broker: active",
+            BrokerState::Paused => "Broker: paused",
+            BrokerState::Unavailable if self.broker_window => "Broker: hook unavailable",
+            BrokerState::Unavailable => "Broker: stopped",
+        }
+    }
+
+    /// The About page's filesystem-driver line — the same four states the
+    /// General page's status text shows.
+    fn driver_component_line(&self) -> String {
+        format!("Filesystem driver: {}", self.driver.label())
+    }
+
+    /// Which of the two package flavors is running, or neither.
+    fn flavor_component_line(&self) -> &'static str {
+        if !self.packaged {
+            "Flavor: unpackaged"
+        } else if self.store_flavor {
+            "Flavor: Microsoft Store"
+        } else {
+            "Flavor: GitHub"
         }
     }
 
@@ -233,8 +417,11 @@ impl State {
         self.root.is_some()
     }
 
-    /// Verbatim from `src/settings/main.cpp:832-838`, including the hardcoded
-    /// driver line — the driver is production-gated and never queried here.
+    /// Ported from `src/settings/main.cpp:832-838`. The broker line is
+    /// verbatim; the driver line is not. The C++ hardcodes
+    /// "not installed (production-gated)" — this reports what the machine
+    /// actually has, from the service and the filter port
+    /// (docs/divergences.md, settings window).
     fn status_text(&self) -> String {
         let broker = if self.windows {
             match self.broker {
@@ -247,7 +434,8 @@ impl State {
             "not installed"
         };
         format!(
-            "Windows broker: {broker}\nFilesystem driver: not installed (production-gated)"
+            "Windows broker: {broker}\nFilesystem driver: {}",
+            self.driver.label()
         )
     }
 }
@@ -269,16 +457,46 @@ enum Msg {
     ApplyRoot,
     BrowseRoot,
     UpdateCheckFinished(update::UpdateOutcome),
-    DismissUpdateNotice,
     SetAutoUpdate(bool),
     SelectDistribution(Option<usize>),
     ToggleIntegration(Integration, bool),
     OpenWslRoot,
     RefreshStatus,
     DismissNotice,
-    /// The settings HWND exists; install the tray/lifecycle subclass on the UI
-    /// thread. The payload is the window discovered by the background poll.
-    WindowHookReady(isize),
+    /// Register the downloaded bundle now instead of waiting for the next logon.
+    RestartToUpdate,
+    /// A background `State::read()` completed. Every refresh is off-thread: the
+    /// read touches the registry, the broker window and the update directory.
+    StateLoaded(State),
+    /// `ensure_broker_running()` finished off-thread; the broker column of the
+    /// status line may have changed.
+    BrokerProbed,
+    /// A `fwdslash.exe` invocation finished off-thread. `action` is the
+    /// `show_result` phrase the request was started with.
+    ControllerFinished {
+        action: &'static str,
+        terminal: bool,
+        succeeded: bool,
+    },
+}
+
+/// The automatic shell-adapter upgrade in flight.
+///
+/// The broker runs the same upgrade at logon, so by the time this window opens
+/// there is usually nothing to do; when there is, it happens without being
+/// asked. One `fwdslash integration <id> enable` per adapter, sequentially --
+/// the CLI transaction is per adapter, and two at once would race the shared
+/// payload directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Upgrade {
+    /// The adapter whose `integration <id> enable` is running now.
+    current: Integration,
+    /// Adapters still waiting, popped from the back.
+    queue: Vec<Integration>,
+    /// Adapters the CLI reported success for.
+    done: Vec<Integration>,
+    /// At least one step failed; the summary becomes an error.
+    failed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -296,9 +514,42 @@ struct SettingsModel {
     /// also clear the persisted AvailableUpdate value.
     notice_is_update: bool,
     notice: Option<(InfoBarSeverity, &'static str, String)>,
+    /// The `show_result` phrase of the controller invocation in flight, or
+    /// `None`. Every control that mutates state is disabled while it is set,
+    /// so a second request can never race the first.
+    pending: Option<&'static str>,
+    /// The running adapter upgrade, or `None` when none is in flight.
+    upgrade: Option<Upgrade>,
+    /// An upgrade has already been started (or found unnecessary) this process.
+    /// Every refresh re-reads the adapter versions, and a failed upgrade would
+    /// otherwise restart itself on every one of them.
+    upgrade_attempted: bool,
 }
 
 impl SettingsModel {
+    /// Whether state-mutating controls accept input right now.
+    fn controls_enabled(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    /// Starts a `fwdslash.exe` invocation on the thread pool. The UI thread
+    /// never waits on the controller: `integration windows-powershell enable`
+    /// loads the user's whole profile and can take 15 s.
+    fn start_controller(
+        &mut self,
+        context: &ComponentContext<Self>,
+        action: &'static str,
+        terminal: bool,
+        arguments: Vec<String>,
+    ) {
+        self.pending = Some(action);
+        context.spawn_background(move |_| Msg::ControllerFinished {
+            action,
+            terminal,
+            succeeded: run_controller(arguments),
+        });
+    }
+
     /// The single notification path, reproducing `ShowResult`
     /// (`src/settings/main.cpp:874-887`). Only Success and Error are ever used.
     fn show_result(&mut self, succeeded: bool, action: &str, terminal: bool) {
@@ -323,8 +574,95 @@ impl SettingsModel {
         ));
     }
 
-    fn refresh(&mut self) {
-        self.state = State::read();
+    /// Re-reads state off the UI thread; the result arrives as
+    /// `Msg::StateLoaded`.
+    fn refresh(context: &ComponentContext<Self>) {
+        context.spawn_background(|_| Msg::StateLoaded(State::read()));
+    }
+
+    /// Starts the automatic upgrade if any installed adapter is outdated.
+    ///
+    /// Called for every `State` the model accepts. Nothing is asked of the
+    /// user: an outdated payload is a bug to fix, not a decision to make.
+    fn maybe_start_upgrade(&mut self, context: &ComponentContext<Self>) {
+        if self.upgrade_attempted || self.upgrade.is_some() || self.pending.is_some() {
+            return;
+        }
+        let mut queue = self.state.outdated_adapters();
+        if queue.is_empty() {
+            return;
+        }
+        // Popped from the back, so reverse to keep page order.
+        queue.reverse();
+        let Some(current) = queue.pop() else { return };
+        self.upgrade_attempted = true;
+        self.upgrade = Some(Upgrade {
+            current,
+            queue,
+            done: Vec::new(),
+            failed: false,
+        });
+        self.start_upgrade_step(context, current);
+    }
+
+    /// `integration <id> enable` on an installed-but-outdated marker reinstalls
+    /// the payload, so one enable per adapter is the whole upgrade. It is
+    /// transactional and idempotent: if the broker already ran it at logon,
+    /// this exits 0 with nothing to do, which is a success.
+    fn start_upgrade_step(&mut self, context: &ComponentContext<Self>, integration: Integration) {
+        self.start_controller(
+            context,
+            UPGRADE_ACTION,
+            true,
+            vec![
+                "integration".to_string(),
+                integration.id().to_string(),
+                "enable".to_string(),
+            ],
+        );
+    }
+
+    /// Records one finished step and either starts the next or reports the
+    /// whole upgrade once.
+    fn advance_upgrade(&mut self, succeeded: bool, context: &ComponentContext<Self>) {
+        let Some(mut upgrade) = self.upgrade.take() else {
+            return;
+        };
+        if succeeded {
+            upgrade.done.push(upgrade.current);
+        } else {
+            upgrade.failed = true;
+        }
+        if let Some(next) = upgrade.queue.pop() {
+            upgrade.current = next;
+            self.upgrade = Some(upgrade);
+            self.start_upgrade_step(context, next);
+            return;
+        }
+        self.notice = Some(if upgrade.failed {
+            (
+                InfoBarSeverity::Error,
+                "Some terminal integrations could not be updated",
+                "Turn the affected integration off and on again on the Terminals page."
+                    .to_string(),
+            )
+        } else {
+            let names: Vec<&str> = upgrade
+                .done
+                .iter()
+                .map(|integration| integration.display_name())
+                .collect();
+            let verb = if names.len() == 1 { "is" } else { "are" };
+            (
+                InfoBarSeverity::Success,
+                "Terminal integrations updated",
+                format!("{} {verb} now on {FSW_VERSION}", names.join(", ")),
+            )
+        });
+        // Not the update-available notice, so dismissal must not clear the
+        // persisted AvailableUpdate value.
+        self.notice_is_update = false;
+        Self::refresh(context);
     }
 }
 
@@ -335,11 +673,12 @@ impl Component for SettingsModel {
     fn create(input: &Self::Input, context: &ComponentContext<Self>) -> Self {
         // A packaged build runs nothing at install time and its startup task only
         // fires at logon, so opening this window is the first chance to arm the
-        // broker. Without this a Store install does nothing at all.
-        ensure_broker_running();
-        // Reactor materializes the HWND after `create` returns, so discovery
-        // runs off-thread with bounded polling; `WindowHookReady` hands the
-        // window back for the (UI-thread-only) subclass installation.
+        // broker. Without this a Store install does nothing at all. Off the UI
+        // thread: the probe spins for up to 2 s waiting for the broker window.
+        context.spawn_background(|_| {
+            ensure_broker_running();
+            Msg::BrokerProbed
+        });
         // Daily GitHub update check (GitHub flavor only; the gate inside
         // `run_update_check` no-ops for the Store flavor and unpackaged
         // builds). Off the UI thread so the curl timeouts cannot stall the
@@ -351,29 +690,28 @@ impl Component for SettingsModel {
         ) {
             context.spawn_background(|_| Msg::UpdateCheckFinished(update::run_update_check()));
         }
-        context.spawn_background(|_| {
-            for _ in 0..100 {
-                let window = tray::discover_window();
-                if window != 0 {
-                    return Msg::WindowHookReady(window);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Msg::WindowHookReady(0)
-        });
-        Self {
+        let mut model = Self {
             section: *input,
             pane_open: false,
             color_scheme: ColorScheme::Dark,
+            // The only synchronous read: the first frame has nothing to show
+            // without it.
             state: State::read(),
             root_draft: String::new(),
             folder_selected: false,
             notice_is_update: false,
             notice: None,
-        }
+            pending: None,
+            upgrade: None,
+            upgrade_attempted: false,
+        };
+        // An outdated adapter is repaired on sight, at the first state the
+        // window ever sees.
+        model.maybe_start_upgrade(context);
+        model
     }
 
-    fn update(&mut self, message: Self::Message, _context: &ComponentContext<Self>) {
+    fn update(&mut self, message: Self::Message, context: &ComponentContext<Self>) {
         match message {
             Msg::Navigate(Some(tag)) => {
                 let section = Section::from_tag(&tag);
@@ -382,8 +720,10 @@ impl Component for SettingsModel {
                 }
                 self.section = section;
                 // Stands in for the C++ `window_.Activated` refresh, which reactor
-                // has no equivalent for. See docs/divergences.md.
-                self.refresh();
+                // has no equivalent for. See docs/divergences.md. Every page,
+                // About included -- its Components card is live state, and the
+                // read is off the UI thread.
+                Self::refresh(context);
             }
             // A cleared selection is WinUI normalizing, never a user choice.
             Msg::Navigate(None) => {}
@@ -395,17 +735,16 @@ impl Component for SettingsModel {
                     // The switch already shows the stored state; nothing changed.
                     return;
                 }
-                let succeeded = run_controller([if enabled { "enable" } else { "disable" }]);
-                self.show_result(
-                    succeeded,
+                self.start_controller(
+                    context,
                     if enabled {
                         "Resolution enabled"
                     } else {
                         "Resolution disabled"
                     },
                     false,
+                    vec![if enabled { "enable" } else { "disable" }.to_string()],
                 );
-                self.refresh();
             }
 
             // Both radios share a group, so checking one unchecks the other and
@@ -422,9 +761,12 @@ impl Component for SettingsModel {
                     return;
                 }
                 self.folder_selected = false;
-                let succeeded = run_controller(["bare-slash", "list"]);
-                self.show_result(succeeded, "Bare slash shows all distributions", false);
-                self.refresh();
+                self.start_controller(
+                    context,
+                    "Bare slash shows all distributions",
+                    false,
+                    vec!["bare-slash".to_string(), "list".to_string()],
+                );
             }
             Msg::BareSlashDefaultChecked(checked) => {
                 if !checked
@@ -433,9 +775,12 @@ impl Component for SettingsModel {
                     return;
                 }
                 self.folder_selected = false;
-                let succeeded = run_controller(["bare-slash", "default"]);
-                self.show_result(succeeded, "Bare slash opens the default distribution", false);
-                self.refresh();
+                self.start_controller(
+                    context,
+                    "Bare slash opens the default distribution",
+                    false,
+                    vec!["bare-slash".to_string(), "default".to_string()],
+                );
             }
             Msg::FolderRadioChecked(checked) => {
                 // Selecting the radio only reveals the folder controls; the
@@ -447,7 +792,7 @@ impl Component for SettingsModel {
                 self.folder_selected = true;
                 // Deterministic re-render: every other view-input change ends
                 // in a refresh, so this one must too (divergences #5 flow).
-                self.refresh();
+                Self::refresh(context);
                 return;
             }
             Msg::RootTextChanged(text) => {
@@ -458,8 +803,7 @@ impl Component for SettingsModel {
             }
             Msg::BrowseRoot => {
                 // Modal picker on the UI thread; it pumps its own messages.
-                let parent = crate::tray::discover_window();
-                let Some(path) = folder_picker::pick_folder(parent as _) else {
+                let Some(path) = folder_picker::pick_folder() else {
                     return; // cancelled
                 };
                 self.root_draft = path.clone();
@@ -468,12 +812,12 @@ impl Component for SettingsModel {
                 {
                     return;
                 }
-                let succeeded = run_controller(["bare-slash", "root", &path]);
-                if succeeded {
-                    self.folder_selected = false;
-                }
-                self.show_result(succeeded, "Bare slash opens the chosen folder", false);
-                self.refresh();
+                self.start_controller(
+                    context,
+                    ROOT_ACTION,
+                    false,
+                    vec!["bare-slash".to_string(), "root".to_string(), path],
+                );
             }
             Msg::ApplyRoot => {
                 // Echo guard: re-pressing Apply with an unchanged draft must
@@ -491,12 +835,13 @@ impl Component for SettingsModel {
                     ));
                     return;
                 }
-                let succeeded = run_controller(["bare-slash", "root", candidate]);
-                if succeeded {
-                    self.folder_selected = false;
-                }
-                self.show_result(succeeded, "Bare slash opens the chosen folder", false);
-                self.refresh();
+                let candidate = candidate.to_string();
+                self.start_controller(
+                    context,
+                    ROOT_ACTION,
+                    false,
+                    vec!["bare-slash".to_string(), "root".to_string(), candidate],
+                );
             }
 
             Msg::SelectDistribution(index) => {
@@ -506,32 +851,30 @@ impl Component for SettingsModel {
                 if index == self.state.distribution_index() {
                     return;
                 }
-                let succeeded = if index == 0 {
-                    run_controller(["bare-slash", "default"])
-                } else if let Some(distribution) = self.state.distributions.get(index - 1) {
-                    run_controller(["bare-slash", "default", distribution.as_str()])
-                } else {
-                    return;
-                };
-                self.show_result(succeeded, "Bare slash default updated", false);
-                self.refresh();
+                let mut arguments = vec!["bare-slash".to_string(), "default".to_string()];
+                if index > 0 {
+                    let Some(distribution) = self.state.distributions.get(index - 1) else {
+                        return;
+                    };
+                    arguments.push(distribution.clone());
+                }
+                self.start_controller(context, "Bare slash default updated", false, arguments);
             }
 
             Msg::ToggleIntegration(integration, enabled) => {
                 if enabled == integration.installed(&self.state) {
                     return;
                 }
-                let succeeded = run_controller([
-                    "integration",
-                    integration.id(),
-                    if enabled { "enable" } else { "disable" },
-                ]);
-                self.show_result(
-                    succeeded,
+                self.start_controller(
+                    context,
                     integration.action(enabled),
                     integration.is_terminal(),
+                    vec![
+                        "integration".to_string(),
+                        integration.id().to_string(),
+                        if enabled { "enable" } else { "disable" }.to_string(),
+                    ],
                 );
-                self.refresh();
             }
 
             Msg::OpenWslRoot => {
@@ -540,7 +883,7 @@ impl Component for SettingsModel {
                 }
             }
             Msg::RefreshStatus => {
-                self.refresh();
+                Self::refresh(context);
                 self.show_result(true, "Status refreshed", false);
             }
             Msg::UpdateCheckFinished(outcome) => {
@@ -552,19 +895,39 @@ impl Component for SettingsModel {
                     InfoBarSeverity::Informational,
                     "Update available",
                     format!(
-                        "Version {short} was downloaded and applies the next time \
-                         Forward Slash Windows starts."
+                        "Version {short} was downloaded. It applies after you sign out and \
+                         back in, or restart Forward Slash Windows now."
                     ),
                 ));
                 self.notice_is_update = true;
-                tray::show_notification(&format!(
-                    "Forward Slash Windows {short} will apply on next launch."
-                ));
+                // The bundle only exists once the check has downloaded it, so
+                // the "Restart to update" action appears with this refresh.
+                Self::refresh(context);
             }
-            Msg::DismissUpdateNotice => {
-                let _ = update::dismiss_update();
-                self.notice = None;
-                self.notice_is_update = false;
+            Msg::RestartToUpdate => {
+                let Some(bundle) = update::pending_bundle_path() else {
+                    self.notice = Some((
+                        InfoBarSeverity::Error,
+                        "Could not start the update",
+                        "The update could not be started.".to_string(),
+                    ));
+                    return;
+                };
+                // Ask the broker to close first so it removes its notification
+                // icon itself; a forced shutdown by the installer would leave a
+                // ghost icon behind.
+                close_broker_window();
+                if update::restart_to_update(&bundle) {
+                    // Exit through the window's own close path: the reactor's
+                    // only process-exit route is WinUI's `Window.Closed`.
+                    request_close();
+                } else {
+                    self.notice = Some((
+                        InfoBarSeverity::Error,
+                        "Could not start the update",
+                        "The update could not be started.".to_string(),
+                    ));
+                }
             }
             Msg::SetAutoUpdate(enabled) => {
                 if enabled == update::read_auto_update_enabled() {
@@ -590,28 +953,28 @@ impl Component for SettingsModel {
                 }
                 self.notice = None;
             }
-            Msg::WindowHookReady(window) => {
-                // Subclassing requires the window's own thread; `update` runs
-                // on it. A 0 payload means discovery timed out -- tray and
-                // close-to-tray would silently degrade to default behavior,
-                // leaving an unquittable window; exit loudly instead.
-                if window == 0 {
-                    log_crash("settings window discovery failed; exiting");
-                    show_startup_error(
-                        "Forward Slash Windows could not attach to its own window \
-                         and will now exit.",
-                    );
-                    watchdog::note_exit_requested();
-                    watchdog::quit_ui_thread();
-                } else {
-                    watchdog::note_window(window);
-                    if let Err(code) = tray::install(window) {
-                        log_crash(&format!(
-                            "tray subclass installation failed: Win32 error {code}"
-                        ));
-                    }
+            Msg::ControllerFinished {
+                action,
+                terminal,
+                succeeded,
+            } => {
+                self.pending = None;
+                if action == UPGRADE_ACTION {
+                    // The upgrade reports itself once, when the queue drains.
+                    self.advance_upgrade(succeeded, context);
+                    return;
                 }
+                if succeeded && action == ROOT_ACTION {
+                    self.folder_selected = false;
+                }
+                self.show_result(succeeded, action, terminal);
+                Self::refresh(context);
             }
+            Msg::StateLoaded(state) => {
+                self.state = state;
+                self.maybe_start_upgrade(context);
+            }
+            Msg::BrokerProbed => Self::refresh(context),
         }
     }
 
@@ -738,15 +1101,74 @@ impl SettingsModel {
             .padding(Thickness::uniform(24.0))
             .content(
                 Grid::new()
-                    .rows([GridLength::Auto, GridLength::Star(1.0)])
+                    .rows([GridLength::Auto, GridLength::Auto, GridLength::Star(1.0)])
                     .children((
                         notice,
+                        self.banners(context),
                         ScrollViewer::new()
-                            .grid_row(1)
+                            .grid_row(2)
                             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                             .content(page),
                     )),
             )
+    }
+
+    /// The second fixed row: standing notices and actions that are derived from
+    /// state rather than from a single completed command, plus the in-flight
+    /// indicator. Kept out of `self.notice` so a routine "Updated" result never
+    /// hides the adapter-upgrade progress, and vice versa.
+    ///
+    /// Reactor's `InfoBar` exposes no action-button slot, so each action is a
+    /// `Button` rendered directly beneath its bar.
+    fn banners(&self, context: &mut ViewContext<Self>) -> View {
+        // The GitHub flavor only: the Store updates through the Store.
+        let restartable =
+            self.state.packaged && !self.state.store_flavor && self.state.update_bundle_ready;
+        if self.upgrade.is_none() && !restartable && self.pending.is_none() {
+            return View::empty();
+        }
+
+        // Progress only -- there is no button, because there is no decision to
+        // make. The result lands in the dismissible notice above.
+        let upgrade_notice: View = match &self.upgrade {
+            Some(upgrade) => InfoBar::new()
+                .title("Updating terminal integrations\u{2026}")
+                .message(format!(
+                    "{} adapter \u{2192} {FSW_VERSION}",
+                    upgrade.current.display_name()
+                ))
+                .severity(InfoBarSeverity::Informational)
+                .is_open(true)
+                .is_closable(false)
+                .into(),
+            None => View::empty(),
+        };
+        let restart_action: View = if restartable {
+            Button::new()
+                .is_enabled(self.controls_enabled())
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .on_click(context.message(Msg::RestartToUpdate))
+                .content("Restart to update")
+        } else {
+            View::empty()
+        };
+        let progress: View = if self.pending.is_some() {
+            ProgressRing::new()
+                .is_active(true)
+                .is_indeterminate(true)
+                .width(20.0)
+                .height(20.0)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .into()
+        } else {
+            View::empty()
+        };
+
+        StackPanel::new()
+            .spacing(8.0)
+            .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
+            .grid_row(1)
+            .children((upgrade_notice, restart_action, progress))
     }
 
     fn view_general(&self, context: &mut ViewContext<Self>) -> View {
@@ -768,11 +1190,14 @@ impl SettingsModel {
                                 .min_width(240.0)
                                 .placeholder_text(r"C:\code or \\wsl.localhost\Ubuntu\home")
                                 .text(self.root_draft.clone())
+                                .is_enabled(self.controls_enabled())
                                 .on_text_changed(context.callback(Msg::RootTextChanged)),
                             Button::new()
+                                .is_enabled(self.controls_enabled())
                                 .on_click(context.message(Msg::BrowseRoot))
                                 .content("Browse\u{2026}"),
                             Button::new()
+                                .is_enabled(self.controls_enabled())
                                 .on_click(context.message(Msg::ApplyRoot))
                                 .content("Apply folder"),
                         )),
@@ -798,6 +1223,7 @@ impl SettingsModel {
                                 .automation_name("Default distribution for bare slash")
                                 .items_source(state.distribution_options())
                                 .selected_index(Some(state.distribution_index()))
+                                .is_enabled(self.controls_enabled())
                                 .on_selection_changed(
                                     context.callback(Msg::SelectDistribution),
                                 ),
@@ -817,6 +1243,7 @@ impl SettingsModel {
                     "Disable temporarily without removing selected integrations.",
                     ToggleSwitch::new()
                         .is_on(!state.disabled)
+                        .is_enabled(self.controls_enabled())
                         .automation_name("Enable forward-slash resolution")
                         .on_toggled(context.callback(Msg::ToggleGlobal))
                         .grid_column(1)
@@ -838,18 +1265,21 @@ impl SettingsModel {
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Show all distributions")
+                        .is_enabled(self.controls_enabled())
                         .is_checked(state.is_list_mode() && state.root.is_none() && !self.folder_selected)
                         .on_checked(context.callback(Msg::BareSlashListChecked))
                         .content("Show all distributions"),
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Open my default distribution")
+                        .is_enabled(self.controls_enabled())
                         .is_checked(!state.is_list_mode() && state.root.is_none() && !self.folder_selected)
                         .on_checked(context.callback(Msg::BareSlashDefaultChecked))
                         .content("Open my default distribution"),
                     RadioButton::new()
                         .group_name("BareSlashMode")
                         .automation_name("Open a folder I choose")
+                        .is_enabled(self.controls_enabled())
                         .is_checked(state.is_folder_mode() || self.folder_selected)
                         .on_checked(context.callback(Msg::FolderRadioChecked))
                         .content("Open a folder I choose"),
@@ -864,6 +1294,7 @@ impl SettingsModel {
                         "Check GitHub daily and install new versions automatically.",
                         ToggleSwitch::new()
                             .is_on(state.auto_update)
+                            .is_enabled(self.controls_enabled())
                             .automation_name("Automatic updates")
                             .on_toggled(context.callback(Msg::SetAutoUpdate))
                             .grid_column(1)
@@ -909,8 +1340,8 @@ impl SettingsModel {
                     "Explorer, Run, and Search",
                     "Installs the per-user broker and startup entry. Turning this off stops the \
                      broker and removes its startup registration.",
-                    integration_toggle(Integration::Windows, state, context)
-                        .is_enabled(!state.packaged)
+                    integration_toggle(Integration::Windows, self, context)
+                        .is_enabled(!state.packaged && self.controls_enabled())
                         .automation_name("Install Windows surface integration"),
                 ),
                 body(
@@ -929,27 +1360,34 @@ impl SettingsModel {
                     "Terminal integrations",
                     "Each shell is independent and can be removed without changing the others.",
                 ),
-                toggle_card(
+                toggle_card_detail(
                     "Command Prompt",
                     "Adds reversible dir and ls DOSKEY adapters for new cmd.exe sessions.",
-                    integration_toggle(Integration::Cmd, state, context)
+                    state.adapter_detail(Integration::Cmd),
+                    integration_toggle(Integration::Cmd, self, context)
                         .automation_name("Install Command Prompt integration"),
                 ),
-                toggle_card(
+                toggle_card_detail(
                     "Windows PowerShell 5.1",
                     "Adds a guarded profile import and preserves normal Get-ChildItem behavior.",
-                    integration_toggle(Integration::WindowsPowerShell, state, context)
+                    state.adapter_detail(Integration::WindowsPowerShell),
+                    integration_toggle(Integration::WindowsPowerShell, self, context)
                         .automation_name("Install Windows PowerShell integration"),
                 ),
-                toggle_card(
+                toggle_card_detail(
                     "PowerShell 7",
                     if state.powershell7_available {
                         "Adds the same reversible adapter to the PowerShell 7 profile."
                     } else {
                         "PowerShell 7 is not installed on this computer."
                     },
-                    integration_toggle(Integration::PowerShell7, state, context)
-                        .is_enabled(state.powershell7_available || state.powershell7)
+                    state.adapter_detail(Integration::PowerShell7),
+                    integration_toggle(Integration::PowerShell7, self, context)
+                        .is_enabled(
+                            (state.powershell7_available
+                                || Integration::PowerShell7.installed(state))
+                                && self.controls_enabled(),
+                        )
                         .automation_name("Install PowerShell 7 integration"),
                 ),
                 body(
@@ -961,20 +1399,44 @@ impl SettingsModel {
             ))
     }
 
+    /// The running package version (the MSIX identity when packaged, the crate
+    /// version otherwise) and the package architecture.
+    fn package_label() -> String {
+        format!(
+            "{} ({})",
+            package_version().as_deref().unwrap_or(FSW_VERSION),
+            package_architecture()
+                .unwrap_or_else(|| env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default()),
+        )
+    }
+
+    /// What is actually deployed on this machine, one line per component.
+    ///
+    /// Rendered from `State`, which `Msg::Navigate` refreshes for this page too:
+    /// the broker line and the three adapter versions are live.
+    fn components_card(&self) -> View {
+        let state = &self.state;
+        card(StackPanel::new().spacing(4.0).children((
+            strong("Components"),
+            body(state.broker_component_line()).foreground(ThemeBrush::TextSecondary),
+            body(state.driver_component_line()).foreground(ThemeBrush::TextSecondary),
+            body(state.adapter_component_line(Integration::Cmd))
+                .foreground(ThemeBrush::TextSecondary),
+            body(state.adapter_component_line(Integration::WindowsPowerShell))
+                .foreground(ThemeBrush::TextSecondary),
+            body(state.adapter_component_line(Integration::PowerShell7))
+                .foreground(ThemeBrush::TextSecondary),
+            body(format!("Package: {}", Self::package_label()))
+                .foreground(ThemeBrush::TextSecondary),
+            body(state.flavor_component_line()).foreground(ThemeBrush::TextSecondary),
+        )))
+    }
+
     // The only `expect`s in the crate: `navigate_uri` on a compile-time
     // constant string is infallible by construction.
     #[allow(clippy::expect_used)]
     fn view_about(&self) -> View {
-        // Dynamic subtitle: the running package version (the MSIX identity
-        // when packaged, the crate version otherwise) and the package
-        // architecture.
-        let subtitle = format!(
-            "Forward Slash Windows {} ({})",
-            package_version().as_deref().unwrap_or(fsw_core::FSW_VERSION),
-            package_architecture().unwrap_or_else(|| {
-                std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default()
-            }),
-        );
+        let subtitle = format!("Forward Slash Windows {}", Self::package_label());
         page_stack(16.0)
             .children((
                 // page_header demands &'static str; the subtitle is dynamic.
@@ -986,16 +1448,12 @@ impl SettingsModel {
                         .text_wrapping(TextWrapping::Wrap),
                     body(&subtitle).foreground(ThemeBrush::TextSecondary),
                 )),
+                self.components_card(),
                 body(
                     "Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to either the \
                      WSL distribution list or your default distribution, on supported Windows \
                      surfaces.",
                 ),
-                body(
-                    "The filesystem minifilter remains production-gated and is not installed by \
-                     this app.",
-                )
-                .foreground(ThemeBrush::TextSecondary),
                 Border::new()
                     .padding(Thickness::new(18.0, 16.0, 18.0, 16.0))
                     .corner_radius(CornerRadius::uniform(8.0))
@@ -1075,6 +1533,22 @@ fn card(content: impl Into<View>) -> View {
 }
 
 fn toggle_card(title: &'static str, description: &'static str, toggle: impl Into<View>) -> View {
+    toggle_card_detail(title, description, None, toggle)
+}
+
+/// `toggle_card` with a second, dynamic secondary line -- what the adapter
+/// actually has deployed. `toggle_card`'s descriptions are `&'static str`
+/// literals; this one is built per render from `State`.
+fn toggle_card_detail(
+    title: &'static str,
+    description: &'static str,
+    detail: Option<String>,
+    toggle: impl Into<View>,
+) -> View {
+    let detail: View = match detail {
+        Some(text) => body(text).foreground(ThemeBrush::TextSecondary).into(),
+        None => View::empty(),
+    };
     card(
         Grid::new()
             .columns([GridLength::Star(1.0), GridLength::Auto])
@@ -1084,7 +1558,11 @@ fn toggle_card(title: &'static str, description: &'static str, toggle: impl Into
                     .grid_column(0)
                     .spacing(3.0)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .children((strong(title), body(description).foreground(ThemeBrush::TextSecondary))),
+                    .children((
+                        strong(title),
+                        body(description).foreground(ThemeBrush::TextSecondary),
+                        detail,
+                    )),
                 toggle,
             )),
     )
@@ -1092,11 +1570,14 @@ fn toggle_card(title: &'static str, description: &'static str, toggle: impl Into
 
 fn integration_toggle(
     integration: Integration,
-    state: &State,
+    model: &SettingsModel,
     context: &mut ViewContext<SettingsModel>,
 ) -> ToggleSwitch {
     ToggleSwitch::new()
-        .is_on(integration.installed(state))
+        .is_on(integration.installed(&model.state))
+        // Callers narrow this further (the packaged Windows toggle, the missing
+        // pwsh.exe toggle); a later `is_enabled` wins, so they must AND this in.
+        .is_enabled(model.controls_enabled())
         .grid_column(1)
         .vertical_alignment(VerticalAlignment::Center)
         .on_toggled(
@@ -1203,17 +1684,6 @@ fn log_crash(message: &str) {
 
 fn main() {
     std::panic::set_hook(Box::new(|info| log_crash(&format!("panic: {info}"))));
-    #[cfg(windows)]
-    if std::env::var_os("FSW_SIMULATE_WINDOWLESS").is_some() {
-        // Test hook for the takeover path in `activate_existing_instance`:
-        // hold the single-instance mutex forever with no window, exactly the
-        // state a direct `DestroyWindow` (or a session end) can leave behind.
-        // See docs/divergences.md. Set the variable to any value to enable.
-        simulate_windowless();
-        return;
-    }
-    watchdog::note_ui_thread();
-    watchdog::spawn();
     if activate_existing_instance() {
         return;
     }
@@ -1224,6 +1694,10 @@ fn main() {
 
 const SETTINGS_MUTEX_NAME: &str = "Local\\ForwardSlashWindows.Settings";
 const WINDOW_TITLE: &str = "Forward Slash Windows";
+/// The image name every settings instance runs under. The raise path matches
+/// on it so a same-titled window belonging to anything else cannot be raised.
+#[cfg(windows)]
+const SETTINGS_IMAGE_NAME: &str = "fswsettings.exe";
 
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -1235,11 +1709,9 @@ fn to_wide(value: &str) -> Vec<u16> {
 /// `Local\ForwardSlashWindows.Broker` convention), and a second launch raises
 /// the existing window instead of opening a duplicate.
 ///
-/// A prior instance can outlive its own window (a direct `DestroyWindow` or a
-/// session end skips the reactor's `Window.Closed` exit path), leaving a
-/// process that holds the mutex but has nothing to raise -- every future
-/// launch would then be a silent no-op. That zombie is terminated and the
-/// launching instance takes over.
+/// Closing the window exits the process (the reactor routes `Window.Closed` to
+/// `exit_ui_thread`), so a live mutex holder always has a window to raise --
+/// after the poll below, which covers the beat WinUI takes to materialize it.
 ///
 /// The mutex handle is intentionally leaked so it lives until process exit;
 /// the kernel releases it when the owning process terminates.
@@ -1249,9 +1721,9 @@ fn activate_existing_instance() -> bool {
         use std::thread::sleep;
         use std::time::Duration;
         use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        use windows_sys::Win32::System::Threading::CreateMutexW;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+            SetForegroundWindow, ShowWindow, SW_RESTORE,
         };
 
         let name = to_wide(SETTINGS_MUTEX_NAME);
@@ -1259,7 +1731,7 @@ fn activate_existing_instance() -> bool {
         if mutex.is_null() {
             // Fail closed: an error here means ownership cannot be decided,
             // and silently running a second instance is exactly the
-            // duplicate-tray-icon failure this guard exists to prevent.
+            // duplicate-window failure this guard exists to prevent.
             let code = GetLastError();
             log_crash(&format!("single-instance mutex creation failed: Win32 error {code}"));
             show_startup_error(&format!(
@@ -1275,9 +1747,8 @@ fn activate_existing_instance() -> bool {
         // Another instance owns the mutex. Its window may still be materializing
         // (the WinUI activation path takes a beat), so poll before concluding
         // anything -- 10 s, not 2 s.
-        let title = to_wide(WINDOW_TITLE);
         for _ in 0..200 {
-            let window = FindWindowW(std::ptr::null(), title.as_ptr());
+            let window = find_settings_window();
             if !window.is_null() {
                 ShowWindow(window, SW_RESTORE);
                 SetForegroundWindow(window);
@@ -1285,19 +1756,9 @@ fn activate_existing_instance() -> bool {
             }
             sleep(Duration::from_millis(50));
         }
-        // No window anywhere. Take over from a windowless holder, if one is
-        // there to take over from.
-        if terminate_windowless_holder() {
-            // WAIT_ABANDONED is success: the holder died holding the mutex.
-            let wait = WaitForSingleObject(mutex, 5000);
-            if wait == 0 || wait == 0x0000_0080 {
-                return false;
-            }
-        }
         show_startup_error(
             "Forward Slash Windows is already running, but its window could not be \
-             restored. Quit it from the notification area (or Task Manager) and try \
-             again.",
+             restored. Quit it from Task Manager and try again.",
         );
         true
     }
@@ -1307,107 +1768,66 @@ fn activate_existing_instance() -> bool {
     }
 }
 
-/// Kills an `fswsettings.exe` peer that holds the single-instance mutex but
-/// owns no window: the windowless zombie. Only a same-identity peer older than
-/// 15 s qualifies, and the kill is skipped whenever anything is ambiguous -- a
-/// killed healthy instance is worse than a failed launch.
+/// The other instance's settings window: a top-level window whose title is
+/// `WINDOW_TITLE` **and** whose owning process image is `fswsettings.exe`.
+///
+/// A bare `FindWindowW(NULL, WINDOW_TITLE)` is not enough. The broker owns a
+/// never-shown top-level window, and anything else on the desktop is free to
+/// use the same caption; raising the first Z-order match put a 0x0 caption-only
+/// window on screen instead of the real settings window.
 #[cfg(windows)]
-unsafe fn terminate_windowless_holder() -> bool {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, TerminateProcess, GetCurrentProcessId,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+unsafe fn find_settings_window() -> windows_sys::Win32::Foundation::HWND {
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
     };
 
-    // 15 s in 100 ns units. A younger peer is a legitimate concurrent launch
-    // still materializing its window.
-    const MINIMUM_AGE_100NS: u64 = 15 * 10_000_000;
-    // FILETIME epoch offset: 100 ns intervals between 1601-01-01 and 1970-01-01.
-    const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
-
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot.is_null() {
-        return false;
+    struct Match {
+        title: Vec<u16>,
+        found: HWND,
     }
-    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-    if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
-        unsafe { CloseHandle(snapshot) };
-        return false;
-    }
-    let mine = unsafe { GetCurrentProcessId() };
-    let now = UNIX_EPOCH_FILETIME
-        + u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() / 100)
-                .unwrap_or(0),
-        )
-        .unwrap_or(0);
-    let mut killed = false;
-    loop {
-        if entry.th32ProcessID != mine && eq_wide(&entry.szExeFile, "fswsettings.exe") {
-            let handle = unsafe {
-                OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
-                    0,
-                    entry.th32ProcessID,
-                )
-            };
-            if !handle.is_null() {
-                let mut creation: FILETIME = unsafe { std::mem::zeroed() };
-                let mut exit_time: FILETIME = unsafe { std::mem::zeroed() };
-                let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
-                let mut user: FILETIME = unsafe { std::mem::zeroed() };
-                if unsafe {
-                    GetProcessTimes(handle, &mut creation, &mut exit_time, &mut kernel, &mut user)
-                } != 0 {
-                    let created = (creation.dwLowDateTime as u64)
-                        | ((creation.dwHighDateTime as u64) << 32);
-                    let qualifies = now.saturating_sub(created) >= MINIMUM_AGE_100NS
-                        && unsafe {
-                            same_package_identity(entry.th32ProcessID)
-                                && !window_exists(entry.th32ProcessID)
-                        };
-                    if qualifies {
-                        unsafe { TerminateProcess(handle, 1) };
-                        killed = true;
-                    }
-                }
-                unsafe { CloseHandle(handle) };
+    unsafe extern "system" fn on_window(window: HWND, lparam: isize) -> i32 {
+        unsafe {
+            let state = &mut *(lparam as *mut Match);
+            let length = GetWindowTextLengthW(window);
+            if length <= 0 {
+                return 1;
             }
-        }
-        if killed || unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
-            break;
+            let mut text = vec![0u16; (length as usize) + 1];
+            GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32);
+            // `title` carries its NUL; compare the caption against the rest.
+            if text.get(..length as usize) != state.title.get(..state.title.len() - 1) {
+                return 1;
+            }
+            let mut owner = 0u32;
+            GetWindowThreadProcessId(window, &raw mut owner);
+            if owner != 0 && process_image_is_settings(owner) {
+                state.found = window;
+                return 0;
+            }
+            1
         }
     }
-    unsafe { CloseHandle(snapshot) };
-    killed
+
+    let mut state = Match {
+        title: to_wide(WINDOW_TITLE),
+        found: std::ptr::null_mut(),
+    };
+    unsafe { EnumWindows(Some(on_window), (&raw mut state) as isize) };
+    state.found
 }
 
-/// True only when the peer lives in the same packaging context as us: two
-/// unpackaged builds, or the same MSIX package family. A packaged instance and
-/// an unpackaged dev build use different named-object namespaces and must
-/// never kill each other.
+/// Whether `pid` runs `fswsettings.exe`, compared on the basename only and
+/// case-insensitively. An unreadable process is never a match.
 #[cfg(windows)]
-unsafe fn same_package_identity(pid: u32) -> bool {
+unsafe fn process_image_is_settings(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
     };
 
-    let Ok(mine) = env::current_exe() else {
-        return false;
-    };
-    let handle = unsafe {
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-    };
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return false;
     }
@@ -1420,67 +1840,62 @@ unsafe fn same_package_identity(pid: u32) -> bool {
     if queried == 0 {
         return false;
     }
-    let theirs = String::from_utf16_lossy(&image[..length as usize]).to_ascii_lowercase();
-    let mine = mine.to_string_lossy().to_ascii_lowercase();
-    const WINDOWS_APPS: &str = r"\windowsapps\";
-    let mine_packaged = mine.contains(WINDOWS_APPS);
-    let theirs_packaged = theirs.contains(WINDOWS_APPS);
-    if mine_packaged != theirs_packaged {
+    let Some(slice) = image.get(..length as usize) else {
         return false;
-    }
-    if !mine_packaged {
-        return true;
-    }
-    // Same package family: the segment right after windowsapps\ is
-    // <family>_<version>_<arch>_<publisherhash>; compare up to the first '_'.
-    let family = |path: &str| {
-        path.split(WINDOWS_APPS)
-            .nth(1)
-            .unwrap_or("")
-            .split('_')
-            .next()
-            .unwrap_or("")
-            .to_string()
     };
-    family(&mine) == family(&theirs)
+    String::from_utf16_lossy(slice)
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case(SETTINGS_IMAGE_NAME))
 }
 
-/// Whether `pid` owns any top-level window at all. The zombie is defined by
-/// owning none; any window disqualifies the kill, whatever its title.
+/// Asks the broker to close and waits up to 3 s for its window to go away.
+///
+/// The broker owns the product's only notification icon and removes it on its
+/// own `WM_CLOSE`; letting the installer force it down instead would leave a
+/// ghost icon in the notification area until the next shell restart. Best
+/// effort -- no broker is not an error.
 #[cfg(windows)]
-unsafe fn window_exists(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId};
+fn close_broker_window() {
+    use std::thread::sleep;
+    use std::time::Duration;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
 
-    struct Match {
-        pid: u32,
-        found: bool,
-    }
-    unsafe extern "system" fn on_window(window: HWND, lparam: isize) -> i32 {
-        unsafe {
-            let state = &mut *(lparam as *mut Match);
-            let mut owner = 0u32;
-            GetWindowThreadProcessId(window, &mut owner);
-            if owner == state.pid {
-                state.found = true;
-                return 0;
+    let class = to_wide(FSW_BROKER_WINDOW_CLASS);
+    unsafe {
+        let window = FindWindowW(class.as_ptr(), std::ptr::null());
+        if window.is_null() {
+            return;
+        }
+        PostMessageW(window, WM_CLOSE, 0, 0);
+        for _ in 0..30 {
+            if FindWindowW(class.as_ptr(), std::ptr::null()).is_null() {
+                return;
             }
-            1
+            sleep(Duration::from_millis(100));
         }
     }
-    let mut state = Match { pid, found: false };
-    unsafe { EnumWindows(Some(on_window), &mut state as *mut Match as isize) };
-    state.found
 }
 
-/// Wide-string comparison against a NUL-terminated fixed buffer.
+#[cfg(not(windows))]
+fn close_broker_window() {}
+
+/// Requests the ordinary shutdown by closing our own window. The reactor's only
+/// process-exit route is WinUI's `Window.Closed`, so `WM_CLOSE` -- never
+/// `DestroyWindow` -- is how this app exits.
 #[cfg(windows)]
-fn eq_wide(buffer: &[u16], value: &str) -> bool {
-    let expected: Vec<u16> = value.encode_utf16().collect();
-    buffer.len() >= expected.len()
-        && buffer[..expected.len()] == expected[..]
-        && buffer.iter().nth(expected.len()) == Some(&0)
+fn request_close() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+
+    let window = folder_picker::current_process_window();
+    if window == 0 {
+        return;
+    }
+    unsafe { PostMessageW(window as _, WM_CLOSE, 0, 0) };
 }
+
+#[cfg(not(windows))]
+fn request_close() {}
 
 /// Modal error shown when startup cannot proceed. Category text only.
 #[cfg(windows)]
@@ -1495,26 +1910,5 @@ fn show_startup_error(message: &str) {
             to_wide(WINDOW_TITLE).as_ptr(),
             MB_ICONERROR | MB_OK | MB_SETFOREGROUND,
         );
-    }
-}
-
-/// Holds the single-instance mutex forever with no window, for testing the
-/// takeover path. Enabled by setting `FSW_SIMULATE_WINDOWLESS`.
-#[cfg(windows)]
-fn simulate_windowless() {
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::System::Threading::CreateMutexW;
-
-    let name = to_wide(SETTINGS_MUTEX_NAME);
-    let mutex = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-    if mutex.is_null() || unsafe { GetLastError() } == windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS {
-        eprintln!("another instance already holds the mutex");
-        return;
-    }
-    // The handle must outlive everything this process does; the loop below
-    // keeps it alive, and the kernel reaps it at process exit.
-    let _ = mutex;
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
     }
 }

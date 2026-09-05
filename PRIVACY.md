@@ -1,23 +1,34 @@
 # Privacy Policy — fwdslash (Forward Slash Windows)
 
-**Last updated:** 3 September 2026
-**Publisher:** Fara Technologies LLC
+**Last updated:** 4 September 2026
+**Publisher:** WindowsForum.com (the Microsoft Store publisher display name).
+Developed by Mike Fara, Fara Technologies LLC.
 
 ## Summary
 
-fwdslash collects nothing, stores no personal data, and makes no network
-connections. Everything it does happens locally on your computer.
+fwdslash collects nothing and stores no personal data. Everything it does with
+your paths happens locally on your computer.
+
+**Network.** The **Microsoft Store** build makes no network connections at all.
+The **GitHub** build checks for its own updates: at most once per day, only
+while it is installed as a package and only while **Automatic updates** is
+switched on in Settings, it sends a plain `GET` to `api.github.com` for the
+latest release and, when a newer version exists, downloads the release asset
+from `github.com`. The requests carry no identifiers — no account, no machine
+id, no installation id, no usage data — and nothing is uploaded. Turning
+Automatic updates off stops them entirely. Which flavor you have is decided at
+runtime from the package identity, never at build time.
 
 The product is open source under the MIT License. Every claim below can be
-checked against the source at <https://github.com/faratech/fwdslash>.
+checked against the source at <https://github.com/faratech/fwdslash>
+(`crates/fsw-core/src/update.rs` is the whole of the network code).
 
 ## What the app does not do
 
 - It does **not** collect, store, or transmit personal data.
 - It does **not** contain analytics or telemetry of any kind.
-- It does **not** make network connections. None of the shipped executables
-  (`fwdslash.exe`, `fswbroker.exe`, `fswsettings.exe`) import any networking
-  library.
+- It does **not** send anything anywhere. The only outbound requests are the
+  GitHub update check described above, and only in the GitHub build.
 - It does **not** log keystrokes, or record what you type.
 - It does **not** show advertising, and there are no third-party SDKs.
 
@@ -35,6 +46,11 @@ text begins with `/`, it is translated into the equivalent WSL path (for
 example `/etc/apt` becomes `\\wsl.localhost\Ubuntu\etc\apt`) and written back to
 the control so Windows opens the right location. If the text does not begin with
 `/`, the keystroke is replayed unchanged and nothing further happens.
+
+The text is only read at all when the focused control is an editable, non-password
+Edit or ComboBox that the app could write back to — so a Find box, a password
+field or a read-only control in one of those windows is never read, and the
+keystroke passes through untouched.
 
 This text is used immediately, in memory, and is never written to disk or sent
 anywhere.
@@ -55,6 +71,10 @@ All of it is local, and all of it is reversible from the settings app.
 | `HKCU\Software\Microsoft\Command Processor` (`AutoRun`) | Only if you enable the Command Prompt integration. Loads the `dir`/`ls` adapter in new Command Prompt sessions. The previous value is recorded first and restored exactly on removal. |
 | `Documents\WindowsPowerShell\profile.ps1`, `Documents\PowerShell\profile.ps1` | Only if you enable a PowerShell integration. A marked block that imports the adapter module. The original file is snapshotted first and restored byte-for-byte on removal. |
 | `%LOCALAPPDATA%\ForwardSlashWindows` | The adapter files that Command Prompt and PowerShell load. |
+| `HKCU\Software\ForwardSlashWindows\Settings` (`AutoUpdate`) | GitHub build only. Whether the daily update check runs. |
+| `HKCU\Software\ForwardSlashWindows\Settings` (`LastUpdateCheck`) | GitHub build only. A timestamp, so the check runs at most once a day. |
+| `HKCU\Software\ForwardSlashWindows\Settings` (`AvailableUpdate`) | GitHub build only. The release tag of an update that is waiting, so the notice survives a restart. |
+| `%LOCALAPPDATA%\ForwardSlashWindows\update` | GitHub build only. The downloaded update package. It is deleted once it has been applied, and `fwdslash uninstall` removes the directory. |
 
 **Diagnostics.** The background process writes a diagnostic log only if you set
 the `FSW_DIAGNOSTIC_LOG` environment variable yourself. It is off by default.
@@ -77,4 +97,6 @@ history is the changelog.
 
 ## Contact
 
-Open an issue at <https://github.com/faratech/fwdslash/issues>.
+Published on the Microsoft Store as **WindowsForum.com**; developed by Mike
+Fara, Fara Technologies LLC, New York. Open an issue at
+<https://github.com/faratech/fwdslash/issues>.

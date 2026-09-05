@@ -1,7 +1,5 @@
 fn main() {
     println!("cargo:rerun-if-changed=app.rc");
-    println!("cargo:rerun-if-changed=app.manifest");
-    println!("cargo:rerun-if-changed=../../assets/fwdslash.ico");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
     compile_resources();
 }

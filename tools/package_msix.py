@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
+"""Stages and packs the Rust product as an MSIX bundle, from WSL.
+
+The WSL-runnable equivalent of `tools/Package-Msix.ps1 -BinarySource Rust`:
+it shells out to the SDK's makeappx.exe/makepri.exe through `wslpath`, so
+packaging never requires leaving WSL for native PowerShell. Build first with
+`cargo build --release --target <triple> --workspace` on the Windows side.
+"""
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -11,13 +20,74 @@ PRICONFIG = os.path.join(PACKAGING_ROOT, "priconfig.xml")
 ASSETS_SRC = os.path.join(PACKAGING_ROOT, "Assets")
 OUTPUT_ROOT = os.path.join(REPO, "out", "msix")
 
+CARGO_TOML = os.path.join(REPO, "Cargo.toml")
+
 IDENTITY_NAME = "32827MikeFara.fwdslash"
 PUBLISHER = "CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4"
 PUBLISHER_DISPLAY_NAME = "WindowsForum.com"
-VERSION = "0.0.2.0"  # instance-guard + custom-root + driver-protocol fixes
 
-MAKEAPPX = os.path.join(REPO, "packages/Microsoft.Windows.SDK.CPP.10.0.28000.2526/c/bin/10.0.28000.0/arm64/makeappx.exe")
-MAKEPRI = os.path.join(REPO, "packages/Microsoft.Windows.SDK.CPP.10.0.28000.2526/c/bin/10.0.28000.0/arm64/makepri.exe")
+# The shell payload the CLI's adapters copy out of the package at
+# `fwdslash integration <name> enable`. Keep in step with the payload lists in
+# crates/fsw-cli/src/adapters/cmd.rs, tools/Package.ps1 and
+# tools/Package-Msix.ps1.
+REQUIRED_PAYLOAD = [
+    ("cmd", "fsw-autorun.cmd"),
+    ("cmd", "fsw-cd.cmd"),
+    ("cmd", "fsw-dir.cmd"),
+    ("cmd", "fsw-pushd.cmd"),
+    ("powershell", "ForwardSlashWindows.psm1"),
+]
+
+# The SDK ships makeappx/makepri per host architecture. Picking one at random
+# (this hardcoded arm64 for a while) fails outright on the other kind of dev
+# box; FSW_SDK_TOOL_ARCH overrides the detection when a host runs, say, the x64
+# tools under emulation.
+SDK_BIN_ROOT = os.path.join(
+    REPO, "packages/Microsoft.Windows.SDK.CPP.10.0.28000.2526/c/bin/10.0.28000.0"
+)
+
+
+def sdk_tool_arch():
+    override = os.environ.get("FSW_SDK_TOOL_ARCH")
+    if override:
+        return override
+    machine = platform.machine().lower()
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    return "x64"
+
+
+TOOL_ARCH = sdk_tool_arch()
+MAKEAPPX = os.path.join(SDK_BIN_ROOT, TOOL_ARCH, "makeappx.exe")
+MAKEPRI = os.path.join(SDK_BIN_ROOT, TOOL_ARCH, "makepri.exe")
+
+
+def read_version():
+    """The MSIX four-part version, from `workspace.package.version`.
+
+    The workspace version is the one place a release is declared; a literal
+    here is how 0.0.2 shipped binaries stamped 0.0.1.0. MSIX identities are
+    always four-part, so the revision field is appended.
+    """
+    with open(CARGO_TOML, "r", encoding="utf-8") as f:
+        text = f.read()
+    section = re.search(r"^\[workspace\.package\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
+    if not section:
+        sys.exit(f"No [workspace.package] section in {CARGO_TOML}")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', section.group(1), re.M)
+    if not match:
+        sys.exit(f"No workspace.package.version in {CARGO_TOML}")
+    version = match.group(1)
+    fields = version.split(".")
+    if len(fields) == 3:
+        fields.append("0")
+    if len(fields) != 4:
+        sys.exit(f"Unsupported workspace version {version!r}; expected 3 or 4 fields")
+    return ".".join(fields)
+
+
+VERSION = read_version()
+
 
 def to_win_path(p):
     out = subprocess.check_output(["wslpath", "-w", p]).decode("utf-8").strip()
@@ -60,19 +130,34 @@ def main():
         # License
         shutil.copy2(os.path.join(REPO, "LICENSE"), os.path.join(stage, "LICENSE"))
 
-        # Shell directories
+        # Shell adapter payload, from the repo tree.
+        #
+        # NOT from out/user/<arch>/Release/shell: that is whatever
+        # Build-UserMode.ps1 last staged for the C++ build, and 0.0.2 shipped a
+        # ForwardSlashWindows.psm1 two days older than the repo's because of it.
         for sh_dir in ["cmd", "powershell"]:
-            src_sh = os.path.join(REPO, "out", "user", "arm64", "Release", "shell", sh_dir)
+            src_sh = os.path.join(REPO, "shell", sh_dir)
             dst_sh = os.path.join(stage, "shell", sh_dir)
-            if os.path.exists(src_sh):
-                shutil.copytree(src_sh, dst_sh, dirs_exist_ok=True)
+            if not os.path.isdir(src_sh):
+                sys.exit(f"Missing shell payload directory: {src_sh}")
+            shutil.copytree(src_sh, dst_sh, dirs_exist_ok=True)
 
-        # Assets
+        # A silently incomplete payload is the worst outcome: the adapter
+        # installs, and the DOSKEY macro it wrote calls a file that is not
+        # there.
+        missing = [
+            os.path.join("shell", sh_dir, name)
+            for sh_dir, name in REQUIRED_PAYLOAD
+            if not os.path.isfile(os.path.join(stage, "shell", sh_dir, name))
+        ]
+        if missing:
+            sys.exit("Shell payload incomplete; missing: " + ", ".join(missing))
+
+        # Assets. The titlebar PNG is deliberately not staged: the Rust
+        # settings app embeds it with include_bytes! and never resolves an
+        # ms-appx:/// URI, so a copy in the package is dead weight (#35).
         stage_assets = os.path.join(stage, "Assets")
         shutil.copytree(ASSETS_SRC, stage_assets, dirs_exist_ok=True)
-        titlebar = os.path.join(REPO, "assets", "fwdslash-titlebar.png")
-        if os.path.exists(titlebar):
-            shutil.copy2(titlebar, os.path.join(stage_assets, "fwdslash-titlebar.png"))
 
         # AppxManifest.xml
         manifest = (

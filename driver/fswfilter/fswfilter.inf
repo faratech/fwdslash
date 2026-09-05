@@ -3,7 +3,9 @@ Signature   = "$Windows NT$"
 Class       = "ActivityMonitor"
 ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
 Provider    = %Provider%
-DriverVer   = 09/02/2026,0.0.1.0
+; DriverVer is a placeholder: the build date and the Cargo workspace version
+; are stamped by tools/Build-Driver.ps1.
+DriverVer   = 01/01/2026,0.0.0.0
 CatalogFile = fswfilter.cat
 PnpLockdown = 1
 
@@ -31,6 +33,7 @@ AddReg        = FswFilter.Registry
 [FswFilter.Registry]
 HKR,"Parameters","SupportedFeatures",0x00010001,0x3
 HKR,"Parameters\Instances","DefaultInstance",0x00000000,"FswFilter Instance"
+; lab placeholder - a production altitude must be allocated by Microsoft before any public release
 HKR,"Parameters\Instances\FswFilter Instance","Altitude",0x00000000,"371120"
 HKR,"Parameters\Instances\FswFilter Instance","Flags",0x00010001,0x0
 
@@ -44,7 +47,7 @@ fswfilter.sys
 fswfilter.sys = 1
 
 [Strings]
-Provider           = "Forward Slash Windows contributors"
+Provider           = "Fara Technologies LLC"
 ServiceName        = "FswFilter"
 ServiceDescription = "Forward Slash Windows WSL path reparse filter (lab build)"
 DiskName           = "Forward Slash Windows driver media"

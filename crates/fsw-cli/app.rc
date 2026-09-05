@@ -1,13 +1,11 @@
 #include <winver.h>
 
-// Kept in step with include/fsw_resources.h and the IDI_FSW_APP const in main.rs.
-#define IDI_FSW_APP 101
-
-// A reduced icon: the tray and the window class never request above 48px, and the
-// resident broker is the binary where size matters most. See docs/size-baseline.md.
-IDI_FSW_APP ICON "../../assets/fwdslash-tray.ico"
-
-// VERSIONINFO fields come from the build script, which derives them from
+// VERSIONINFO only. The CLI links no icon on purpose: it is a console
+// controller that never appears in a shell surface, and every icon variant it
+// carried would be dead weight in a binary the MSIX ships three times over.
+// See docs/size-baseline.md and the icon-resource note in CLAUDE.md.
+//
+// The fields come from the build script, which derives them from
 // CARGO_PKG_VERSION (the workspace `version` in the root Cargo.toml). The
 // fallbacks below keep this file compilable on its own -- and keep a build
 // whose defines never arrived at the last known-good version rather than at
@@ -37,11 +35,11 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName", "Fara Technologies LLC\0"
-            VALUE "FileDescription", "Forward Slash Windows Broker\0"
+            VALUE "FileDescription", "Forward Slash Windows Controller\0"
             VALUE "FileVersion", FSW_VER_STR
-            VALUE "InternalName", "Forward Slash Windows Broker\0"
+            VALUE "InternalName", "Forward Slash Windows Controller\0"
             VALUE "LegalCopyright", "Copyright (c) 2026 Mike Fara, Fara Technologies LLC\0"
-            VALUE "OriginalFilename", "fswbroker.exe\0"
+            VALUE "OriginalFilename", "fwdslash.exe\0"
             VALUE "ProductName", "Forward Slash Windows\0"
             VALUE "ProductVersion", FSW_VER_STR
         END

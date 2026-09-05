@@ -5,11 +5,13 @@
 ```text
 recognized navigation edit receives Enter
                  |
-      low-level hook snapshots HWND
+  low-level hook classifies the window
+    and posts HWND + surface kind
                  |
-       broker message-loop worker
+   broker WORKER thread (own STA + UIA)
                  |
-     UIA value + surface revalidated
+   focused control must be a writable
+   Edit/ComboBox; foreground rechecked
           /                  \
    not a slash path       slash path
           |                  |
@@ -26,6 +28,16 @@ only recognizes a bounded surface, queues work, and suppresses the matching
 key-up. Broker-generated replay input carries a private marker so it cannot
 loop through the resolver.
 
+Everything after the classification runs on a **worker thread** with its own STA
+and its own `IUIAutomation`, reached through a second message-only window
+(`ForwardSlashWindows.BrokerWorker`). UI Automation, the resolver, the shell
+open, the replay and the Explorer COM navigation all happen there. Windows
+removes a low-level hook whose thread exceeds `LowLevelHooksTimeout` and does
+not say so, and binding `\\wsl.localhost\<distro>` boots a stopped distribution
+— seconds of blocking on the thread that owns every keystroke on the machine.
+If the foreground window changed while the request was queued it is dropped
+rather than replayed into whatever the user switched to.
+
 Explorer and native dialogs receive a UNC rewrite followed by Enter, preserving
 native behavior and the active Explorer tab. Bare `/` is special-cased by the
 shared resolver: by default it targets the WSL provider root (with an Explorer
@@ -41,12 +53,21 @@ paths are not logged.
 
 ## Settings and optional shell adapters
 
-The settings process is an unpackaged WinUI 3 desktop app. It delegates every
-state change to `fwdslash`; it never edits profiles or registry integration state
-itself. The app uses a Mica system backdrop and the Windows App SDK `TitleBar`
-control with an `ImageIconSource`, while retaining the system caption buttons.
-Tray commands deep-link to sections through the per-user `fwdslash` URI
-registration.
+The settings process is a Rust desktop app built on the vendored
+`windows-reactor` crate over the Windows App SDK (`crates/fsw-settings`; the
+WinUI 3 C++ app in `src/settings/` is the reference implementation it was ported
+from). It delegates every state change to `fwdslash`; it never edits profiles or
+registry integration state itself, and it runs those invocations on the thread
+pool so the window stays responsive. The app uses a Mica system backdrop and the
+Windows App SDK `TitleBar` control, with the caption icon in the `LeftHeader`
+slot, while retaining the system caption buttons.
+
+The settings window has **no** notification-area icon and no watchdog: the
+product's single tray icon belongs to the resident broker, and closing the
+window exits the process. Menu commands from that icon deep-link to sections
+through the `fwdslash://` protocol — registered per user by `fwdslash install`
+for an unpackaged build, and declared as `windows.protocol` in the manifest for
+a packaged one.
 
 Command Prompt and the two PowerShell editions have separate transactional
 install records. PowerShell installation snapshots the original profile bytes,

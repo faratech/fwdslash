@@ -4,8 +4,8 @@
 //! verification matrix.
 
 use fsw_core::update::{
-    check_is_due, extract_bundle_url, extract_tag_name, is_newer_version, parse_version,
-    update_check_allowed, UpdateOutcome,
+    check_is_due, extract_bundle_url, extract_tag_name, is_newer_version, normalize_running_version,
+    parse_version, update_check_allowed, UpdateOutcome,
 };
 use fsw_core::{
     package_family_from_full_name, package_version_from_full_name,
@@ -67,6 +67,32 @@ fn is_newer_version_compares_numerically() {
     assert!(is_newer_version("0.0.9", "0.0.10"), "numeric, not lexical");
     assert!(is_newer_version("0.0.2", "0.1.0"));
     assert!(is_newer_version("0.0.2", "1.0.0"));
+}
+
+#[test]
+fn normalize_running_version_drops_the_msix_fourth_group() {
+    assert_eq!(normalize_running_version("0.0.2.0"), "0.0.2");
+    assert_eq!(normalize_running_version("1.2.3.4"), "1.2.3");
+    // Already three parts: unchanged.
+    assert_eq!(normalize_running_version("0.0.2"), "0.0.2");
+    // Anything else is left alone for `parse_version` to reject.
+    assert_eq!(normalize_running_version("1.2"), "1.2");
+    assert_eq!(normalize_running_version("1.2.3.4.5"), "1.2.3.4.5");
+    assert_eq!(normalize_running_version(""), "");
+    assert_eq!(normalize_running_version("not-a-version"), "not-a-version");
+}
+
+#[test]
+fn the_packaged_four_part_version_can_see_a_release() {
+    // The shipped bug: `package_version()` reports the four-part MSIX version,
+    // `parse_version` rejects four groups, so every packaged GitHub install
+    // answered `false` here and never updated.
+    assert!(!is_newer_version("0.0.2.0", "v0.0.3"), "the raw shape never compares");
+
+    assert!(is_newer_version(&normalize_running_version("0.0.2.0"), "v0.0.3"));
+    assert!(!is_newer_version(&normalize_running_version("0.0.3.0"), "v0.0.3"));
+    assert!(!is_newer_version(&normalize_running_version("0.0.3.0"), "v0.0.2"));
+    assert!(is_newer_version(&normalize_running_version("0.0.9.0"), "v0.0.10"));
 }
 
 #[test]

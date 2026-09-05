@@ -28,6 +28,9 @@ const RRF_NOEXPAND: u32 = 0x1000_0000;
 pub enum RegKind {
     Sz,
     ExpandSz,
+    /// Recognised so a DWORD `AutoRun` is refused rather than rewritten as a
+    /// string; the adapters never construct or write this kind.
+    #[allow(dead_code)]
     Dword,
 }
 
@@ -225,16 +228,7 @@ pub fn read_raw_string(
                     )));
                 }
                 data.truncate(len as usize);
-                // Strip the terminating NUL(s) and decode.
-                while data.last() == Some(&0) {
-                    data.pop();
-                }
-                let text = String::from_utf16_lossy(
-                    &data
-                        .chunks_exact(2)
-                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                        .collect::<Vec<u16>>(),
-                );
+                let text = decode_reg_string(&data);
                 let kind = match kind2 {
                     1 => RegKind::Sz,
                     2 => RegKind::ExpandSz,
@@ -252,6 +246,34 @@ pub fn read_raw_string(
             "registry read failed with error {status}"
         )))
     }
+}
+
+/// Decodes the raw `REG_SZ`/`REG_EXPAND_SZ` bytes `RegGetValueW` returns.
+///
+/// **Order is the whole point.** Bytes become UTF-16 code units *first* (a
+/// trailing odd byte, which a well-formed value never has, is ignored), and
+/// only then are the trailing `0u16` terminators stripped — one or more,
+/// since `RegGetValueW` may report a size that carries a second NUL.
+///
+/// 0.0.2 did it the other way round: it popped trailing zero *bytes* off the
+/// buffer before pairing them. Every value whose last character is ASCII ends
+/// in a zero high byte (`"` is `22 00`), so that pop ate half of the final
+/// code unit and left an odd byte count whose last pair `chunks_exact(2)`
+/// silently discarded — the returned string was one character short. That is
+/// what made `judge_autorun` see `call "…fsw-autorun.cmd` against an
+/// `InstalledAutoRun` of `call "…fsw-autorun.cmd"` and refuse the upgrade,
+/// and what truncated the `OriginalAutoRun` snapshot of every 0.0.2 install.
+#[must_use]
+pub fn decode_reg_string(bytes: &[u8]) -> String {
+    let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
+    let mut iter = bytes.iter().copied();
+    while let (Some(low), Some(high)) = (iter.next(), iter.next()) {
+        units.push(u16::from_le_bytes([low, high]));
+    }
+    while units.last() == Some(&0) {
+        units.pop();
+    }
+    String::from_utf16_lossy(&units)
 }
 
 fn to_wide(value: &str) -> Vec<u16> {

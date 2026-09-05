@@ -72,8 +72,8 @@ no `windows-core` at all**:
 
 ```
 $ cargo tree -p fsw-core --locked --offline
-fsw-core v0.0.1
-├── fsw-path v0.0.1
+fsw-core v0.0.3
+├── fsw-path v0.0.3
 ├── windows-registry v0.6.1
 │   ├── windows-link v0.2.1
 │   ├── windows-result v0.4.1 └── windows-link v0.2.1
@@ -96,7 +96,10 @@ safe here:
 - `windows-result`'s `Error` can hold an `IErrorInfo`. `fsw-core` never returns
   one: every fallible path maps to `u32` via `e.code().0 as u32`.
 
-The gate to keep this honest, alongside the `fsw-path` one:
+The gate to keep this honest, alongside the `fsw-path` one. It runs in the
+`rust` job of `.github/workflows/build.yml` (step "Assert one windows-core
+version in fswsettings"), which fails the build when more than one line comes
+back:
 
 ```sh
 cargo tree -p fswsettings -e normal --target aarch64-pc-windows-msvc \
@@ -110,12 +113,18 @@ version of `windows-registry`, and 0.6.1 pulls `windows-result ^0.4.1` /
 `windows-strings ^0.5.1` while the 0.100 line pulls the 0.100 set — so a shared
 crate that touched either would drag both generations into `fswsettings.exe`.
 
-**`fsw-path` therefore has an intentionally empty `[dependencies]` table**, and CI
-asserts:
+**`fsw-path` therefore has an intentionally empty `[dependencies]` table** — and
+an empty `[dev-dependencies]` table too, because `cargo tree` counts those. The
+`rust` job of `.github/workflows/build.yml` (step "Assert fsw-path has no
+dependencies") runs exactly this, on every push and pull request:
 
 ```sh
 test "$(cargo tree -p fsw-path | wc -l)" -eq 1
 ```
+
+That job also runs `cargo test -p fsw-path -p fsw-core --locked` and
+`cargo check --workspace --all-targets` against both MSVC targets; the
+companion `rust-windows` job runs the CLI's bin tests and a release build.
 
 The registry adapter **is** shared, through `fsw-core` — see the section above
 for why that is sound. `fsw-path` stays dependency-free regardless, because it is

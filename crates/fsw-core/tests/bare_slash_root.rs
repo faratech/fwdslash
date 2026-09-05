@@ -75,6 +75,32 @@ fn input_shape_errors_are_not_intercepted() {
     assert_eq!(resolve_str("tmp", &snap), Err(ResolveError::NotASlashPath));
     assert_eq!(resolve_str("//tmp", &snap), Err(ResolveError::DoubleLeadingSlash));
     assert_eq!(resolve_str("/a\\b", &snap), Err(ResolveError::BackslashNotAllowed));
+    // The funnel used to slice `input[1..]` before these checks: an empty
+    // input was out of bounds and a multi-byte first character was not a char
+    // boundary. Under `panic = "abort"` either aborted the process, so
+    // `fwdslash resolve ''` killed the CLI instead of printing R1.
+    for input in ["", "\u{fc}", "\u{fc}nix/x", "\u{65e5}\u{672c}"] {
+        assert_eq!(
+            resolve_str(input, &snap),
+            Err(ResolveError::NotASlashPath),
+            "for {input:?}"
+        );
+    }
+}
+
+#[test]
+fn input_shape_errors_survive_without_a_configured_root() {
+    // Same inputs, no root: the shape check is in the funnel, not the root.
+    for mode in [BareSlashMode::DistributionList, BareSlashMode::DefaultDistribution] {
+        let snap = snapshot(mode, None, None);
+        for input in ["", "\u{fc}", "tmp"] {
+            assert_eq!(
+                resolve_str(input, &snap),
+                Err(ResolveError::NotASlashPath),
+                "for {input:?} in {mode:?}"
+            );
+        }
+    }
 }
 
 #[test]

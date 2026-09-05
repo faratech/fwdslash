@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D6?style=flat-square&logo=windows)
-![C++](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square&logo=cplusplus)
+![Rust](https://img.shields.io/badge/Rust-1.98-000000?style=flat-square&logo=rust)
 ![WSL](https://img.shields.io/badge/WSL-2-E95420?style=flat-square&logo=linux&logoColor=white)
 [![GitHub stars](https://img.shields.io/github/stars/faratech/fwdslash?style=flat-square)](https://github.com/faratech/fwdslash/stargazers)
 
@@ -16,16 +16,14 @@
 
 ## Why fwdslash?
 
-You already know where the file is. You just can't type it.
-
-WSL files live at `\\wsl.localhost\Ubuntu\...` — fine in a script, miserable to type into an address bar. So type the path you were already thinking of:
+You know where the file is. You just can't type it. `\\wsl.localhost\Ubuntu\...` is fine in a script and miserable in an address bar, so type the path you were thinking of instead.
 
 - **Works where you already navigate** — File Explorer, Win+R, Windows Search, Open/Save dialogs
-- **No driver, no admin** — per-user, reversible, and no Explorer restart
-- **Terminals too, if you want** — `dir` and `ls` keep working in Command Prompt and PowerShell
-- **Fails safely** — a typo is blocked with an explanation instead of turning into a web search
-- **Stays out of the way** — pause it from the tray without uninstalling anything
-- **No network, no telemetry, no account**
+- **No driver, no admin** — per-user, reversible, no Explorer restart
+- **Terminals too, if you want** — `dir`, `ls` and `cd` take slash paths in Command Prompt and PowerShell
+- **Fails safely** — a typo is blocked with an explanation instead of becoming a web search
+- **Stays out of the way** — pause it from the tray icon
+- **No telemetry, no account** — the Store build makes no network connections
 
 ---
 
@@ -37,8 +35,8 @@ WSL files live at `\\wsl.localhost\Ubuntu\...` — fine in a script, miserable t
 | Run (Win+R) | `/usr/share` |
 | Windows Search | `/etc` |
 | Open / Save dialogs | `/home/alice` |
-| Command Prompt&nbsp;* | `dir /etc/apt` |
-| PowerShell 5.1 / 7&nbsp;* | `ls /usr` |
+| Command Prompt&nbsp;* | `dir /etc/apt` · `cd /Ubuntu` |
+| PowerShell 5.1 / 7&nbsp;* | `ls /usr` · `cd /Ubuntu` |
 
 <sub>* optional adapters, off by default</sub>
 
@@ -51,7 +49,7 @@ WSL files live at `\\wsl.localhost\Ubuntu\...` — fine in a script, miserable t
 /Ubuntu/home/alice      →  \\wsl.localhost\Ubuntu\home\alice
 ```
 
-Bare `/` lists your distributions — it never silently picks one. Prefer a default? Turn on default-distribution mode and plain Linux paths work unprefixed:
+Bare `/` lists your distributions and never silently picks one. Prefer a default? Then plain Linux paths work unprefixed:
 
 ```powershell
 fwdslash bare-slash default          # follow `wsl --set-default`
@@ -60,12 +58,9 @@ fwdslash bare-slash default Ubuntu   # or pin one
 
 ```text
 /etc/apt                →  \\wsl.localhost\Ubuntu\etc\apt
-/tmp/build/log.txt      →  \\wsl.localhost\Ubuntu\tmp\build\log.txt
 ```
 
-A registered distribution always wins over a same-named folder, so `/Ubuntu/home` keeps meaning the distribution.
-
-Want `/` to open something else entirely? Point it at any folder on your machine — a real directory or one inside a distro:
+Or point `/` at any folder at all — WSL not required:
 
 ```powershell
 fwdslash bare-slash root C:\code                            # / becomes C:\code
@@ -76,31 +71,55 @@ fwdslash bare-slash root                                    # clear it
 ```text
 /                →  C:\code
 /proj/build      →  C:\code\proj\build
-/Ubuntu/home     →  still the distribution — distro paths always win
+/Ubuntu/home     →  still the distribution
 ```
+
+A registered distribution always wins over a same-named folder.
 
 ---
 
 ## Install
 
-**Requires** Windows 11 and WSL with at least one distribution installed. With no distribution registered there is nothing for a slash path to open.
+**Requires Windows 11.** WSL is optional: `/Ubuntu/...` paths and default-distribution mode need a registered distribution; a custom `/` root works with none.
+
+### Microsoft Store (recommended)
+
+[**Get it from the Microsoft Store**](https://apps.microsoft.com/detail/9P51CM0MTMK2) — Store ID `9P51CM0MTMK2`. The Store handles the Windows App Runtime dependency and updates.
+
+### GitHub
+
+One line, no administrator rights; the release is signed with a publicly trusted certificate:
 
 ```powershell
-.\tools\Build-UserMode.ps1 -Architecture ARM64 -Configuration Release
-.\out\user\arm64\Release\fwdslash.exe install
+powershell -ExecutionPolicy Bypass -File Install-fwdslash.ps1
 ```
 
-Replace `ARM64` with `x64` or `x86` as needed. Uninstalling is one command and leaves nothing behind:
+It fetches the latest signed `.msixbundle`, installs the [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) if missing, and registers the package for the current user. This build checks GitHub for updates daily (switchable in Settings).
+
+Pick one flavor. Both register the same startup task and `fwdslash` alias, so only one broker survives a logon with both installed; the script refuses to install over a Store install unless you pass `-Force`.
+
+### Build from source
+
+```powershell
+cargo build --release --target aarch64-pc-windows-msvc --workspace   # x86_64-pc-windows-msvc on Intel/AMD
+.\target\aarch64-pc-windows-msvc\release\fwdslash.exe install
+```
+
+An unpackaged build needs the Windows App Runtime 2.x installed separately.
+
+### Uninstall
 
 ```powershell
 fwdslash uninstall
 ```
 
+Removing the package from Settings > Apps does not sweep the shell adapters (an uninstalling MSIX runs no code), so turn the terminal integrations off in the settings app first.
+
 ---
 
 ## Terminals
 
-Command interpreters parse `/` before the filesystem ever sees it — `cmd.exe` reads it as a switch, and to a filesystem API a bare `/` means the current drive root. So terminal support is an opt-in adapter rather than a global hook.
+Shells parse `/` before the filesystem sees it (`cmd.exe` reads it as a switch), so terminal support is an opt-in adapter:
 
 ```powershell
 fwdslash integration cmd enable
@@ -108,9 +127,18 @@ fwdslash integration windows-powershell enable
 fwdslash integration powershell enable
 ```
 
-Each adapter records exactly what it replaced and restores it byte-for-byte when you turn it off, and refuses to overwrite anything another program changed in the meantime. Open a **new** shell afterwards — running ones can't reload their profile.
+Each adapter records what it replaced, restores it byte-for-byte when turned off, and refuses to overwrite anything another program changed since. Open a **new** shell afterwards.
 
-Prefer not to touch your shell? These always work:
+With an adapter on, `dir`/`ls` and `cd` both take slash paths:
+
+```text
+cmd          cd /Ubuntu/etc     chdir /Ubuntu     pushd /Ubuntu   (cd /d /Ubuntu too)
+PowerShell   cd /Ubuntu/etc     chdir  sl  pushd
+```
+
+Notes: `cmd.exe` cannot make a UNC path current, so its adapter enters the target with `pushd` (a temporary drive letter released by `popd`). DIR's own switches (`dir /b`, `dir /s`, `dir /a:d`) stay native. In PowerShell a slash path the resolver rejects reports the resolver's message rather than landing on the current drive, so use `cd \Windows` for `C:\Windows`.
+
+Without an adapter, these always work:
 
 ```powershell
 fwdslash list /Ubuntu/etc
@@ -126,6 +154,9 @@ fwdslash resolve /etc/apt
 fwdslash status [--json]          Broker, distributions, and driver state
 fwdslash resolve /Distro/path     Print the resolved UNC path
 fwdslash open|list /Distro/path   Open in Explorer, or list to stdout
+fwdslash cmd-list /path           Shell adapter DIR (exit 3 = run native DIR)
+fwdslash cmd-cd /path             Directory for the cmd CD/PUSHD macros
+fwdslash shell-resolve /path      One JSON line for the PowerShell module
 fwdslash doctor /path | --all     Diagnose a path
 fwdslash bare-slash [list|default [Distro]]
 fwdslash bare-slash root <WindowsPath>
@@ -134,33 +165,34 @@ fwdslash integration <name> enable|disable
 fwdslash pause | resume           Pause resolution, keep integrations
 fwdslash settings [section]       Open the settings app
 fwdslash start | stop | install | uninstall
+fwdslash version                  Print the running version
 ```
 
 ---
 
 ## Settings
 
-A WinUI 3 app with a tray icon. Every integration is independent, and turning one off runs its reversible uninstall. The General **Disable** switch pauses resolution without forgetting what you installed.
+One notification-area icon, owned by the resident broker. Left click opens the settings window; right click offers **Enabled**, **Open WSL root**, **Open distribution** (one entry per distribution), **Integrations**, and **Exit**. Closing the settings window closes only the window; the broker keeps running.
 
-Needs the [Windows App Runtime 1.8](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) for your architecture.
+Each integration is independent, and turning one off runs its reversible uninstall. The **Disable** switch pauses resolution without forgetting what you installed. Adapters left behind by an older release are upgraded automatically, by the broker at start and by the settings window on launch. The About page shows the broker state, each adapter's payload version, and the package version and flavor.
 
 ---
 
 ## Tests
 
 ```powershell
-.\out\user\arm64\Release\fswcore_tests.exe                        # resolver contract
-.\out\user\arm64\Release\fsw_address_bar_integration.exe Ubuntu /usr/share
-.\tools\Test-Sandbox.ps1                                          # lifecycle smoke test
+cargo test -p fsw-path -p fsw-core                              # resolver + registry contract (runs on Linux/WSL too)
+cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc   # shell adapters
+.\tools\Test-Sandbox.ps1                                        # lifecycle smoke test
 ```
 
 ---
 
 ## Filesystem driver
 
-`driver/` holds an optional minifilter that would extend explicit `/Ubuntu/...` paths to PowerShell, .NET, Python and anything else reaching Windows filesystem APIs. It is **production-gated and not part of any release.**
+`driver/` holds an optional minifilter that would extend `/Ubuntu/...` paths to every Windows filesystem API (PowerShell, .NET, Python). It is **not part of any release**.
 
-> **Do not load the unsigned driver on a physical machine.** Build and test it only in a checkpointed Hyper-V guest. See [`SECURITY.md`](SECURITY.md) and [`docs/compatibility.md`](docs/compatibility.md).
+> **Do not load the unsigned driver on a physical machine.** Build and test it only in a checkpointed Hyper-V guest; [`docs/driver-lab.md`](docs/driver-lab.md) is the runbook. See also [`SECURITY.md`](SECURITY.md) and [`docs/compatibility.md`](docs/compatibility.md).
 
 ---
 
@@ -168,7 +200,7 @@ Needs the [Windows App Runtime 1.8](https://learn.microsoft.com/windows/apps/win
 
 - [`docs/architecture.md`](docs/architecture.md) — trust boundaries and design
 - [`docs/compatibility.md`](docs/compatibility.md) — what's verified, and what isn't
-- [`PRIVACY.md`](PRIVACY.md) — no data collected, no network calls
+- [`PRIVACY.md`](PRIVACY.md) — no data collected; the Store build makes no network calls, the GitHub build checks for updates
 
 ---
 
@@ -179,4 +211,14 @@ MIT — see [LICENSE](LICENSE). By Mike Fara, Fara Technologies LLC, New York.
 <p align="center">
   <b>Star this repo if you find it useful!</b><br>
   <a href="https://github.com/faratech/fwdslash">https://github.com/faratech/fwdslash</a>
+</p>
+
+<p align="center">
+  <a href="https://apps.microsoft.com/detail/9P51CM0MTMK2?mode=direct">
+    <picture>
+      <source media="(prefers-color-scheme: light)" srcset="https://get.microsoft.com/images/en-us%20light.svg">
+      <img src="https://get.microsoft.com/images/en-us%20dark.svg" width="220" alt="Get fwdslash from the Microsoft Store">
+    </picture>
+  </a><br>
+  <sub>Available on the Microsoft Store as <b>fwdslash</b> — Store ID <code>9P51CM0MTMK2</code></sub>
 </p>
