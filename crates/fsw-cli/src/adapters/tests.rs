@@ -235,20 +235,28 @@ fn encode_round_trips_through_utf16() {
 
 #[test]
 fn block_text_matches_the_script_layout() {
-    let block = profile::block_text(
-        "0.0.2",
-        "cafe",
-        r"C:\Users\me\AppData\Local\ForwardSlashWindows\PowerShell\0.0.2\ForwardSlashWindows.psm1",
-        false,
+    // The payload version follows the crate version, so the layout assertions
+    // are built from PAYLOAD_VERSION rather than a literal that goes stale
+    // at every release.
+    let version = super::PAYLOAD_VERSION;
+    let module = format!(
+        r"C:\Users\me\AppData\Local\ForwardSlashWindows\PowerShell\{version}\ForwardSlashWindows.psm1"
     );
-    assert!(block.starts_with("# >>> Forward Slash Windows 0.0.2 cafe >>>\r\n"));
-    assert!(block.contains("Import-Module -Name 'C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\PowerShell\\0.0.2\\ForwardSlashWindows.psm1' -Global -Force\r\n"));
-    assert!(block.ends_with("# <<< Forward Slash Windows 0.0.2 cafe <<<\r\n"));
+    let block = profile::block_text(version, "cafe", &module, false);
+    assert!(block.starts_with(&format!(
+        "# >>> Forward Slash Windows {version} cafe >>>\r\n"
+    )));
+    assert!(block.contains(&format!(
+        "Import-Module -Name 'C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\PowerShell\\{version}\\ForwardSlashWindows.psm1' -Global -Force\r\n"
+    )));
+    assert!(block.ends_with(&format!(
+        "# <<< Forward Slash Windows {version} cafe <<<\r\n"
+    )));
 }
 
 #[test]
 fn block_text_escapes_quotes_and_prefixes_nonempty_originals() {
-    let block = profile::block_text("0.0.2", "t", "C:\\it's", true);
+    let block = profile::block_text(super::PAYLOAD_VERSION, "t", "C:\\it's", true);
     assert!(block.starts_with("\r\n"));
     assert!(block.contains("'C:\\it''s'"));
 }

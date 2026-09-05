@@ -277,14 +277,21 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
         std::fs::remove_dir_all(&state_root)?;
     }
 
-    // The shared module directory goes away with the last edition.
+    // The shared module directory goes away with the last edition. Its name
+    // is the payload version this install deployed, not the one this build
+    // ships: an upgrade removes the directory it actually created.
     let other = state::other_edition(edition);
     let other_marker = marker_key(other);
     if state::remove_shared_module(read_marker(&other_marker)?.is_some()) {
+        let deployed_version = if values.version.is_empty() {
+            super::PAYLOAD_VERSION
+        } else {
+            &values.version
+        };
         let module_root = super::local_app_data()?
             .join("ForwardSlashWindows")
             .join("PowerShell")
-            .join(super::PAYLOAD_VERSION);
+            .join(deployed_version);
         if module_root.exists() {
             std::fs::remove_dir_all(&module_root)?;
         }
@@ -310,6 +317,7 @@ fn read_marker(key: &str) -> Result<Option<MarkerValues>, AdapterError> {
     };
     Ok(Some(MarkerValues {
         state: key.get_string("State").unwrap_or_default(),
+        version: key.get_string("Version").unwrap_or_default(),
         profile_path: PathBuf::from(key.get_string("ProfilePath").unwrap_or_default()),
         state_directory: PathBuf::from(key.get_string("StateDirectory").unwrap_or_default()),
         original_present: key.get_u32("OriginalPresent").unwrap_or(0) != 0,
@@ -319,6 +327,9 @@ fn read_marker(key: &str) -> Result<Option<MarkerValues>, AdapterError> {
 #[derive(Debug, Default, Clone)]
 struct MarkerValues {
     state: String,
+    /// The payload version this install deployed; empty for a marker written
+    /// before the value existed.
+    version: String,
     profile_path: PathBuf,
     state_directory: PathBuf,
     original_present: bool,

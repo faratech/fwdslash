@@ -1,0 +1,51 @@
+#include <winver.h>
+
+// VERSIONINFO only. The CLI links no icon on purpose: it is a console
+// controller that never appears in a shell surface, and every icon variant it
+// carried would be dead weight in a binary the MSIX ships three times over.
+// See docs/size-baseline.md and the icon-resource note in CLAUDE.md.
+//
+// The fields come from the build script, which derives them from
+// CARGO_PKG_VERSION (the workspace `version` in the root Cargo.toml). The
+// fallbacks below keep this file compilable on its own -- and keep a build
+// whose defines never arrived at the last known-good version rather than at
+// 0.0.0 -- so they must be kept in step with Cargo.toml.
+#ifndef FSW_VER_COMMAS
+#define FSW_VER_COMMAS 0,0,3,0
+#endif
+#ifndef FSW_VER_STR
+#define FSW_VER_STR "0.0.3"
+#endif
+
+1 VERSIONINFO
+ FILEVERSION FSW_VER_COMMAS
+ PRODUCTVERSION FSW_VER_COMMAS
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Fara Technologies LLC\0"
+            VALUE "FileDescription", "Forward Slash Windows Controller\0"
+            VALUE "FileVersion", FSW_VER_STR
+            VALUE "InternalName", "Forward Slash Windows Controller\0"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Mike Fara, Fara Technologies LLC\0"
+            VALUE "OriginalFilename", "fwdslash.exe\0"
+            VALUE "ProductName", "Forward Slash Windows\0"
+            VALUE "ProductVersion", FSW_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
