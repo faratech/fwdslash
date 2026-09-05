@@ -56,12 +56,32 @@ if (-not (Test-Path -LiteralPath $assetSource -PathType Container)) {
 }
 
 if (-not $Version) {
-    # assets\fwdslash.rc is the single place the product version is authored.
-    $resourceScript = Get-Content -LiteralPath (Join-Path $repo 'assets\fwdslash.rc') -Raw
-    if ($resourceScript -notmatch 'VALUE\s+"FileVersion",\s*"([0-9]+)\.([0-9]+)\.([0-9]+)') {
-        throw 'Could not read FileVersion from assets\fwdslash.rc; pass -Version explicitly.'
+    if ($BinarySource -eq 'Rust') {
+        # The Rust product's version lives in the workspace Cargo.toml, not in
+        # the C++ resource script: reading assets\fwdslash.rc here stamped the
+        # package with a version the staged binaries did not carry.
+        $metadataJson = & cargo metadata --format-version 1 --no-deps
+        if ($LASTEXITCODE -ne 0) {
+            throw 'cargo metadata failed; pass -Version explicitly.'
+        }
+        $metadata = ($metadataJson | Out-String) | ConvertFrom-Json
+        $core = @($metadata.packages | Where-Object { $_.name -eq 'fsw-core' })
+        if ($core.Count -ne 1) {
+            throw 'cargo metadata did not report exactly one fsw-core package; pass -Version explicitly.'
+        }
+        if ($core[0].version -notmatch '^([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+            throw "Unexpected workspace version '$($core[0].version)'; pass -Version explicitly."
+        }
+        # MSIX identities are four-part and the Store reserves the last field.
+        $Version = '{0}.0' -f $core[0].version
+    } else {
+        # assets\fwdslash.rc is where the C++ product's version is authored.
+        $resourceScript = Get-Content -LiteralPath (Join-Path $repo 'assets\fwdslash.rc') -Raw
+        if ($resourceScript -notmatch 'VALUE\s+"FileVersion",\s*"([0-9]+)\.([0-9]+)\.([0-9]+)') {
+            throw 'Could not read FileVersion from assets\fwdslash.rc; pass -Version explicitly.'
+        }
+        $Version = '{0}.{1}.{2}.0' -f $Matches[1], $Matches[2], $Matches[3]
     }
-    $Version = '{0}.{1}.{2}.0' -f $Matches[1], $Matches[2], $Matches[3]
 }
 if ($Version -notmatch '^\d+\.\d+\.\d+\.0$') {
     throw "MSIX version must be Major.Minor.Build.0 (the Store reserves the revision field): $Version"
@@ -181,18 +201,18 @@ foreach ($target in $Architecture) {
     }
     Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination $stage
 
-    # The MSIX logo set, plus the title-bar image the settings app loads through
-    # ms-appx:///Assets/.
+    # The MSIX logo set. The C++ settings app additionally loads a title-bar
+    # image through ms-appx:///Assets/; the Rust app embeds that PNG with
+    # include_bytes! and never resolves an ms-appx URI, so staging it into a
+    # Rust package would ship a resource nothing reads.
     $stageAssets = Join-Path $stage 'Assets'
     New-Item -ItemType Directory -Force -Path $stageAssets | Out-Null
     Copy-Item -Path (Join-Path $assetSource '*') -Destination $stageAssets -Recurse -Force
-    $titleBar = if ($BinarySource -eq 'Cpp') {
-        Join-Path $binaries 'Assets\fwdslash-titlebar.png'
-    } else {
-        Join-Path $repo 'assets\fwdslash-titlebar.png'
-    }
-    if (Test-Path -LiteralPath $titleBar -PathType Leaf) {
-        Copy-Item -LiteralPath $titleBar -Destination $stageAssets -Force
+    if ($BinarySource -eq 'Cpp') {
+        $titleBar = Join-Path $binaries 'Assets\fwdslash-titlebar.png'
+        if (Test-Path -LiteralPath $titleBar -PathType Leaf) {
+            Copy-Item -LiteralPath $titleBar -Destination $stageAssets -Force
+        }
     }
 
     $stagedAssets = @(Get-ChildItem -LiteralPath $stageAssets -File).Count
@@ -200,6 +220,7 @@ foreach ($target in $Architecture) {
         throw "Only $stagedAssets files staged into Assets; expected the full MSIX logo set."
     }
     foreach ($adapter in 'shell\cmd\fsw-autorun.cmd', 'shell\cmd\fsw-dir.cmd',
+                         'shell\cmd\fsw-cd.cmd', 'shell\cmd\fsw-pushd.cmd',
                          'shell\powershell\ForwardSlashWindows.psm1') {
         if (-not (Test-Path -LiteralPath (Join-Path $stage $adapter) -PathType Leaf)) {
             throw "Adapter payload missing from the stage: $adapter"
@@ -228,16 +249,22 @@ foreach ($target in $Architecture) {
         '/o'
     )
 
-    # The settings app resolves ms-appx:///App.xaml and its title-bar image
-    # through the package resource map, which must be named after Identity/Name.
-    # A silent mismatch here surfaces only as a blank or crashing window.
+    # The index has to be named after Identity/Name either way: that is what
+    # makes the manifest's own logo qualifiers resolve. The C++ app also
+    # resolves ms-appx:///App.xaml and its title-bar image through this map, so
+    # only that payload asserts the title-bar resource is present.
     $priDump = Join-Path $outputRoot ('resources-{0}.xml' -f $target.ToLowerInvariant())
     Invoke-Tool $makepri @('dump', '/if', (Join-Path $stage 'resources.pri'), '/of', $priDump, '/o')
     $dump = Get-Content -LiteralPath $priDump -Raw
     if ($dump -notmatch [regex]::Escape('name=' + [char]34 + $IdentityName + [char]34)) {
         throw "resources.pri primary map is not named '$IdentityName'; ms-appx lookups would fail."
     }
-    foreach ($resource in 'Square44x44Logo.png', 'fwdslash-titlebar.png') {
+    $expectedResources = if ($BinarySource -eq 'Cpp') {
+        @('Square44x44Logo.png', 'fwdslash-titlebar.png')
+    } else {
+        @('Square44x44Logo.png')
+    }
+    foreach ($resource in $expectedResources) {
         if ($dump -notmatch [regex]::Escape($resource)) {
             throw "resources.pri is missing an expected resource: $resource"
         }

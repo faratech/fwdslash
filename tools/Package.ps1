@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $source = Join-Path $repo ("out\user\{0}\{1}" -f $Architecture.ToLowerInvariant(), $Configuration)
 $packageRoot = Join-Path $repo 'out\package'
-$stage = Join-Path $packageRoot ("forward-slash-windows-0.0.2-{0}" -f $Architecture.ToLowerInvariant())
+$stage = Join-Path $packageRoot ("forward-slash-windows-0.0.3-{0}" -f $Architecture.ToLowerInvariant())
 $archive = "$stage.zip"
 
 if (-not (Test-Path -LiteralPath $source)) {
@@ -46,7 +46,9 @@ Copy-Item -LiteralPath (Join-Path $repo 'README.md') -Destination $stage
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination $stage
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'shell\cmd') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo 'shell\cmd\fsw-autorun.cmd') -Destination (Join-Path $stage 'shell\cmd')
+Copy-Item -LiteralPath (Join-Path $repo 'shell\cmd\fsw-cd.cmd') -Destination (Join-Path $stage 'shell\cmd')
 Copy-Item -LiteralPath (Join-Path $repo 'shell\cmd\fsw-dir.cmd') -Destination (Join-Path $stage 'shell\cmd')
+Copy-Item -LiteralPath (Join-Path $repo 'shell\cmd\fsw-pushd.cmd') -Destination (Join-Path $stage 'shell\cmd')
 New-Item -ItemType Directory -Force -Path (Join-Path $stage 'shell\powershell') | Out-Null
 Copy-Item -LiteralPath (Join-Path $repo 'shell\powershell\ForwardSlashWindows.psm1') -Destination (Join-Path $stage 'shell\powershell')
 if (Test-Path -LiteralPath $archive) {

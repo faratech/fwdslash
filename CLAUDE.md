@@ -8,42 +8,21 @@ or a classic Open/Save dialog opens `\\wsl.localhost\Ubuntu\etc\apt`.
 
 ## Build
 
-`tools/Build-UserMode.ps1` is authoritative for shippable artifacts. It drives `cl.exe`/`link.exe`
-directly for the native binaries and MSBuild for the WinUI 3 settings app.
+**The shipping product is the Rust tree in `crates/`.** It is what is on the Microsoft Store,
+what `release.yml` signs, and what both packagers stage. Build it from Windows:
 
 ```powershell
-.\tools\Build-UserMode.ps1 -Architecture ARM64 -Configuration Release
-.\tools\Build.ps1 -Architecture x64 -Configuration Release -Driver   # adds the kernel driver
+cargo build --release --target aarch64-pc-windows-msvc --workspace
+cargo build --release --target x86_64-pc-windows-msvc  --workspace
 ```
 
-Output: `out\user\<arch>\<config>\`. Architectures are `x86`, `x64`, `ARM64`.
+Output: `target\<rust-triple>\release\` — `fwdslash.exe`, `fswbroker.exe`, `fswsettings.exe`.
+Package it with `python3 tools/package_msix.py` (from WSL) or
+`.\tools\Package-Msix.ps1 -BinarySource Rust` (from Windows); both read the version from
+`workspace.package.version`. See [Rust port](#rust-port) under Architecture for the crate map and
+the version-island rule before touching any crate.
 
-CMake (`CMakePresets.json`, Debug-only presets) is a **partial parallel path used by CI for
-compile/test coverage**. It does not build the settings app, the driver, or stage the shell
-payloads. Do not assume a CMake build produces a runnable product.
-
-`.github/workflows/build.yml` runs three independent jobs: CMake presets `x64-debug` /
-`arm64-debug` / `x86-debug` (ctest only on `x64-debug`), MSBuild invoked directly against
-`ForwardSlashWindows.Settings.vcxproj` for `Win32`/`x64`/`ARM64` (not via `Build-UserMode.ps1`),
-and a driver-compile job gated to `workflow_dispatch` only — hosted runners ship no WDK
-(`stampinf.exe` is missing), so it needs a self-hosted runner.
-
-**A running broker or settings window will fail the link** — `link.exe` cannot overwrite a
-loaded image. Before rebuilding:
-
-```powershell
-.\out\user\arm64\Release\fwdslash.exe stop
-Get-Process fswsettings -ErrorAction SilentlyContinue | Stop-Process
-```
-
-### Rust port (parallel, not yet wired into the build)
-
-A full Rust rewrite lives in `crates/` (workspace root `Cargo.toml`). It is committed as of
-v0.0.1, but it is **not wired into the build or release pipeline** — `build.yml`,
-`Build-UserMode.ps1`, `Package.ps1` and the README all still describe only the C++ product
-above, and nothing in CI compiles or tests the Rust tree yet. See [Rust port](#rust-port) under Architecture for the crate map and the
-version-island rule before touching any crate. From WSL/Linux, only the two library crates
-build without an MSVC linker:
+From WSL/Linux, only the two library crates build without an MSVC linker:
 
 ```bash
 cargo test -p fsw-path                                    # runs directly, no target needed
@@ -51,13 +30,68 @@ cargo check --target x86_64-pc-windows-msvc -p fsw-core   # type-checks only, no
 ```
 
 The three `[[bin]]` crates (`fsw-cli`, `fsw-broker`, `fsw-settings`) link against `windows`-crate
-COM/UI Automation surfaces and require `link.exe` — Windows only, and subject to the same
-running-process-blocks-the-linker rule as the C++ binaries above.
+COM/UI Automation surfaces and require `link.exe` — Windows only.
+
+**A running broker or settings window will fail the link** — the linker cannot overwrite a
+loaded image, and this applies to the packaged copy too. Before rebuilding:
+
+```powershell
+.\target\aarch64-pc-windows-msvc\release\fwdslash.exe stop
+Get-Process fswsettings -ErrorAction SilentlyContinue | Stop-Process
+```
+
+### C++ tree (reference implementation, still buildable)
+
+`src/`, `include/` and `tests/` hold the original C++ product. It is **no longer what ships**,
+but it still builds, still has its own tests, and is the reference the Rust port is checked
+against — `docs/divergences.md` is the list of places they deliberately differ.
+
+```powershell
+.\tools\Build-UserMode.ps1 -Architecture ARM64 -Configuration Release
+.\tools\Build.ps1 -Architecture x64 -Configuration Release -Driver   # adds the kernel driver
+```
+
+Output: `out\user\<arch>\<config>\`. Architectures are `x86`, `x64`, `ARM64`.
+`Package-Msix.ps1` still defaults to `-BinarySource Cpp`, so pass `-BinarySource Rust`
+deliberately. `tools/Measure-Runtime.ps1` builds this tree into
+`out\user\<arch>\ReleaseCpp` so it never clobbers the Rust exes.
+
+CMake (`CMakePresets.json`, Debug-only presets) is a **partial parallel path used by CI for
+compile/test coverage** of the C++ tree. It does not build the settings app, the driver, or
+stage the shell payloads. Do not assume a CMake build produces a runnable product.
+
+`.github/workflows/build.yml` runs five independent jobs: CMake presets `x64-debug` /
+`arm64-debug` / `x86-debug` (ctest only on `x64-debug`), MSBuild invoked directly against
+`ForwardSlashWindows.Settings.vcxproj` for `Win32`/`x64`/`ARM64` (not via `Build-UserMode.ps1`),
+a driver-compile job gated to `workflow_dispatch` only — hosted runners ship no WDK
+(`stampinf.exe` is missing), so it needs a self-hosted runner — and the two Rust jobs described
+under Test.
 
 ## Test
 
+The shipping suites:
+
+```bash
+cargo test -p fsw-path -p fsw-core                              # resolver + funnel; runs on Linux/WSL
+cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc   # shell adapters
+```
+
+`cargo test -p fsw-path` needs no target flag and is the fastest way to validate a resolver
+change. `fsw-core` adds the funnel and update-check tests. **`fwdslash` has no lib target** —
+the adapter unit tests live in the bin, hence `--bins`, and they need a Windows target (and a
+host that can run the resulting exe).
+
+**CI runs all three** (`.github/workflows/build.yml`): the `rust` job on ubuntu-latest runs the
+two portable crates, the `cargo tree -p fsw-path` single-line assertion, the `windows-core`
+single-version assertion and `cargo check --workspace --all-targets` for both MSVC targets; the
+`rust-windows` job on windows-latest runs the CLI bin tests, a release build and a binary-size
+report (reported, not gated — clippy is not clean on this tree yet, so there is no
+`-D warnings` gate either).
+
+The C++ tree keeps its own suite:
+
 ```powershell
-.\out\user\<arch>\<config>\fswcore_tests.exe    # resolver unit tests; the only automated suite
+.\out\user\<arch>\<config>\fswcore_tests.exe    # resolver unit tests
 cmake --preset x64-debug; ctest --preset x64-debug
 ```
 
@@ -72,37 +106,36 @@ any suite:
 .\fsw_filesystem_integration.exe <distribution> /path
 ```
 
-`cargo test -p fsw-path` is the Rust resolver's equivalent of `fswcore_tests.exe` (47 cases) and
-runs directly on Linux/WSL with no target flag — it's the fastest way to validate a resolver
-change before touching the C++ side. It is currently the only crate in the Rust workspace with
-tests.
-
 `tools/Test-Sandbox.ps1` drives a Windows Sandbox install/start/pause/uninstall cycle;
 `tools/Test-Prerequisites.ps1 [-RequireWdk]` checks the toolchain.
 
 ## Package
 
 ```powershell
-.\tools\Package.ps1 -Architecture ARM64            # ZIP, the sideload SKU
-.\tools\Package-Msix.ps1                           # x64 + ARM64 .msixbundle for the Store
+.\tools\Package-Msix.ps1 -BinarySource Rust        # x64 + ARM64 .msixbundle — the shipping path
+.\tools\Package.ps1 -Architecture ARM64            # ZIP of the C++ build, the sideload SKU
 ```
+
+`-BinarySource Rust` stages `target\<triple>\release`, takes the `shell/` payload from the repo,
+and defaults `-Version` from `cargo metadata`. The **default is still `Cpp`**, which stages the
+C++ reference build and reads the version from `assets\fwdslash.rc` — pass the flag.
 
 See `docs/store-submission.md` for identity values and Store constraints.
 
-`tools/package_msix.py` is a WSL-runnable equivalent to `Package-Msix.ps1`: it shells out to
+`tools/package_msix.py` is the WSL-runnable equivalent: it shells out to
 `makeappx.exe`/`makepri.exe` under `packages/` via `wslpath`, so MSIX packaging doesn't require
-leaving WSL for native PowerShell. It is part of the Rust-port work (see below) and currently
-hardcodes its own `VERSION` constant rather than reading the workspace version.
+leaving WSL for native PowerShell. It reads the version from `workspace.package.version`, stages
+the `shell/` payload from the repo tree and fails if any adapter file is missing, and picks the
+SDK tool architecture from `platform.machine()` (override with `FSW_SDK_TOOL_ARCH`).
 
 **Local MSIX test loop (Rust binaries):** `cargo build --release --target <rust-triple>
 --workspace` on the Windows side (both `aarch64-pc-windows-msvc` and `x86_64-pc-windows-msvc`
 are installed), then `python3 tools/package_msix.py` from WSL — it stages the three Rust exes
-from `target/<triple>/release`, so the MSIX is the *Rust* product even though nothing else
-consumes it yet. Sign with the publisher-matching self-sign cert
+from `target/<triple>/release`. Sign with the publisher-matching self-sign cert
 (`C:\code\wfdiag-selfsign.pfx`, password recorded in the wfdiag repo's `build-cross.py`; the
 cert must also be in the machine's trusted root — it already is on the dev host). Same-version
 reinstall is blocked with 0x80073CFB: `Get-AppxPackage 32827MikeFara.fwdslash | Remove-AppxPackage`
-before each `Add-AppxPackage`, or bump `VERSION` in `package_msix.py`. Launch the packaged
+before each `Add-AppxPackage`, or bump `workspace.package.version`. Launch the packaged
 app with `explorer.exe 'shell:AppsFolder\32827MikeFara.fwdslash!App'`, and remember the
 running-process rule above applies to the packaged copy too — a running settings window
 (often the leftover unpackaged dev build in `target\release`) blocks relinking.
@@ -111,26 +144,46 @@ running-process rule above applies to the packaged copy too — a running settin
 
 Three user-mode binaries share one static core and cooperate at runtime:
 
-- **`fswbroker.exe`** — resident tray + `HWND_MESSAGE` daemon. Installs a system-wide
-  `WH_KEYBOARD_LL` hook that inspects **only `VK_RETURN`** and passes everything else through.
-  On Enter, if the foreground window is a recognized surface, it reads the focused control's
-  text via UI Automation, and if it starts with `/` rewrites it to the resolved UNC path and
-  replays Enter (tagged with a private `dwExtraInfo` marker so the hook ignores its own input).
-  Otherwise it replays the keystroke untouched. This swallow-inspect-rewrite-replay cycle is
-  the heart of the product; read `ProcessEnterRequest` in `src/broker/main.cpp` first.
+- **`fswbroker.exe`** — the resident daemon, and the owner of the product's **single**
+  notification-area icon. Installs a system-wide `WH_KEYBOARD_LL` hook that inspects **only
+  `VK_RETURN`** and passes everything else through. On Enter the hook does nothing but
+  classify the foreground window (class first, then process image) and post to a **worker
+  thread**; the worker — its own STA, its own `IUIAutomation`, its own message-only window
+  `ForwardSlashWindows.BrokerWorker` — reads the focused control's text via UI Automation and,
+  if it starts with `/`, rewrites it to the resolved UNC path and replays Enter (tagged with a
+  private `dwExtraInfo` marker so the hook ignores its own input). Otherwise it replays the
+  keystroke untouched. This swallow-inspect-rewrite-replay cycle is the heart of the product;
+  read `process_enter_request` in `crates/fsw-broker/src/main.rs` first (the C++ original is
+  `ProcessEnterRequest` in `src/broker/main.cpp`). Nothing that can block belongs on the hook
+  thread: Windows silently removes a low-level hook that exceeds `LowLevelHooksTimeout`.
   `docs/architecture.md` has the ASCII data-flow diagrams for this path and for the
-  (excluded-from-build) filesystem-routing path through the driver.
+  (excluded-from-build) filesystem-routing path through the driver; `docs/divergences.md`
+  Broker §2 is the full list of broker behaviour (tray menu, tooltip, health timer, the
+  `#32770` narrowing, the diagnostic categories).
 - **`fwdslash.exe`** — the CLI and the only component that mutates install state. The settings
-  app never writes integration state itself; it shells out to this.
-- **`fswsettings.exe`** — unpackaged WinUI 3 desktop app (Windows App SDK 1.8).
+  app never writes integration state itself; it shells out to this. Beyond the user-facing
+  verbs it carries the shell-adapter contract: `cmd-list`, `cmd-cd` and `shell-resolve`, all
+  three sharing one `shell_target` funnel, with **exit 3 meaning "run your own command
+  unchanged"**. Installing an adapter whose recorded `Version` is older than `PAYLOAD_VERSION`
+  upgrades it in place (uninstall transaction, then install transaction).
+- **`fswsettings.exe`** — Rust desktop app on the vendored `windows-reactor` crate (Windows App
+  Runtime **2.x**). It has **no tray icon and no watchdog**: closing the window exits the
+  process, and the broker keeps the icon. Controller calls and state reads run on the thread
+  pool with the affected controls disabled and a `ProgressRing` shown.
 
-They find each other by well-known names in `include/fsw_user_protocol.h`: window class
-`ForwardSlashWindows.Broker`, mutex `Local\ForwardSlashWindows.Broker`, and `WM_APP+10..12`
-messages. There is no pipe or RPC.
+They find each other by well-known names in `include/fsw_user_protocol.h` (mirrored in
+`crates/fsw-core/src/lib.rs`): window class `ForwardSlashWindows.Broker`, mutex
+`Local\ForwardSlashWindows.Broker`, and `WM_APP+10..12` messages. There is no pipe or RPC.
+The broker window is titled `fwdslash broker` — never discovered by title, but the settings
+window's caption is `Forward Slash Windows` and the two used to collide.
+`FSW_WM_SET_PAUSED` replies with the resulting `BrokerState` (`Active` = 1, `Paused` = 2) or
+**0** when the change could not be applied; it is not a boolean ack.
 
-`src/core/` holds the pure resolver (`path_resolver.cpp`) and WSL registry reads
-(`wsl_registry.cpp`). **All resolution flows through `ResolveUserSlashPath`**, so a change
-there reaches Explorer, Run, Search and both shell adapters at once. Bare-slash behaviour is
+`crates/fsw-path` holds the pure resolver and `crates/fsw-core` the registry reads and the
+funnel (`src/core/path_resolver.cpp` + `wsl_registry.cpp` are the C++ originals). **All
+resolution flows through `resolve_user_slash_path` / `ResolveUserSlashPath`**, so a change
+there reaches Explorer, Run, Search and both shell adapters at once. The rule numbers R1-R12
+cited throughout the resolver are enumerated in `docs/divergences.md`. Bare-slash behaviour is
 opt-in: in `default_distribution` mode a leading segment that is not a registered distribution
 resolves against the default distro, so `/tmp/build` works unprefixed. A registered
 distribution always wins over a same-named directory.
@@ -138,9 +191,14 @@ distribution always wins over a same-named directory.
 ### Settings persistence
 
 Runtime settings live under `HKCU\Software\ForwardSlashWindows\Settings` — `Disabled` (DWORD,
-global pause), `BareSlashMode` (DWORD, 0 = distribution list / 1 = default distribution), and
-`BareSlashDistribution` (string, the pin). The key path and value names are defined once in
-`include/fsw_user_protocol.h` and shared by the core, broker and controller — **except**
+global pause), `BareSlashMode` (DWORD, 0 = distribution list / 1 = default distribution),
+`BareSlashDistribution` (string, the pin), `BareSlashRoot` (string, the custom folder root —
+Rust only), and, in the GitHub flavor only, `AutoUpdate` / `LastUpdateCheck` /
+`AvailableUpdate`. Anything reading two or more of them should take
+`fsw_core::SettingsValues::read()`, which opens the key once; the single-value getters delegate
+to it. The key path and value names are defined once in
+`include/fsw_user_protocol.h` (mirrored in `crates/fsw-core/src/lib.rs`) and shared by the
+core, broker and controller — **except**
 `shell/powershell/ForwardSlashWindows.psm1`, which hardcodes the same key path as a literal
 string (`Test-ForwardSlashWindowsDisabled`) because it can't include a C++ header. Renaming a
 setting means updating the module too. Each optional integration also has its own
@@ -153,7 +211,8 @@ bytes) and is only what `fwdslash integration <name> enable|disable` and
 ### Packaged vs unpackaged duality
 
 The product ships both as a ZIP and as an MSIX, and behaves differently in each.
-`fsw::HasPackageIdentity()` (`src/core/package_identity.cpp`) is the switch:
+`fsw_core::has_package_identity()` (`fsw::HasPackageIdentity()` in
+`src/core/package_identity.cpp`) is the switch:
 
 | Concern | Unpackaged | Packaged (MSIX) |
 |---|---|---|
@@ -161,29 +220,34 @@ The product ships both as a ZIP and as an MSIX, and behaves differently in each.
 | `fwdslash://` protocol | HKCU `Software\Classes\fwdslash` | `windows.protocol` in the manifest |
 | CLI on PATH | user adds the folder | `windows.appExecutionAlias` |
 
-When adding anything that writes install state, branch on `HasPackageIdentity()`. Writing the
+When adding anything that writes install state, branch on package identity. Writing the
 Run key or protocol registration from a packaged build leaves **orphaned entries pointing into
 a deleted `WindowsApps` directory** — those locations are deliberately un-virtualized.
 
-MSIX virtualizes HKCU and `%APPDATA%`, which would hide the adapter payload and the cmd
-`AutoRun` value from unpackaged shells. `packaging/AppxManifest.xml` names three targeted
-virtualization exclusions and declares the `unvirtualizedResources` restricted capability.
-Do not widen those exclusions casually — the narrow scope is what makes Store approval
-plausible.
+MSIX virtualizes HKCU, which would hide the cmd `AutoRun` value from unpackaged shells. The
+manifest declares **no** virtualization exclusions and **no** `unvirtualizedResources`
+capability: the adapters route every registry write through `reg.exe`, a System32 child with no
+package identity, so the writes land in the real hive regardless. Reads use the merged view and
+are always correct. Do not reintroduce the exclusions — dropping them is what removed the
+Microsoft-approval requirement from the Store submission (`docs/compatibility.md` has the
+clean-room result). File writes to `%LOCALAPPDATA%\ForwardSlashWindows` and `Documents` are
+already real for this package.
 
 The startup task only fires at **logon** and MSIX runs nothing at install time, so the settings
-app calls `EnsureBrokerRunning()` on launch. Without it a Store install does nothing at all.
+app calls `ensure_broker_running()` on launch (off the UI thread; `EnsureBrokerRunning()` in the
+C++). Without it a Store install does nothing at all.
 
-The settings app must be built with `-Packaged` for MSIX: otherwise the Windows App SDK
+The **C++** settings app must be built with `-Packaged` for MSIX: otherwise the Windows App SDK
 compiles in a bootstrap initializer that calls `exit()` when it finds package identity.
 `WindowsPackageType=MSIX` is *not* usable — it makes the SDK demand an `AppxManifest` item on
-the vcxproj; the gate is `WindowsAppSdkBootstrapInitialize=false`.
+the vcxproj; the gate is `WindowsAppSdkBootstrapInitialize=false`. The Rust app has no such
+switch: `windows-reactor`'s bootstrap detects identity at runtime, so one binary serves both.
 
 ### Rust port
 
-`crates/` holds a full Rust rewrite of the entire product, developed in parallel with the C++
-tree described above and shipped alongside it since v0.0.1. Five crates map onto the three C++ binaries plus
-the shared core:
+`crates/` holds the shipping product — a full rewrite of everything the C++ tree does, first
+committed at v0.0.1 and the packaged product since v0.0.2. Five crates map onto the three
+binaries plus the shared core:
 
 | Crate | Binary / role | Mirrors |
 |---|---|---|
@@ -208,8 +272,8 @@ constraint on this workspace: `windows-reactor` requires `windows-core` 0.100, w
 else uses the `windows`/`windows-sys` 0.62/0.61 generation, and the two `windows-core` majors are
 incompatible COM/WinRT type systems that must never appear in the same binary. `fsw-path` and
 `fsw-core` are therefore the only crates shared across both islands, which is only sound because
-`fsw-path`'s `[dependencies]` table is intentionally empty — CI asserts `cargo tree -p fsw-path`
-is exactly one line, and a PR that needs to add a dependency there must justify it in
+`fsw-path`'s `[dependencies]` table is intentionally empty — the `rust` job in
+`.github/workflows/build.yml` asserts `cargo tree -p fsw-path` is exactly one line, and a PR that needs to add a dependency there must justify it in
 `docs/dependencies.md` first. `crates/windows-reactor/` is Microsoft's own crate (MIT/Apache-2.0,
 from microsoft/windows-rs), vendored and pulled in via `[patch.crates-io]` in the root
 `Cargo.toml` so it can be patched locally — treat it as a dependency to patch, not code owned by
@@ -235,9 +299,10 @@ the C++ one (case-folding table, error-shape tightening, an unreachable error va
 distribution names, and the structural vs. textual bare-slash rewrite) — and, further down,
 every settings-app divergence (caption icon route, pane display mode, Fluent-conformance
 departures from the C++ such as 24px padding / 320 pane length / semantic secondary-text
-brush, tray + single-instance behavior the C++ lacks), each backed by a named
-test in `crates/fsw-path/tests/resolver.rs`. A difference not listed there is a bug, not a
-feature. `docs/size-baseline.md` records the measured C++ binary sizes (e.g. `fswbroker.exe`
+brush, the single-instance guard the C++ lacks), the broker's own section (worker thread,
+tray menu, `#32770` narrowing, diagnostic categories), the CLI's shell verbs, and the
+enumerated resolver rules R1-R12 — resolver entries are each backed by a named test in
+`crates/fsw-path/tests/resolver.rs`. A difference not listed there is a bug, not a feature. `docs/size-baseline.md` records the measured C++ binary sizes (e.g. `fswbroker.exe`
 ~161–173 KB of code) as the budget the Rust binaries have to clear, and the codegen policy
 (`crt-static`, fat LTO, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`) that makes a
 comparable size plausible — `panic = "abort"` in particular is not negotiable, since unwinding
@@ -278,6 +343,18 @@ installed adapters before removing the Run key and protocol.
 
 The cmd adapter works by `doskey` macros, so **it only takes effect in interactive consoles** —
 `cmd /c "dir /etc"` will always fail with "Invalid switch". Test it in a real console window.
+The macros cover `dir`/`ls` (`fsw-dir.cmd`) and `cd`/`chdir`/`pushd` (`fsw-cd.cmd`,
+`fsw-pushd.cmd`); `cmd.exe` cannot make a UNC path current, so the CD adapter enters the target
+with `pushd` on an `endlocal &` line — never inside `setlocal`, or the directory change dies
+with the script. The PowerShell module aliases `cd`/`chdir`/`sl`/`pushd` as well, and its
+`pushd` wrapper is a *global* function built from an unbound script block (a module function
+would push onto the module's own location stack). A payload list lives in four places —
+`crates/fsw-cli/src/adapters/cmd.rs`, `tools/Package.ps1`, `tools/Package-Msix.ps1` and
+`tools/package_msix.py` — and adding a file means editing all four.
+
+The installed payload directory is named for `PAYLOAD_VERSION`, which now derives from
+`CARGO_PKG_VERSION`. A version bump therefore marks every deployed adapter outdated, and
+`fwdslash integration <name> enable` upgrades it in place.
 
 ### Driver
 
@@ -292,28 +369,46 @@ change) whether or not the driver is actually loaded.
 
 ## Conventions
 
-- C++20, `/W4 /WX /permissive- /utf-8`. Native binaries use `/MT`; the MSBuild settings app
-  uses `/MD`. Warnings are errors — a new warning fails the build.
+- Rust 2024, toolchain pinned by `rust-toolchain.toml`; workspace lints deny `unwrap_used`,
+  `expect_used` and `panic` (see the reasoning in the root `Cargo.toml` — `panic = "abort"`
+  makes any of them an instant process death that skips `WM_DESTROY`). Clippy is **not** clean
+  on the tree today and CI does not gate on it.
+- C++20 for `src/`, `/W4 /WX /permissive- /utf-8`. Native binaries use `/MT`; the MSBuild
+  settings app uses `/MD`. Warnings are errors — a new warning fails the build.
 - **Per-user only.** Everything is HKCU and `asInvoker`; there are no HKLM writes and nothing
   requires elevation. Keep it that way.
-- Version `0.0.1` is hardcoded in `assets/fwdslash.rc`, `src/settings/app.manifest`,
-  `CMakeLists.txt`, `tools/Package.ps1` and the adapter payload directory name. Changing it
-  means changing all of them. The Rust port adds its own set of copies: root `Cargo.toml`
-  (`workspace.package.version`, inherited by every crate), `crates/fsw-settings/app.manifest`,
-  `crates/fsw-settings/app.rc`, `crates/fsw-broker/app.rc`, and `tools/package_msix.py`'s
-  hardcoded `VERSION` constant.
+- **Version `0.0.3`.** The Rust tree has one source of truth — `workspace.package.version` in
+  the root `Cargo.toml` — and everything downstream of it derives:
+  - each `build.rs` (`fsw-broker`, `fsw-settings`, `fsw-cli`) passes `FSW_VER_COMMAS` /
+    `FSW_VER_STR` defines to `embed_resource::compile`, so both the numeric
+    `FILEVERSION`/`PRODUCTVERSION` fields **and** the string block in `crates/*/app.rc` come
+    from `CARGO_PKG_VERSION` (the `#ifndef` fallbacks in those `.rc` files are a last-resort
+    literal — keep them in step, but they are not the source);
+  - `adapters::PAYLOAD_VERSION` is `env!("CARGO_PKG_VERSION")`;
+  - `tools/package_msix.py` and `Package-Msix.ps1 -BinarySource Rust` read it (from the TOML
+    and from `cargo metadata` respectively);
+  - `release.yml` fails the run when the tag disagrees with it.
+
+  Still hand-copied, and all of them must move together with a bump:
+  `crates/fsw-settings/app.manifest` (`0.0.3.0`), `src/settings/app.manifest` (`0.0.3.0`),
+  `src/settings/main.cpp` (the About header literal), `assets/fwdslash.rc` (**both** the
+  numeric `FILEVERSION`/`PRODUCTVERSION` fields and the `FileVersion`/`ProductVersion`
+  strings), `CMakeLists.txt`, `tools/Package.ps1` (the ZIP stage directory), `SECURITY.md`
+  (supported version) and `docs/store-submission.md` §5.
 - The icon resource id `IDI_FSW_APP = 101` also has copies: `include/fsw_resources.h`
   for the C++ tree, and `crates/fsw-broker/app.rc` plus a `const` in
   `crates/fsw-broker/src/main.rs` for the Rust broker. Each Rust binary links a
-  different icon on purpose — none for the CLI, a 16-48px `assets/fwdslash-tray.ico`
-  for the broker, the full `assets/fwdslash.ico` for the settings app. See
-  `docs/size-baseline.md`.
+  different icon on purpose — a 16-48px `assets/fwdslash-tray.ico` for the broker, the full
+  `assets/fwdslash.ico` for the settings app, and **none** for the CLI, whose
+  `crates/fsw-cli/app.rc` carries VERSIONINFO only. See `docs/size-baseline.md`.
 - `docs/compatibility.md` lists release gates; blank entries mean unverified and must not be
   advertised as working.
-- **Never log a path.** `Diagnostic()` in `src/broker/main.cpp` (opt-in only, via the
-  `FSW_DIAGNOSTIC_LOG` env var) writes fixed event/reason category strings such as
-  `event=route_distribution` — never the text the user typed or the UNC path it resolved to.
-  This is a commitment made in `PRIVACY.md`; keep new diagnostic calls category-only.
+- **Never log a path.** `log_diagnostic()` in `crates/fsw-broker/src/main.rs` (`Diagnostic()`
+  in `src/broker/main.cpp`), opt-in only via the `FSW_DIAGNOSTIC_LOG` env var, writes fixed
+  event/reason category strings such as `event=route_distribution` — never the text the user
+  typed or the UNC path it resolved to. This is a commitment made in `PRIVACY.md`; keep new
+  diagnostic calls category-only. The current category list is in `docs/divergences.md`
+  Broker §2.
 
 ### PowerShell gotchas in `tools/`
 

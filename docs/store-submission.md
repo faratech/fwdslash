@@ -4,8 +4,22 @@ Product: **fwdslash** — Store ID `9P51CM0MTMK2`, publisher `windowsforum`.
 
 ## 1. Package identity
 
-These are baked into `tools/Package-Msix.ps1` as the defaults, so a plain
-`.\tools\Package-Msix.ps1` produces an uploadable bundle:
+These are the defaults in both packagers, so producing an uploadable bundle is
+one command once the binaries are built. **The shipping product is the Rust
+tree**, so build it first and then package with `-BinarySource Rust` (the
+`Cpp` default stages the C++ reference build, which is not what is on the
+Store):
+
+```powershell
+cargo build --release --target aarch64-pc-windows-msvc --workspace
+cargo build --release --target x86_64-pc-windows-msvc  --workspace
+.\tools\Package-Msix.ps1 -BinarySource Rust
+```
+
+From WSL, `python3 tools/package_msix.py` does the same thing: it stages the
+same three Rust exes and the `shell/` payload out of the repo, and shells out
+to `makeappx.exe`/`makepri.exe` through `wslpath`. Both read the version from
+`workspace.package.version` in the root `Cargo.toml`.
 
 | Field | Value |
 |---|---|
@@ -24,7 +38,7 @@ time — it cannot be patched into a finished package.
 signs a package with the real Store identity for local install testing:
 
 ```powershell
-.\tools\Package-Msix.ps1 -CertificatePath C:\code\wfdiag-selfsign.pfx -CertificatePassword '<pw>'
+.\tools\Package-Msix.ps1 -BinarySource Rust -CertificatePath C:\code\wfdiag-selfsign.pfx -CertificatePassword '<pw>'
 Add-AppxPackage out\msix\fwdslash-<version>.msixbundle
 ```
 
@@ -64,8 +78,14 @@ here but resembles a keylogger to an automated scan, so state plainly:
 > in those same four surfaces — this is how a typed `/etc/apt` becomes
 > `\\wsl.localhost\Ubuntu\etc\apt` before Windows acts on it.
 >
-> The hook can be turned off at any time from the tray icon or the settings app,
-> and is removed entirely when the feature is disabled.
+> Enter is processed on a dedicated worker thread, not in the hook callback, and
+> only when the focused element is an editable, non-password Edit or ComboBox
+> with a writable ValuePattern. A control the app could not write back to is
+> never read, so a Find box or a password field in one of those windows passes
+> Enter through untouched.
+>
+> The hook can be turned off at any time from the notification-area icon or the
+> settings app, and is removed entirely when the feature is disabled.
 >
 > Full source: https://github.com/faratech/fwdslash (MIT).
 
@@ -83,7 +103,8 @@ here but resembles a keylogger to an automated scan, so state plainly:
 
 - **Startup task is `Enabled="true"`**, but it only fires at *logon* and MSIX
   runs nothing at install time. Opening the app therefore starts the broker if
-  it is not already running (`EnsureBrokerRunning` in `src/settings/main.cpp`).
+  it is not already running (`ensure_broker_running`, called from `create()` in
+  `crates/fsw-settings/src/main.rs`).
   A reviewer who installs and immediately tests a slash path without opening the
   app first will see nothing happen, so the certification notes tell them to
   open the app or run `fwdslash start`.
@@ -94,27 +115,50 @@ here but resembles a keylogger to an automated scan, so state plainly:
   The `AutoRun` value, the PowerShell profile blocks and
   `%LOCALAPPDATA%\ForwardSlashWindows` survive package removal. Disable the
   integrations from the settings app before uninstalling.
-- **Version is `0.0.1.0`.** Each submission must increase it, and the fourth
-  field is reserved by the Store (always `0`).
-## 6. Verified locally (0.0.1.0, ARM64, Windows 11 26200)
+- **Version is `0.0.3.0`.** Each submission must increase it, and the fourth
+  field is reserved by the Store (always `0`). It comes from
+  `workspace.package.version`; see the version-copy list in CLAUDE.md.
 
-Installed from a self-signed bundle with `Add-AppxPackage` and exercised:
+## 6. Verification checklist for the 0.0.3 submission
+
+Install the self-signed bundle with `Add-AppxPackage` (`Remove-AppxPackage`
+first — a same-version reinstall is blocked) and confirm each of these before
+uploading. Carried over from the 0.0.2 pass and still expected to hold:
 
 - Package family name resolves to `32827MikeFara.fwdslash_t6j5qexy2jpp2`.
 - `windows.appExecutionAlias` puts `fwdslash.exe` on PATH at
-  `%LOCALAPPDATA%\Microsoft\WindowsApps`.
+  `%LOCALAPPDATA%\Microsoft\WindowsApps`, and `fwdslash version` prints
+  `0.0.3.0` (the packaged identity version).
 - The packaged controller runs and reports broker/integration state.
-- **Virtualization exclusion confirmed**: the packaged controller wrote
-  `Disabled` under `HKCU\Software\ForwardSlashWindows\Settings` and an
-  unpackaged `reg.exe` read the new value back. This is the behaviour the
-  restricted capability exists for.
-- The WinUI settings app launches from `WindowsApps` with a window, confirming
-  the bootstrap initializer is correctly suppressed and the package resource map
-  resolves `ms-appx:///` lookups.
-- `windows.protocol` activation works, and `fwdslash://settings/terminals`
-  selects the Terminals page — so protocol activation still delivers the URI as
-  a command-line argument, which `InitialSection` in `src/settings/main.cpp`
-  depends on.
+- The packaged controller's writes reach the **real** hive: packaged
+  `fwdslash disable` must flip `HKCU\Software\ForwardSlashWindows\Settings`
+  `Disabled` as read from an *unpackaged* shell. This works because the writes
+  go through `reg.exe`, not because of a virtualization exclusion — there is
+  none (see §2).
+- The settings app launches from `WindowsApps` with a window, confirming the
+  Windows App SDK bootstrap initializer is correctly suppressed.
+- `windows.protocol` activation works and `fwdslash://settings/terminals`
+  selects the Terminals page, so activation still delivers the URI as a
+  command-line argument (`initial_section` in `crates/fsw-settings/src/main.rs`).
 
-Not yet verified: the startup task firing at logon (needs a sign-out), and the
-cmd/PowerShell adapters reinstalled from the packaged payload.
+New in 0.0.3, and the reason this section is a checklist rather than a record:
+
+- **One notification-area icon.** Launch from Start: exactly one icon. Close the
+  settings window: `Get-Process fswsettings` is empty and the icon stays.
+  Relaunch while the window is open: same PID, window raised.
+- **Tray menu.** Open settings, the Enabled check, Open WSL root, Open
+  distribution (one item per registered distribution), Integrations, Exit; a
+  second right-click opens cleanly.
+- **cd adapters from the packaged payload.** In a new console:
+  `cd /Ubuntu`, `cd /d /Ubuntu`, `pushd /Ubuntu` + `popd`, and `dir /b` staying
+  native. In a new PowerShell session: `cd /Ubuntu`, `pushd /Ubuntu` + `popd`,
+  and `cd ..` / `cd C:\` untouched.
+- **Packaged adapters enable.** A fresh packaged
+  `fwdslash integration cmd enable` produces a real `Command Processor AutoRun`
+  value, and the staged payload under `%LOCALAPPDATA%\ForwardSlashWindows\cmd`
+  contains `fsw-cd.cmd` and `fsw-pushd.cmd`.
+- **Adapter upgrade.** With a 0.0.2 adapter installed, the settings app shows
+  the "Terminal integrations need updating" bar and "Update integrations"
+  reinstalls the payload.
+
+Still unverified: the startup task firing at logon (needs a sign-out).

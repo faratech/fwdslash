@@ -4,6 +4,32 @@ Every entry here is a place the Rust port behaves differently on purpose. Each
 one has a test pinning it. Anything *not* listed here is meant to be
 byte-for-byte identical, and a difference is a bug.
 
+## Resolver rules (R1-R12)
+
+The rule numbers are cited throughout `crates/fsw-path/src/lib.rs`,
+`crates/fsw-core/src/lib.rs` and the entries below, and this is where they are
+defined. They describe the shared contract both resolvers implement, in the
+order the code applies them (`resolve` in `crates/fsw-path/src/lib.rs`,
+mirroring the C++ `ResolveSlashPath`).
+
+| Rule | Contract |
+|---|---|
+| **R1** | The input must begin with `/`. Empty or anything else is `NotASlashPath` — the CLI's "not a slash path" and the shells' exit 3. |
+| **R2** | A second `/` at index 1 is `DoubleLeadingSlash`. Checked **before** R3, so `//\0` reports the double slash rather than the NUL. |
+| **R3** | An embedded NUL anywhere is `EmbeddedNul`. |
+| **R4** | A backslash anywhere is `BackslashNotAllowed`. This is what lets R10 derive the Linux path from the rendered UNC by swapping separators. |
+| **R5** | A bare `/` is the provider root (`Resolved::WslRoot`, rendered `\\wsl.localhost`) — but only in distribution-list mode with no custom folder root; see R7-R9. |
+| **R6** | A trailing `/` on an input longer than one character is *captured* as `had_trailing_separator`; whether it survives is R12. In default-distribution mode it is captured from the rewritten string, which is why bare `/` reports `true` there (Settings-independent; see Resolver §5). |
+| **R7** | The leading segment is everything from index 1 up to the next `/`, or to the end. |
+| **R8** | If that segment is a **registered** distribution (case-insensitively, per Resolver §1), the input is an explicit distribution path and resolves against it. A registered distribution always wins over a same-named folder. |
+| **R9** | Otherwise the bare-slash mode decides: *distribution list* → bare `/` is R5 and anything else is `UnregisteredDistribution`; *default distribution* → the pinned distribution, else the WSL default, else `NoDefaultDistribution`. A configured folder root pre-empts both (Resolver §6). |
+| **R10** | Components are normalized during the render: an empty component and `.` are dropped, `..` truncates back to the previous separator. No component vector is built. |
+| **R11** | A `..` that would leave the distribution (or folder) root is `TraversalAboveRoot`. Traversal *to* exactly the root is allowed. |
+| **R12** | The captured trailing separator (R6) is re-appended only if at least one component survived R10. `/Ubuntu/` keeps it, `/Ubuntu/.` does not, and bare `/` in default mode does not. |
+
+Rules R1-R4 and R10-R12 apply unchanged to a custom folder root; R5 and R7-R9
+are where a folder root differs (Resolver §6).
+
 ## Resolver (`fsw-path`)
 
 ### 1. Case folding uses Rust's Unicode tables, not `CompareStringOrdinal`
@@ -34,9 +60,21 @@ or recased between those versions can disagree. WSL distribution names are
 overwhelmingly ASCII (`Ubuntu`, `Debian`, `kali-linux`, `openSUSE-Tumbleweed`),
 and the ASCII fast path is exact, so the exposure is theoretical.
 
+**Non-BMP characters.** `simple_upper` folds `char`s — Unicode scalar values —
+while `CompareStringOrdinal` folds UTF-16 code *units*. For anything above
+U+FFFF the two are structurally different operations: Win32 sees a surrogate
+pair and case-folds neither half (no surrogate code unit has a simple uppercase
+mapping), whereas Rust sees one scalar and would apply its mapping if the plane
+has one — Deseret (U+10428 `𐐨` → U+10400 `𐐀`) and Adlam are the live examples.
+A distribution name containing one of those characters would compare
+case-insensitively in Rust and case-sensitively in Win32. No WSL distribution
+name is plausibly in that set, and the C++ behaviour is the accidental one, so
+this is recorded rather than "fixed".
+
 **Follow-up:** a Windows-only differential test walking the BMP against
 `CompareStringOrdinal` is the honest way to keep this table current. It cannot
-run on Linux CI, so it belongs in the Windows leg.
+run on Linux CI, so it belongs in the Windows leg. It would not cover the
+non-BMP case above; that needs its own surrogate-pair cases.
 
 Pinned by `case_folding_matches_the_win32_simple_uppercase_table`.
 
@@ -122,10 +160,29 @@ Deliberate details:
 - `ResolveError::message()` for `TraversalAboveRoot` still says "distribution
   root", which reads slightly wrong under a folder root. Generalizing the
   sentence is a cross-tree wire-text change; accepted for now.
-- `ForwardSlashWindows.psm1` keeps an **exact** provider-root comparison
-  (against both `\\wsl.localhost` and `\\wsl.localhost\`) — a prefix match
-  would misread a custom root that itself lives under `\\wsl.localhost` as the
-  provider root and list distributions instead of the folder.
+- `ForwardSlashWindows.psm1` no longer compares rendered paths at all. It calls
+  `fwdslash shell-resolve`, which reports `kind` (`root` / `distribution` /
+  `folder` / `native`) structurally, so a custom root that itself lives under
+  `\\wsl.localhost` can never be misread as the provider root. The old exact
+  `\\wsl.localhost` / `\\wsl.localhost\` literal comparison is gone (the second
+  of those literals could never match anything the resolver rendered).
+- `is_valid_windows_root` accepts only *absolute* locations, and 0.0.3 tightened
+  it: a drive-**relative** root (`C:code`, `C:Users\me`) is rejected, because
+  Win32 resolves it against a hidden per-drive current directory rather than a
+  fixed folder; a share-less UNC root (`\\server`, `\\server\`,
+  `\\server\\share`) is rejected, because it names no folder; wildcards (`*`,
+  `?`) are rejected; and `\\wsl.localhost` itself is rejected in any casing and
+  with any number of trailing separators, so `Resolved::unc_display` can only
+  ever produce that literal for `Resolved::WslRoot`. `C:` and `C:\` stay valid.
+  Pinned by `windows_root_validation_table`.
+- `has_win32_normalization_hazard` inspects the **last** component only. Win32
+  strips a trailing `.` or space outside the `\\?\` namespace, but only at the
+  end of the string — a `.` or space followed by a separator survives, so a
+  middle component and a path written with a trailing separator are not hazards,
+  and `.`/`..` are normalized away by R10 rather than truncated. It is also no
+  longer computed and discarded: the broker appends a trailing `\` when it is
+  true, and logs `event=win32_normalization_hazard`. `FolderPath` exposes the
+  same accessor, because a folder root can sit on ext4 too.
 
 Named tests: `folder_root_*` and `windows_root_validation_table`
 (`crates/fsw-path/tests/resolver.rs`), `folder_root_resolution_allocates_nothing`
@@ -141,8 +198,11 @@ daily and can atomically install its own signed MSIX bundle
 `packaged && !is_store_flavor() && AutoUpdate` — the Store build never
 performs the check, and an `AutoUpdate` settings value (default on) can switch
 it off. The settings app surfaces a found update as an Informational InfoBar
-plus a tray balloon, and shows an "Automatic updates" toggle only in the
-GitHub flavor. The C++ tree has no counterpart; documented for certification
+with a "Restart to update" button beneath it (registration is deferred while
+this process is part of the package, so applying now means closing the broker,
+re-registering with `-ForceApplicationShutdown` from a detached PowerShell, and
+relaunching), and shows an "Automatic updates" toggle only in the GitHub
+flavor. There is no tray balloon: the settings app has no tray icon. The C++ tree has no counterpart; documented for certification
 in docs/store-submission.md (the Store package performs no network
 connections).
 
@@ -184,17 +244,31 @@ The only remaining caption gap versus the C++ is that the PNG sits in
 `LeftHeader` rather than `IconSource` — functionally equivalent at the leading
 edge.
 
-### 1b. The settings window has tray + close/minimize-to-tray behavior the C++ lacks
+### 1b. The settings window is a plain window; only the single-instance guard is new
 
-`crates/fsw-settings/src/tray.rs` subclasses the window (`SetWindowSubclass`)
-and adds a notification-area icon: minimizing or closing hides the window to
-the tray, left click restores, right click offers Show/Exit, and
-`TaskbarCreated` re-adds the icon after a shell restart. The C++ settings app
-has no tray surface at all. This is the wfdiag `reactor-spike/window_support.rs`
-solution ported onto `windows-sys`; it also pairs with the single-instance
-mutex in `activate_existing_instance` — a second launch raises the existing
-window instead of starting a duplicate, which the C++ app does not guard
-against either.
+The settings app has **no** notification-area icon, no window subclass, and no
+watchdog thread. 0.0.2 gave it a tray icon of its own (`tray.rs`) that hid the
+window on close or minimize; because the broker also owns one, the product
+showed **two** identical icons for the rest of the session, and the whole
+watchdog / zombie-takeover / `FSW_SIMULATE_WINDOWLESS` apparatus existed only to
+survive that hide-to-tray design. All of it is deleted. The product's one icon
+belongs to the broker (Broker §2).
+
+Closing the window now exits the process: `windows-reactor` routes WinUI's
+`Window.Closed` through `dispatch_window_closed` → `finalize_closed_window` →
+`exit_ui_thread()`, and nothing calls `DestroyWindow` directly, so a process
+holding the mutex always has a window to raise.
+
+What remains — and what the C++ app still does not have — is the single-instance
+guard: a `Local\ForwardSlashWindows.Settings` mutex, and a second launch raises
+the first instance's window instead of opening a duplicate. The raise matches on
+the window title **and** on the owning process image being `fswsettings.exe`
+(`EnumWindows` + `GetWindowThreadProcessId` + `QueryFullProcessImageNameW`); a
+bare `FindWindowW(NULL, title)` used to match the broker's own never-shown
+top-level window, which had the same caption, and "raise" it as a 0x0 caption
+strip. The broker's window was retitled `fwdslash broker` as well, so the two
+can no longer collide by name. The same current-process-only enumeration is what
+supplies the folder picker's owner HWND (`folder_picker::current_process_window`).
 
 ### 2. The navigation pane pushes content instead of overlaying it
 
@@ -250,38 +324,46 @@ against current state and returns early when they agree — see
 the items-source `RadioButtons` control: `RadioButton.IsChecked` echoes
 synchronously and is suppressed by the framework.
 
-### 6. Instance lifecycle: takeover, watchdog, fail-closed guard
+### 6. Instance lifecycle and off-thread controller calls
 
-The C++ settings app has no single-instance guard and no tray, so it has no
-zombie failure mode. The Rust app's guard (added with the tray) initially had
-three holes, all now closed; the fixes are behavior the C++ does not have:
+The C++ settings app has no single-instance guard, and it runs every controller
+invocation on the UI thread. Both differ here:
 
 - **Fail closed.** Any `CreateMutexW` error other than "already exists" shows a
-  message box and exits — it never falls through to "I'm the first instance",
-  which is how a duplicate tray icon could appear.
-- **Zombie takeover.** A prior instance can outlive its own window (a direct
-  `DestroyWindow` or a session end skips the reactor's only exit path, the
-  `Window.Closed` event), leaving a process that holds the single-instance mutex
-  with nothing to raise; every later launch would then be a silent no-op. When a
-  relaunch finds no window for 10 s, it terminates a *qualifying* peer and takes
-  over. Qualifying means: `fswsettings.exe`, same packaging context (same MSIX
-  package family, or both unpackaged — a packaged and an unpackaged instance
-  never kill each other), older than 15 s (a young peer is a concurrent launch
-  still materializing), and owning no window at all. Anything ambiguous shows an
-  error box instead of killing.
-- **Watchdog.** `watchdog.rs` posts `WM_QUIT` to the UI thread (and exits the
-  process as a last resort) if the window the discovery poller found ever
-  disappears without an exit having been requested. `WM_DESTROY` in the tray
-  subclass posts the quit directly as the first line of defense.
-- **Exit routes through the close pipeline.** The tray Exit item posts
-  `WM_CLOSE` with `FORCE_CLOSE` armed rather than calling `DestroyWindow`
-  directly, so the reactor's `Window.Closed` exit path actually runs.
-- **`FSW_SIMULATE_WINDOWLESS`** (any value) makes the process hold the mutex
-  forever with no window — the test fixture for the takeover path.
-- **Tray tooltips are distinct**: the broker reads `"fwdslash broker"` (plus
-  `" (paused)"` while resolution is disabled) and the settings app reads
-  `"fwdslash settings"`. Both used to read `"Forward Slash Windows"`, making the
-  two icons indistinguishable.
+  message box and exits — it never falls through to "I'm the first instance".
+  Silently running a second instance is the failure this guard exists to
+  prevent.
+- **Raise, never take over.** With the mutex held elsewhere, the relaunch polls
+  for the other instance's window for 10 s (WinUI takes a beat to materialize
+  it) and raises it. There is no windowless-zombie state to recover from any
+  more, so there is no process termination, no packaging-identity comparison,
+  and no `FSW_SIMULATE_WINDOWLESS` fixture; if no window appears, the launch
+  reports it and exits rather than killing anything.
+- **Controller calls run on the thread pool.** `run_controller` reaches
+  `fwdslash.exe`, and `integration windows-powershell enable` loads the user's
+  whole profile — up to 15 s with the window frozen in the C++ design. Every
+  invocation now goes through `SettingsModel::start_controller`, which sets a
+  `pending` action, spawns the work with `context.spawn_background`, and
+  finishes on `Msg::ControllerFinished`. While `pending` is set every
+  state-mutating control is disabled (`controls_enabled()`) and a `ProgressRing`
+  is shown, so a second request cannot race the first.
+- **State reads are off-thread too.** `State::read()` runs in
+  `spawn_background` and arrives as `Msg::StateLoaded`; only the very first
+  frame reads synchronously. `ensure_broker_running()` (which spins up to 2 s)
+  moved off-thread as well and reports back with `Msg::BrokerProbed`.
+  `broker_state` uses a 250 ms timeout (the C++ uses 750), `pwsh.exe` discovery
+  is a process-wide `OnceLock`, and navigating to About skips the refresh
+  because it shows nothing live.
+- **Standing banners are Buttons, not InfoBar actions.** Reactor's `InfoBar`
+  exposes no action-button slot, so the "Terminal integrations need updating"
+  and "Restart to update" actions are ordinary `Button`s rendered directly
+  beneath their bar, in a second fixed grid row that is kept out of
+  `self.notice` — a routine "Updated" result must not hide a standing warning,
+  and vice versa.
+- **The tray tooltip is the broker's alone.** It reads
+  `Forward Slash Windows — active` / `— paused` / `— hook unavailable`. The
+  0.0.2 arrangement of two deliberately-different tooltips is gone with the
+  second icon.
 
 ## Broker (fsw-broker)
 
@@ -295,6 +377,107 @@ real top-level window with `WS_EX_TOOLWINDOW` that is never shown: same
 `FindWindowW`-by-class discovery for the CLI and settings app, but the icon is
 re-added after a shell restart and removed before a session-end ghost can appear.
 
+### 2. Two windows, two threads, and a tray icon the C++ does not have
+
+The C++ broker classifies and processes Enter on the hook thread, owns one
+window, and has no notification-area presence. The Rust broker differs on all
+three, and this section is the whole list.
+
+**Windows and threads.**
+
+- The top-level window is titled `fwdslash broker` (the C++ and 0.0.2 titled it
+  `Forward Slash Windows`, which collided with the settings window's caption —
+  see Settings §1b). Nothing discovers it by title; the class
+  `ForwardSlashWindows.Broker` is the contract.
+- A **second** window, class `ForwardSlashWindows.BrokerWorker`, lives on a
+  worker thread with its own `CoInitializeEx(STA)` and its own `IUIAutomation`.
+  This one *is* `HWND_MESSAGE`, which is correct precisely because it needs no
+  broadcasts. The hook posts `PROCESS_ENTER` to it with the classification in
+  `wParam` and the foreground HWND in `lParam`.
+- Everything that can block runs there: UI Automation, the resolver,
+  `ShellExecuteExW` (now with `SEE_MASK_ASYNCOK | SEE_MASK_FLAG_NO_UI`),
+  `SendInput`, `Navigate2`, and `persist_disabled`. A low-level hook whose
+  thread exceeds `LowLevelHooksTimeout` is removed by Windows without telling
+  the process, and binding `\\wsl.localhost\<distro>` boots a stopped
+  distribution — seconds, on the thread that owns every keystroke on the
+  machine. Menu commands are handed to the worker the same way
+  (`WORKER_OPEN_PATH`, which transfers ownership of a boxed `String`).
+- The hook thread's own work is now only: class check → return `Unknown` unless
+  the class is `CabinetWClass`, `ExploreWClass`, `#32770` or
+  `Windows.UI.Core.CoreWindow`; only then the process image, into a 1024-unit
+  buffer instead of 32768. The classification travels to the worker, which never
+  re-runs it.
+
+**Behaviour.**
+
+- **A stale request is dropped, not replayed.** If the foreground window changed
+  while the request was queued, the worker logs
+  `event=enter_dropped_foreground_changed` and returns. Replaying Enter into
+  whatever the user switched to would send a half-written message or run a
+  half-typed command.
+- **`#32770` is narrowed twice.** In the hook, a dialog outside `explorer.exe`
+  qualifies only if it has a `DUIViewWndClassName` child (the modern
+  common-item dialog) or a `cmb13`/`edt1` control (the classic one). In the
+  worker, **every** surface additionally requires the focused element to be an
+  Edit or ComboBox, `IsPassword == false`, and a non-read-only `ValuePattern`;
+  otherwise it logs `event=surface_rejected` and replays untouched. The C++
+  claims every `#32770` in every process, which is how it swallowed Enter in
+  Find boxes and rewrote their search text. Requiring the writable pattern
+  before reading also means the broker never reads text it could not have
+  written back — the promise `PRIVACY.md` makes.
+- **`FSW_WM_SET_PAUSED` replies the resulting `BrokerState`** (`Active` = 1,
+  `Paused` = 2) or **0** when the change could not be honoured. The old
+  unconditional `1` made a failed resume indistinguishable from a successful
+  one. The hook is removed *before* the setting is persisted, and the write
+  itself is asynchronous — `persist_disabled` shells out to `reg.exe`, and a
+  process creation plus wait on the hook thread is exactly what must not happen.
+  A failed write surfaces later as a balloon plus
+  `event=persist_disabled_failed`; a failed `install_hook` on resume shows the
+  hook balloon and answers 0. The CLI turns that 0 into a specific message by
+  asking the broker what state it actually reached.
+- **The tray icon and its menu.** Tooltip:
+  `Forward Slash Windows — active` / `— paused` / `— hook unavailable`.
+  `Shell_NotifyIconW(NIM_ADD)` is checked (it fails with `ERROR_TIMEOUT` while
+  the shell is busy — exactly when the MSIX startup task runs at logon); a
+  failure sets `ICON_ADDED = false`, logs `event=tray_icon_add_failed`,
+  suppresses every balloon, and is retried from the health timer, with
+  `NIM_SETVERSION` applied only after an add lands. The menu is **Open
+  settings** (the `SetMenuDefaultItem` default, and what left click and
+  double-click do) · separator · **Enabled** as an `MF_CHECKED` toggle · **Open
+  WSL root** · **Open distribution ▸** (one item per registered distribution,
+  capped at 64, resolved against the list the menu was built from) ·
+  **Integrations ▸** · separator · a greyed version line · **Exit**. It opens at
+  the point `NOTIFYICON_VERSION_4` carries in `wParam` (sign-extended per
+  monitor), falling back to `GetCursorPos` on the legacy `WM_RBUTTONUP` path,
+  and `PostMessageW(window, WM_NULL, 0, 0)` follows `TrackPopupMenu` — without
+  it the *next* right-click flashes a menu that dismisses itself.
+- **The health timer is adaptive.** 5 s only while a driver actually answers on
+  the filter port; 60 s otherwise, which is the shipping configuration. The
+  connect probe runs first and decides the interval; with no port the registry
+  enumeration and the kernel round-trip are skipped entirely, and the attempted
+  distribution list is recorded anyway (`ATTEMPTED_DISTRIBUTIONS`) so the
+  compare-only path can engage with no driver present. The same tick doubles as
+  the tray-icon retry and as a hook **re-arm** (`UnhookWindowsHookEx` +
+  `SetWindowsHookExW`, keeping the incumbent if the replacement fails, logging
+  `event=hook_rearmed`), spaced at 60 s independently of the tick interval.
+  There is no way to ask whether a hook handle is still live, so re-arming on a
+  slow timer is the only defence against a silent removal.
+- **Trailing separator for the Win32 hazard.** When
+  `Resolved::has_win32_normalization_hazard()` is true and the rendered path
+  does not already end in `\`, one is appended before opening — Win32 keeps a
+  trailing `.` or space when a separator follows it — and
+  `event=win32_normalization_hazard` is logged.
+- **Balloon text.** `"Windows could not open the location."` where the C++ says
+  `"...WSL location."`: with a custom folder root the target need not be in WSL.
+  The pause-write failure adds `"The pause setting could not be saved."`
+- **New diagnostic categories** (category-only, per `PRIVACY.md`):
+  `event=enter_dropped_foreground_changed`, `event=surface_rejected`,
+  `event=hook_rearmed`, `event=persist_disabled_failed`,
+  `event=win32_normalization_hazard`, `event=tray_icon_add_failed`,
+  `event=worker_start_failed`, `event=debug_uia_failed`,
+  `event=debug_hook_failed`. The C++'s `event=enter_handler_failed` has no Rust
+  counterpart.
+
 ## CLI (fwdslash)
 
 ### 1. `fwdslash start` only ever closes the broker it spawned
@@ -307,21 +490,66 @@ compares the window's PID against the spawned `dwProcessId` before posting
 when the probed broker is merely paused instead of the misleading "keyboard hook
 is unavailable".
 
+### 2. Shell verbs, exit 3, and a self-upgrading adapter payload
+
+The C++ controller has no shell verbs beyond `cmd-list`, and its adapter
+payload is frozen at install time. The Rust CLI adds:
+
+- **`fwdslash cmd-cd <input>`** — the target for the cmd `CD`/`CHDIR`/`PUSHD`
+  macros. Stdout carries the Win32 path and nothing else, so the batch file can
+  capture it verbatim. A bare `/` in distribution-list mode is not one
+  directory, so it goes to stderr with the "`/` lists your WSL distributions…"
+  message and exit 1.
+- **`fwdslash shell-resolve <input>`** — one JSON line
+  (`{"kind":"root|distribution|folder","target":…,"distributions":[…]}`) for the
+  PowerShell module, so `ls /` costs a single spawn instead of a `resolve` plus
+  a `status --json`. It answers from `Snapshot::current()` alone: no broker
+  round trip, no filter-port probe.
+- **The exit-3 contract.** Every shell verb returns **3** for "run your own
+  command unchanged" — resolution is paused, the input is not a slash path, or
+  (for `cmd-list`) the target does not exist (`ERROR_FILE_NOT_FOUND` /
+  `ERROR_PATH_NOT_FOUND`, so a missing path degrades to native `DIR`). **1** is
+  a resolver rejection, already explained on stderr. **0** is a target on
+  stdout. All three verbs share one funnel, `shell_target`, so a `cd` and a
+  `dir` can never disagree about what an input means.
+- **The PowerShell `pushd` wrapper is a global function built from an unbound
+  script block**, not a module function — the only wrapper that is. `Push-Location`
+  run inside a module pushes onto *that module's* location stack, so the caller's
+  `popd` never sees it; and `@args` re-splats named parameters faithfully only
+  from a simple function's own `$args`, whereas the same array collected by an
+  advanced function rebinds `-LiteralPath` as a positional value. Running in the
+  caller's session state fixes both, at the cost of being able to call only
+  commands the global scope can see — which is why
+  `Resolve-ForwardSlashWindowsLocationTarget` is exported.
+- **`pushd -StackName` is not mirrored.** The wrapper pushes onto the default
+  stack; a named stack is passed through to `Push-Location` untouched only when
+  the argument list carries no slash path.
+- **Adapters self-upgrade.** `PAYLOAD_VERSION` derives from
+  `CARGO_PKG_VERSION`, and an `installed` marker whose `Version` differs from
+  it makes `fwdslash integration <name> enable` run the uninstall transaction
+  for the deployed payload followed by the install transaction for this one —
+  same rollback guarantees, and the PowerShell uninstall removes the module
+  directory it actually created rather than the one this build would create.
+  `fwdslash integrations` prints `installed (update available)` for such an
+  adapter and reports it in `--json`; the settings app offers "Update
+  integrations". Without this an updated product kept running a frozen copy of
+  the old payload and old `fwdslash.exe` forever.
+
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 
 These are planned, not yet implemented. Each needs its own entry with a test
 before the milestone that lands it can close.
 
-- **Surface classification narrows.** The C++ treats every `#32770` window in
-  every process as an editable file dialog. The Rust broker requires
-  `!IsPassword`, an Edit or ComboBox control type, a writable ValuePattern, and a
-  `SHELLDLL_DefView` ancestor for the generic-dialog candidate. This changes what
-  `PRIVACY.md` and `docs/store-submission.md` must say, and it can lose a surface
-  that currently works — calibrate against `docs/compatibility.md` first.
 - **A second rendered path form.** `unc_win32` (`\\?\UNC\wsl.localhost\…`) for raw
-  Win32 file calls, alongside `unc_display` for the shell. `unc_display` is frozen:
-  `ForwardSlashWindows.psm1` compares `fwdslash resolve /` against the literal
-  `\\wsl.localhost`.
-- **Enter latency is bounded at 400 ms** by the abandon-and-replay deadline. This
-  contradicts `docs/compatibility.md`'s "No lost, duplicated, or delayed Enter
-  behavior" gate as currently worded, which must be restated.
+  Win32 file calls, alongside `unc_display` for the shell. `unc_display` is still effectively frozen: the
+  provider root renders as exactly `\\wsl.localhost`, and
+  `is_valid_windows_root` rejects that literal as a folder root specifically so
+  the two can never be confused (Resolver §6).
+- **A bounded Enter deadline.** There is none today: the hook swallows Enter,
+  posts to the worker and returns immediately, and the worker takes as long as
+  the surface takes. Nothing is lost or duplicated — a request whose foreground
+  window changed is dropped rather than replayed (Broker §2) — but a slow
+  surface still delays the *replayed* Enter it produces. A deadline after which
+  the worker abandons and replays would bound that; if one lands,
+  `docs/compatibility.md`'s "No lost, duplicated, or delayed Enter behavior"
+  gate needs restating with the number.

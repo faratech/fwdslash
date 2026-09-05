@@ -26,17 +26,23 @@ fn version_defines() -> [String; 2] {
     ]
 }
 
-/// Compiles `app.rc` for a Windows target, failing the build when the
-/// resource compiler is present and rejects it. `manifest_optional` keeps a
-/// cross-check from a host with no resource compiler (`cargo check --target
-/// *-pc-windows-msvc` on Linux) succeeding, which is how this workspace is
-/// checked in CI.
+/// Compiles `app.rc` for a Windows target.
+///
+/// A rejected `app.rc` is fatal on a Windows host, because that is where the
+/// shippable binaries are built and a silently skipped resource means an exe
+/// with no icon and no version -- exactly the class of defect this file exists
+/// to prevent. Cross-compiling from Linux (the CI type-check, the WSL dev
+/// loop) only warns: the resource toolchain there may be absent or incomplete,
+/// and nothing shippable comes out of that host anyway. `manifest_optional`
+/// already treats "no resource compiler at all" as success on both.
 fn compile_resources() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
     if let Err(error) = embed_resource::compile("app.rc", version_defines()).manifest_optional() {
         eprintln!("app.rc could not be compiled: {error}");
-        std::process::exit(1);
+        if cfg!(windows) {
+            std::process::exit(1);
+        }
     }
 }

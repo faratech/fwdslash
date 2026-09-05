@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 ![Platform](https://img.shields.io/badge/platform-Windows%2011-0078D6?style=flat-square&logo=windows)
-![C++](https://img.shields.io/badge/C%2B%2B-20-00599C?style=flat-square&logo=cplusplus)
+![Rust](https://img.shields.io/badge/Rust-1.98-000000?style=flat-square&logo=rust)
 ![WSL](https://img.shields.io/badge/WSL-2-E95420?style=flat-square&logo=linux&logoColor=white)
 [![GitHub stars](https://img.shields.io/github/stars/faratech/fwdslash?style=flat-square)](https://github.com/faratech/fwdslash/stargazers)
 
@@ -24,8 +24,8 @@ WSL files live at `\\wsl.localhost\Ubuntu\...` — fine in a script, miserable t
 - **No driver, no admin** — per-user, reversible, and no Explorer restart
 - **Terminals too, if you want** — `dir` and `ls` keep working in Command Prompt and PowerShell
 - **Fails safely** — a typo is blocked with an explanation instead of turning into a web search
-- **Stays out of the way** — pause it from the tray without uninstalling anything
-- **No network, no telemetry, no account**
+- **Stays out of the way** — pause it from the one tray icon without uninstalling anything
+- **No telemetry, no account** — the Store build makes no network connections at all
 
 ---
 
@@ -85,16 +85,38 @@ fwdslash bare-slash root                                    # clear it
 
 **Requires** Windows 11 and WSL with at least one distribution installed. With no distribution registered there is nothing for a slash path to open.
 
+### Microsoft Store (recommended)
+
+[**Get it from the Microsoft Store**](https://apps.microsoft.com/detail/9P51CM0MTMK2) — Store ID `9P51CM0MTMK2`. The Store carries the Windows App Runtime dependency and keeps the app updated for you.
+
+### GitHub
+
+One line, no administrator rights — the release is signed with a publicly trusted certificate:
+
 ```powershell
-.\tools\Build-UserMode.ps1 -Architecture ARM64 -Configuration Release
-.\out\user\arm64\Release\fwdslash.exe install
+powershell -ExecutionPolicy Bypass -File Install-fwdslash.ps1
 ```
 
-Replace `ARM64` with `x64` or `x86` as needed. Uninstalling is one command and leaves nothing behind:
+The script downloads the latest signed `.msixbundle`, installs the [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) first if it is missing, and registers the package for the current user. This build updates itself from GitHub (daily check, switched off in Settings).
+
+Install one flavor or the other. Both register the same startup task and the same `fwdslash` alias, so with both installed only one broker survives the logon race; `Install-fwdslash.ps1` refuses to install over a Store install unless you pass `-Force`.
+
+### Build from source
+
+```powershell
+cargo build --release --target aarch64-pc-windows-msvc --workspace
+.\target\aarch64-pc-windows-msvc\release\fwdslash.exe install
+```
+
+Use `x86_64-pc-windows-msvc` on an Intel/AMD machine. An unpackaged build needs the [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) for your architecture installed separately; the Store and GitHub packages declare it as a dependency.
+
+Uninstalling from the command line is one command:
 
 ```powershell
 fwdslash uninstall
 ```
+
+Removing the **package** (Store or Settings > Apps) does not sweep the shell adapters, because an uninstalling MSIX runs no code. Turn the Command Prompt and PowerShell integrations off in the settings app before you uninstall.
 
 ---
 
@@ -109,6 +131,19 @@ fwdslash integration powershell enable
 ```
 
 Each adapter records exactly what it replaced and restores it byte-for-byte when you turn it off, and refuses to overwrite anything another program changed in the meantime. Open a **new** shell afterwards — running ones can't reload their profile.
+
+With an adapter on, `dir`/`ls` **and** changing directory both take slash paths:
+
+```text
+cmd          cd /Ubuntu/etc     chdir /Ubuntu     pushd /Ubuntu   (cd /d /Ubuntu too)
+PowerShell   cd /Ubuntu/etc     chdir  sl  pushd
+```
+
+`cmd.exe` cannot make a UNC path current, so the cmd adapter enters the target with `pushd`, which maps a temporary drive letter; `popd` or closing the window releases it. PowerShell moves there directly.
+
+DIR's own switches stay native: `dir /b`, `dir /s`, `dir /w`, `dir /a:d` and friends are handed straight to the shell, even in default-distribution mode where `/b` would otherwise look like a path.
+
+`cd /Windows` no longer means `C:\Windows` in PowerShell — a slash path that the resolver rejects is reported with the resolver's own message instead of silently landing on the current drive. Use `cd \Windows` for that.
 
 Prefer not to touch your shell? These always work:
 
@@ -126,6 +161,9 @@ fwdslash resolve /etc/apt
 fwdslash status [--json]          Broker, distributions, and driver state
 fwdslash resolve /Distro/path     Print the resolved UNC path
 fwdslash open|list /Distro/path   Open in Explorer, or list to stdout
+fwdslash cmd-list /path           Shell adapter DIR (exit 3 = run native DIR)
+fwdslash cmd-cd /path             Directory for the cmd CD/PUSHD macros
+fwdslash shell-resolve /path      One JSON line for the PowerShell module
 fwdslash doctor /path | --all     Diagnose a path
 fwdslash bare-slash [list|default [Distro]]
 fwdslash bare-slash root <WindowsPath>
@@ -134,25 +172,30 @@ fwdslash integration <name> enable|disable
 fwdslash pause | resume           Pause resolution, keep integrations
 fwdslash settings [section]       Open the settings app
 fwdslash start | stop | install | uninstall
+fwdslash version                  Print the running version
 ```
 
 ---
 
 ## Settings
 
-A WinUI 3 app with a tray icon. Every integration is independent, and turning one off runs its reversible uninstall. The General **Disable** switch pauses resolution without forgetting what you installed.
+The product shows **one** notification-area icon, and the resident broker owns it. Left click opens the settings window; right click gives you an **Enabled** toggle, **Open WSL root**, **Open distribution** (one entry per registered distribution), **Integrations**, and **Exit**.
 
-Needs the [Windows App Runtime 1.8](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) for your architecture.
+The settings window itself is a plain window: no icon of its own, and closing it closes the app — the broker keeps running and keeps the tray icon. Every integration is independent, and turning one off runs its reversible uninstall. The General **Disable** switch pauses resolution without forgetting what you installed.
+
+Needs the [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) for your architecture. The Store and GitHub packages declare it as a dependency and pull it in; an unpackaged build from source needs it installed separately.
 
 ---
 
 ## Tests
 
 ```powershell
-.\out\user\arm64\Release\fswcore_tests.exe                        # resolver contract
-.\out\user\arm64\Release\fsw_address_bar_integration.exe Ubuntu /usr/share
-.\tools\Test-Sandbox.ps1                                          # lifecycle smoke test
+cargo test -p fsw-path -p fsw-core                              # resolver + registry contract
+cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc   # shell adapters
+.\tools\Test-Sandbox.ps1                                        # lifecycle smoke test
 ```
+
+`cargo test -p fsw-path` runs on Linux/WSL with no target flag, so it is the fastest check for a resolver change.
 
 ---
 
@@ -168,7 +211,7 @@ Needs the [Windows App Runtime 1.8](https://learn.microsoft.com/windows/apps/win
 
 - [`docs/architecture.md`](docs/architecture.md) — trust boundaries and design
 - [`docs/compatibility.md`](docs/compatibility.md) — what's verified, and what isn't
-- [`PRIVACY.md`](PRIVACY.md) — no data collected, no network calls
+- [`PRIVACY.md`](PRIVACY.md) — no data collected; the Store build makes no network calls, the GitHub build checks for updates
 
 ---
 

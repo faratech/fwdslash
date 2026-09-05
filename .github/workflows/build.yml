@@ -63,3 +63,81 @@ jobs:
           $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
           & $msbuild .\src\settings\ForwardSlashWindows.Settings.vcxproj /restore /m:1 /p:UseMultiToolTask=false /p:Configuration=Release /p:Platform=${{ matrix.platform }}
           if ($LASTEXITCODE -ne 0) { throw "MSBuild exited with $LASTEXITCODE" }
+
+  # The Rust tree is the shipping product; this job is what the "CI asserts …"
+  # claims in docs/dependencies.md and docs/size-baseline.md refer to.
+  #
+  # Deliberately NOT `cargo clippy -- -D warnings`: clippy is not clean on the
+  # current tree (the workspace turns on `pedantic`), and a gate that fails on
+  # arrival teaches people to ignore the job. Add it once the backlog is clear.
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc,aarch64-pc-windows-msvc
+
+      # The two library crates are host-portable: fsw-path has no dependencies
+      # at all and fsw-core is #[cfg(windows)]-gated with non-Windows
+      # fallbacks, so both test suites run natively on Linux. The CLI's own
+      # tests live in the fwdslash *bin* (there is no lib target) and need a
+      # Windows target, so they run in the rust-windows job below.
+      - name: Test the portable crates
+        run: cargo test -p fsw-path -p fsw-core --locked
+
+      # docs/dependencies.md: fsw-path's [dependencies] and [dev-dependencies]
+      # are both intentionally empty, because it is one of the only two crates
+      # shared across the windows-core version islands. One line of tree output
+      # is the crate itself and nothing else.
+      - name: Assert fsw-path has no dependencies
+        run: test "$(cargo tree -p fsw-path | wc -l)" -eq 1
+
+      # The version-island rule: two windows-core majors are incompatible
+      # COM/WinRT type systems and must never meet inside one binary. The
+      # settings app is the binary that could see both.
+      - name: Assert one windows-core version in fswsettings
+        run: |
+          versions=$(cargo tree -p fswsettings --target aarch64-pc-windows-msvc -e normal \
+            | grep -o 'windows-core v[0-9.]*' | sort -u)
+          echo "$versions"
+          test "$(echo "$versions" | wc -l)" -eq 1
+
+      # `cargo check` links nothing, so the MSVC targets type-check here
+      # without a linker or the Windows SDK.
+      - name: Check x64 (all targets)
+        run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc --locked
+      - name: Check ARM64 (all targets)
+        run: cargo check --workspace --all-targets --target aarch64-pc-windows-msvc --locked
+
+  # Everything that needs a real MSVC linker: the CLI's bin tests (which also
+  # have to *run*, so they need a Windows host) and the release build the size
+  # budget is measured against. Sizes are reported, not gated — see
+  # docs/size-baseline.md for the recorded C++ numbers to compare against.
+  rust-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Test the CLI (adapter tests live in the bin, not a lib)
+        run: cargo test -p fwdslash --bins --target x86_64-pc-windows-msvc --locked
+
+      - name: Release build
+        run: cargo build --release --workspace --target x86_64-pc-windows-msvc --locked
+
+      - name: Report binary sizes
+        run: |
+          Get-ChildItem 'target\x86_64-pc-windows-msvc\release' -Filter '*.exe' |
+            Where-Object { $_.Name -in 'fwdslash.exe', 'fswbroker.exe', 'fswsettings.exe' } |
+            Select-Object Name, @{ Name = 'KB'; Expression = { [Math]::Round($_.Length / 1KB, 1) } } |
+            Format-Table -AutoSize | Out-String | Write-Host

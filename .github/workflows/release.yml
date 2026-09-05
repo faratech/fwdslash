@@ -2,9 +2,17 @@
 # signs it through Azure Trusted Signing, and publishes a GitHub Release with
 # the signed bundle plus per-architecture ZIPs of signed executables.
 #
-# Triggered ONLY by version tags — never by branch pushes. `workflow_dispatch`
-# runs the same pipeline as a dry run: everything is built and signed but the
-# artifacts are uploaded as workflow artifacts instead of creating a release.
+# Triggered by version tags, or manually. A tag push always publishes. A
+# `workflow_dispatch` run publishes only when its `dry_run` input is explicitly
+# false: with the default (true) everything is built and signed and the results
+# are uploaded as workflow artifacts, and no release is created — including when
+# the dispatch is aimed at a tag ref, which used to publish regardless.
+#
+# The tag and the workspace version must agree. The binaries embed
+# `workspace.package.version` (through FSW_VERSION, PAYLOAD_VERSION and the
+# generated VERSIONINFO) while the tag drives the MSIX Identity version, so a
+# mismatch would ship a package whose identity contradicts its contents; the
+# assertion below fails the run instead.
 #
 # Required repository secrets (Settings > Secrets and variables > Actions):
 #   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the
@@ -47,6 +55,23 @@ jobs:
         uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: aarch64-pc-windows-msvc,x86_64-pc-windows-msvc
+
+      - name: Assert the tag matches the workspace version
+        run: |
+          $metadata = cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
+          $core = @($metadata.packages | Where-Object { $_.name -eq 'fsw-core' })
+          if ($core.Count -ne 1) { throw 'cargo metadata did not report exactly one fsw-core package.' }
+          $workspace = $core[0].version
+          if ($env:GITHUB_REF_NAME -notlike 'v*') {
+              Write-Host "Not a tag ref ('$env:GITHUB_REF_NAME'); workspace version is $workspace."
+              exit 0
+          }
+          $tag = $env:GITHUB_REF_NAME.Substring(1)
+          if ($tag -ne $workspace) {
+              throw "Tag v$tag does not match workspace.package.version $workspace. " +
+                    'Bump the root Cargo.toml (and the version-copy list in CLAUDE.md) or retag.'
+          }
+          Write-Host "Tag v$tag matches workspace.package.version $workspace."
 
       - name: Derive version from tag
         id: version
@@ -105,8 +130,14 @@ jobs:
             out\msix\*.msixbundle
             out\package\*.zip
 
+      # A tag push publishes; a manual run publishes only when dry_run was
+      # explicitly turned off. `inputs.dry_run` is empty on a push, which is
+      # why the event name is tested first.
       - name: Create the GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: >-
+          startsWith(github.ref, 'refs/tags/v') &&
+          (github.event_name == 'push' ||
+           (github.event_name == 'workflow_dispatch' && inputs.dry_run == false))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
