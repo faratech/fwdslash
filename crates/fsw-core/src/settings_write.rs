@@ -74,6 +74,19 @@ pub enum SettingValue {
     Sz(String),
 }
 
+// `windows_registry` preserves Win32 registry errors as HRESULTs. These are
+// the only two errors that prove an opened key or value is absent; access
+// denial, malformed data, and every other failure must reach the caller.
+#[cfg(any(windows, test))]
+const HRESULT_FILE_NOT_FOUND: u32 = 0x8007_0002;
+#[cfg(any(windows, test))]
+const HRESULT_PATH_NOT_FOUND: u32 = 0x8007_0003;
+
+#[cfg(any(windows, test))]
+const fn registry_item_is_absent(code: u32) -> bool {
+    matches!(code, HRESULT_FILE_NOT_FOUND | HRESULT_PATH_NOT_FOUND)
+}
+
 impl SettingValue {
     /// The `/t` token for `reg add`.
     #[must_use]
@@ -199,6 +212,77 @@ fn split_value_line(line: &str) -> Option<(String, String, String)> {
     Some((name.to_string(), kind.to_string(), data.to_string()))
 }
 
+/// Normalizes the two spellings `reg.exe` uses for HKCU. Key headers, unlike
+/// value rows, carry no type token, so recognizing them structurally avoids
+/// interpreting localized diagnostics as proof that a key is absent.
+#[cfg(any(windows, test))]
+fn canonical_hkcu_key(path: &str) -> Option<String> {
+    let path = path.trim();
+    let (hive, tail) = path.split_once('\\').unwrap_or((path, ""));
+    if !(hive.eq_ignore_ascii_case("HKCU") || hive.eq_ignore_ascii_case("HKEY_CURRENT_USER")) {
+        return None;
+    }
+    Some(if tail.is_empty() {
+        "HKCU".to_owned()
+    } else {
+        format!("HKCU\\{tail}")
+    })
+}
+
+/// Whether a successful `reg query <parent>` proves that its exact immediate
+/// child is present. `Err(())` is malformed output: successful output must
+/// name the queried parent and every non-value, nonblank row must be a key
+/// header. This deliberately does not inspect localized stderr text.
+#[cfg(any(windows, test))]
+fn query_lists_child_key(output: &str, parent: &str, child: &str) -> Result<bool, ()> {
+    let parent = canonical_hkcu_key(parent).ok_or(())?;
+    let target = format!("{parent}\\{child}");
+    let mut saw_parent = false;
+    let mut saw_target = false;
+    for line in output.lines() {
+        if line.trim().is_empty() || split_value_line(line).is_some() {
+            continue;
+        }
+        let header = canonical_hkcu_key(line).ok_or(())?;
+        if header.eq_ignore_ascii_case(&parent) {
+            saw_parent = true;
+        }
+        if header.eq_ignore_ascii_case(&target) {
+            saw_target = true;
+        }
+    }
+    if saw_parent { Ok(saw_target) } else { Err(()) }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingSettingEvidence {
+    /// A successful query of the settings key proved the key is readable.
+    KeyReadable,
+    /// A successful query of an ancestor proved the requested child is absent.
+    KeyMissing,
+    /// A successful query of an ancestor proved the requested child exists.
+    KeyExists,
+    /// Successful `reg.exe` output did not have the expected key structure.
+    Malformed,
+    /// `reg.exe` could not be started, waited for, or completed in time.
+    Unavailable,
+}
+
+/// Resolves the ambiguous nonzero status from `reg query <key> /v <value>`.
+/// Only positive structural evidence makes an absent value a success.
+#[cfg(any(windows, test))]
+fn resolve_missing_setting_read(
+    _value_query_error: u32,
+    evidence: MissingSettingEvidence,
+) -> Result<bool, u32> {
+    match evidence {
+        MissingSettingEvidence::KeyReadable | MissingSettingEvidence::KeyMissing => Ok(true),
+        MissingSettingEvidence::KeyExists => Ok(false),
+        MissingSettingEvidence::Malformed | MissingSettingEvidence::Unavailable => Err(u32::MAX),
+    }
+}
+
 /// The names whose real-hive copy is missing or different, in `merged` order.
 /// Absence in `merged` is never a delete: a value the packaged app does not
 /// hold is simply left alone.
@@ -246,7 +330,8 @@ const SYNCED_STRINGS: [&str; 3] = [
 mod imp {
     use super::{
         FSW_SETTINGS_KEY, RawSetting, SYNCED_DWORDS, SYNCED_QWORDS, SYNCED_STRINGS, SettingValue,
-        WritePlan, parse_reg_query, sync_plan, write_plan,
+        WritePlan, MissingSettingEvidence, parse_reg_query, query_lists_child_key,
+        registry_item_is_absent, resolve_missing_setting_read, sync_plan, write_plan,
     };
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -314,10 +399,13 @@ mod imp {
 
     /// Runs `reg.exe` and returns its stdout, with the same bound. The reader
     /// runs on a thread of its own so a child that never closes the pipe
-    /// cannot park the caller; on timeout that thread is left to finish and
-    /// the answer is `None`.
-    fn reg_output(arguments: &[&str]) -> Option<String> {
-        let exe = reg_exe()?;
+    /// cannot park the caller; on timeout that thread is left to finish. A
+    /// nonzero child status is deliberately an error, not an empty key: `reg
+    /// query` uses the same status for an absent item and for access failures.
+    fn reg_output(arguments: &[&str]) -> Result<String, u32> {
+        let Some(exe) = reg_exe() else {
+            return Err(REG_UNAVAILABLE);
+        };
         let child = Command::new(exe)
             .args(arguments)
             .creation_flags(CREATE_NO_WINDOW)
@@ -325,22 +413,61 @@ mod imp {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+            .map_err(|_| REG_UNAVAILABLE)?;
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("fsw-reg-query".to_owned())
             .spawn(move || {
                 let _ = sender.send(child.wait_with_output().ok());
             })
-            .ok()?;
+            .map_err(|_| REG_UNAVAILABLE)?;
         match receiver.recv_timeout(REG_TIMEOUT) {
-            Ok(Some(output)) => Some(String::from_utf8_lossy(&output.stdout).into_owned()),
-            _ => None,
+            Ok(Some(output)) if output.status.success() => {
+                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+            Ok(Some(output)) => Err(output.status.code().unwrap_or(i32::MAX) as u32),
+            _ => Err(REG_UNAVAILABLE),
         }
     }
 
     fn settings_key_argument() -> String {
         format!("HKCU\\{FSW_SETTINGS_KEY}")
+    }
+
+    fn parent_key_and_child(key: &str) -> Option<(&str, &str)> {
+        key.rsplit_once('\\')
+    }
+
+    /// Proves a missing settings key by walking readable ancestors. A parent
+    /// which lists its child proves the child exists, so the original failing
+    /// query remains an error (for example, access denied). A parent which
+    /// does not list it proves the entire descendant path is absent.
+    fn settings_key_is_proven_absent(key: &str, original_error: u32) -> Result<bool, u32> {
+        let mut child_key = key;
+        loop {
+            let Some((parent, child)) = parent_key_and_child(child_key) else {
+                return Err(original_error);
+            };
+            match reg_output(&["query", parent]) {
+                Ok(output) => {
+                    let evidence = match query_lists_child_key(&output, parent, child) {
+                        Ok(true) => MissingSettingEvidence::KeyExists,
+                        Ok(false) => MissingSettingEvidence::KeyMissing,
+                        Err(()) => MissingSettingEvidence::Malformed,
+                    };
+                    return resolve_missing_setting_read(original_error, evidence);
+                }
+                Err(REG_UNAVAILABLE) => {
+                    return resolve_missing_setting_read(
+                        original_error,
+                        MissingSettingEvidence::Unavailable,
+                    );
+                }
+                // This ancestor may itself be absent. Its parent can prove
+                // that structurally; if none can, preserve the original error.
+                Err(_) => child_key = parent,
+            }
+        }
     }
 
     /// Writes one value to the real hive through `reg.exe`.
@@ -364,20 +491,50 @@ mod imp {
     /// `reg delete` reports a failure for it, so ask first.
     fn delete_real_hive(name: &str) -> Result<(), u32> {
         let key = settings_key_argument();
-        if read_real_hive_value(name).is_none() {
+        if read_real_hive_value(name)?.is_none() {
             return Ok(());
         }
         run_reg(&["delete", &key, "/v", name, "/f"])
     }
 
-    /// One value's real-hive rendering, or `None` when it is not there.
-    fn read_real_hive_value(name: &str) -> Option<RawSetting> {
+    /// One value's real-hive rendering, or `None` when it is confirmed absent.
+    ///
+    /// `reg query <key> /v <name>` returns the same nonzero status for a
+    /// missing value and access denied. A second *successful* key query is the
+    /// positive proof that the key is readable, making the former absence;
+    /// without it, the original child failure is propagated.
+    fn read_real_hive_value(name: &str) -> Result<Option<RawSetting>, u32> {
         let key = settings_key_argument();
-        let output = reg_output(&["query", &key, "/v", name])?;
-        parse_reg_query(&output)
-            .into_iter()
-            .find(|(found, _)| found.eq_ignore_ascii_case(name))
-            .map(|(_, raw)| raw)
+        match reg_output(&["query", &key, "/v", name]) {
+            Ok(output) => parse_reg_query(&output)
+                .into_iter()
+                .find(|(found, _)| found.eq_ignore_ascii_case(name))
+                .map(|(_, raw)| Some(raw))
+                // A successful query whose output cannot name the requested
+                // value is malformed output, never evidence of absence.
+                .ok_or(REG_UNAVAILABLE),
+            // A timeout/start/wait failure is operational, not the ambiguous
+            // "item missing" status that a successful parent query can
+            // disambiguate.
+            Err(REG_UNAVAILABLE) => Err(REG_UNAVAILABLE),
+            Err(query_error) => match reg_output(&["query", &key]) {
+                Ok(output) => {
+                    let evidence = if query_lists_child_key(&output, &key, "__never__").is_ok() {
+                        MissingSettingEvidence::KeyReadable
+                    } else {
+                        MissingSettingEvidence::Malformed
+                    };
+                    match resolve_missing_setting_read(query_error, evidence) {
+                        Ok(true) => Ok(None),
+                        Ok(false) => Err(query_error),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(REG_UNAVAILABLE) => Err(REG_UNAVAILABLE),
+                Err(_) => settings_key_is_proven_absent(&key, query_error)
+                    .and_then(|absent| absent.then_some(None).ok_or(query_error)),
+            },
+        }
     }
 
     /// The whole real-hive key, as `reg query` prints it.
@@ -410,16 +567,15 @@ mod imp {
     /// this module. Not `create`, so deleting from a key that does not exist
     /// cannot conjure one.
     fn delete_package_hive(name: &str) -> Result<(), u32> {
-        let Ok(key) = CURRENT_USER
-            .options()
-            .read()
-            .write()
-            .open(FSW_SETTINGS_KEY)
-        else {
-            return Ok(());
+        let key = match CURRENT_USER.options().read().write().open(FSW_SETTINGS_KEY) {
+            Ok(key) => key,
+            Err(error) if registry_item_is_absent(error.code().0 as u32) => return Ok(()),
+            Err(error) => return Err(error.code().0 as u32),
         };
-        if key.get_type(name).is_err() {
-            return Ok(());
+        match key.get_type(name) {
+            Ok(_) => {}
+            Err(error) if registry_item_is_absent(error.code().0 as u32) => return Ok(()),
+            Err(error) => return Err(error.code().0 as u32),
         }
         key.remove_value(name)
             .map_err(|error| error.code().0 as u32)
@@ -594,5 +750,59 @@ pub fn sync_settings_to_real_hive() -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HRESULT_FILE_NOT_FOUND, HRESULT_PATH_NOT_FOUND, MissingSettingEvidence,
+        query_lists_child_key, registry_item_is_absent, resolve_missing_setting_read,
+    };
+
+    #[test]
+    fn only_typed_not_found_registry_errors_are_absence() {
+        assert!(registry_item_is_absent(HRESULT_FILE_NOT_FOUND));
+        assert!(registry_item_is_absent(HRESULT_PATH_NOT_FOUND));
+        assert!(!registry_item_is_absent(0x8007_0005)); // access denied
+        assert!(!registry_item_is_absent(u32::MAX)); // unavailable child
+        assert!(!registry_item_is_absent(0x8007_000D)); // malformed data
+    }
+
+    #[test]
+    fn readable_key_and_absent_child_prove_delete_is_idempotent() {
+        assert_eq!(
+            resolve_missing_setting_read(1, MissingSettingEvidence::KeyReadable),
+            Ok(true)
+        );
+        let parent = "HKCU\\Software\\ForwardSlashWindows";
+        let output = "HKEY_CURRENT_USER\\Software\\ForwardSlashWindows\n";
+        assert_eq!(query_lists_child_key(output, parent, "Settings"), Ok(false));
+        assert_eq!(
+            resolve_missing_setting_read(1, MissingSettingEvidence::KeyMissing),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn existing_inaccessible_key_preserves_the_original_query_failure() {
+        assert_eq!(
+            resolve_missing_setting_read(5, MissingSettingEvidence::KeyExists),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn malformed_or_unavailable_probes_are_not_absence() {
+        let parent = "HKCU\\Software\\ForwardSlashWindows";
+        assert_eq!(query_lists_child_key("not registry output", parent, "Settings"), Err(()));
+        assert_eq!(
+            resolve_missing_setting_read(1, MissingSettingEvidence::Malformed),
+            Err(u32::MAX)
+        );
+        assert_eq!(
+            resolve_missing_setting_read(1, MissingSettingEvidence::Unavailable),
+            Err(u32::MAX)
+        );
     }
 }
