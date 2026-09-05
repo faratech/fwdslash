@@ -1,6 +1,6 @@
 # Privacy Policy — fwdslash (Forward Slash Windows)
 
-**Last updated:** 4 September 2026
+**Last updated:** 5 September 2026
 **Publisher:** WindowsForum.com (the Microsoft Store publisher display name).
 Developed by Mike Fara, Fara Technologies LLC.
 
@@ -9,26 +9,42 @@ Developed by Mike Fara, Fara Technologies LLC.
 fwdslash collects nothing and stores no personal data. Everything it does with
 your paths happens locally on your computer.
 
-**Network.** The **Microsoft Store** build makes no network connections at all.
-The **GitHub** build checks for its own updates: at most once per day, only
-while it is installed as a package and only while **Automatic updates** is
-switched on in Settings, it sends a plain `GET` to `api.github.com` for the
-latest release and, when a newer version exists, downloads the release asset
-from `github.com`. The requests carry no identifiers — no account, no machine
-id, no installation id, no usage data — and nothing is uploaded. Turning
-Automatic updates off stops them entirely. Which flavor you have is decided at
-runtime from the package identity, never at build time.
+**Network.** Both builds can check for their own updates, and both do it under
+the same **Automatic updates** switch in Settings — on by default in the
+**GitHub** build, off by default in the **Microsoft Store** build. Which flavor
+you have is decided at runtime from the package identity, never at build time.
+A check runs only while the app is installed as a package, and at most once per
+day.
+
+With the switch on:
+
+- the **GitHub** build sends a plain `GET` to `api.github.com` for the latest
+  release and, when a newer version exists, downloads that release's signed
+  package from `github.com`;
+- the **Store** build asks Microsoft's own Store update service whether a newer
+  version of this app has been published, and — when you let it install one —
+  asks the same service to install it. Its only fallback, used when the Store
+  declines a silent install, is Windows Package Manager (`winget`) against its
+  `msstore` source, which is that same service. The Store build never downloads
+  code from anywhere but the Store.
+
+Neither build's requests carry identifiers — no account, no machine id, no
+installation id, no usage data — and nothing is uploaded. With the switch off,
+nothing checks on a timer and neither build makes a network connection of its
+own; the only way to reach the network then is to press **Check now** in
+Settings yourself.
 
 The product is open source under the MIT License. Every claim below can be
 checked against the source at <https://github.com/faratech/fwdslash>
-(`crates/fsw-core/src/update.rs` is the whole of the network code).
+(`crates/fsw-core/src/update.rs` and `crates/fsw-cli/src/update/` are the whole
+of the network code).
 
 ## What the app does not do
 
 - It does **not** collect, store, or transmit personal data.
 - It does **not** contain analytics or telemetry of any kind.
 - It does **not** send anything anywhere. The only outbound requests are the
-  GitHub update check described above, and only in the GitHub build.
+  update checks described above.
 - It does **not** log keystrokes, or record what you type.
 - It does **not** show advertising, and there are no third-party SDKs.
 
@@ -71,10 +87,13 @@ All of it is local, and all of it is reversible from the settings app.
 | `HKCU\Software\Microsoft\Command Processor` (`AutoRun`) | Only if you enable the Command Prompt integration. Loads the `dir`/`ls` adapter in new Command Prompt sessions. The previous value is recorded first and restored exactly on removal. |
 | `Documents\WindowsPowerShell\profile.ps1`, `Documents\PowerShell\profile.ps1` | Only if you enable a PowerShell integration. A marked block that imports the adapter module. The original file is snapshotted first and restored byte-for-byte on removal. |
 | `%LOCALAPPDATA%\ForwardSlashWindows` | The adapter files that Command Prompt and PowerShell load. |
-| `HKCU\Software\ForwardSlashWindows\Settings` (`AutoUpdate`) | GitHub build only. Whether the daily update check runs. |
-| `HKCU\Software\ForwardSlashWindows\Settings` (`LastUpdateCheck`) | GitHub build only. A timestamp, so the check runs at most once a day. |
-| `HKCU\Software\ForwardSlashWindows\Settings` (`AvailableUpdate`) | GitHub build only. The release tag of an update that is waiting, so the notice survives a restart. |
-| `%LOCALAPPDATA%\ForwardSlashWindows\update` | GitHub build only. The downloaded update package. It is deleted once it has been applied, and `fwdslash uninstall` removes the directory. |
+| `HKCU\Software\ForwardSlashWindows\Settings` (`AutoUpdate`) | Both builds. Whether the daily update check runs. Absent means on for the GitHub build and off for the Store build. |
+| `HKCU\Software\ForwardSlashWindows\Settings` (`LastUpdateCheck`) | Both builds. A timestamp, so the check runs at most once a day. |
+| `HKCU\Software\ForwardSlashWindows\Settings` (`AvailableUpdate`) | Both builds. The version or release tag of an update that is waiting, so the notice survives a restart. |
+| `HKCU\Software\ForwardSlashWindows\Settings` (`UpdateRoute`) | Both builds. Optional and never written by the app: set it by hand to pin one install route, or to `notify` to stop the app installing anything by itself. |
+| `%LOCALAPPDATA%\ForwardSlashWindows\update` | Both builds. The GitHub build's downloaded update package, deleted once it has been applied; the two files below. `fwdslash uninstall` removes the directory. |
+| `%LOCALAPPDATA%\ForwardSlashWindows\update\fwdslash-helper.exe` | Only while an update installs. A byte-identical copy of the app's own command-line executable, run without package identity — the only way to ask the Store to install an update over the running app, and to register a downloaded GitHub package while it is in use. The next install overwrites it and `fwdslash uninstall` removes it. |
+| `%LOCALAPPDATA%\ForwardSlashWindows\update\last-result.txt` | One word written by that helper — `completed`, `paused`, or `error:` with the Windows error code — so the app can learn how the install ended. The next check or status reads it and deletes it. It records no path and nothing you typed. |
 
 **Diagnostics.** The background process writes a diagnostic log only if you set
 the `FSW_DIAGNOSTIC_LOG` environment variable yourself. It is off by default.

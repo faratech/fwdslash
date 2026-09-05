@@ -23,7 +23,7 @@ You know where the file is. You just can't type it. `\\wsl.localhost\Ubuntu\...`
 - **Terminals too, if you want** — `dir`, `ls` and `cd` take slash paths in Command Prompt and PowerShell
 - **Fails safely** — a typo is blocked with an explanation instead of becoming a web search
 - **Stays out of the way** — pause it from the tray icon
-- **No telemetry, no account** — the Store build makes no network connections
+- **No telemetry, no account** — the only network use is the app checking for its own update, under a switch you control
 
 ---
 
@@ -84,7 +84,7 @@ A registered distribution always wins over a same-named folder.
 
 ### Microsoft Store (recommended)
 
-[**Get it from the Microsoft Store**](https://apps.microsoft.com/detail/9P51CM0MTMK2) — Store ID `9P51CM0MTMK2`. The Store handles the Windows App Runtime dependency and updates.
+[**Get it from the Microsoft Store**](https://apps.microsoft.com/detail/9P51CM0MTMK2) — Store ID `9P51CM0MTMK2`. The Store handles the Windows App Runtime dependency, and updates the app on its own schedule. Switch **Automatic updates** on in Settings (it is off by default in this build) and the app will also ask the Store to install its updates itself, without waiting for that schedule.
 
 ### GitHub
 
@@ -94,7 +94,7 @@ One line, no administrator rights; the release is signed with a publicly trusted
 powershell -ExecutionPolicy Bypass -File Install-fwdslash.ps1
 ```
 
-It fetches the latest signed `.msixbundle`, installs the [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) if missing, and registers the package for the current user. This build checks GitHub for updates daily (switchable in Settings).
+It fetches the latest signed `.msixbundle`, installs the [Windows App Runtime 2.x](https://learn.microsoft.com/windows/apps/windows-app-sdk/downloads) if missing, and registers the package for the current user. This build checks GitHub for updates once a day and installs them itself; **Automatic updates** is on by default here and can be switched off in Settings.
 
 Pick one flavor. Both register the same startup task and `fwdslash` alias, so only one broker survives a logon with both installed; the script refuses to install over a Store install unless you pass `-Force`.
 
@@ -184,6 +184,7 @@ fwdslash bare-slash [list|default [Distro]]
 fwdslash bare-slash root <WindowsPath>
 fwdslash integrations [--json]
 fwdslash integration <name> enable|disable
+fwdslash update check|install|status
 fwdslash pause | resume           Pause resolution, keep integrations
 fwdslash settings [section]       Open the settings app
 fwdslash start | stop | install | uninstall
@@ -196,7 +197,11 @@ fwdslash version                  Print the running version
 
 One notification-area icon, owned by the resident broker. Left click opens the settings window; right click offers **Enabled**, **Open WSL root**, **Open distribution** (one entry per distribution), **Integrations**, and **Exit**. Closing the settings window closes only the window; the broker keeps running.
 
-Each integration is independent, and turning one off runs its reversible uninstall. The **Disable** switch pauses resolution without forgetting what you installed. Adapters left behind by an older release are upgraded automatically, by the broker at start and by the settings window on launch. The About page shows the broker state, each adapter's payload version, and the package version and flavor.
+Each integration is independent, and turning one off runs its reversible uninstall. The **Disable** switch pauses resolution without forgetting what you installed. Adapters left behind by an older release are upgraded automatically, by the broker at start and by the settings window on launch. The About page shows the broker state, each adapter's payload version, the package version and flavor, and when the last update check ran.
+
+### Updates
+
+**Automatic updates** is one switch, in both flavors — on by default in the GitHub build, off by default in the Store build. With it on, the app checks once a day: the GitHub build against its release feed, the Store build against the Store. **Check now** runs a check immediately. When an update installs, Windows closes the running app to replace it, and the app starts itself again as soon as the new version is registered — usually within seconds, and never with a prompt for administrator rights. With the switch off nothing is checked or installed on its own; the Store still updates a Store install on its own schedule, as it does for every app.
 
 ---
 
@@ -228,7 +233,7 @@ The version lives in one place — `[workspace.package] version` in the root `Ca
 
 - [`docs/architecture.md`](docs/architecture.md) — trust boundaries and design
 - [`docs/compatibility.md`](docs/compatibility.md) — what's verified, and what isn't
-- [`PRIVACY.md`](PRIVACY.md) — no data collected; the Store build makes no network calls, the GitHub build checks for updates
+- [`PRIVACY.md`](PRIVACY.md) — no data collected; what the update check sends, and how to turn it off
 
 ---
 

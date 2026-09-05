@@ -191,20 +191,107 @@ Named tests: `folder_root_*` and `windows_root_validation_table`
 
 ## Product behaviour (Rust-only): dual-track distribution + self-update
 
-The GitHub-distributed build (Trusted Signing publisher, different package
-family from the Store listing) checks `api.github.com/releases/latest` at most
-daily and can atomically install its own signed MSIX bundle
-(`crates/fsw-core/src/update.rs`). Gated at runtime to
-`packaged && !is_store_flavor() && AutoUpdate` — the Store build never
-performs the check, and an `AutoUpdate` settings value (default on) can switch
-it off. The settings app surfaces a found update as an Informational InfoBar
-with a "Restart to update" button beneath it (registration is deferred while
-this process is part of the package, so applying now means closing the broker,
-re-registering with `-ForceApplicationShutdown` from a detached PowerShell, and
-relaunching), and shows an "Automatic updates" toggle only in the GitHub
-flavor. There is no tray balloon: the settings app has no tray icon. The C++ tree has no counterpart; documented for certification
-in docs/store-submission.md (the Store package performs no network
-connections).
+The C++ tree has no counterpart to any of this: it neither checks for updates
+nor installs them. What follows is the whole of the Rust product's update
+behaviour, in one place.
+
+**Both flavors update themselves, under one switch.** The GitHub-distributed
+build (Trusted Signing publisher, different package family from the Store
+listing) checks `api.github.com/releases/latest`; the Store build asks the Store.
+The gate is `fsw_core::update::update_check_allowed(packaged, auto_update)` —
+two arguments, no flavor — and the flavor decides only the switch's **default**:
+`default_auto_update(store_flavor) = !store_flavor`, so `AutoUpdate` absent means
+on for the GitHub build and off for the Store build. The stored encoding is the
+inverted DWORD it always was (`1` = auto-update off), so an explicit "off"
+recorded by an older build still reads as off. Cadence is unchanged at
+`CHECK_CADENCE_SECS` = 24 h, bypassed by `--force`.
+
+**All of it lives in the CLI**, `crates/fsw-cli/src/update/`, as
+`fwdslash update check|install|status` plus two helper-only verbs
+(`apply-store`, `apply-bundle`) that are absent from `usage()` and exit **20**
+when run with package identity. The broker and the settings window own no update
+logic: they run `fwdslash update` and read its exit code — `0` up to date or
+install started, `10` update available or deferred, `11` needs the user, `12`
+nothing to install, `1` error, `2` usage, `20` wrong execution context — or its
+one hand-rolled JSON line
+(`{"flavor","state","available","autoUpdate","lastUpdateCheck","route","action","detail"}`,
+golden-tested; there is no serde in this workspace). COM is initialised in this
+module and nowhere else in the CLI, so the `cd /` hot path pays nothing for it.
+
+**The install ladder (Store flavor).** `route_for` is a pure function of five
+inputs and the single definition of precedence; the probes below it are lazy, so
+a rung is only asked about once the rung above is out.
+
+| # | Route | Precondition | Runs in | Terminates the app |
+|---|---|---|---|---|
+| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`) | always attempted first when packaged | the packaged CLI, in-process | yes, by the Store |
+| 1b | the same call from the staged helper | 1a failed before an item was queued (`E_ACCESSDENIED` above all) | the identity-less helper, from the scheduled task | yes |
+| 2 | `StoreContext` silent download + install | route 1 unavailable and `CanSilentlyDownloadStorePackageUpdates` | the packaged CLI | yes, when deployment lands |
+| 3 | `winget upgrade --id … --source msstore --silent --force` | winget present and the network unmetered | the scheduled task | yes |
+| 4 | notify | otherwise | the packaged CLI | no (exit 11) |
+
+Two orderings inside `install` are load-bearing and each fixed a shipped bug:
+*nothing to install* (exit 12) is answered **before** the moment gate, because
+exit 10 promises there is something to come back for; and availability outranks
+`--route`, because a forced route says how to install, never whether there is
+anything to. `install_moment_ok(forced, settings_window_open, worker_busy)` is
+the moment gate — an explicit request always wins, otherwise an open settings
+window or a busy Enter worker defers. Only the broker knows `worker_busy`, so it
+gates before it invokes the CLI at all. Route 1's phase-1a call exists because
+the spike found `AppInstallManager` activates and answers queries *inside* the
+package; whether the install itself is allowed there is only knowable at
+runtime, so it is tried and the identity-less path is the fallback, not the
+default.
+
+**The GitHub flavor** keeps its two-phase shape — `run_update_check` downloads
+the signed bundle and registers it with
+`-DeferRegistrationWhenPackagesAreInUse` — but no longer applies it from a
+detached PowerShell. `install` hands the downloaded bundle to the same helper,
+which registers it with `-ForceApplicationShutdown` (the broker is resident, so
+a deferred registration would never land), behind the same watchdog. No bundle
+is exit 12.
+
+**The helper** is `%LOCALAPPDATA%\ForwardSlashWindows\update\fwdslash-helper.exe`:
+a byte-identical copy of the running `fwdslash.exe`, staged through
+`adapters::real_copy_file` (a `cmd.exe` child, because the source is in
+`WindowsApps`) and named distinctly so a user or an antivirus report can
+identify it. It exists for the one thing package identity forbids — asking the
+Store to replace the package that is asking, and `Add-AppxPackage` against the
+package it is running inside. Its hard rule: **it never writes HKCU.** An
+identity-less write lands in the real hive while the packaged app reads the
+virtualized one, which would be invisible on a dev build where the two views are
+the same. It reports through `last-result.txt` in the same directory —
+`completed`, `paused`, or `error:<hex>` — and the next packaged
+`update check`/`update status` folds that file into the registry and **deletes
+it**, so one helper run is folded exactly once. Only `completed` clears the
+cached `AvailableUpdate` notice; a pause or an error leaves it standing.
+
+**The watchdog** is one per-user scheduled task, `fwdslash-update`, registered
+with `/f` (so retries overwrite rather than accumulate) **before** the install
+runs, because a process the Store has just force-closed cannot relaunch itself.
+Its `.cmd` runs the optional lead command (the helper, or `winget`), then an
+inline `powershell.exe -Command` watchdog that polls `Get-AppxPackage` every 5 s
+until the installed version is greater than the one that was running, ceiling 45
+minutes, then relaunches — `--relaunch broker` (the default) starts the broker
+through the app-execution alias and only when none is running, `app` starts the
+package's `App` entry point, `none` skips. Then the task deletes itself and its
+script. The script text obeys two rules the tests assert: **no `%`** (`cmd.exe`
+would expand it silently — hence `$env:LOCALAPPDATA`) and **no `"`** (it would
+end the argument `cmd.exe` is building), which is also why the comparisons are
+`-lt`/`-gt`/`-not`. Every literal spliced in is checked by
+`is_safe_task_literal` first, and an unsafe one produces **no script at all**
+rather than a mangled one.
+
+**`UpdateRoute`** (`REG_SZ` under the settings key, values `auto`, `appinstall`,
+`store`, `winget`, `notify`) pins one rung without a rebuild — the escape hatch
+if the Store ever objects to route 1, and the way a user keeps the check while
+refusing unattended installs (`notify`). It applies to the **Store** ladder
+only: the GitHub path has a single route and never consults it. It is read-only
+to the product — nothing writes it — and `--route <name>` is the same override
+for one invocation.
+
+Certification wording for all of the above is in `docs/store-submission.md` §3;
+what it sends and stores is in `PRIVACY.md`.
 
 ## Product behaviour (Rust-only): every settings write reaches both hives (#52)
 

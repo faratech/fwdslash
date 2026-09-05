@@ -111,6 +111,41 @@ property dialogs, but it also means the Open/Save row above has to be
 re-verified against real applications before it can be advertised: a picker
 that satisfies neither test now passes Enter through untouched.
 
+## Automatic updates gate
+
+The self-update path (`fwdslash update check|install|status`,
+`crates/fsw-cli/src/update/`) ships in **0.0.5**, which is the first release
+that carries it. A full end-to-end run therefore cannot be observed until a
+*newer* version than the installed one is published: the rows below that need
+one are marked pending, and the first observable Store update is a 0.0.5
+install being offered 0.0.6. Blank or pending means unverified and must not be
+advertised as working.
+
+Store-identity rows are produced with
+
+```powershell
+Invoke-CommandInDesktopPackage -PackageFamilyName 32827MikeFara.fwdslash_t6j5qexy2jpp2 `
+  -AppId App -Command <dev>\fwdslash.exe -Args 'update check --json'
+```
+
+— and a `cmd.exe` wrapper needs `-PreventBreakaway`, or the System32 child runs
+without the identity (the same fact the adapters rely on for `reg.exe`).
+
+| Gate | How | Evidence |
+|---|---|---|
+| `update check` under Store package identity reports the flavor and the true state, and never fails closed | `update check --json` through `Invoke-CommandInDesktopPackage` | ARM64 host, Windows 11 26200, Store package 0.0.4, 2026-09-05: `flavor` `store`, `state` `upToDate`, `autoUpdate` `false`, exit 0 — **PASS** |
+| `update install` with nothing to install answers "nothing", not "deferred" | `update install --json` on a current install | Same host, 2026-09-05: exit **12**, `state` `upToDate`; answered before any route probe or moment gate — **PASS** |
+| A helper-only verb refuses to run with package identity | `update apply-store` through `Invoke-CommandInDesktopPackage` | Same host, 2026-09-05: exit **20**, no task registered, no helper staged — **PASS** |
+| The Store accepts `StartProductInstallWithOptionsAsync` from an identity-less process (route 1b is real) | `update apply-store --product 9P51CM0MTMK2` from a plain console | Same host, 2026-09-05: the call was accepted and completed as a no-op on the current version; `last-result.txt` = `completed`; the running app was not terminated — **PASS** |
+| `update check` without package identity reports `disabled` and makes no network call | `update check --json` from an unpackaged build | Pending |
+| Route 1 end to end: Store installs, package force-closed, version advanced, broker back through the alias, task and script gone, `last-result.txt` = `completed` | `update install --route appinstall` with a newer version published | Pending — needs a published version above the installed one |
+| Route 2 (`StoreContext` silent), route 3 (`winget upgrade --source msstore`), route 4 (notify) | `update install --route store|winget|notify` | Pending — needs a published version above the installed one |
+| A metered connection suppresses route 3, and the Store's `Paused*` states map to exit 10 rather than an error | Metered Wi-Fi profile, `update install --route winget` | Pending |
+| Watchdog alone: `--previous 0.0.1` relaunches at once, `--previous 99.0.0` waits the ceiling and relaunches only when no broker is running; no task or script left behind; exactly one broker and one tray icon afterwards | `update install` with each `--previous`, then `schtasks /query /tn fwdslash-update` | Pending |
+| GitHub flavor end to end through the same watchdog (download, `-ForceApplicationShutdown` from the helper, relaunch) | A bumped tag installed over an older GitHub build | Pending |
+| Broker cadence: no check within 5 minutes of logon, none while the Enter worker is busy, at most one check a day | `FSW_DIAGNOSTIC_LOG` over a logon and an idle day | Pending |
+| The Automatic updates switch is honoured in both flavors, and an explicit "off" recorded by an older build still reads as off | Settings toggle plus a hand-written `AutoUpdate` DWORD | Pending |
+
 ## Driver release gate
 
 The gate is executed by `tools/Test-Driver.ps1`, inside the checkpointed

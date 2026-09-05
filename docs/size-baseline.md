@@ -64,6 +64,48 @@ large.
 
 ## Rust side, measured
 
+### 2026-09-05 — current tree (0.0.4, with the self-update path)
+
+Built with `cargo build --release --target aarch64-pc-windows-msvc --workspace`
+and the same for `x86_64-pc-windows-msvc`, on the Windows host at the pinned
+toolchain, at the size-tuned release profile plus the committed
+`.cargo/config.toml` target flags.
+
+| Artifact | ARM64 | x64 |
+|---|---:|---:|
+| `fwdslash.exe` | 473,600 | 496,640 |
+| `fswbroker.exe` | 345,600 | 351,232 |
+| `fswsettings.exe` | 1,831,936 | 1,776,640 |
+
+`fwdslash.exe` is 78,336 bytes (+19.8 %) larger on ARM64 than before the
+auto-update work. Measured at each of the four merges that make it up, same host
+and flags, ARM64 `fwdslash.exe`:
+
+| Commit | Size | Δ | What landed |
+|---|---:|---:|---|
+| `2cb1348` | 395,264 | — | before any of it |
+| `ab45c45` | 396,800 | +1,536 | the CLI joins the 0.62 island — `windows` 0.62.2 (`Services_Store`, `Foundation`, `Foundation_Collections`, `ApplicationModel`, `Networking_Connectivity`, `Win32_System_Com`) and the vendored InstallControl bindings (~96 KB of source). Almost free, because fat LTO drops what nothing calls yet |
+| `2224cbe` | 430,080 | +33,280 | the #52 settings writer (the `reg.exe` dual-write and its self-heal) and the #55 state broadcast |
+| `d7c8ba7` | 473,600 | +43,520 | the `fwdslash update` verbs: `StoreContext`, the `AppInstallManager` sequence, the metered-network cost probe, the helper and the watchdog — the bindings' code finally being *called* |
+
+So the cost of the feature is the last two rows: WinRT `Services_Store` +
+`Networking_Connectivity` + the vendored InstallControl bindings called for
+real, and the #52 `reg.exe` settings writer that arrived alongside them.
+
+That puts the Rust CLI **past** the C++ binary it replaces — 473,600 against
+436,224 on ARM64, and wider than that against C++ code alone (~336 KB), since
+the C++ figure carries a 100 KB icon the Rust CLI does not link. `fwdslash.exe`
+is the binary the shell adapters spawn once per `dir`, so this is the number to
+watch. Whether it costs anything that matters is a cold-start question, not a
+size question: `tools/Measure-Runtime.ps1` answers it, and its row in the
+runtime table below has not been re-measured since this landed.
+
+`fswbroker.exe` is byte-identical at `2224cbe` and at HEAD (345,600 ARM64) —
+none of the update work reached it. Its growth against the 0.0.3 row below, and
+the settings app's, happened elsewhere in 0.0.4.
+
+### 2026-09-04 — 0.0.3
+
 Built 2026-09-04 with `cargo build --release --target aarch64-pc-windows-msvc`
 from an ARM64 VS 18 developer shell, at the size-tuned release profile in the
 root `Cargo.toml` (`opt-level = "s"`, fat LTO, `codegen-units = 1`,
@@ -115,12 +157,18 @@ so the WSL loop works for everything up to the first `[[bin]]`.
 ## Reproducing
 
 ```powershell
+# Rust (what ships)
+cargo build --release --target aarch64-pc-windows-msvc --workspace
+cargo build --release --target x86_64-pc-windows-msvc  --workspace
+
+# C++ reference tree
 .\tools\Build-UserMode.ps1 -Architecture ARM64 -Configuration Release
 .\tools\Build-UserMode.ps1 -Architecture x64   -Configuration Release
 ```
 
 Stop the broker and settings window first — `link.exe` cannot overwrite a loaded
-image.
+image. `fwdslash.exe` alone is never locked by a running product, so
+`-p fwdslash` measures the CLI without stopping anything.
 
 ## Runtime baseline, measured
 
