@@ -189,6 +189,16 @@ impl SurfaceKind {
 }
 
 static PAUSED: AtomicBool = AtomicBool::new(false);
+/// Pause writes started but not yet finished, so [`reload_settings`] can tell
+/// "the registry disagrees with us" from "the registry has not caught up with
+/// us yet".
+///
+/// The tray toggle changes `PAUSED` in memory and persists it off-thread (see
+/// [`request_persist_disabled`]), which leaves a window in which the stored
+/// value is still the old one. A state-changed broadcast landing inside that
+/// window — anyone's, including the one this broker's own write posts — would
+/// otherwise be read as an external change and revert the toggle.
+static PERSIST_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
 static ENTER_DOWN: AtomicBool = AtomicBool::new(false);
 static SUPPRESS_ENTER_UP: AtomicBool = AtomicBool::new(false);
 
@@ -1073,10 +1083,15 @@ fn taskbar_created_message() -> u32 {
 /// in-memory state plus the hook result, and a failed write surfaces later as
 /// a balloon plus `event=persist_disabled_failed`.
 fn request_persist_disabled(disabled: bool) {
+    // Raised before the write starts and dropped when it ends, on whichever of
+    // the two paths below runs it.
+    PERSIST_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
     let spawned = std::thread::Builder::new()
         .name("fsw-persist".to_owned())
         .spawn(move || {
-            if persist_disabled(disabled).is_err() {
+            let failed = persist_disabled(disabled).is_err();
+            PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+            if failed {
                 log_diagnostic("event=persist_disabled_failed");
                 let window = BROKER_WINDOW.load(Ordering::Relaxed) as HWND;
                 if !window.is_null() {
@@ -1089,7 +1104,9 @@ fn request_persist_disabled(disabled: bool) {
     if spawned.is_err() {
         // Out of threads: the write is the whole point of the setting, so do
         // it inline rather than silently skip it.
-        if persist_disabled(disabled).is_err() {
+        let failed = persist_disabled(disabled).is_err();
+        PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        if failed {
             log_diagnostic("event=persist_disabled_failed");
             show_notification("The pause setting could not be saved.", NIIF_ERROR);
         }
@@ -1301,22 +1318,74 @@ fn start_adapter_upgrade() {
     }
 }
 
+/// Applies a pause/resume to the *running* broker and reports whether the
+/// keyboard hook ended up armed as the new state requires.
+///
+/// Persistence is deliberately not part of it: this is also the path a
+/// state-changed broadcast takes, where the value has already been written by
+/// somebody else and writing it again would be a loop.
+fn apply_paused(paused: bool) -> bool {
+    PAUSED.store(paused, Ordering::Relaxed);
+    if paused {
+        remove_hook();
+        true
+    } else {
+        install_hook()
+    }
+}
+
+/// Re-reads the settings another component just changed and catches the
+/// running broker up (issue #55).
+///
+/// The tray tooltip, the keyboard hook and the mapping published to the driver
+/// are all derived from state that `fwdslash pause`, the settings window or a
+/// shell adapter can change from another process. Before this they caught up
+/// at the next health tick — a minute — or, for the pause flag, not at all.
+///
+/// Runs on the broker's window thread, which also owns the low-level keyboard
+/// hook, so it stays a registry read plus, at most, exactly the work a tray
+/// pause already does. The menus need nothing: they are built from live state
+/// when the tray menu opens.
+fn reload_settings(window: HWND) {
+    // A pause of our own is mid-flight: `PAUSED` is ahead of the stored value
+    // on purpose, and re-reading now would undo it.
+    if PERSIST_IN_FLIGHT.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let disabled = is_disabled();
+    if disabled == PAUSED.load(Ordering::Relaxed) {
+        // Nothing the tray shows changed. The distribution list still might
+        // have, and this is how the driver hears about it; with no driver
+        // connected it costs one failed connect attempt.
+        publish_filter_mappings(false);
+        return;
+    }
+    log_diagnostic("event=state_changed");
+    let hook_ok = apply_paused(disabled);
+    update_tray_tooltip(window);
+    publish_filter_mappings(true);
+    if !hook_ok {
+        // No balloon: the user did not ask *this* process for anything, and
+        // the tooltip already reads "hook unavailable". The health timer
+        // re-arms on its own.
+        log_diagnostic("event=hook_unavailable");
+    }
+}
+
 /// Applies a pause/resume and reports the state the broker ended up in.
 ///
 /// `Err` means the resume could not arm the keyboard hook, i.e. the broker is
 /// `Unavailable`. The persistence result is deliberately *not* part of it —
 /// see [`request_persist_disabled`].
+///
+/// No broadcast from here: the write this schedules broadcasts when it lands
+/// (`fsw_core::settings_write`), and announcing the change before the value is
+/// stored would have every listener — this broker included — re-read the old
+/// one.
 fn set_paused(paused: bool) -> Result<BrokerState, ()> {
-    PAUSED.store(paused, Ordering::Relaxed);
-
     // Unhook before persisting: the write is off-thread now, but the ordering
     // is what guarantees a pause stops swallowing Enter immediately.
-    let hook_ok = if paused {
-        remove_hook();
-        true
-    } else {
-        install_hook()
-    };
+    let hook_ok = apply_paused(paused);
 
     request_persist_disabled(paused);
 
@@ -1655,6 +1724,16 @@ unsafe extern "system" fn window_proc(
         message if message == taskbar_created_message() => {
             ICON_ADDED.store(false, Ordering::Relaxed);
             add_tray_icon(window);
+            0
+        }
+        // Somebody changed shared state (issue #55). It is a broadcast, so it
+        // arrives whoever the writer was — the CLI, a shell adapter's staged
+        // copy of it, the settings window — and including this process's own
+        // writes, which `reload_settings` recognizes as already applied.
+        // `message != 0` because a failed registration answers 0, and 0 is
+        // WM_NULL — which arrives whenever anything probes this window.
+        message if message != 0 && message == state_changed_message() => {
+            reload_settings(window);
             0
         }
         // Session end: Windows destroys the window without WM_DESTROY running

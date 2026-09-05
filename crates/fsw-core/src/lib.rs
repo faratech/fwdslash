@@ -23,6 +23,21 @@ pub const FSW_WM_QUERY_STATE: u32 = 0x8000 + 10; // WM_APP + 10
 pub const FSW_WM_SET_PAUSED: u32 = 0x8000 + 11; // WM_APP + 11
 pub const FSW_WM_SHOW_SETTINGS: u32 = 0x8000 + 12; // WM_APP + 12
 
+/// The name every component registers with `RegisterWindowMessageW` to hear
+/// that some *other* component changed state (issue #55).
+///
+/// Unlike the three `FSW_WM_*` messages above this one is not addressed to a
+/// window: it is posted to `HWND_BROADCAST` by the writer and picked up by
+/// whoever happens to be running — a settings window that would otherwise keep
+/// rendering the state it read at launch, and the broker, whose tray tooltip
+/// and menus would otherwise wait for the next health tick.
+///
+/// The string is the contract, not the number: `RegisterWindowMessageW` hands
+/// every process the same id for the same string, and that id is only stable
+/// for the life of the session. Never hardcode a value for it, and never
+/// change this string without changing every component together.
+pub const FSW_STATE_CHANGED_MESSAGE: &str = "ForwardSlashWindows.StateChanged";
+
 /// The settings key, and every value name under it.
 ///
 /// **Writes to this key go through [`settings_write`] and nowhere else** —
@@ -767,6 +782,58 @@ pub fn broker_state(timeout_ms: u32) -> BrokerState {
     {
         let _ = timeout_ms;
         BrokerState::Unavailable
+    }
+}
+
+/// This session's id for [`FSW_STATE_CHANGED_MESSAGE`], registered once.
+///
+/// `RegisterWindowMessageW` is idempotent per string per session, but it is
+/// still a user32 round trip, and the broker asks for this id inside its window
+/// procedure — the thread that owns the low-level keyboard hook. The `OnceLock`
+/// keeps every call after the first to a load. `0` means the registration
+/// failed (or the platform is not Windows): callers must treat it as "no
+/// notification", never as a message id.
+#[must_use]
+pub fn state_changed_message() -> u32 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
+        static MESSAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *MESSAGE.get_or_init(|| unsafe {
+            RegisterWindowMessageW(to_wide(FSW_STATE_CHANGED_MESSAGE).as_ptr())
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// Tells every running component that this process changed shared state.
+///
+/// Posted, never sent: the caller — a CLI verb finishing, the broker's tray
+/// toggle, a settings write — must not wait on anyone's message loop, and a
+/// hung listener must not be able to hold up a write. `HWND_BROADCAST` reaches
+/// top-level windows only, which is why the broker's window and the settings
+/// app's watcher window are both real (never-shown) top-level windows rather
+/// than message-only ones.
+///
+/// Call it **only after** the mutation has actually landed: a listener that
+/// re-reads on a failed write would just re-render the old state, and one that
+/// re-reads before the write lands would render it as well. Carries no
+/// payload — the listeners re-read what they need, so nothing about what
+/// changed travels in the message (PRIVACY.md).
+pub fn broadcast_state_changed() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, PostMessageW};
+        let message = state_changed_message();
+        if message == 0 {
+            return;
+        }
+        unsafe {
+            PostMessageW(HWND_BROADCAST, message, 0, 0);
+        }
     }
 }
 
