@@ -61,7 +61,7 @@ that produces its evidence. `docs/driver-lab.md` is the operator runbook.
 
 | Gate | Harness step | Evidence |
 |---|---|---|
-| Unsigned/test-signed installation only in a checkpointed Hyper-V guest | a | VM gate pending |
+| Unsigned/test-signed installation only in a checkpointed Hyper-V guest | a | ARM64 guest, Win 26200.9278, FakeShare, 2026-09-05: PASS (gate blocked past step b by issue #38) |
 | Alias-versus-UNC parity for create, read, write, enumerate, metadata, rename, delete, long and Unicode paths | c | VM gate pending |
 | Standard and elevated callers redirected; AppContainer and SYSTEM not | d | VM gate pending |
 | ARM64 native, x64 emulated and x86 emulated callers; native x64 in an x64 VM | c (re-run per lab) | VM gate pending; x64 lab not stood up |
@@ -77,6 +77,38 @@ that produces its evidence. `docs/driver-lab.md` is the operator runbook.
 | Transactional install, unload and driver-store removal | a and h | VM gate pending |
 | Collision warning for every registered distro name on every mounted drive | not automated | VM gate pending |
 | Applicable HLK filter/filesystem playlists and Microsoft production signing | out of scope of the lab | Deferred (Tier 3: altitude allocation, Partner Center, attestation signing) |
+
+**Driver gate status 2026-09-05 (ARM64 guest, Win 26200.9278, FakeShare).**
+Step a passes in full (test signing, `pnputil /add-driver /install`, `fltmc
+load`, altitude `371120`, disk-volume-only attachment). Two distinct bugchecks
+have been found and one is fixed:
+
+- **Fixed (issue #36).** The guest bugchecked `0x0000003B`
+  `SYSTEM_SERVICE_EXCEPTION` (param 1 `0xC0000005`) on the broker's first
+  `\FswFilterPort` connect: `FswQueryRequestorIdentity` dereferenced
+  `*(PULONG)sessionInformation` with no NULL check, and
+  `SeQueryInformationToken(token, TokenSessionId, ...)` returns
+  `STATUS_SUCCESS` but leaves the out-pointer NULL on this Win 11 ARM64 build.
+  The read now uses the scalar `SeQuerySessionIdToken`; the `0x3B` is gone
+  (verified — the driver progresses past that point). Run 1's dump is
+  `out/lab/crash/090426-4750-01.dmp`.
+
+- **Open (issue #38).** With #36 fixed the connect proceeds into
+  `FswQueryRequestorIdentity`'s cleanup and the guest bugchecks
+  **`0x000000C2` `BAD_POOL_CALLER`** `(0x99, 0x3000, 0, 0)` — arg1 `0x99` is a
+  free of an invalid pool address. Symbolized against
+  `out/driver/arm64/Release/fswfilter.pdb`, the faulting frame is
+  `FswQueryRequestorIdentity` at `driver/fswfilter/fswfilter.c:217` (the
+  `ExFreePool()` of a `SeQueryInformationToken` output buffer), called from
+  `FswPortConnect` at `:664` (the first broker connect). Same family as #36:
+  `SeQueryInformationToken`'s allocate/free contract misbehaves on this
+  OS/arch. Dump preserved at `out/lab/crash/090426-4562-01.dmp` (Verifier
+  active, mask `0x93B`); the poller now detects a bugcheck by a guest
+  `LastBootUpTime` jump and copies `C:\Windows\Minidump\*.dmp` out before
+  any checkpoint restore.
+
+No harness step from b onward has completed, so every row below stays "VM gate
+pending" until #38 is fixed and the whole matrix can run.
 
 Verifier runs with mask `0x93B` and deliberately **without** low-resource
 simulation (`0x0004`): the filter is fail-open on every allocation failure by
