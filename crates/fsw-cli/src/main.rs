@@ -1090,6 +1090,48 @@ fn integration_label(installed: bool, outdated: bool) -> &'static str {
     }
 }
 
+/// One edition's execution-policy fields for `integrations --json` (#45).
+/// Appended to the existing object, never renamed into it: an unknown edition
+/// reports an empty policy string and `false`, so a consumer that only reads
+/// the 0.0.3 fields is unaffected.
+fn policy_json_fields(key: &str, reported: &str, blocked: bool, remedy: &str) -> String {
+    format!(
+        ",\"{key}ExecutionPolicy\":\"{}\",\"{key}PolicyBlocked\":{},\"{key}PolicyRemedy\":\"{}\"",
+        json_escape(reported),
+        blocked,
+        json_escape(remedy)
+    )
+}
+
+/// The execution-policy fields for both PowerShell editions, in the order the
+/// text output reports them.
+fn execution_policy_json() -> String {
+    #[cfg(windows)]
+    {
+        let statuses = adapters::execution_policy_statuses();
+        let mut out = String::new();
+        for (key, edition) in [
+            ("windowsPowerShell", adapters::Edition::WindowsPowerShell),
+            ("powerShell7", adapters::Edition::PowerShell),
+        ] {
+            match statuses.iter().find(|status| status.edition == edition) {
+                Some(status) => out.push_str(&policy_json_fields(
+                    key,
+                    &status.reported,
+                    status.blocked,
+                    &status.remedy,
+                )),
+                None => out.push_str(&policy_json_fields(key, "", false, "")),
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
+}
+
 fn cmd_integrations(json: bool) -> i32 {
     let disabled = is_disabled();
     let windows = windows_integration_installed();
@@ -1104,8 +1146,11 @@ fn cmd_integrations(json: bool) -> i32 {
     let ps7_avail = executable_available("pwsh.exe");
 
     if json {
+        // Additive only: every field 0.0.3 emitted keeps its name and meaning,
+        // and the execution-policy fields (#45) are appended. An edition whose
+        // shell could not be asked reports an empty policy and `false`.
         println!(
-            "{{\"disabled\":{},\"windows\":{},\"cmd\":{},\"windowsPowerShell\":{},\"powerShell7\":{},\"powerShell7Available\":{},\"cmdOutdated\":{},\"windowsPowerShellOutdated\":{},\"powerShell7Outdated\":{}}}",
+            "{{\"disabled\":{},\"windows\":{},\"cmd\":{},\"windowsPowerShell\":{},\"powerShell7\":{},\"powerShell7Available\":{},\"cmdOutdated\":{},\"windowsPowerShellOutdated\":{},\"powerShell7Outdated\":{}{}}}",
             disabled,
             windows,
             cmd,
@@ -1114,7 +1159,8 @@ fn cmd_integrations(json: bool) -> i32 {
             ps7_avail,
             cmd_outdated,
             win_ps_outdated,
-            ps7_outdated
+            ps7_outdated,
+            execution_policy_json()
         );
         return 0;
     }

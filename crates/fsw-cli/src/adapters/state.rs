@@ -271,3 +271,185 @@ pub fn other_edition(edition: Edition) -> Edition {
 pub fn remove_shared_module(other_marker_version: Option<&str>, this_version: &str) -> bool {
     other_marker_version != Some(this_version)
 }
+
+// ---------------------------------------------------------------------------
+// PowerShell execution policy (#45)
+// ---------------------------------------------------------------------------
+
+/// An execution policy as `Get-ExecutionPolicy` names it.
+///
+/// Windows PowerShell 5.1 ships **Restricted** on client editions, so the
+/// guarded block the adapter appends to `profile.ps1` can never load there
+/// until the user changes it — the most common reason an install appears to
+/// succeed and then does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    Restricted,
+    /// No policy configured in any scope. Windows PowerShell treats this as
+    /// `Restricted`; `pwsh` reports `RemoteSigned` instead and so never
+    /// surfaces it in practice.
+    Undefined,
+    /// Blocking for a different reason: every script *including the user's own
+    /// `profile.ps1`* would need an Authenticode signature, and no installer
+    /// can sign a file the user owns. Signing the shipped module does not
+    /// help.
+    AllSigned,
+    RemoteSigned,
+    Unrestricted,
+    Bypass,
+    /// Anything else the shell printed. Never blocking — a parse failure must
+    /// not refuse an install that would have worked.
+    Unrecognized,
+}
+
+/// Parses one `Get-ExecutionPolicy` line. Case-insensitive and
+/// whitespace-tolerant, because the value arrives as raw console output.
+#[must_use]
+pub fn parse_execution_policy(reported: &str) -> ExecutionPolicy {
+    let trimmed = reported.trim();
+    if trimmed.eq_ignore_ascii_case("restricted") {
+        ExecutionPolicy::Restricted
+    } else if trimmed.eq_ignore_ascii_case("undefined") {
+        ExecutionPolicy::Undefined
+    } else if trimmed.eq_ignore_ascii_case("allsigned") {
+        ExecutionPolicy::AllSigned
+    } else if trimmed.eq_ignore_ascii_case("remotesigned") {
+        ExecutionPolicy::RemoteSigned
+    } else if trimmed.eq_ignore_ascii_case("unrestricted") {
+        ExecutionPolicy::Unrestricted
+    } else if trimmed.eq_ignore_ascii_case("bypass") {
+        ExecutionPolicy::Bypass
+    } else {
+        ExecutionPolicy::Unrecognized
+    }
+}
+
+/// Why a policy blocks the adapter, and the one line that fixes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyBlock {
+    /// A complete sentence naming the edition and the policy.
+    pub reason: String,
+    /// A complete sentence ending in the command to run, with no trailing
+    /// punctuation — it is meant to be copied.
+    pub remedy: String,
+}
+
+/// The verdict on one edition's effective execution policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyVerdict {
+    /// Scripts load. `note` is `Some` only for a policy string this build does
+    /// not know, which is reported but never refused.
+    Allowed { note: Option<String> },
+    Blocked(PolicyBlock),
+}
+
+impl PolicyVerdict {
+    #[must_use]
+    pub fn blocked(&self) -> Option<&PolicyBlock> {
+        match self {
+            Self::Blocked(block) => Some(block),
+            Self::Allowed { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, Self::Blocked(_))
+    }
+}
+
+/// The command that fixes a Restricted machine. Named once so the CLI text,
+/// the docs and the tests cannot drift apart.
+pub const REMOTE_SIGNED_COMMAND: &str = "Set-ExecutionPolicy -Scope CurrentUser RemoteSigned";
+
+/// Where the user has to run [`REMOTE_SIGNED_COMMAND`]: the policy is per
+/// edition, so fixing Windows PowerShell from a `pwsh` window changes the
+/// wrong one.
+fn shell_to_run_in(edition: Edition) -> &'static str {
+    match edition {
+        Edition::WindowsPowerShell => "Windows PowerShell",
+        Edition::PowerShell => "PowerShell 7 (pwsh)",
+    }
+}
+
+/// Classifies `reported` for `edition`. Pure: the caller supplies whatever the
+/// edition's own shell printed for `Get-ExecutionPolicy`.
+///
+/// Blocking policies are `Restricted`, `Undefined` and `AllSigned`. Everything
+/// else — including a string this build has never heard of — is allowed, so a
+/// future policy name or a localized shell can never refuse an install that
+/// would have worked.
+#[must_use]
+pub fn classify_execution_policy(edition: Edition, reported: &str) -> PolicyVerdict {
+    let policy = parse_execution_policy(reported);
+    let edition_name = edition.display_name();
+    let where_to_run = shell_to_run_in(edition);
+    let remedy = format!(
+        "Run this in {where_to_run}, then enable the adapter again: {REMOTE_SIGNED_COMMAND}"
+    );
+    match policy {
+        ExecutionPolicy::Restricted => PolicyVerdict::Blocked(PolicyBlock {
+            reason: format!(
+                "{edition_name}'s execution policy is Restricted, so the profile the adapter installs can never load."
+            ),
+            remedy,
+        }),
+        ExecutionPolicy::Undefined => PolicyVerdict::Blocked(PolicyBlock {
+            reason: format!(
+                "{edition_name}'s execution policy is Undefined, which is treated as Restricted, so the profile the adapter installs can never load."
+            ),
+            remedy,
+        }),
+        ExecutionPolicy::AllSigned => PolicyVerdict::Blocked(PolicyBlock {
+            reason: format!(
+                "{edition_name}'s execution policy is AllSigned, which the adapter does not support: under AllSigned your own profile.ps1 would need an Authenticode signature that Forward Slash Windows cannot provide."
+            ),
+            remedy: format!(
+                "Run this in {where_to_run} to use the adapter, then enable it again: {REMOTE_SIGNED_COMMAND}"
+            ),
+        }),
+        ExecutionPolicy::RemoteSigned | ExecutionPolicy::Unrestricted | ExecutionPolicy::Bypass => {
+            PolicyVerdict::Allowed { note: None }
+        }
+        ExecutionPolicy::Unrecognized => PolicyVerdict::Allowed {
+            note: Some(format!(
+                "unrecognized execution policy '{}'; treating it as allowing scripts",
+                reported.trim()
+            )),
+        },
+    }
+}
+
+/// The message `fwdslash integration <id> enable` prints when the preflight
+/// refuses. Nothing has been written at that point, which is the part a user
+/// needs to know before re-running anything.
+#[must_use]
+pub fn policy_install_error(block: &PolicyBlock) -> String {
+    format!("{} Nothing was changed. {}", block.reason, block.remedy)
+}
+
+/// The message the alias verification prints when the child shell refused to
+/// run the profile (exit 42) and the policy explains why. The writes are
+/// already undone by the transaction's rollback, which is the only difference
+/// from [`policy_install_error`].
+#[must_use]
+pub fn policy_verify_error(block: &PolicyBlock) -> String {
+    format!(
+        "{} The installation was rolled back. {}",
+        block.reason, block.remedy
+    )
+}
+
+/// The `fwdslash doctor` / `fwdslash integrations` line for one edition's
+/// policy: the policy the shell reported, plus the remedy when it blocks.
+#[must_use]
+pub fn policy_health_status(reported: &str, verdict: &PolicyVerdict) -> String {
+    let policy = reported.trim();
+    match verdict {
+        PolicyVerdict::Blocked(block) => {
+            format!("{policy} — blocked by execution policy: {}", block.remedy)
+        }
+        PolicyVerdict::Allowed { note: Some(note) } => format!("{policy} ({note})"),
+        PolicyVerdict::Allowed { note: None } => policy.to_string(),
+    }
+}

@@ -21,6 +21,14 @@ same three Rust exes and the `shell/` payload out of the repo, and shells out
 to `makeappx.exe`/`makepri.exe` through `wslpath`. Both read the version from
 `workspace.package.version` in the root `Cargo.toml`.
 
+`release.yml` Authenticode-signs `shell/powershell/ForwardSlashWindows.psm1`
+with the Trusted Signing kit *before* packaging, so the GitHub bundle carries a
+signed module (both packagers copy that file byte-for-byte, and the Store's
+re-signing of the package leaves an embedded script signature alone). A Store
+bundle built by hand from an unsigned tree ships the module unsigned, which
+changes nothing functional — script signing is integrity only and does not
+affect the execution-policy behaviour documented in `docs/compatibility.md`.
+
 | Field | Value |
 |---|---|
 | `Package/Identity/Name` | `32827MikeFara.fwdslash` |

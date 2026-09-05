@@ -729,6 +729,163 @@ fn blocked_write_classification_covers_the_cfa_not_found_case() {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// state.rs — execution policy (#45)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn execution_policy_parses_every_documented_name_case_insensitively() {
+    use state::ExecutionPolicy as Policy;
+    for (text, expected) in [
+        ("Restricted", Policy::Restricted),
+        ("restricted", Policy::Restricted),
+        ("  RESTRICTED\r\n", Policy::Restricted),
+        ("Undefined", Policy::Undefined),
+        ("AllSigned", Policy::AllSigned),
+        ("allsigned", Policy::AllSigned),
+        ("RemoteSigned", Policy::RemoteSigned),
+        ("remotesigned ", Policy::RemoteSigned),
+        ("Unrestricted", Policy::Unrestricted),
+        ("Bypass", Policy::Bypass),
+        ("", Policy::Unrecognized),
+        ("Eingeschränkt", Policy::Unrecognized),
+        ("MachineSomethingNew", Policy::Unrecognized),
+    ] {
+        assert_eq!(state::parse_execution_policy(text), expected, "{text:?}");
+    }
+}
+
+#[test]
+fn only_restricted_undefined_and_allsigned_block() {
+    for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+        for blocking in ["Restricted", "Undefined", "AllSigned"] {
+            assert!(
+                state::classify_execution_policy(edition, blocking).is_blocked(),
+                "{edition:?} {blocking}"
+            );
+        }
+        for allowed in ["RemoteSigned", "Unrestricted", "Bypass"] {
+            assert_eq!(
+                state::classify_execution_policy(edition, allowed),
+                state::PolicyVerdict::Allowed { note: None },
+                "{edition:?} {allowed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unknown_policy_never_blocks_but_is_noted() {
+    let verdict = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Whatever\r\n");
+    assert!(!verdict.is_blocked());
+    let note = match &verdict {
+        state::PolicyVerdict::Allowed { note } => note.clone().unwrap_or_default(),
+        state::PolicyVerdict::Blocked(_) => String::new(),
+    };
+    assert!(note.contains("unrecognized execution policy 'Whatever'"), "{note}");
+}
+
+#[test]
+fn the_remedy_names_the_edition_that_owns_the_policy() {
+    let windows = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Restricted");
+    let seven = state::classify_execution_policy(state::Edition::PowerShell, "Restricted");
+    let windows = windows.blocked().map(|block| block.remedy.clone()).unwrap_or_default();
+    let seven = seven.blocked().map(|block| block.remedy.clone()).unwrap_or_default();
+    assert!(windows.contains("Run this in Windows PowerShell,"), "{windows}");
+    assert!(seven.contains("Run this in PowerShell 7 (pwsh),"), "{seven}");
+    // Both point at the same one-line fix, ending in a copyable command.
+    for remedy in [&windows, &seven] {
+        assert!(remedy.ends_with(state::REMOTE_SIGNED_COMMAND), "{remedy}");
+    }
+}
+
+#[test]
+fn the_preflight_error_names_edition_policy_remedy_and_that_nothing_changed() {
+    let verdict = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Restricted");
+    let block = verdict.blocked().cloned().unwrap_or(state::PolicyBlock {
+        reason: String::new(),
+        remedy: String::new(),
+    });
+    assert_eq!(
+        state::policy_install_error(&block),
+        "Windows PowerShell's execution policy is Restricted, so the profile the adapter installs \
+         can never load. Nothing was changed. Run this in Windows PowerShell, then enable the \
+         adapter again: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"
+    );
+}
+
+#[test]
+fn undefined_explains_that_it_means_restricted() {
+    let verdict = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Undefined");
+    let text = verdict
+        .blocked()
+        .map(state::policy_install_error)
+        .unwrap_or_default();
+    assert!(text.contains("is Undefined, which is treated as Restricted"), "{text}");
+}
+
+#[test]
+fn allsigned_says_the_adapter_is_unsupported_and_why() {
+    let verdict = state::classify_execution_policy(state::Edition::PowerShell, "AllSigned");
+    let text = verdict
+        .blocked()
+        .map(state::policy_install_error)
+        .unwrap_or_default();
+    assert!(text.contains("does not support"), "{text}");
+    // Signing the shipped module cannot help: the user's own profile is the
+    // file that would need a signature.
+    assert!(text.contains("your own profile.ps1"), "{text}");
+}
+
+#[test]
+fn the_exit_42_rewrite_keeps_the_rollback_clause() {
+    let verdict = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Restricted");
+    let block = verdict.blocked().cloned().unwrap_or(state::PolicyBlock {
+        reason: String::new(),
+        remedy: String::new(),
+    });
+    let text = state::policy_verify_error(&block);
+    assert!(text.starts_with("Windows PowerShell's execution policy is Restricted,"), "{text}");
+    assert!(text.contains("The installation was rolled back."), "{text}");
+    assert!(text.ends_with(state::REMOTE_SIGNED_COMMAND), "{text}");
+    // The generic "did not load the ... adapter" wording is replaced, not
+    // appended to.
+    assert!(!text.contains("did not load"), "{text}");
+}
+
+#[test]
+fn the_health_line_says_blocked_by_execution_policy() {
+    let verdict = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Restricted");
+    let line = state::policy_health_status("Restricted\r\n", &verdict);
+    assert!(line.starts_with("Restricted — blocked by execution policy: "), "{line}");
+    let ok = state::classify_execution_policy(state::Edition::WindowsPowerShell, "RemoteSigned");
+    assert_eq!(state::policy_health_status("RemoteSigned\r\n", &ok), "RemoteSigned");
+}
+
+#[test]
+fn integrations_json_appends_policy_fields_without_renaming_any() {
+    assert_eq!(
+        crate::policy_json_fields(
+            "windowsPowerShell",
+            "Restricted",
+            true,
+            "Run this in Windows PowerShell, then enable the adapter again: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"
+        ),
+        ",\"windowsPowerShellExecutionPolicy\":\"Restricted\",\"windowsPowerShellPolicyBlocked\":true,\
+         \"windowsPowerShellPolicyRemedy\":\"Run this in Windows PowerShell, then enable the adapter again: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned\""
+    );
+    // An edition that could not be asked reports empty, never absent.
+    assert_eq!(
+        crate::policy_json_fields("powerShell7", "", false, ""),
+        ",\"powerShell7ExecutionPolicy\":\"\",\"powerShell7PolicyBlocked\":false,\"powerShell7PolicyRemedy\":\"\""
+    );
+    // Anything a shell could print stays valid JSON.
+    assert_eq!(
+        crate::policy_json_fields("powerShell7", "we\"ird\\", false, ""),
+        ",\"powerShell7ExecutionPolicy\":\"we\\\"ird\\\\\",\"powerShell7PolicyBlocked\":false,\"powerShell7PolicyRemedy\":\"\""
+    );
+}
+
 #[test]
 fn find_subslice_locations() {
     assert_eq!(profile::find_subslice(b"abcdef", b"cd"), Some(2));
