@@ -124,11 +124,14 @@ python3 tools/bump_version.py --check   # what CI will assert
 ```
 
 **Write `docs/release-notes/<version>.md` in the same PR.** `release.yml` refuses to publish
-without it, and it is the only thing Store customers read: `publish-to-store.yml` derives the
+without it, `python3 tools/check_release_notes.py` is a CI gate on how it reads, and it is the
+only thing Store customers read: `publish-to-store.yml` derives the
 Store "What's new" by truncating the release body at the `## Downloads` marker, and this file
 is everything above that marker. Write it in plain language for someone who has never seen the
 code — one short sentence per user-visible change, no file or function names, no issue numbers,
-no internals. The generated "What's Changed" commit list still lands in the GitHub release for
+no internals. **Do not put a `## Downloads` heading in the file** — `release.yml` appends its own
+asset table under that heading, and one in the file produces a duplicate (0.1.0 shipped exactly
+that). The generated "What's Changed" commit list still lands in the GitHub release for
 developers, but it sits *below* the marker and never reaches the Store.
 
 Open a PR with that bump, merge it, then tag the merge commit `v0.0.4` and push the tag
@@ -216,7 +219,15 @@ global pause), `BareSlashMode` (DWORD, 0 = distribution list / 1 = default distr
 `BareSlashDistribution` (string, the pin), `BareSlashRoot` (string, the custom folder root),
 and — in **both** flavors — `AutoUpdate` / `LastUpdateCheck` / `AvailableUpdate`,
 plus the read-only `UpdateRoute` override (`auto|appinstall|store|winget|notify`, never written
-by the product). `AutoUpdate` is the one value whose *absent* meaning depends on the flavor:
+by the product), plus two Store-only values: `StoreUpdatePending` (DWORD) and
+`StoreUpdateAttempt` (QWORD). **`StoreUpdatePending` is the availability truth and
+`AvailableUpdate` is only its label** — the Store can offer an update whose version is not
+a trustworthy target, and the installed version must never be advertised as one (issue #97).
+Read the pair through `fsw_core::update::cached_offer()`, which returns an
+`Offer::Named(tag)` or `Offer::Unnamed`, and never read `AvailableUpdate` raw: a persisted
+label that is no longer newer than what runs is spent, not an offer. `StoreUpdateAttempt`
+stamps an install started from an unnamed offer, so a same-version repair offer gets one
+attempt a day rather than one per cycle. `AutoUpdate` is the one value whose *absent* meaning depends on the flavor:
 `fsw_core::update::default_auto_update(store_flavor) = !store_flavor`, so nothing stored means
 on for the GitHub build and off for the Store build, while the stored encoding stays the
 inverted DWORD it always was (`1` = off) so an explicit "off" never flips. The gate itself,
@@ -366,12 +377,17 @@ route is unchanged in shape (`crates/fsw-core/src/update.rs`: daily
 `api.github.com` check, download, `Add-AppxPackage`); the Store route asks the
 Store itself. **All of it is in the CLI**, `crates/fsw-cli/src/update/` — the
 broker calls `fwdslash update` from its health timer and the settings window
-from its button, and neither carries update logic of its own. The install ladder
-is `appinstall` (winget's `AppInstallManager` sequence, tried in-process first
-and then from the helper) → `store` (`StoreContext` silent install) → `winget`
-(`--source msstore`, skipped on a metered network) → `notify`; `route_for` is
-the pure function that picks, and the `UpdateRoute` value or `--route` pins one
-rung without a rebuild.
+from its button, and neither carries update logic of its own. The install ladder is
+`store` (`StoreContext` silent install) → `winget` (`--source msstore`, skipped
+on a metered network) → `appinstall` (winget's `AppInstallManager` sequence,
+tried in-process first and then from the helper) → `notify`, and the rungs are
+genuine fallbacks: `auto_ladder` lists them all and `install_via_ladder` walks
+it, falling through any rung that declines *before* queueing anything and
+stopping at the first that did something. `appinstall` is deliberately last
+because Microsoft documents that API as gated by a private capability
+restricted to its own apps (issue #98); it is kept as the rung before giving up
+rather than removed. The `UpdateRoute` value or `--route` pins one rung with no
+failover, without a rebuild.
 
 Two pieces of that are easy to break. The **helper**,
 `%LOCALAPPDATA%\ForwardSlashWindows\update\fwdslash-helper.exe`, is a

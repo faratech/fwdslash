@@ -213,13 +213,42 @@ one hand-rolled JSON line
 golden-tested; there is no serde in this workspace). COM is initialised in this
 module and nowhere else in the CLI, so the `cd /` hot path pays nothing for it.
 
+**What "an update is available" means (issues #90 and #97).** The presence of an
+offer and its version are separate facts, and only the first is authoritative.
+`StoreUpdatePending` records that the last successful Store query listed a
+pending update for this package; `AvailableUpdate` records a version *only* when
+one passed the strictly-newer filter. `fsw_core::update::offer_from_state` turns
+the pair into an `Offer::Named(tag)` or `Offer::Unnamed`, and everything reads
+through it — a label that is no longer newer than the running version is spent
+and yields no offer at all, which is how a notice left by an older build stops
+being shown without a migration. `store_offer_from_entries` does the same job for
+a live query, and is deliberately agnostic about whether
+`StorePackageUpdate.Package.Id.Version` names the catalog's version or echoes the
+installed one: under the first reading it yields `Named`, under the second
+`Unnamed`, and under neither does it advertise the installed version as a target.
+
+An unnamed offer is fully installable — every route installs by product id, not
+by version — but bounded. It may be a same-version repair offer that will never
+advance the version, and each attempt costs a force-close plus a watchdog
+timeout, so `unnamed_offer_actionable` gives it one attempt per
+`UNNAMED_RETRY_BACKOFF_SECS` (24 h) rather than one per cycle. A named offer is
+never subject to that: its version is the proof that something will change.
+
+`install`'s whole gate is the pure `install_answer`, whose third arm is issue
+#90: a Store query that **failed** is not a Store that answered "nothing". It
+reports `needsUser` / exit 11 and starts no installer. Not exit 12, which would
+claim there is nothing to install; and not exit 0, which the settings window
+reads as "about to be force-closed" — it would show no message and leave the
+broker down. On the wire an unnamed offer is the already-legal shape `state:
+"available"` with `available: null`, so no JSON field and no exit code changed.
+
 **The install ladder (Store flavor).** `route_for` is a pure function of five
 inputs and the single definition of precedence; the probes below it are lazy, so
 a rung is only asked about once the rung above is out.
 
 | # | Route | Precondition | Runs in | Terminates the app |
 |---|---|---|---|---|
-| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`), watched for at most `ADMISSION_WINDOW` (3 min) | always attempted first when packaged | the packaged CLI, in-process | yes, by the Store |
+| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`), watched for at most `ADMISSION_WINDOW` (3 min) | **last rung**, after both sanctioned routes decline (issue #98) | the packaged CLI, in-process | yes, by the Store |
 | 1b | the same call from the staged helper | 1a failed before an item was queued (`E_ACCESSDENIED` above all) | the identity-less helper, from the scheduled task | yes |
 | 2 | `StoreContext` silent download + install | route 1 unavailable and `CanSilentlyDownloadStorePackageUpdates` | the packaged CLI | yes, when deployment lands |
 | 3 | `winget upgrade --id … --source msstore --silent --force` | winget present and the network unmetered | the scheduled task | yes |
@@ -236,6 +265,43 @@ gates before it invokes the CLI at all. Route 1's phase-1a call exists because
 `AppInstallManager` activates and answers queries *inside* the package; whether
 the install itself is allowed there is only knowable at runtime, so it is tried
 and the identity-less path is the fallback, not the default.
+
+**The routes are now genuine fallbacks for each other, and the private API is
+last (issue #98).** `auto_ladder` returns *every* rung an unforced install may
+try, in order, and `install_via_ladder` walks it: a rung that declines before
+queueing anything falls through to the next. `Rung::Declined` is the only
+outcome that licenses continuing — once a rung has queued work, deployment may
+already be under way and a second installer would race it, so everything else
+stops the walk.
+
+The order is sanctioned APIs first. `StoreContext` is the documented way for an
+app to install its own Store update, `winget` is the same service again, and
+`AppInstallManager` — which Microsoft documents as gated by a private
+capability restricted to its own apps — is the rung before giving up rather
+than the default. It is kept because a user who turned automatic updates on
+would rather have the update than a notification.
+
+Before this, route 1 was *first* and its probe was
+`has_package_identity() || helper_path().is_some()`, true on every real
+install, so it was always selected and neither sanctioned rung was ever
+evaluated once in the product's life. `route_for` is gone: `auto_ladder`
+supersedes it and says strictly more, since the ladder is the whole precedence
+rather than only its head. A forced `--route` or `UpdateRoute` still runs
+exactly one rung with no failover, which is what makes the escape hatch useful
+for diagnosis.
+
+**The hand-off bound belongs to every route that can block, not just route 1
+(issue #140).** `WaitPolicy`, `Verdict` and `verdict` live in the update module
+root and both Store routes use them. This matters because route 2 carried the
+identical defect: `silent_download_and_install` blocked up to 45 minutes on
+`TrySilentDownloadAndInstallStorePackageUpdatesAsync` from the packaged CLI,
+with the settings window or the broker waiting on it, so promoting route 2 to
+the default without bounding it would have moved the hang rather than fixed it.
+Route 2 has no pollable progress signal — progress on an
+`IAsyncOperationWithProgress` arrives through a handler, and `GetResults` on a
+still-`Started` operation is invalid — so its foreground wait is bounded by the
+admission window alone, and it reports the same `installing` / exit 0 /
+`action: "queued"` on hand-off.
 
 **Route 1 hands off instead of waiting (issue #140).** The packaged CLI is a
 child of the settings window or the broker, so it never polls a queued Store
@@ -542,8 +608,20 @@ framework.
   frame reads synchronously. `ensure_broker_running()` (which spins up to 2 s)
   is off-thread as well and reports back with `Msg::BrokerProbed`.
   `broker_state` uses a 250 ms timeout, `pwsh.exe` discovery is a process-wide
-  `OnceLock`, and navigating to About skips the refresh because it shows nothing
-  live.
+  `OnceLock`, and every page refreshes on navigation, About included — its
+  Components and Updates cards are live state.
+- **All app-update UI lives on the About page.** The Automatic updates toggle,
+  the last-check line, "Check now", the install button and the progress ring
+  with its caption are one card there, beside the version and the offer the
+  Components card already shows — an install button only means something next
+  to what it would replace. The card renders nothing at all on an unpackaged
+  build, which has no package to replace. `banners()` therefore keeps only the
+  terminal-integration upgrade bar, which belongs to Terminals rather than to
+  the app's own updates and is progress the user did not ask for and cannot act
+  on, the one thing that earns a standing row on every page. The dismissible
+  result bar stays shared: every feature reports through it. Note `self.pending`
+  is still a single global, so a check started from About disables the
+  bare-slash and integration controls on the other pages while it runs.
 - **Standing banners are Buttons, not InfoBar actions.** Reactor's `InfoBar`
   exposes no action-button slot, so the "Restart to update" action is an
   ordinary `Button` rendered directly beneath its bar, in a second fixed grid
@@ -843,10 +921,20 @@ activate.` when the probed broker is merely paused, rather than the misleading
 ### 2. Shell verbs, exit 3, and a self-upgrading adapter payload
 
 - **`fwdslash cmd-cd <input>`** — the target for the cmd `CD`/`CHDIR`/`PUSHD`
-  macros. Stdout carries the Win32 path and nothing else, so the batch file can
-  capture it verbatim. A bare `/` in distribution-list mode is not one
-  directory, so it goes to stderr with the "`/` lists your WSL distributions…"
-  message and exit 1.
+  macros. Stdout carries the Win32 path and nothing else on success, so the
+  batch file captures it verbatim. A bare `/` in distribution-list mode is not
+  one directory, so it goes to stderr with the "`/` lists your WSL
+  distributions…" message and exit 1.
+
+  On exit 3 it also prints **`:native`** (issue #136). `cmd.exe`'s `for /f`
+  cannot see a child's exit code, and the exit code is what separates "run your
+  own verb" from "the resolver said no", so the adapters used to write, read
+  and delete a `%TEMP%` file on every `cd /x` purely to recover it. The verdict
+  is now legible in the output instead: a colon cannot begin a UNC path, so the
+  marker and a resolved target can never be confused, and the scripts touch the
+  filesystem nowhere. The exit codes are unchanged, and an adapter from an
+  older install checks the code before it reads stdout, so the two remain
+  compatible across an upgrade.
 - **`fwdslash shell-resolve <input>`** — one JSON line
   (`{"kind":"root|distribution|folder","target":…,"distributions":[…]}`) for the
   PowerShell module, so `ls /` costs a single spawn instead of a `resolve` plus

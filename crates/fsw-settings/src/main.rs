@@ -258,9 +258,11 @@ struct State {
     root: Option<String>,
     store_flavor: bool,
     auto_update: bool,
-    /// The version the last check found, from `AvailableUpdate`. This is the
-    /// plan's `update_available`; it already existed under this name.
-    update_tag: Option<String>,
+    /// What the last check found, read through `update::cached_offer` rather
+    /// than raw: a persisted label that is no longer newer than what runs is
+    /// not an offer, and rendering one as a target was issue #97. A Store
+    /// offer with no trustworthy version is `Offer::Unnamed`.
+    offer: Option<update::Offer>,
     /// Unix time of the last check attempt, whatever it concluded. Rendered
     /// through `format_last_check` on the About page.
     last_check: Option<u64>,
@@ -321,7 +323,7 @@ impl State {
             root: settings.bare_slash_root,
             store_flavor: is_store_flavor(),
             auto_update: update::read_auto_update_enabled(),
-            update_tag: update::cached_update_tag(),
+            offer: update::cached_offer(),
             last_check: update::last_update_check(),
             distributions,
             wsl_default,
@@ -417,11 +419,7 @@ impl State {
 
     /// The About page's "there is a newer version" line, or `None`.
     fn update_available_line(&self) -> Option<String> {
-        let tag = self.update_tag.as_deref()?;
-        Some(format!(
-            "Update available: {}",
-            tag.strip_prefix('v').unwrap_or(tag)
-        ))
+        update_offer_line(self.offer.as_ref())
     }
 
     /// Which of the two package flavors is running, or neither.
@@ -1270,6 +1268,20 @@ impl Component for SettingsModel {
                         ));
                         self.notice_is_update = true;
                     }
+                    // The Store says there is an update but named no version
+                    // we trust. Announce the fact without inventing a number
+                    // (issue #97). Not gated on `explicit`: an offer is worth
+                    // surfacing from the launch check too, exactly like a
+                    // named one.
+                    UpdateOutcome::ReadyUnnamed => {
+                        self.notice = Some(Notice::new(
+                            InfoBarSeverity::Informational,
+                            "Update available",
+                            "An update is available in the Microsoft Store. Install it now, \
+                             or let the Store install it on its own schedule.",
+                        ));
+                        self.notice_is_update = true;
+                    }
                     // Everything else is silent unless the user asked: the
                     // launch check is background work they did not request.
                     UpdateOutcome::UpToDate | UpdateOutcome::NotDue if explicit => {
@@ -1648,7 +1660,7 @@ impl SettingsModel {
             Section::General => self.view_general(context),
             Section::Windows => self.view_windows(context),
             Section::Terminals => self.view_terminals(context),
-            Section::About => self.view_about(),
+            Section::About => self.view_about(context),
         };
 
         Border::new().padding(Thickness::uniform(24.0)).content(
@@ -1672,29 +1684,20 @@ impl SettingsModel {
     ///
     /// Reactor's `InfoBar` exposes no action-button slot, so each action is a
     /// `Button` rendered directly beneath its bar.
-    fn banners(&self, context: &mut ViewContext<Self>) -> View {
-        // Both flavors now: the Store build drives the Store's own installer
-        // through the CLI, the GitHub build registers the bundle it already
-        // downloaded.
-        let install_label = install_banner_label(
-            self.state.packaged,
-            self.state.store_flavor,
-            self.state.update_bundle_ready,
-            self.state.update_tag.is_some(),
-        );
-        let notice_action = self.notice.as_ref().and_then(|notice| notice.action);
-        if self.upgrade.is_none()
-            && install_label.is_none()
-            && notice_action.is_none()
-            && self.pending.is_none()
-        {
+    fn banners(&self, _context: &mut ViewContext<Self>) -> View {
+        // Terminal integrations only. Everything about updating the app itself
+        // moved onto the About page, next to the version and the last check,
+        // where an install button actually means something. What is left here
+        // is progress the user did not ask for and cannot act on, which is the
+        // only thing that earns a standing row on every page.
+        let Some(upgrade) = &self.upgrade else {
             return View::empty();
-        }
-
-        // Progress only -- there is no button, because there is no decision to
-        // make. The result lands in the dismissible notice above.
-        let upgrade_notice: View = match &self.upgrade {
-            Some(upgrade) => InfoBar::new()
+        };
+        StackPanel::new()
+            .spacing(8.0)
+            .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
+            .grid_row(1)
+            .children((InfoBar::new()
                 .title("Updating terminal integrations\u{2026}")
                 .message(format!(
                     "{} adapter \u{2192} {FSW_VERSION}",
@@ -1702,59 +1705,7 @@ impl SettingsModel {
                 ))
                 .severity(InfoBarSeverity::Informational)
                 .is_open(true)
-                .is_closable(false)
-                .into(),
-            None => View::empty(),
-        };
-        let install_action: View = match install_label {
-            Some(label) => Button::new()
-                .is_enabled(self.controls_enabled())
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .on_click(context.message(Msg::InstallUpdate))
-                .content(label),
-            None => View::empty(),
-        };
-        // Reactor's InfoBar has no action slot, so the notice's action is a
-        // button of its own directly under the bar.
-        let notice_action: View = match notice_action {
-            Some(action @ NoticeAction::OpenStore) => Button::new()
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .on_click(context.message(Msg::OpenStorePage))
-                .content(action.label()),
-            None => View::empty(),
-        };
-        let progress: View = if self.pending.is_some() {
-            let ring: View = ProgressRing::new()
-                .is_active(true)
-                .is_indeterminate(true)
-                .width(20.0)
-                .height(20.0)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .into();
-            // The two update verbs can legitimately take minutes, so the
-            // ring says what it is waiting for and the caller's ceiling says
-            // for how long at most (issue #140).
-            match pending_caption(self.pending) {
-                Some(caption) => StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        ring,
-                        body(caption)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .foreground(ThemeBrush::TextSecondary),
-                    )),
-                None => ring,
-            }
-        } else {
-            View::empty()
-        };
-
-        StackPanel::new()
-            .spacing(8.0)
-            .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
-            .grid_row(1)
-            .children((upgrade_notice, notice_action, install_action, progress))
+                .is_closable(false),))
     }
 
     #[allow(clippy::too_many_lines)] // This page is deliberately one visual section.
@@ -1873,32 +1824,6 @@ impl SettingsModel {
                     folder_picker,
                 )),
             ),
-            // Automatic updates: both flavors, for any packaged build. The
-            // Store build asks the Store for its own update instead of
-            // GitHub, and is off by default — the Store already updates
-            // the app on its own schedule, so driving it from in here is
-            // something the user opts into.
-            if state.packaged {
-                toggle_card_detail(
-                    "Automatic updates",
-                    if state.store_flavor {
-                        "Let fwdslash install Store updates in the background. Off by \
-                             default; the Store still updates the app on its own schedule."
-                    } else {
-                        "Check GitHub daily and install new versions automatically."
-                    },
-                    Some(state.last_check_line()),
-                    ToggleSwitch::new()
-                        .is_on(state.auto_update)
-                        .is_enabled(self.controls_enabled())
-                        .automation_name("Automatic updates")
-                        .on_toggled(context.callback(Msg::SetAutoUpdate))
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center),
-                )
-            } else {
-                View::empty()
-            },
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(12.0)
@@ -1909,18 +1834,6 @@ impl SettingsModel {
                     Button::new()
                         .on_click(context.message(Msg::RefreshStatus))
                         .content("Refresh status"),
-                    // Independent of the Automatic updates switch: asking
-                    // once, now, is not the same decision as checking every
-                    // day. Hidden only where there is no package to update.
-                    if state.packaged {
-                        Button::new()
-                            .is_enabled(self.controls_enabled())
-                            .automation_name("Check for updates now")
-                            .on_click(context.message(Msg::CheckForUpdates))
-                            .content("Check now")
-                    } else {
-                        View::empty()
-                    },
                 )),
             body(state.status_text()).foreground(ThemeBrush::TextSecondary),
         ))
@@ -2037,6 +1950,102 @@ impl SettingsModel {
     ///
     /// Rendered from `State`, which `Msg::Navigate` refreshes for this page too:
     /// the broker line and the three adapter versions are live.
+    /// Everything about updating the app itself, in one place on About.
+    ///
+    /// It lives here rather than split between General and a banner row
+    /// visible on every page: the version, the last check and the offer are
+    /// already on this page, and an install button is only meaningful next to
+    /// them. `banners()` keeps the terminal-integration bar, which belongs to
+    /// Terminals rather than to the app's own updates.
+    fn updates_card(&self, context: &mut ViewContext<Self>) -> View {
+        let state = &self.state;
+        if !state.packaged {
+            // Nothing here applies to an unpackaged build: there is no package
+            // to replace, and a dev build must not offer to replace itself.
+            return View::empty();
+        }
+        let install_label = install_banner_label(
+            state.packaged,
+            state.store_flavor,
+            state.update_bundle_ready,
+            state.offer.is_some(),
+        );
+        let install_button: View = match install_label {
+            Some(label) => Button::new()
+                .is_enabled(self.controls_enabled())
+                .automation_name("Install the update")
+                .on_click(context.message(Msg::InstallUpdate))
+                .content(label),
+            None => View::empty(),
+        };
+        // The Store hand-off link, when the last install said the user has to
+        // finish it there. Reachable only through `install_notice`.
+        let store_button: View = if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.action == Some(NoticeAction::OpenStore))
+        {
+            Button::new()
+                .is_enabled(self.controls_enabled())
+                .on_click(context.message(Msg::OpenStorePage))
+                .content(NoticeAction::OpenStore.label())
+        } else {
+            View::empty()
+        };
+        let progress: View = match pending_caption(self.pending) {
+            Some(caption) => StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    ProgressRing::new()
+                        .is_active(true)
+                        .is_indeterminate(true)
+                        .width(20.0)
+                        .height(20.0),
+                    body(caption)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .foreground(ThemeBrush::TextSecondary),
+                )),
+            None => View::empty(),
+        };
+        card(
+            StackPanel::new().spacing(12.0).children((
+                toggle_card_detail(
+                    "Automatic updates",
+                    if state.store_flavor {
+                        "Let fwdslash install Store updates in the background. Off by \
+                     default; the Store still updates the app on its own schedule."
+                    } else {
+                        "Check GitHub daily and install new versions automatically."
+                    },
+                    Some(state.last_check_line()),
+                    ToggleSwitch::new()
+                        .is_on(state.auto_update)
+                        .is_enabled(self.controls_enabled())
+                        .automation_name("Automatic updates")
+                        .on_toggled(context.callback(Msg::SetAutoUpdate))
+                        .grid_column(1)
+                        .vertical_alignment(VerticalAlignment::Center),
+                ),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        // Independent of the switch above: asking once, now, is
+                        // not the same decision as checking every day.
+                        Button::new()
+                            .is_enabled(self.controls_enabled())
+                            .automation_name("Check for updates now")
+                            .on_click(context.message(Msg::CheckForUpdates))
+                            .content("Check now"),
+                        install_button,
+                        store_button,
+                    )),
+                progress,
+            )),
+        )
+    }
+
     fn components_card(&self) -> View {
         let state = &self.state;
         card(
@@ -2065,7 +2074,7 @@ impl SettingsModel {
     // The only `expect`s in the crate: `navigate_uri` on a compile-time
     // constant string is infallible by construction.
     #[allow(clippy::expect_used)]
-    fn view_about(&self) -> View {
+    fn view_about(&self, context: &mut ViewContext<Self>) -> View {
         let subtitle = format!("Forward Slash Windows {}", Self::package_label());
         page_stack(16.0).children((
             // page_header demands &'static str; the subtitle is dynamic.
@@ -2078,6 +2087,7 @@ impl SettingsModel {
                 body(&subtitle).foreground(ThemeBrush::TextSecondary),
             )),
             self.components_card(),
+            self.updates_card(context),
             body(
                 "Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to either the \
                      WSL distribution list or your default distribution, on supported Windows \
@@ -2249,6 +2259,21 @@ fn install_banner_label(
     } else {
         "Restart to update"
     })
+}
+
+/// The About page's update line for an offer, or `None` when there is none.
+///
+/// An offer the Store would not name still gets a line: "an update exists" is
+/// the fact, and its version is only a label (issue #97).
+#[must_use]
+fn update_offer_line(offer: Option<&update::Offer>) -> Option<String> {
+    match offer? {
+        update::Offer::Named(tag) => Some(format!(
+            "Update available: {}",
+            tag.strip_prefix('v').unwrap_or(tag)
+        )),
+        update::Offer::Unnamed => Some("Update available".to_string()),
+    }
 }
 
 fn body(text: impl Into<String>) -> TextBlock {
@@ -2540,7 +2565,11 @@ fn check_outcome(code: i32, stdout: &str) -> UpdateOutcome {
     if code == UPDATE_EXIT_AVAILABLE {
         return match json_string_field(line, "available") {
             Some(tag) if !tag.is_empty() => UpdateOutcome::Ready(tag),
-            _ => UpdateOutcome::Unavailable,
+            // Exit 10 without a version is a check that found something it
+            // could not name, not a check that failed. Reporting it as a
+            // failure hid every Store offer whose version we do not trust
+            // (issue #97).
+            _ => UpdateOutcome::ReadyUnnamed,
         };
     }
     match json_string_field(line, "state").as_deref() {
@@ -3000,7 +3029,7 @@ mod tests {
         REPAIR_ACTION, SettingsModel, UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NEEDS_USER,
         UPDATE_EXIT_NOTHING, UPDATE_EXIT_OK, UPDATE_EXIT_TIMEOUT, UpdateOutcome, check_outcome,
         install_banner_label, install_notice, install_was_queued, json_string_field,
-        pending_caption, store_product_uri,
+        pending_caption, store_product_uri, update_offer_line,
     };
     use std::cell::Cell;
 
@@ -3125,19 +3154,57 @@ mod tests {
     // -- check answers -----------------------------------------------------
 
     #[test]
-    fn exit_ten_with_a_version_is_the_only_ready() {
+    fn exit_ten_names_a_version_when_it_has_one_and_still_announces_when_it_does_not() {
         assert_eq!(
             check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "\"0.0.5\"")),
             UpdateOutcome::Ready("0.0.5".to_string())
         );
-        // Exit 10 that cannot name a version is nothing to announce.
+        // Exit 10 without a version is an offer we cannot name, not a check
+        // that failed. Treating it as a failure hid every Store offer whose
+        // version is not trustworthy (issue #97).
         assert_eq!(
             check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "null")),
-            UpdateOutcome::Unavailable
+            UpdateOutcome::ReadyUnnamed
         );
         assert_eq!(
             check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "\"\"")),
+            UpdateOutcome::ReadyUnnamed
+        );
+        // A genuine failure still has to look like one, and that comes from
+        // the state field on a different exit code.
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_OK, &json_line("state", "\"unavailable\"")),
             UpdateOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn the_about_line_never_prints_a_version_the_store_did_not_name() {
+        assert_eq!(
+            update_offer_line(Some(&fsw_core::update::Offer::Named("0.1.0.0".to_string()))),
+            Some("Update available: 0.1.0.0".to_string())
+        );
+        // The GitHub shape keeps its `v` stripped.
+        assert_eq!(
+            update_offer_line(Some(&fsw_core::update::Offer::Named("v0.1.0".to_string()))),
+            Some("Update available: 0.1.0".to_string())
+        );
+        // An offer with no trustworthy version still gets a line, without one.
+        assert_eq!(
+            update_offer_line(Some(&fsw_core::update::Offer::Unnamed)),
+            Some("Update available".to_string())
+        );
+        assert_eq!(update_offer_line(None), None);
+    }
+
+    #[test]
+    fn an_unnamed_store_offer_still_offers_to_install() {
+        // `install_banner_label`'s fourth argument is now "is there an offer",
+        // not "is there a version", so a Store offer we cannot name is still
+        // installable from the window.
+        assert_eq!(
+            install_banner_label(true, true, false, true),
+            Some("Install now")
         );
     }
 

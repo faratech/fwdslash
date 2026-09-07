@@ -19,11 +19,13 @@ use super::relaunch::{
     winget_command_for,
 };
 use super::{
-    EXIT_AVAILABLE, EXIT_ERROR, EXIT_NEEDS_USER, EXIT_NOTHING, EXIT_OK, Fold, HelperResult,
-    Options, Precheck, Route, UpdateJson, Verb, fold_helper_result, install_moment_ok,
-    install_precheck, parse_args, parse_helper_result, render_json, route_for, state_for_code,
+    Availability, EXIT_AVAILABLE, EXIT_ERROR, EXIT_NEEDS_USER, EXIT_NOTHING, EXIT_OK, Fold,
+    HelperResult, InstallAnswer, Options, Precheck, Route, UpdateJson, Verb, auto_ladder,
+    fold_helper_result, install_answer, install_moment_ok, install_precheck, parse_args,
+    parse_helper_result, render_json, state_for_code,
 };
 use crate::scheduled_task::is_safe_task_literal;
+use fsw_core::update::Offer;
 use std::path::Path;
 
 const FAMILY: &str = "32827MikeFara.fwdslash_t6j5qexy2jpp2";
@@ -40,62 +42,78 @@ fn argv(parts: &[&str]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn route_for_is_exhaustive_over_the_ladder() {
-    // No override: the ladder in order, over all sixteen input rows.
-    for appinstall in [false, true] {
-        for silent in [false, true] {
-            for winget in [false, true] {
-                for metered in [false, true] {
-                    let expected = if appinstall {
-                        Route::AppInstall
-                    } else if silent {
-                        Route::Store
-                    } else if winget && !metered {
-                        Route::Winget
-                    } else {
-                        Route::Notify
-                    };
-                    assert_eq!(
-                        route_for(None, appinstall, silent, winget, metered),
-                        expected,
-                        "appinstall={appinstall} silent={silent} winget={winget} metered={metered}"
-                    );
+fn the_ladder_is_exhaustive_and_ordered() {
+    // Sanctioned rungs first, in order, over all eight probe rows. The
+    // private-API rung is always last and always present, because it is the
+    // fallback of last resort rather than a choice.
+    for silent in [false, true] {
+        for winget in [false, true] {
+            for metered in [false, true] {
+                let mut expected = Vec::new();
+                if silent {
+                    expected.push(Route::Store);
                 }
+                if winget && !metered {
+                    expected.push(Route::Winget);
+                }
+                expected.push(Route::AppInstall);
+                assert_eq!(
+                    auto_ladder(silent, winget, metered),
+                    expected,
+                    "silent={silent} winget={winget} metered={metered}"
+                );
             }
         }
     }
 }
 
 #[test]
-fn a_metered_network_suppresses_only_winget() {
-    // winget downloads regardless of the user's data settings, so it is the
-    // one rung the cost probe can veto...
+fn the_private_api_route_is_never_preferred() {
+    // Issue #98: `AppInstallManager` is documented as gated by a private
+    // capability restricted to Microsoft's own apps, so nothing may reach it
+    // before the sanctioned routes have declined. It stays in the ladder as
+    // the rung before giving up, because a user who asked for automatic
+    // updates would rather have the update than a notification.
+    for silent in [false, true] {
+        for winget in [false, true] {
+            for metered in [false, true] {
+                let ladder = auto_ladder(silent, winget, metered);
+                assert_eq!(
+                    ladder.last(),
+                    Some(&Route::AppInstall),
+                    "silent={silent} winget={winget} metered={metered}"
+                );
+            }
+        }
+    }
+    // It leads only on the row where nothing else can run at all.
+    assert_eq!(auto_ladder(false, false, false), vec![Route::AppInstall]);
+    assert_eq!(auto_ladder(true, false, false).first(), Some(&Route::Store));
     assert_eq!(
-        route_for(None, false, false, true, true),
-        Route::Notify,
-        "metered must not reach winget"
+        auto_ladder(false, true, false).first(),
+        Some(&Route::Winget)
     );
-    assert_eq!(route_for(None, false, false, true, false), Route::Winget);
-    // ...and the rungs above it are unaffected, because the Store makes its
-    // own metered decision (`CanSilentlyDownloadStorePackageUpdates`).
-    assert_eq!(route_for(None, true, false, false, true), Route::AppInstall);
-    assert_eq!(route_for(None, false, true, false, true), Route::Store);
 }
 
 #[test]
-fn an_override_wins_over_every_probe() {
-    // The `UpdateRoute` escape hatch has to work when nothing is available,
-    // including forcing a route that will then fail: that is what makes it
-    // useful for diagnosis.
-    for route in [
-        Route::AppInstall,
-        Route::Store,
-        Route::Winget,
-        Route::Notify,
-    ] {
-        assert_eq!(route_for(Some(route), false, false, false, true), route);
-        assert_eq!(route_for(Some(route), true, true, true, false), route);
-    }
+fn every_rung_is_reachable_which_it_never_was_before() {
+    // The old probe was `has_package_identity() || helper_path().is_some()`,
+    // true on every real install, so route 1 was always chosen and neither
+    // sanctioned rung was ever evaluated once.
+    assert!(auto_ladder(true, false, false).contains(&Route::Store));
+    assert!(auto_ladder(false, true, false).contains(&Route::Winget));
+    assert!(auto_ladder(false, false, false).contains(&Route::AppInstall));
+}
+
+#[test]
+fn a_metered_network_suppresses_only_winget() {
+    // winget downloads regardless of the user's data settings, so it is the
+    // one rung the cost probe can veto...
+    assert!(!auto_ladder(false, true, true).contains(&Route::Winget));
+    assert!(auto_ladder(false, true, false).contains(&Route::Winget));
+    // ...and the rung above it is unaffected, because the Store makes its
+    // own metered decision (`CanSilentlyDownloadStorePackageUpdates`).
+    assert!(auto_ladder(true, false, true).contains(&Route::Store));
 }
 
 #[test]
@@ -156,9 +174,8 @@ fn every_route_reports_nothing_to_install_the_same_way() {
         Route::Winget,
         Route::Notify,
     ] {
-        // `route_for` still answers, because picking a rung is a separate
-        // question from whether one will ever be walked.
-        assert_eq!(route_for(Some(route), false, false, false, true), route);
+        // Picking a rung is a separate question from whether one is walked.
+        let _ = route;
         // ...and the precheck that gates it never sees the route.
         assert_eq!(install_precheck(false, true), Precheck::Nothing);
     }
@@ -264,7 +281,7 @@ fn all_fourteen_documented_states_are_classified() {
 
 #[test]
 fn a_foreground_wait_hands_off_on_progress_or_at_the_admission_window() {
-    use super::appinstall::{Verdict, WaitPolicy, verdict};
+    use super::{Verdict, WaitPolicy, verdict};
     use std::time::Duration;
     let policy = WaitPolicy::Foreground {
         admission: Duration::from_secs(180),
@@ -291,8 +308,41 @@ fn a_foreground_wait_hands_off_on_progress_or_at_the_admission_window() {
 }
 
 #[test]
+fn the_whole_attempt_shares_one_budget() {
+    // Issue #144. Every await and the poll loop measure from the same start,
+    // so a foreground caller promised a three-minute hand-off cannot be held
+    // for the sum of three independent ceilings.
+    use super::{Verdict, WaitPolicy, verdict};
+    use std::time::Duration;
+    let policy = WaitPolicy::Foreground {
+        admission: Duration::from_secs(180),
+    };
+    // Spent budget hands off immediately rather than opening a fresh window.
+    assert_eq!(
+        verdict(policy, Duration::from_secs(180), false),
+        Verdict::HandOff
+    );
+    assert_eq!(
+        verdict(policy, Duration::from_secs(600), false),
+        Verdict::HandOff
+    );
+    // And the background policy's much larger budget is still a single one.
+    let background = WaitPolicy::Background {
+        ceiling: Duration::from_mins(45),
+    };
+    assert_eq!(
+        verdict(background, Duration::from_mins(45), false),
+        Verdict::TimedOut
+    );
+    assert_eq!(
+        verdict(background, Duration::from_mins(44), false),
+        Verdict::Continue
+    );
+}
+
+#[test]
 fn a_background_wait_polls_to_the_ceiling_whatever_the_progress() {
-    use super::appinstall::{Verdict, WaitPolicy, verdict};
+    use super::{Verdict, WaitPolicy, verdict};
     use std::time::Duration;
     let policy = WaitPolicy::Background {
         ceiling: Duration::from_mins(45),
@@ -969,4 +1019,90 @@ fn the_winget_command_answers_every_prompt_in_advance() {
             "batch command contains {character}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The install gate (issues #90 and #97)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unknown_availability_never_reaches_a_route() {
+    // The property issue #90 is about, and the one a refactor is most likely
+    // to break: a Store query that failed must not license an install, and
+    // must not claim there is nothing to install either.
+    for actionable in [false, true] {
+        for moment_ok in [false, true] {
+            assert_eq!(
+                install_answer(&Availability::Unknown, actionable, moment_ok),
+                InstallAnswer::Unknown,
+                "actionable {actionable}, moment {moment_ok}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nothing_to_install_still_outranks_the_moment() {
+    for moment_ok in [false, true] {
+        assert_eq!(
+            install_answer(&Availability::Nothing, true, moment_ok),
+            InstallAnswer::Nothing
+        );
+    }
+}
+
+#[test]
+fn a_named_offer_is_never_subject_to_the_unnamed_backoff() {
+    // Its version is the proof that something will change, so it is retried
+    // as often as the caller likes.
+    let named = Availability::Offer(Offer::Named("0.1.0.0".to_string()));
+    for actionable in [false, true] {
+        assert_eq!(
+            install_answer(&named, actionable, true),
+            InstallAnswer::Proceed
+        );
+        assert_eq!(
+            install_answer(&named, actionable, false),
+            InstallAnswer::Defer
+        );
+    }
+}
+
+#[test]
+fn an_unnamed_offer_backs_off_before_the_moment_is_even_asked() {
+    let unnamed = Availability::Offer(Offer::Unnamed);
+    for moment_ok in [false, true] {
+        assert_eq!(
+            install_answer(&unnamed, false, moment_ok),
+            InstallAnswer::BackedOff,
+            "a spent unnamed offer must not retry every cycle"
+        );
+    }
+    assert_eq!(install_answer(&unnamed, true, true), InstallAnswer::Proceed);
+    assert_eq!(install_answer(&unnamed, true, false), InstallAnswer::Defer);
+}
+
+#[test]
+fn the_availability_label_never_invents_a_version() {
+    assert_eq!(
+        Availability::Offer(Offer::Named("0.1.0.0".to_string())).label(),
+        Some("0.1.0.0".to_string())
+    );
+    assert_eq!(Availability::Offer(Offer::Unnamed).label(), None);
+    assert_eq!(Availability::Nothing.label(), None);
+    assert_eq!(Availability::Unknown.label(), None);
+}
+
+#[test]
+fn each_install_answer_carries_the_exit_code_its_state_names() {
+    // Pins the state/exit pairs `cmd_install` emits, so the two cannot drift.
+    // `Unknown` is 11 and not 12: twelve claims there is nothing to install,
+    // which is the whole of issue #90. It is not 0 either — the settings
+    // window reads exit 0 without `action: "queued"` as "about to be
+    // force-closed", shows nothing and leaves the broker down.
+    assert_eq!(state_for_code(EXIT_NOTHING), "upToDate");
+    assert_eq!(state_for_code(EXIT_NEEDS_USER), "needsUser");
+    assert_eq!(state_for_code(EXIT_AVAILABLE), "deferred");
+    assert_ne!(EXIT_NEEDS_USER, EXIT_NOTHING);
+    assert_ne!(EXIT_NEEDS_USER, EXIT_OK);
 }

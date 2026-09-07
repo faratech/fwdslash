@@ -44,6 +44,14 @@ pub const AVAILABLE_UPDATE_VALUE: &str = "AvailableUpdate";
 /// The one-line escape hatch if a route ever has to be switched off in the
 /// field without shipping a build.
 pub const UPDATE_ROUTE_VALUE: &str = "UpdateRoute";
+/// DWORD, `1` when the last **successful** Store query listed a pending update
+/// for this package, named or not. This is the availability *truth*;
+/// [`AVAILABLE_UPDATE_VALUE`] is only its optional label (issue #97).
+pub const STORE_UPDATE_PENDING_VALUE: &str = "StoreUpdatePending";
+/// QWORD, the unix time an install was last started from an **unnamed** offer.
+/// Bounds the retry loop a same-version repair offer would otherwise cause:
+/// each attempt force-closes the package and never advances the version.
+pub const STORE_UPDATE_ATTEMPT_VALUE: &str = "StoreUpdateAttempt";
 /// The file the identity-less update helper reports through, in
 /// [`update_directory_path`]. The helper must never write HKCU — its writes
 /// would land in the real hive while the packaged app reads the virtualized
@@ -430,6 +438,114 @@ pub fn format_last_check(now: u64, last: Option<u64>) -> String {
     }
 }
 
+/// What the update state knows about the next version.
+///
+/// The **presence** of an offer is the availability signal; a version is only a
+/// label, kept when it is strictly newer than what runs and discarded
+/// otherwise. That split is what keeps the installed version from ever being
+/// advertised as the target (issue #97), and it is correct whether or not
+/// `StorePackageUpdate.Package.Id.Version` names the catalog's version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Offer {
+    /// A newer version exists and can be named: a `v`-prefixed GitHub release
+    /// tag, or a four-part Store version strictly newer than what runs.
+    Named(String),
+    /// The Store lists a pending update for this package but named no version
+    /// worth repeating. Never carries the installed version.
+    Unnamed,
+}
+
+impl Offer {
+    /// The label to put in the `available` JSON field, or `None` for an offer
+    /// that cannot be named.
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        match self {
+            Self::Named(tag) => Some(tag),
+            Self::Unnamed => None,
+        }
+    }
+}
+
+/// The offer the persisted state describes, or `None` when there is none.
+///
+/// The label wins when it is still newer than what runs. The Store's pending
+/// flag is the fallback, so a spent label can never suppress a real offer. A
+/// label that is no longer newer is treated as spent, which is also how a
+/// notice left by an older build stops being shown without a migration.
+#[must_use]
+pub fn offer_from_state(
+    current: &str,
+    cached_tag: Option<&str>,
+    store_pending: bool,
+) -> Option<Offer> {
+    if let Some(tag) = cached_tag.filter(|tag| is_newer_available_version(current, tag)) {
+        return Some(Offer::Named(tag.to_string()));
+    }
+    store_pending.then_some(Offer::Unnamed)
+}
+
+/// The offer a Store query describes, from one entry per update that belongs to
+/// this package. `None` inside an entry means the entry is ours but its version
+/// could not be read, which still counts as pending.
+///
+/// Deliberately agnostic about issue #97: if `Package.Id.Version` names the
+/// catalog's version this yields [`Offer::Named`], and if it echoes the
+/// installed one it yields [`Offer::Unnamed`]. Either way it never advertises
+/// the installed version as the target.
+#[must_use]
+pub fn store_offer_from_entries(current: &str, entries: &[Option<String>]) -> Option<Offer> {
+    if entries.is_empty() {
+        return None;
+    }
+    // Newest first is how the Store returns them, so the first that is
+    // genuinely newer is the one to name.
+    entries
+        .iter()
+        .flatten()
+        .find(|version| is_newer_package_version(current, version))
+        .map_or(Some(Offer::Unnamed), |version| {
+            Some(Offer::Named(version.clone()))
+        })
+}
+
+/// One diagnostic line summarising what a Store query returned and how it was
+/// classified. Counts and version strings only — never a path, per `PRIVACY.md`.
+#[must_use]
+pub fn explain_entries(current: &str, entries: &[Option<String>]) -> String {
+    let named = entries
+        .iter()
+        .flatten()
+        .filter(|version| is_newer_package_version(current, version))
+        .count();
+    let first = entries
+        .iter()
+        .flatten()
+        .next()
+        .map_or("none", String::as_str);
+    format!(
+        "store-offer: ours={} named={} first={first} installed={current}",
+        entries.len(),
+        named
+    )
+}
+
+/// How long an unnamed Store offer stays actionable after an install attempt
+/// that did not advance the package version.
+///
+/// A named offer is never subject to this: its version is the proof that
+/// something will change. An unnamed one may be a same-version repair offer,
+/// and each attempt at one costs a force-close plus a watchdog timeout, so it
+/// gets one try a day rather than one per cycle. Evidence for that failure
+/// shape is `docs/update-test-0.0.7.md` finding 2.
+pub const UNNAMED_RETRY_BACKOFF_SECS: u64 = 24 * 60 * 60;
+
+/// Whether an unnamed offer may be installed now.
+#[must_use]
+pub fn unnamed_offer_actionable(last_attempt: Option<u64>, now: u64) -> bool {
+    last_attempt.is_none_or(|last| now.saturating_sub(last) >= UNNAMED_RETRY_BACKOFF_SECS)
+}
+
 /// The outcome of one update-check attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -445,12 +561,17 @@ pub enum UpdateOutcome {
     /// A newer release exists; the tag names it. With auto-update on the
     /// bundle was already downloaded and registered.
     Ready(String),
+    /// An update exists but the check could not name it — the Store's answer
+    /// when its offer carries no version worth repeating (issue #97). Never
+    /// produced by the GitHub path, whose offers are always release tags.
+    ReadyUnnamed,
 }
 
 #[cfg(windows)]
 pub mod windows_impl {
     use super::{
-        AUTO_UPDATE_VALUE, AVAILABLE_UPDATE_VALUE, LAST_UPDATE_CHECK_VALUE, UpdateOutcome,
+        AUTO_UPDATE_VALUE, AVAILABLE_UPDATE_VALUE, LAST_UPDATE_CHECK_VALUE,
+        STORE_UPDATE_ATTEMPT_VALUE, STORE_UPDATE_PENDING_VALUE, UpdateOutcome,
         UpdateVerificationError, expected_bundle_url, extract_bundle_digest, extract_tag_name,
         is_newer_version, update_check_allowed,
     };
@@ -493,12 +614,77 @@ pub mod windows_impl {
 
     /// Clears the persisted update notice (user dismissed it, or a newer
     /// check found the running version current).
+    ///
+    /// Clears the pending flag too. Dropping only the label would leave the
+    /// Store's own "there is an update" answer standing, and the banner would
+    /// come straight back as an unnamed offer.
     pub fn dismiss_update() -> Result<(), u32> {
-        crate::delete_setting(AVAILABLE_UPDATE_VALUE)
+        clear_update_offer()
     }
 
     pub fn clear_cached_update_tag() -> Result<(), u32> {
         crate::delete_setting(AVAILABLE_UPDATE_VALUE)
+    }
+
+    /// Whether the last successful Store query listed a pending update for this
+    /// package. The availability truth behind an unnamed offer (issue #97).
+    #[must_use]
+    pub fn store_update_pending() -> bool {
+        CURRENT_USER
+            .open(FSW_SETTINGS_KEY)
+            .ok()
+            .and_then(|key| key.get_u32(STORE_UPDATE_PENDING_VALUE).ok())
+            .is_some_and(|value| value != 0)
+    }
+
+    /// Records, or clears, the Store's pending-update flag. `false` deletes the
+    /// value rather than writing a zero, so an absent key reads the same as a
+    /// negative answer.
+    pub fn set_store_update_pending(pending: bool) -> Result<(), u32> {
+        if pending {
+            crate::set_setting_u32(STORE_UPDATE_PENDING_VALUE, 1)
+        } else {
+            crate::delete_setting(STORE_UPDATE_PENDING_VALUE)
+        }
+    }
+
+    /// When an install was last started from an unnamed offer.
+    #[must_use]
+    pub fn store_update_attempt() -> Option<u64> {
+        let key = CURRENT_USER.open(FSW_SETTINGS_KEY).ok()?;
+        key.get_u64(STORE_UPDATE_ATTEMPT_VALUE).ok()
+    }
+
+    /// Stamps an unnamed-offer install attempt, which starts its backoff.
+    pub fn note_store_update_attempt() -> Result<(), u32> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        crate::set_setting_u64(STORE_UPDATE_ATTEMPT_VALUE, now)
+    }
+
+    /// Clears the whole offer: the label, the pending flag and the attempt
+    /// stamp. This is what a Store check that found nothing must call, and what
+    /// a user dismissal must call — clearing only the label would leave the
+    /// pending flag to bring the banner straight back as an unnamed offer.
+    pub fn clear_update_offer() -> Result<(), u32> {
+        let label = crate::delete_setting(AVAILABLE_UPDATE_VALUE);
+        let pending = set_store_update_pending(false);
+        let attempt = crate::delete_setting(STORE_UPDATE_ATTEMPT_VALUE);
+        label.and(pending).and(attempt)
+    }
+
+    /// The offer the persisted state describes, filtered for newness. This is
+    /// the only way anything should read the update notice: the raw
+    /// `AvailableUpdate` value can name a version that is no longer newer.
+    #[must_use]
+    pub fn cached_offer() -> Option<super::Offer> {
+        let current = crate::package_version()?;
+        super::offer_from_state(
+            &current,
+            cached_update_tag().as_deref(),
+            store_update_pending(),
+        )
     }
 
     /// Records that a check attempt happened, whatever the outcome: an
@@ -1000,9 +1186,11 @@ pub mod windows_impl {
 
 #[cfg(windows)]
 pub use windows_impl::{
-    cached_update_tag, clear_cached_update_tag, dismiss_update, last_update_check,
-    note_check_attempt, pending_bundle_path, read_auto_update_enabled, run_update_check,
-    set_auto_update_enabled, set_cached_update_tag, sweep_update_directory, update_directory_path,
+    cached_offer, cached_update_tag, clear_cached_update_tag, clear_update_offer, dismiss_update,
+    last_update_check, note_check_attempt, note_store_update_attempt, pending_bundle_path,
+    read_auto_update_enabled, run_update_check, set_auto_update_enabled, set_cached_update_tag,
+    set_store_update_pending, store_update_attempt, store_update_pending, sweep_update_directory,
+    update_directory_path,
 };
 
 // Non-Windows stand-ins for the three entry points other crates call
@@ -1034,4 +1222,30 @@ pub fn update_directory_path() -> Option<std::path::PathBuf> {
 #[must_use]
 pub fn last_update_check() -> Option<u64> {
     None
+}
+
+/// No Store, so never a pending offer off Windows.
+#[cfg(not(windows))]
+#[must_use]
+pub fn cached_offer() -> Option<Offer> {
+    None
+}
+
+/// No Store, so nothing to clear off Windows.
+#[cfg(not(windows))]
+pub fn clear_update_offer() -> Result<(), u32> {
+    Ok(())
+}
+
+/// No Store, so no attempt was ever stamped off Windows.
+#[cfg(not(windows))]
+#[must_use]
+pub fn store_update_attempt() -> Option<u64> {
+    None
+}
+
+/// No Store, so nothing to stamp off Windows.
+#[cfg(not(windows))]
+pub fn note_store_update_attempt() -> Result<(), u32> {
+    Ok(())
 }

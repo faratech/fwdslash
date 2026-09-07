@@ -79,6 +79,15 @@ jobs:
       - name: Test the version bumper
         run: python3 -m unittest tools.test_bump_version
 
+      # The notes file is the only thing Store customers read. 0.1.0 shipped
+      # notes naming internal routes, a watchdog and an issue number, and they
+      # reached a Store submission before anyone read them.
+      - name: Assert the release notes read as customer copy
+        run: python3 tools/check_release_notes.py
+
+      - name: Test the release-notes linter
+        run: python3 -m unittest tools.test_check_release_notes
+
       # Models check-store-submission.yml's HTTP/JSON response guard against a
       # loopback server; it never contacts Partner Center.
       - name: Test Store-submission HTTP verifier

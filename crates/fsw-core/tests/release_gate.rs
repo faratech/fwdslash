@@ -4,11 +4,12 @@
 //! verification matrix.
 
 use fsw_core::update::{
-    UpdateOutcome, auto_update_from_value, check_is_due, default_auto_update, expected_bundle_url,
-    expected_bundle_version, extract_bundle_digest, extract_bundle_url, extract_tag_name,
-    format_last_check, is_newer_available_version, is_newer_github_release,
-    is_newer_package_version, is_newer_version, normalize_running_version, parse_release_tag,
-    parse_version, update_check_allowed,
+    Offer, UNNAMED_RETRY_BACKOFF_SECS, UpdateOutcome, auto_update_from_value, check_is_due,
+    default_auto_update, expected_bundle_url, expected_bundle_version, explain_entries,
+    extract_bundle_digest, extract_bundle_url, extract_tag_name, format_last_check,
+    is_newer_available_version, is_newer_github_release, is_newer_package_version,
+    is_newer_version, normalize_running_version, offer_from_state, parse_release_tag,
+    parse_version, store_offer_from_entries, unnamed_offer_actionable, update_check_allowed,
 };
 use fsw_core::{package_family_from_full_name, package_version_from_full_name};
 
@@ -360,4 +361,134 @@ fn update_outcome_defaults_to_silence() {
         UpdateOutcome::Ready("v0.0.3".to_string()),
     ];
     assert_eq!(outcomes.len(), 4);
+}
+
+// ---------------------------------------------------------------------------
+// The offer model (issues #90 and #97)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_installed_version_is_never_advertised_as_the_target() {
+    // The whole point of issue #97. A label equal to what runs is spent, and a
+    // spent label must not become an offer on its own.
+    assert_eq!(offer_from_state("0.0.8.0", Some("0.0.8.0"), false), None);
+    assert_eq!(offer_from_state("0.0.8.0", Some("0.0.7.0"), false), None);
+    assert_eq!(offer_from_state("0.0.8.0", Some("nonsense"), false), None);
+    assert_eq!(offer_from_state("0.0.8.0", None, false), None);
+}
+
+#[test]
+fn a_spent_label_never_suppresses_a_real_pending_offer() {
+    // The pending flag is the availability truth; the label is only a name for
+    // it. A leftover label from an older build must not hide a live offer.
+    for label in [None, Some("0.0.8.0"), Some("0.0.7.0"), Some("nonsense")] {
+        assert_eq!(
+            offer_from_state("0.0.8.0", label, true),
+            Some(Offer::Unnamed),
+            "label {label:?}"
+        );
+    }
+}
+
+#[test]
+fn a_newer_label_wins_over_the_bare_pending_flag() {
+    assert_eq!(
+        offer_from_state("0.0.8.0", Some("0.1.0.0"), true),
+        Some(Offer::Named("0.1.0.0".to_string()))
+    );
+    assert_eq!(
+        offer_from_state("0.0.8.0", Some("0.1.0.0"), false),
+        Some(Offer::Named("0.1.0.0".to_string()))
+    );
+    // The GitHub shape goes through the same door untouched.
+    assert_eq!(
+        offer_from_state("0.0.8.0", Some("v0.1.0"), false),
+        Some(Offer::Named("v0.1.0".to_string()))
+    );
+    assert_eq!(offer_from_state("0.0.8.0", Some("v0.0.8"), false), None);
+}
+
+#[test]
+fn an_offers_label_is_only_present_when_it_can_be_named() {
+    assert_eq!(Offer::Named("0.1.0.0".to_string()).label(), Some("0.1.0.0"));
+    assert_eq!(Offer::Unnamed.label(), None);
+}
+
+#[test]
+fn a_store_entry_is_classified_correctly_under_either_reading_of_issue_97() {
+    // This test is the reason the fix is safe to ship before the measurement.
+    // If `Package.Id.Version` names the catalog version, the first row applies
+    // and behaviour is what it always was. If it echoes the installed version,
+    // the second applies and the offer survives as unnamed instead of being
+    // filtered into silence.
+    assert_eq!(
+        store_offer_from_entries("0.0.8.0", &[Some("0.1.0.0".to_string())]),
+        Some(Offer::Named("0.1.0.0".to_string()))
+    );
+    assert_eq!(
+        store_offer_from_entries("0.0.8.0", &[Some("0.0.8.0".to_string())]),
+        Some(Offer::Unnamed)
+    );
+    // Ours, but the version could not be read at all: still pending.
+    assert_eq!(
+        store_offer_from_entries("0.0.8.0", &[None]),
+        Some(Offer::Unnamed)
+    );
+    assert_eq!(
+        store_offer_from_entries("0.0.8.0", &[Some("0.0.7.0".to_string())]),
+        Some(Offer::Unnamed)
+    );
+    assert_eq!(
+        store_offer_from_entries("0.0.8.0", &[Some("garbage".to_string())]),
+        Some(Offer::Unnamed)
+    );
+    // No entry for this package at all is the only "nothing pending".
+    assert_eq!(store_offer_from_entries("0.0.8.0", &[]), None);
+    // A newer entry anywhere in the list is found regardless of position.
+    assert_eq!(
+        store_offer_from_entries(
+            "0.0.8.0",
+            &[Some("0.0.8.0".to_string()), Some("0.1.0.0".to_string())]
+        ),
+        Some(Offer::Named("0.1.0.0".to_string()))
+    );
+}
+
+#[test]
+fn an_unnamed_offer_gets_one_attempt_a_day() {
+    // A same-version repair offer would otherwise loop: force-close, never
+    // advance, time the watchdog out, repeat every cycle.
+    let now = 1_800_000_000;
+    assert!(unnamed_offer_actionable(None, now));
+    assert!(!unnamed_offer_actionable(Some(now), now));
+    assert!(!unnamed_offer_actionable(Some(now - 1), now));
+    assert!(!unnamed_offer_actionable(
+        Some(now - UNNAMED_RETRY_BACKOFF_SECS + 1),
+        now
+    ));
+    assert!(unnamed_offer_actionable(
+        Some(now - UNNAMED_RETRY_BACKOFF_SECS),
+        now
+    ));
+    // A clock that moved backwards reads as "just attempted", which errs
+    // towards not looping.
+    assert!(!unnamed_offer_actionable(Some(now + 60), now));
+}
+
+#[test]
+fn the_offer_diagnostic_carries_versions_and_counts_but_never_a_path() {
+    let line = explain_entries(
+        "0.0.8.0",
+        &[Some("0.0.8.0".to_string()), Some("0.1.0.0".to_string())],
+    );
+    assert!(line.contains("ours=2"), "{line}");
+    assert!(line.contains("named=1"), "{line}");
+    assert!(line.contains("installed=0.0.8.0"), "{line}");
+    // PRIVACY.md: diagnostics carry categories and versions, never a path.
+    assert!(!line.contains('\\'), "{line}");
+    assert!(!line.contains('/'), "{line}");
+    assert!(!line.contains(":\\"), "{line}");
+    let empty = explain_entries("0.0.8.0", &[]);
+    assert!(empty.contains("ours=0"), "{empty}");
+    assert!(empty.contains("first=none"), "{empty}");
 }

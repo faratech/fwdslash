@@ -32,20 +32,6 @@ pub fn helper_context_ok() -> bool {
     !fsw_core::has_package_identity()
 }
 
-/// Where the staged copy lives, if `%LOCALAPPDATA%` is readable at all.
-#[must_use]
-pub fn helper_path() -> Option<PathBuf> {
-    Some(fsw_core::update::update_directory_path()?.join(HELPER_NAME))
-}
-
-/// Whether route 1 is attemptable: either we are packaged (phase 1a runs the
-/// sequence in-process) or the helper directory exists to stage into (phase
-/// 1b). Deliberately cheap — it must not stage anything to answer.
-#[must_use]
-pub fn appinstall_available() -> bool {
-    fsw_core::has_package_identity() || helper_path().is_some()
-}
-
 /// Copies this executable to the update directory under [`HELPER_NAME`].
 ///
 /// The copy goes through `adapters::real_copy_file`, i.e. a `cmd.exe` child, for
@@ -92,43 +78,6 @@ pub fn apply_bundle_command(helper: &Path, bundle: &Path, previous_version: &str
         helper.display(),
         bundle.display()
     )
-}
-
-/// The final automatic rung after the identity-less `AppInstall` API refuses
-/// before it queues work. This is deliberately a direct child of the already
-/// running apply task: its watchdog remains in the surrounding batch file, and
-/// no second installer is launched after an `AppInstall` queue was accepted.
-#[cfg(windows)]
-#[allow(dead_code)]
-#[must_use]
-pub fn run_winget_upgrade(product_id: &str) -> bool {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let Some(winget) = fsw_core::SystemBinary::Winget.path() else {
-        return false;
-    };
-    Command::new(winget)
-        .args([
-            "upgrade",
-            "--id",
-            product_id,
-            "--source",
-            "msstore",
-            "--exact",
-            "--silent",
-            "--force",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-            "--disable-interactivity",
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// Records the helper's verdict for the next packaged run to fold in. Silent on

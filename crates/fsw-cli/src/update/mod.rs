@@ -229,37 +229,38 @@ pub fn parse_args(arguments: &[String]) -> Option<Options> {
 // The pure state machine
 // ---------------------------------------------------------------------------
 
-/// Which rung to take. Pure, so the ladder is a truth table rather than a
-/// sequence of side effects, and so `--route` is testable without a Store.
+/// Every rung an unforced install may try, in the order it tries them.
 ///
-/// `appinstall_available` means "route 1 is attemptable at all": the packaged
-/// process can try it in-process (phase 1a) *or* the identity-less helper can
-/// be staged for it (phase 1b). `metered` suppresses only winget, because that
-/// is the one rung that downloads without consulting the user's data settings.
-// This pure truth table is intentionally exposed to the update tests with its
-// inputs named after the independently probed capabilities.
-#[allow(clippy::fn_params_excessive_bools)]
+/// A rung that declines before queueing anything falls through to the next, so
+/// these are genuine fallbacks for each other rather than one choice made up
+/// front. Once a rung *has* queued work the walk stops, whatever the outcome:
+/// deployment may already be under way and a second installer would race it.
+///
+/// Order is sanctioned APIs first. `StoreContext` is the documented way for an
+/// app to install its own Store update, and `winget` is the same service
+/// again. `AppInstallManager` is last: Microsoft documents it as gated by a
+/// private capability restricted to its own apps, so it is never preferred —
+/// but a user who turned automatic updates on would rather have the update
+/// than a notification, so it stays as the rung before giving up (issue #98).
+/// Before this it was *first* and its probe was always true, so the two
+/// sanctioned rungs were never reached at all.
 #[must_use]
-pub fn route_for(
-    override_route: Option<Route>,
-    appinstall_available: bool,
+pub fn auto_ladder(
     can_silently_download: bool,
     winget_available: bool,
     metered: bool,
-) -> Route {
-    if let Some(route) = override_route {
-        return route;
-    }
-    if appinstall_available {
-        return Route::AppInstall;
-    }
+) -> Vec<Route> {
+    let mut ladder = Vec::new();
     if can_silently_download {
-        return Route::Store;
+        ladder.push(Route::Store);
     }
+    // winget downloads regardless of the user's data settings, so the cost
+    // probe vetoes this rung and only this one.
     if winget_available && !metered {
-        return Route::Winget;
+        ladder.push(Route::Winget);
     }
-    Route::Notify
+    ladder.push(Route::AppInstall);
+    ladder
 }
 
 /// Whether now is a good moment to start an install that will force the package
@@ -272,6 +273,141 @@ pub fn route_for(
 #[must_use]
 pub fn install_moment_ok(forced: bool, settings_window_open: bool, worker_busy: bool) -> bool {
     forced || (!settings_window_open && !worker_busy)
+}
+
+// ---------------------------------------------------------------------------
+// How long an install may be watched
+// ---------------------------------------------------------------------------
+
+/// How long the **foreground** CLI watches a queued Store install before
+/// handing it off. Long enough to catch the fast refusals and the zero-item
+/// no-op; short enough that a settings window or a broker waiting on this
+/// process is never held for the Store's own download schedule (issue #140).
+pub const ADMISSION_WINDOW: std::time::Duration = std::time::Duration::from_mins(3);
+/// How long the **background** helper waits, where nothing is blocked on it.
+pub const INSTALL_CEILING: std::time::Duration = std::time::Duration::from_mins(45);
+
+/// Who is waiting on an install poll, and therefore how long it may run.
+///
+/// This is the whole of issue #140's fix, and it belongs to every route that
+/// can block: the packaged CLI is a child of the settings window or the broker,
+/// so it must never poll a queued item to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitPolicy {
+    /// The packaged CLI, with a caller blocked on its exit code.
+    Foreground { admission: std::time::Duration },
+    /// The identity-less helper, from the scheduled task, with nobody waiting.
+    Background { ceiling: std::time::Duration },
+}
+
+/// What a poll loop does next while work is still in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Read the status again next tick.
+    Continue,
+    /// Stop waiting and report the install as queued: the Store owns it now.
+    HandOff,
+    /// Stop waiting and report a pause: the ceiling passed with no conclusion.
+    TimedOut,
+}
+
+/// The wait rule, pure so both policies are testable without a Store.
+///
+/// `progressed` is whether the install has ever shown the Store actually
+/// working rather than holding it in a queue. A foreground caller leaves as
+/// soon as that is true, because from that moment the Store may force-close
+/// the package and the caller wants to close its own window first.
+#[must_use]
+pub fn verdict(policy: WaitPolicy, elapsed: std::time::Duration, progressed: bool) -> Verdict {
+    match policy {
+        WaitPolicy::Foreground { admission } => {
+            if progressed || elapsed >= admission {
+                Verdict::HandOff
+            } else {
+                Verdict::Continue
+            }
+        }
+        WaitPolicy::Background { ceiling } => {
+            if elapsed >= ceiling {
+                Verdict::TimedOut
+            } else {
+                Verdict::Continue
+            }
+        }
+    }
+}
+
+/// What `install` may act on.
+///
+/// The third case is the point of issue #90: a failed Store query and a Store
+/// that answered "nothing" are different facts, and only the second licenses
+/// "nothing to install".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Availability {
+    /// A successful query, and nothing pending.
+    Nothing,
+    /// The query could not run. Whether an update exists is unknown.
+    Unknown,
+    /// Something is pending, named or not.
+    Offer(fsw_core::update::Offer),
+}
+
+impl Availability {
+    /// The label for the `available` JSON field: a version when there is one,
+    /// `None` for an unnamed offer and for both non-offers.
+    #[must_use]
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::Offer(offer) => offer.label().map(str::to_owned),
+            Self::Nothing | Self::Unknown => None,
+        }
+    }
+}
+
+/// What `install` should answer, before any route is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallAnswer {
+    /// Nothing to install: state `upToDate`, exit 12.
+    Nothing,
+    /// The Store could not be asked, so no installer may start: state
+    /// `needsUser`, exit 11.
+    Unknown,
+    /// An unnamed offer inside its retry backoff: state `deferred`, exit 10.
+    BackedOff,
+    /// Not now, but there is something: state `deferred`, exit 10.
+    Defer,
+    /// Run the ladder.
+    Proceed,
+}
+
+/// The whole of `install`'s gate, as one pure table.
+///
+/// Order matters and each step fixed a shipped bug. Availability outranks the
+/// moment (exit 10 promises something to come back for), the moment outranks
+/// the route (a forced route says *how*, never *whether*), and an unnamed offer
+/// outranks neither but is bounded: it may be a same-version repair offer that
+/// will never advance the version, so it gets one attempt per backoff rather
+/// than one per cycle.
+#[must_use]
+pub fn install_answer(
+    availability: &Availability,
+    unnamed_actionable: bool,
+    moment_ok: bool,
+) -> InstallAnswer {
+    match availability {
+        Availability::Nothing => InstallAnswer::Nothing,
+        Availability::Unknown => InstallAnswer::Unknown,
+        Availability::Offer(offer) => {
+            if matches!(offer, fsw_core::update::Offer::Unnamed) && !unnamed_actionable {
+                return InstallAnswer::BackedOff;
+            }
+            if moment_ok {
+                InstallAnswer::Proceed
+            } else {
+                InstallAnswer::Defer
+            }
+        }
+    }
 }
 
 /// What `install` decides before any route runs.
@@ -643,14 +779,16 @@ fn cmd_status(options: &Options) -> i32 {
     }
     let folded = fold_result_file();
     collect_for(options.verb);
-    let available = fsw_core::update::cached_update_tag();
-    let state = if available.is_some() {
+    // Through the same filter as everything else: a label that is no longer
+    // newer than what runs is not an offer.
+    let offer = cached_offer();
+    let state = if offer.is_some() {
         "available"
     } else {
         "upToDate"
     };
     Report::new(state, EXIT_OK)
-        .available(available)
+        .available(offer.and_then(|offer| offer.label().map(str::to_owned)))
         .emit(options, folded)
 }
 
@@ -667,16 +805,12 @@ fn cmd_check(options: &Options) -> i32 {
     if !options.force
         && !fsw_core::update::check_is_due(fsw_core::update::last_update_check(), now_unix())
     {
-        let current =
-            fsw_core::package_version().unwrap_or_else(|| fsw_core::FSW_VERSION.to_string());
-        if let Some(tag) = fsw_core::update::cached_update_tag()
-            .filter(|candidate| fsw_core::update::is_newer_available_version(&current, candidate))
-        {
+        if let Some(offer) = cached_offer() {
             return Report::new("available", EXIT_AVAILABLE)
-                .available(Some(tag))
+                .available(offer.label().map(str::to_owned))
                 .emit(options, folded);
         }
-        let _ = fsw_core::update::clear_cached_update_tag();
+        let _ = fsw_core::update::clear_update_offer();
         return Report::new("notDue", EXIT_OK).emit(options, folded);
     }
 
@@ -701,6 +835,11 @@ fn cmd_check(options: &Options) -> i32 {
             fsw_core::update::UpdateOutcome::Ready(tag) => Report::new("available", EXIT_AVAILABLE)
                 .available(Some(tag))
                 .emit(options, folded),
+            // Unreachable from the GitHub path, which only ever has release
+            // tags, but exhaustive and correct if that ever changes.
+            fsw_core::update::UpdateOutcome::ReadyUnnamed => {
+                Report::new("available", EXIT_AVAILABLE).emit(options, folded)
+            }
         };
     }
 
@@ -709,26 +848,34 @@ fn cmd_check(options: &Options) -> i32 {
     // time, which decides whether an empty answer is inside the cooldown.
     let previous_check = fsw_core::update::last_update_check();
     let _ = fsw_core::update::note_check_attempt();
-    match store::check_store_updates() {
-        Ok(versions) => {
-            if let Some(version) = versions.first() {
-                let _ = fsw_core::update::set_cached_update_tag(version);
-                Report::new("available", EXIT_AVAILABLE)
-                    .available(Some(version.clone()))
-                    .emit(options, folded)
-            } else if let Some(cached) =
-                cached_newer_offer().filter(|_| keep_cached_offer(previous_check, now_unix()))
+    match store::check_store_offer() {
+        Ok(Some(offer)) => {
+            persist_store_offer(&offer);
+            let mut report = Report::new("available", EXIT_AVAILABLE)
+                .available(offer.label().map(str::to_owned));
+            if offer.label().is_none() {
+                // Exit 10 with no version is a legal shape the contract
+                // already allows; say why, so the window can render an offer
+                // it cannot name rather than a failure (issue #97).
+                report =
+                    report.detail("An update is available in the Microsoft Store.".to_string());
+            }
+            report.emit(options, folded)
+        }
+        Ok(None) => {
+            if let Some(cached) =
+                cached_offer().filter(|_| keep_cached_offer(previous_check, now_unix()))
             {
                 // An empty answer minutes after a real one is the Store's
                 // scan cache, not a withdrawal of the offer.
                 Report::new("available", EXIT_AVAILABLE)
-                    .available(Some(cached))
+                    .available(cached.label().map(str::to_owned))
                     .detail(
                         "The Store answered from its cache; the earlier offer stands.".to_string(),
                     )
                     .emit(options, folded)
             } else {
-                let _ = fsw_core::update::clear_cached_update_tag();
+                let _ = fsw_core::update::clear_update_offer();
                 Report::new("upToDate", EXIT_OK).emit(options, folded)
             }
         }
@@ -743,18 +890,18 @@ fn cmd_check(options: &Options) -> i32 {
 /// Picks the rung, probing lazily. The lower rungs cost `WinRT` round trips, so
 /// they are only asked about once the rung above is out; [`route_for`] still
 /// sees the whole row and remains the single definition of precedence.
-fn resolve_route(explicit: Option<Route>) -> (Route, bool) {
-    let override_route = explicit.or_else(route_override);
-    let probing = override_route.is_none();
-    let appinstall = probing && helper::appinstall_available();
-    let silent = probing && !appinstall && store::can_silently_download();
-    let winget =
-        probing && !appinstall && !silent && fsw_core::SystemBinary::Winget.path().is_some();
+fn resolve_route(explicit: Option<Route>) -> (Vec<Route>, bool) {
+    // A forced route is exactly one rung and no failover: the point of the
+    // escape hatch is to see that rung succeed or fail on its own.
+    if let Some(route) = explicit.or_else(route_override) {
+        return (vec![route], true);
+    }
+    // Every probe now runs, because the ladder may reach every rung. Each is
+    // a `WinRT` round trip or a PATH lookup, once per install.
+    let silent = store::can_silently_download();
+    let winget = fsw_core::SystemBinary::Winget.path().is_some();
     let metered = winget && store::network_is_metered();
-    (
-        route_for(override_route, appinstall, silent, winget, metered),
-        override_route.is_some(),
-    )
+    (auto_ladder(silent, winget, metered), false)
 }
 
 /// What the Store is offering, or — when it cannot be reached — whatever the
@@ -768,7 +915,12 @@ fn resolve_route(explicit: Option<Route>) -> (Route, bool) {
 /// discover there was nothing to do. Asking here, once, from the process that
 /// *can* ask, is the cheap version.
 #[cfg(windows)]
-fn available_update() -> Option<String> {
+fn available_update() -> Availability {
+    // No package version means no basis for any comparison. That is not
+    // evidence of being up to date, so it is `Unknown` rather than `Nothing`.
+    let Some(current) = fsw_core::package_version() else {
+        return Availability::Unknown;
+    };
     // What the last check recorded comes first. `install` runs seconds after
     // `check` — the broker chains them, the settings window's button follows
     // its own launch check — and the Store's install service rate-limits
@@ -776,20 +928,43 @@ fn available_update() -> Option<String> {
     // from its cache ("Online scan not allowed due to cooldown period", 0
     // applicable), which used to read as an authoritative "up to date" and
     // erase the offer the user was about to install (issue #140).
-    let current = fsw_core::package_version()?;
-    if let Some(cached) = fsw_core::update::cached_update_tag()
-        .filter(|candidate| fsw_core::update::is_newer_available_version(&current, candidate))
-    {
-        return Some(cached);
+    if let Some(offer) = fsw_core::update::offer_from_state(
+        &current,
+        fsw_core::update::cached_update_tag().as_deref(),
+        fsw_core::update::store_update_pending(),
+    ) {
+        return Availability::Offer(offer);
     }
-    // Nothing recorded: ask, once, from the process that can. An empty answer
-    // here is left to `check` to interpret — there is no cached notice to
-    // clear anyway.
-    let versions = store::check_store_updates().ok()?;
-    let _ = fsw_core::update::note_check_attempt();
-    let first = versions.into_iter().next()?;
-    let _ = fsw_core::update::set_cached_update_tag(&first);
-    Some(first)
+    // Nothing recorded: ask, once, from the process that can.
+    match store::check_store_offer() {
+        Ok(Some(offer)) => {
+            let _ = fsw_core::update::note_check_attempt();
+            persist_store_offer(&offer);
+            Availability::Offer(offer)
+        }
+        Ok(None) => {
+            let _ = fsw_core::update::note_check_attempt();
+            Availability::Nothing
+        }
+        // The query failed. Saying "nothing to install" here was issue #90.
+        Err(_) => Availability::Unknown,
+    }
+}
+
+/// Records a Store offer: the pending flag always, and the label only when the
+/// offer has one. An unnamed offer must clear a stale label rather than leave
+/// it standing, or the window would print a version the Store never named.
+#[cfg(windows)]
+fn persist_store_offer(offer: &fsw_core::update::Offer) {
+    match offer.label() {
+        Some(version) => {
+            let _ = fsw_core::update::set_cached_update_tag(version);
+        }
+        None => {
+            let _ = fsw_core::update::clear_cached_update_tag();
+        }
+    }
+    let _ = fsw_core::update::set_store_update_pending(true);
 }
 
 /// The Store's install service refuses a second online scan for the same
@@ -820,11 +995,11 @@ fn collect_for(verb: Verb) {
     }
 }
 
-/// The cached `AvailableUpdate`, only if it is still newer than what runs.
-fn cached_newer_offer() -> Option<String> {
-    let current = fsw_core::package_version()?;
-    fsw_core::update::cached_update_tag()
-        .filter(|candidate| fsw_core::update::is_newer_available_version(&current, candidate))
+/// The persisted offer, filtered for newness. The **only** way anything in this
+/// module reads the update notice: the raw `AvailableUpdate` value can name a
+/// version that is no longer newer, and rendering that was issue #97.
+fn cached_offer() -> Option<fsw_core::update::Offer> {
+    fsw_core::update::cached_offer()
 }
 
 fn cmd_install(options: &Options) -> i32 {
@@ -840,33 +1015,67 @@ fn cmd_install(options: &Options) -> i32 {
     // One apartment for the whole Store path; the availability probe, the route
     // probes and every rung below nest inside it.
     let _com = ComScope::new();
-    // Nothing to install outranks everything, including `--route`: a forced
-    // route says *how* to install, never *whether* there is anything to.
-    let Some(available) = available_update() else {
-        return Report::new("upToDate", EXIT_NOTHING).emit(options, folded);
-    };
+    // Availability outranks everything, including `--route`: a forced route
+    // says *how* to install, never *whether* there is anything to.
+    let availability = available_update();
+    let label = availability.label();
     // `worker_busy` is always false from here: only the broker knows whether
     // its Enter worker is mid-handler, so it gates before it ever invokes us.
-    if install_precheck(
-        true,
+    let answer = install_answer(
+        &availability,
+        fsw_core::update::unnamed_offer_actionable(
+            fsw_core::update::store_update_attempt(),
+            now_unix(),
+        ),
         install_moment_ok(options.force, fsw_core::settings_window_exists(), false),
-    ) == Precheck::Defer
-    {
-        return Report::new("deferred", EXIT_AVAILABLE)
-            .available(Some(available))
-            .emit(options, folded);
+    );
+    match answer {
+        InstallAnswer::Nothing => {
+            return Report::new("upToDate", EXIT_NOTHING).emit(options, folded);
+        }
+        // Exit 11, not 12 and not 0. Twelve would claim there is nothing to
+        // install, which is the bug. Zero is unusable here: the settings
+        // window reads exit 0 without `action: "queued"` as "I am about to be
+        // force-closed", shows nothing and declines to restore the broker.
+        InstallAnswer::Unknown => {
+            return Report::new("needsUser", EXIT_NEEDS_USER)
+                .route(Route::Notify)
+                .detail(
+                    "The Store could not be reached. Install the update from the Store."
+                        .to_string(),
+                )
+                .emit(options, folded);
+        }
+        InstallAnswer::BackedOff => {
+            return Report::new("deferred", EXIT_AVAILABLE)
+                .available(label)
+                .detail(
+                    "The last attempt at this update did not advance the version; \
+                     waiting before retrying."
+                        .to_string(),
+                )
+                .emit(options, folded);
+        }
+        InstallAnswer::Defer => {
+            return Report::new("deferred", EXIT_AVAILABLE)
+                .available(label)
+                .emit(options, folded);
+        }
+        InstallAnswer::Proceed => {}
     }
 
-    let (route, forced_route) = resolve_route(options.route);
-    match route {
-        Route::AppInstall => install_via_appinstall(options, &available, folded, !forced_route),
-        Route::Store => install_via_store(options, &available, folded, !forced_route),
-        Route::Winget => install_via_winget(options, &available, folded),
-        Route::Notify => Report::new("needsUser", EXIT_NEEDS_USER)
-            .route(Route::Notify)
-            .available(Some(available))
-            .emit(options, folded),
+    // An unnamed offer may be a repair package that never advances the
+    // version. Stamp the attempt before starting, so a failure backs off
+    // instead of looping every cycle.
+    if matches!(
+        availability,
+        Availability::Offer(fsw_core::update::Offer::Unnamed)
+    ) {
+        let _ = fsw_core::update::note_store_update_attempt();
     }
+
+    let (ladder, _forced) = resolve_route(options.route);
+    install_via_ladder(&ladder, options, label.as_deref(), folded)
 }
 
 /// GitHub flavor: the bundle is already downloaded and deferred-registered, so
@@ -913,37 +1122,47 @@ fn install_github_bundle(options: &Options, folded: Option<String>) -> i32 {
 /// *install* is allowed is only knowable at runtime. Any failure before an item
 /// is queued — `E_ACCESSDENIED` above all — drops to 1b, the identity-less
 /// staged helper; a failure to even schedule that drops to route 2.
-fn install_via_appinstall(
-    options: &Options,
-    available: &str,
-    folded: Option<String>,
-    allow_failover: bool,
-) -> i32 {
+/// What one rung of the ladder did.
+///
+/// `Declined` is the **only** outcome that licenses trying another rung.
+/// Once a rung has queued work, deployment may already be under way and a
+/// second installer would race it, so every other outcome is terminal.
+enum Rung {
+    /// Nothing was queued; it is safe to fall through.
+    Declined(String),
+    /// Terminal. Report this and stop walking.
+    Done(Report),
+}
+
+/// Route 1: `AppInstallManager`, phases 1a and 1b.
+fn try_appinstall(options: &Options, available: Option<&str>) -> Rung {
     let previous = previous_version();
     // Registered but deliberately NOT run yet. Its backstop trigger is a minute
     // out, which is longer than the 1a/1b decision takes, so the script 1b may
     // replace is never a file `cmd.exe` already has open.
     let Some(watchdog) = relaunch::schedule_watchdog(options.relaunch, &previous, false) else {
-        return Report::new("error", EXIT_ERROR)
-            .route(Route::AppInstall)
-            .available(Some(available.to_string()))
-            .detail("The relaunch watchdog could not be registered.".to_string())
-            .emit(options, folded);
+        return Rung::Done(
+            Report::new("error", EXIT_ERROR)
+                .route(Route::AppInstall)
+                .available(available.map(str::to_owned))
+                .detail("The relaunch watchdog could not be registered.".to_string()),
+        );
     };
 
-    let policy = appinstall::WaitPolicy::Foreground {
-        admission: appinstall::ADMISSION_WINDOW,
+    let policy = WaitPolicy::Foreground {
+        admission: ADMISSION_WINDOW,
     };
     match appinstall::apply_store_update(fsw_core::STORE_PRODUCT_ID, policy) {
         // The Store has the item and the watchdog has the comeback. Nothing
         // waits on this process any longer: the settings window and the
         // broker both key on this exit and go on with their day.
-        appinstall::Outcome::Queued => Report::new("installing", EXIT_OK)
-            .route(Route::AppInstall)
-            .action("queued")
-            .available(Some(available.to_string()))
-            .detail("The Store is installing the update in the background.".to_string())
-            .emit(options, folded),
+        appinstall::Outcome::Queued => Rung::Done(
+            Report::new("installing", EXIT_OK)
+                .route(Route::AppInstall)
+                .action("queued")
+                .available(available.map(str::to_owned))
+                .detail("The Store is installing the update in the background.".to_string()),
+        ),
         appinstall::Outcome::Finished { code, result } => {
             if !appinstall_keeps_watchdog(code) {
                 watchdog.cancel();
@@ -953,125 +1172,160 @@ fn install_via_appinstall(
                 // either way the cached notice is spent. `EXIT_NOTHING` counts:
                 // the Store reporting nothing to install means the package is
                 // already current, so a standing notice would repeat forever.
-                let _ = fsw_core::update::clear_cached_update_tag();
+                let _ = fsw_core::update::clear_update_offer();
             }
             let mut report =
-                report_for_code(code, Route::AppInstall).available(Some(available.to_string()));
+                report_for_code(code, Route::AppInstall).available(available.map(str::to_owned));
             if let Some(detail) = helper_result_detail(&result) {
                 report = report.detail(detail);
             }
-            report.emit(options, folded)
+            Rung::Done(report)
         }
         appinstall::Outcome::NotStarted(detail) => {
             watchdog.cancel();
+            // Phase 1b: the same call from the identity-less helper, which is
+            // the context the API may accept when the packaged one is refused.
             if let Some(helper) = helper::stage_helper() {
                 let command =
                     helper::apply_store_command(&helper, fsw_core::STORE_PRODUCT_ID, &previous);
                 if relaunch::schedule_apply(&command, options.relaunch, &previous) {
-                    return Report::new("installing", EXIT_OK)
-                        .route(Route::AppInstall)
-                        .action("scheduled")
-                        .available(Some(available.to_string()))
-                        .detail(format!("In-process install unavailable ({detail})."))
-                        .emit(options, folded);
+                    return Rung::Done(
+                        Report::new("installing", EXIT_OK)
+                            .route(Route::AppInstall)
+                            .action("scheduled")
+                            .available(available.map(str::to_owned))
+                            .detail(format!("In-process install unavailable ({detail}).")),
+                    );
                 }
             }
-            if allow_failover {
-                // 1b is out too: continue down the ladder rather than
-                // reporting a failure the user cannot act on.
-                install_via_store(options, available, folded, true)
-            } else {
-                Report::new("needsUser", EXIT_NEEDS_USER)
-                    .route(Route::AppInstall)
-                    .available(Some(available.to_string()))
-                    .detail(format!("The App Install route did not start ({detail})."))
-                    .emit(options, folded)
-            }
+            Rung::Declined(detail)
         }
     }
 }
 
-/// Route 2: `StoreContext`, which only downloads silently when the user's Store
-/// is set to update apps automatically and the network is unmetered.
-fn install_via_store(
-    options: &Options,
-    available: &str,
-    folded: Option<String>,
-    allow_failover: bool,
-) -> i32 {
+/// Route 2: `StoreContext`'s own silent download and install.
+fn try_store(options: &Options, available: Option<&str>) -> Rung {
     let previous = previous_version();
     // This one can terminate the package the moment deployment starts, so its
     // watchdog runs immediately rather than waiting for the backstop trigger.
     let Some(watchdog) = relaunch::schedule_watchdog(options.relaunch, &previous, true) else {
-        return Report::new("error", EXIT_ERROR)
-            .route(Route::Store)
-            .available(Some(available.to_string()))
-            .detail("The relaunch watchdog could not be registered.".to_string())
-            .emit(options, folded);
+        return Rung::Done(
+            Report::new("error", EXIT_ERROR)
+                .route(Route::Store)
+                .available(available.map(str::to_owned))
+                .detail("The relaunch watchdog could not be registered.".to_string()),
+        );
     };
 
-    match store::silent_download_and_install() {
+    let policy = WaitPolicy::Foreground {
+        admission: ADMISSION_WINDOW,
+    };
+    match store::silent_download_and_install(policy) {
+        // The Store accepted it and is still working. Nothing waits on this
+        // process any longer; the watchdog owns the comeback.
+        store::Outcome::Queued => Rung::Done(
+            Report::new("installing", EXIT_OK)
+                .route(Route::Store)
+                .action("queued")
+                .available(available.map(str::to_owned))
+                .detail("The Store is installing the update in the background.".to_string()),
+        ),
         store::Outcome::Finished { code, detail } => {
             if !store_keeps_watchdog(code) {
                 watchdog.cancel();
             }
             let mut report =
-                report_for_code(code, Route::Store).available(Some(available.to_string()));
+                report_for_code(code, Route::Store).available(available.map(str::to_owned));
             if let Some(detail) = detail {
                 report = report.detail(format!("The Store install failed ({detail})."));
             }
-            report.emit(options, folded)
-        }
-        store::Outcome::NotStarted(_) if allow_failover => {
-            watchdog.cancel();
-            install_via_winget(options, available, folded)
+            Rung::Done(report)
         }
         store::Outcome::NotStarted(detail) => {
             watchdog.cancel();
-            Report::new("needsUser", EXIT_NEEDS_USER)
-                .route(Route::Store)
-                .available(Some(available.to_string()))
-                .detail(format!(
-                    "The Store did not start a silent install ({detail})."
-                ))
-                .emit(options, folded)
+            Rung::Declined(detail)
         }
     }
 }
 
 /// Route 3: hand the whole thing to `winget`, from the scheduled task so it
-/// survives the package going down. Skipped on a metered network — winget
-/// downloads regardless of the user's data settings.
-fn install_via_winget(options: &Options, available: &str, folded: Option<String>) -> i32 {
+/// survives the package going down.
+fn try_winget(options: &Options, available: Option<&str>) -> Rung {
     let Some(command) = relaunch::winget_command(fsw_core::STORE_PRODUCT_ID) else {
-        return Report::new("needsUser", EXIT_NEEDS_USER)
-            .route(Route::Notify)
-            .available(Some(available.to_string()))
-            .detail("The Windows App Installer alias is unavailable.".to_string())
-            .emit(options, folded);
+        return Rung::Declined("the Windows App Installer alias is unavailable".to_string());
     };
     if store::network_is_metered() {
-        return Report::new("deferred", EXIT_AVAILABLE)
-            .route(Route::Winget)
-            .available(Some(available.to_string()))
-            .detail("The network is metered.".to_string())
-            .emit(options, folded);
+        // Not a decline: winget downloads regardless of the user's data
+        // settings, so this is a deliberate stop rather than a rung that
+        // could not run. Falling through would defeat the whole point.
+        return Rung::Done(
+            Report::new("deferred", EXIT_AVAILABLE)
+                .route(Route::Winget)
+                .available(available.map(str::to_owned))
+                .detail("The network is metered.".to_string()),
+        );
     }
     let previous = previous_version();
     if relaunch::schedule_apply(&command, options.relaunch, &previous) {
-        Report::new("installing", EXIT_OK)
-            .route(Route::Winget)
-            .action("scheduled")
-            .available(Some(available.to_string()))
-            .emit(options, folded)
+        Rung::Done(
+            Report::new("installing", EXIT_OK)
+                .route(Route::Winget)
+                .action("scheduled")
+                .available(available.map(str::to_owned)),
+        )
     } else {
-        Report::new("needsUser", EXIT_NEEDS_USER)
-            .route(Route::Notify)
-            .available(Some(available.to_string()))
-            .emit(options, folded)
+        Rung::Declined("the update task could not be registered".to_string())
     }
 }
 
+/// Runs one rung by name.
+fn try_route(route: Route, options: &Options, available: Option<&str>) -> Rung {
+    match route {
+        Route::AppInstall => try_appinstall(options, available),
+        Route::Store => try_store(options, available),
+        Route::Winget => try_winget(options, available),
+        Route::Notify => Rung::Done(
+            Report::new("needsUser", EXIT_NEEDS_USER)
+                .route(Route::Notify)
+                .available(available.map(str::to_owned)),
+        ),
+    }
+}
+
+/// Walks the ladder, falling through every rung that declines before it
+/// queued anything, and stopping at the first that did something.
+fn install_via_ladder(
+    ladder: &[Route],
+    options: &Options,
+    available: Option<&str>,
+    folded: Option<String>,
+) -> i32 {
+    let mut declined = Vec::new();
+    for route in ladder {
+        match try_route(*route, options, available) {
+            Rung::Done(report) => return report.emit(options, folded),
+            Rung::Declined(detail) => declined.push(format!("{}: {detail}", route.name())),
+        }
+    }
+    // Every rung declined without queueing anything. Tell the user, who can
+    // still press Update in the Store themselves.
+    Report::new("needsUser", EXIT_NEEDS_USER)
+        .route(Route::Notify)
+        .available(available.map(str::to_owned))
+        .detail(format!(
+            "No install route was available ({}).",
+            declined.join("; ")
+        ))
+        .emit(options, folded)
+}
+
+/// Route 1, both phases.
+///
+/// 1a runs winget's sequence in-process from the packaged CLI: the spike found
+/// `AppInstallManager` activates and answers queries there, and whether the
+/// *install* is allowed is only knowable at runtime. Any failure before an item
+/// is queued — `E_ACCESSDENIED` above all — drops to 1b, the identity-less
+/// staged helper; a failure to even schedule that drops to route 2.
 fn report_for_code(code: i32, route: Route) -> Report {
     Report::new(state_for_code(code), code).route(route)
 }
@@ -1096,8 +1350,8 @@ fn cmd_apply_store(options: &Options) -> i32 {
         return EXIT_USAGE;
     };
     let _com = ComScope::new();
-    let policy = appinstall::WaitPolicy::Background {
-        ceiling: appinstall::INSTALL_CEILING,
+    let policy = WaitPolicy::Background {
+        ceiling: INSTALL_CEILING,
     };
     match appinstall::apply_store_update(product, policy) {
         appinstall::Outcome::Finished { code, result } => {
