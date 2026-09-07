@@ -20,9 +20,9 @@ use super::relaunch::{
 };
 use super::{
     Availability, EXIT_AVAILABLE, EXIT_ERROR, EXIT_NEEDS_USER, EXIT_NOTHING, EXIT_OK, Fold,
-    HelperResult, InstallAnswer, Options, Precheck, Route, UpdateJson, Verb, fold_helper_result,
-    install_answer, install_moment_ok, install_precheck, parse_args, parse_helper_result,
-    render_json, route_for, state_for_code,
+    HelperResult, InstallAnswer, Options, Precheck, Route, UpdateJson, Verb, auto_ladder,
+    fold_helper_result, install_answer, install_moment_ok, install_precheck, parse_args,
+    parse_helper_result, render_json, state_for_code,
 };
 use crate::scheduled_task::is_safe_task_literal;
 use fsw_core::update::Offer;
@@ -42,20 +42,23 @@ fn argv(parts: &[&str]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn route_for_is_exhaustive_over_the_ladder() {
-    // No override: the ladder in order, over all eight input rows.
+fn the_ladder_is_exhaustive_and_ordered() {
+    // Sanctioned rungs first, in order, over all eight probe rows. The
+    // private-API rung is always last and always present, because it is the
+    // fallback of last resort rather than a choice.
     for silent in [false, true] {
         for winget in [false, true] {
             for metered in [false, true] {
-                let expected = if silent {
-                    Route::Store
-                } else if winget && !metered {
-                    Route::Winget
-                } else {
-                    Route::Notify
-                };
+                let mut expected = Vec::new();
+                if silent {
+                    expected.push(Route::Store);
+                }
+                if winget && !metered {
+                    expected.push(Route::Winget);
+                }
+                expected.push(Route::AppInstall);
                 assert_eq!(
-                    route_for(None, silent, winget, metered),
+                    auto_ladder(silent, winget, metered),
                     expected,
                     "silent={silent} winget={winget} metered={metered}"
                 );
@@ -65,58 +68,52 @@ fn route_for_is_exhaustive_over_the_ladder() {
 }
 
 #[test]
-fn the_private_api_route_is_never_selected_automatically() {
+fn the_private_api_route_is_never_preferred() {
     // Issue #98: `AppInstallManager` is documented as gated by a private
-    // capability restricted to Microsoft's own apps, so nothing the product
-    // decides on its own may reach it. It stays available as a hand-set
-    // diagnostic escape hatch, and only that.
+    // capability restricted to Microsoft's own apps, so nothing may reach it
+    // before the sanctioned routes have declined. It stays in the ladder as
+    // the rung before giving up, because a user who asked for automatic
+    // updates would rather have the update than a notification.
     for silent in [false, true] {
         for winget in [false, true] {
             for metered in [false, true] {
-                assert_ne!(
-                    route_for(None, silent, winget, metered),
-                    Route::AppInstall,
+                let ladder = auto_ladder(silent, winget, metered);
+                assert_eq!(
+                    ladder.last(),
+                    Some(&Route::AppInstall),
                     "silent={silent} winget={winget} metered={metered}"
                 );
             }
         }
     }
-    // Reachable only by asking for it by name.
+    // It leads only on the row where nothing else can run at all.
+    assert_eq!(auto_ladder(false, false, false), vec![Route::AppInstall]);
+    assert_eq!(auto_ladder(true, false, false).first(), Some(&Route::Store));
     assert_eq!(
-        route_for(Some(Route::AppInstall), true, true, false),
-        Route::AppInstall
+        auto_ladder(false, true, false).first(),
+        Some(&Route::Winget)
     );
+}
+
+#[test]
+fn every_rung_is_reachable_which_it_never_was_before() {
+    // The old probe was `has_package_identity() || helper_path().is_some()`,
+    // true on every real install, so route 1 was always chosen and neither
+    // sanctioned rung was ever evaluated once.
+    assert!(auto_ladder(true, false, false).contains(&Route::Store));
+    assert!(auto_ladder(false, true, false).contains(&Route::Winget));
+    assert!(auto_ladder(false, false, false).contains(&Route::AppInstall));
 }
 
 #[test]
 fn a_metered_network_suppresses_only_winget() {
     // winget downloads regardless of the user's data settings, so it is the
     // one rung the cost probe can veto...
-    assert_eq!(
-        route_for(None, false, true, true),
-        Route::Notify,
-        "metered must not reach winget"
-    );
-    assert_eq!(route_for(None, false, true, false), Route::Winget);
+    assert!(!auto_ladder(false, true, true).contains(&Route::Winget));
+    assert!(auto_ladder(false, true, false).contains(&Route::Winget));
     // ...and the rung above it is unaffected, because the Store makes its
     // own metered decision (`CanSilentlyDownloadStorePackageUpdates`).
-    assert_eq!(route_for(None, true, false, true), Route::Store);
-}
-
-#[test]
-fn an_override_wins_over_every_probe() {
-    // The `UpdateRoute` escape hatch has to work when nothing is available,
-    // including forcing a route that will then fail: that is what makes it
-    // useful for diagnosis.
-    for route in [
-        Route::AppInstall,
-        Route::Store,
-        Route::Winget,
-        Route::Notify,
-    ] {
-        assert_eq!(route_for(Some(route), false, false, true), route);
-        assert_eq!(route_for(Some(route), true, true, false), route);
-    }
+    assert!(auto_ladder(true, false, true).contains(&Route::Store));
 }
 
 #[test]
@@ -177,9 +174,8 @@ fn every_route_reports_nothing_to_install_the_same_way() {
         Route::Winget,
         Route::Notify,
     ] {
-        // `route_for` still answers, because picking a rung is a separate
-        // question from whether one will ever be walked.
-        assert_eq!(route_for(Some(route), false, false, true), route);
+        // Picking a rung is a separate question from whether one is walked.
+        let _ = route;
         // ...and the precheck that gates it never sees the route.
         assert_eq!(install_precheck(false, true), Precheck::Nothing);
     }

@@ -374,12 +374,17 @@ route is unchanged in shape (`crates/fsw-core/src/update.rs`: daily
 `api.github.com` check, download, `Add-AppxPackage`); the Store route asks the
 Store itself. **All of it is in the CLI**, `crates/fsw-cli/src/update/` — the
 broker calls `fwdslash update` from its health timer and the settings window
-from its button, and neither carries update logic of its own. The install ladder
-is `appinstall` (winget's `AppInstallManager` sequence, tried in-process first
-and then from the helper) → `store` (`StoreContext` silent install) → `winget`
-(`--source msstore`, skipped on a metered network) → `notify`; `route_for` is
-the pure function that picks, and the `UpdateRoute` value or `--route` pins one
-rung without a rebuild.
+from its button, and neither carries update logic of its own. The install ladder is
+`store` (`StoreContext` silent install) → `winget` (`--source msstore`, skipped
+on a metered network) → `appinstall` (winget's `AppInstallManager` sequence,
+tried in-process first and then from the helper) → `notify`, and the rungs are
+genuine fallbacks: `auto_ladder` lists them all and `install_via_ladder` walks
+it, falling through any rung that declines *before* queueing anything and
+stopping at the first that did something. `appinstall` is deliberately last
+because Microsoft documents that API as gated by a private capability
+restricted to its own apps (issue #98); it is kept as the rung before giving up
+rather than removed. The `UpdateRoute` value or `--route` pins one rung with no
+failover, without a rebuild.
 
 Two pieces of that are easy to break. The **helper**,
 `%LOCALAPPDATA%\ForwardSlashWindows\update\fwdslash-helper.exe`, is a

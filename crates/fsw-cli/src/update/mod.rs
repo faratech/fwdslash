@@ -229,37 +229,38 @@ pub fn parse_args(arguments: &[String]) -> Option<Options> {
 // The pure state machine
 // ---------------------------------------------------------------------------
 
-/// Which rung to take. Pure, so the ladder is a truth table rather than a
-/// sequence of side effects, and so `--route` is testable without a Store.
+/// Every rung an unforced install may try, in the order it tries them.
 ///
-/// **`Route::AppInstall` is deliberately absent from the automatic order**
-/// (issue #98). `AppInstallManager` is documented as gated by a private
-/// capability restricted to Microsoft's own apps, so a third-party updater may
-/// not select it on its own; it stays reachable through `--route appinstall`
-/// and the `UpdateRoute` value as a hand-set diagnostic escape hatch. Before
-/// this, its probe was `has_package_identity() || helper_path().is_some()` —
-/// true on every real install — so it was always chosen and the two rungs
-/// below were never even probed.
+/// A rung that declines before queueing anything falls through to the next, so
+/// these are genuine fallbacks for each other rather than one choice made up
+/// front. Once a rung *has* queued work the walk stops, whatever the outcome:
+/// deployment may already be under way and a second installer would race it.
 ///
-/// `metered` suppresses only winget, because that is the one rung that
-/// downloads without consulting the user's data settings.
+/// Order is sanctioned APIs first. `StoreContext` is the documented way for an
+/// app to install its own Store update, and `winget` is the same service
+/// again. `AppInstallManager` is last: Microsoft documents it as gated by a
+/// private capability restricted to its own apps, so it is never preferred —
+/// but a user who turned automatic updates on would rather have the update
+/// than a notification, so it stays as the rung before giving up (issue #98).
+/// Before this it was *first* and its probe was always true, so the two
+/// sanctioned rungs were never reached at all.
 #[must_use]
-pub fn route_for(
-    override_route: Option<Route>,
+pub fn auto_ladder(
     can_silently_download: bool,
     winget_available: bool,
     metered: bool,
-) -> Route {
-    if let Some(route) = override_route {
-        return route;
-    }
+) -> Vec<Route> {
+    let mut ladder = Vec::new();
     if can_silently_download {
-        return Route::Store;
+        ladder.push(Route::Store);
     }
+    // winget downloads regardless of the user's data settings, so the cost
+    // probe vetoes this rung and only this one.
     if winget_available && !metered {
-        return Route::Winget;
+        ladder.push(Route::Winget);
     }
-    Route::Notify
+    ladder.push(Route::AppInstall);
+    ladder
 }
 
 /// Whether now is a good moment to start an install that will force the package
@@ -889,16 +890,18 @@ fn cmd_check(options: &Options) -> i32 {
 /// Picks the rung, probing lazily. The lower rungs cost `WinRT` round trips, so
 /// they are only asked about once the rung above is out; [`route_for`] still
 /// sees the whole row and remains the single definition of precedence.
-fn resolve_route(explicit: Option<Route>) -> (Route, bool) {
-    let override_route = explicit.or_else(route_override);
-    let probing = override_route.is_none();
-    let silent = probing && store::can_silently_download();
-    let winget = probing && !silent && fsw_core::SystemBinary::Winget.path().is_some();
+fn resolve_route(explicit: Option<Route>) -> (Vec<Route>, bool) {
+    // A forced route is exactly one rung and no failover: the point of the
+    // escape hatch is to see that rung succeed or fail on its own.
+    if let Some(route) = explicit.or_else(route_override) {
+        return (vec![route], true);
+    }
+    // Every probe now runs, because the ladder may reach every rung. Each is
+    // a `WinRT` round trip or a PATH lookup, once per install.
+    let silent = store::can_silently_download();
+    let winget = fsw_core::SystemBinary::Winget.path().is_some();
     let metered = winget && store::network_is_metered();
-    (
-        route_for(override_route, silent, winget, metered),
-        override_route.is_some(),
-    )
+    (auto_ladder(silent, winget, metered), false)
 }
 
 /// What the Store is offering, or — when it cannot be reached — whatever the
@@ -1071,17 +1074,8 @@ fn cmd_install(options: &Options) -> i32 {
         let _ = fsw_core::update::note_store_update_attempt();
     }
 
-    let (route, forced_route) = resolve_route(options.route);
-    let available = label.as_deref();
-    match route {
-        Route::AppInstall => install_via_appinstall(options, available, folded, !forced_route),
-        Route::Store => install_via_store(options, available, folded, !forced_route),
-        Route::Winget => install_via_winget(options, available, folded),
-        Route::Notify => Report::new("needsUser", EXIT_NEEDS_USER)
-            .route(Route::Notify)
-            .available(available.map(str::to_owned))
-            .emit(options, folded),
-    }
+    let (ladder, _forced) = resolve_route(options.route);
+    install_via_ladder(&ladder, options, label.as_deref(), folded)
 }
 
 /// GitHub flavor: the bundle is already downloaded and deferred-registered, so
@@ -1128,22 +1122,31 @@ fn install_github_bundle(options: &Options, folded: Option<String>) -> i32 {
 /// *install* is allowed is only knowable at runtime. Any failure before an item
 /// is queued — `E_ACCESSDENIED` above all — drops to 1b, the identity-less
 /// staged helper; a failure to even schedule that drops to route 2.
-fn install_via_appinstall(
-    options: &Options,
-    available: Option<&str>,
-    folded: Option<String>,
-    allow_failover: bool,
-) -> i32 {
+/// What one rung of the ladder did.
+///
+/// `Declined` is the **only** outcome that licenses trying another rung.
+/// Once a rung has queued work, deployment may already be under way and a
+/// second installer would race it, so every other outcome is terminal.
+enum Rung {
+    /// Nothing was queued; it is safe to fall through.
+    Declined(String),
+    /// Terminal. Report this and stop walking.
+    Done(Report),
+}
+
+/// Route 1: `AppInstallManager`, phases 1a and 1b.
+fn try_appinstall(options: &Options, available: Option<&str>) -> Rung {
     let previous = previous_version();
     // Registered but deliberately NOT run yet. Its backstop trigger is a minute
     // out, which is longer than the 1a/1b decision takes, so the script 1b may
     // replace is never a file `cmd.exe` already has open.
     let Some(watchdog) = relaunch::schedule_watchdog(options.relaunch, &previous, false) else {
-        return Report::new("error", EXIT_ERROR)
-            .route(Route::AppInstall)
-            .available(available.map(str::to_owned))
-            .detail("The relaunch watchdog could not be registered.".to_string())
-            .emit(options, folded);
+        return Rung::Done(
+            Report::new("error", EXIT_ERROR)
+                .route(Route::AppInstall)
+                .available(available.map(str::to_owned))
+                .detail("The relaunch watchdog could not be registered.".to_string()),
+        );
     };
 
     let policy = WaitPolicy::Foreground {
@@ -1153,12 +1156,13 @@ fn install_via_appinstall(
         // The Store has the item and the watchdog has the comeback. Nothing
         // waits on this process any longer: the settings window and the
         // broker both key on this exit and go on with their day.
-        appinstall::Outcome::Queued => Report::new("installing", EXIT_OK)
-            .route(Route::AppInstall)
-            .action("queued")
-            .available(available.map(str::to_owned))
-            .detail("The Store is installing the update in the background.".to_string())
-            .emit(options, folded),
+        appinstall::Outcome::Queued => Rung::Done(
+            Report::new("installing", EXIT_OK)
+                .route(Route::AppInstall)
+                .action("queued")
+                .available(available.map(str::to_owned))
+                .detail("The Store is installing the update in the background.".to_string()),
+        ),
         appinstall::Outcome::Finished { code, result } => {
             if !appinstall_keeps_watchdog(code) {
                 watchdog.cancel();
@@ -1175,54 +1179,42 @@ fn install_via_appinstall(
             if let Some(detail) = helper_result_detail(&result) {
                 report = report.detail(detail);
             }
-            report.emit(options, folded)
+            Rung::Done(report)
         }
         appinstall::Outcome::NotStarted(detail) => {
             watchdog.cancel();
+            // Phase 1b: the same call from the identity-less helper, which is
+            // the context the API may accept when the packaged one is refused.
             if let Some(helper) = helper::stage_helper() {
                 let command =
                     helper::apply_store_command(&helper, fsw_core::STORE_PRODUCT_ID, &previous);
                 if relaunch::schedule_apply(&command, options.relaunch, &previous) {
-                    return Report::new("installing", EXIT_OK)
-                        .route(Route::AppInstall)
-                        .action("scheduled")
-                        .available(available.map(str::to_owned))
-                        .detail(format!("In-process install unavailable ({detail})."))
-                        .emit(options, folded);
+                    return Rung::Done(
+                        Report::new("installing", EXIT_OK)
+                            .route(Route::AppInstall)
+                            .action("scheduled")
+                            .available(available.map(str::to_owned))
+                            .detail(format!("In-process install unavailable ({detail}).")),
+                    );
                 }
             }
-            if allow_failover {
-                // 1b is out too: continue down the ladder rather than
-                // reporting a failure the user cannot act on.
-                install_via_store(options, available, folded, true)
-            } else {
-                Report::new("needsUser", EXIT_NEEDS_USER)
-                    .route(Route::AppInstall)
-                    .available(available.map(str::to_owned))
-                    .detail(format!("The App Install route did not start ({detail})."))
-                    .emit(options, folded)
-            }
+            Rung::Declined(detail)
         }
     }
 }
 
-/// Route 2: `StoreContext`, which only downloads silently when the user's Store
-/// is set to update apps automatically and the network is unmetered.
-fn install_via_store(
-    options: &Options,
-    available: Option<&str>,
-    folded: Option<String>,
-    allow_failover: bool,
-) -> i32 {
+/// Route 2: `StoreContext`'s own silent download and install.
+fn try_store(options: &Options, available: Option<&str>) -> Rung {
     let previous = previous_version();
     // This one can terminate the package the moment deployment starts, so its
     // watchdog runs immediately rather than waiting for the backstop trigger.
     let Some(watchdog) = relaunch::schedule_watchdog(options.relaunch, &previous, true) else {
-        return Report::new("error", EXIT_ERROR)
-            .route(Route::Store)
-            .available(available.map(str::to_owned))
-            .detail("The relaunch watchdog could not be registered.".to_string())
-            .emit(options, folded);
+        return Rung::Done(
+            Report::new("error", EXIT_ERROR)
+                .route(Route::Store)
+                .available(available.map(str::to_owned))
+                .detail("The relaunch watchdog could not be registered.".to_string()),
+        );
     };
 
     let policy = WaitPolicy::Foreground {
@@ -1231,12 +1223,13 @@ fn install_via_store(
     match store::silent_download_and_install(policy) {
         // The Store accepted it and is still working. Nothing waits on this
         // process any longer; the watchdog owns the comeback.
-        store::Outcome::Queued => Report::new("installing", EXIT_OK)
-            .route(Route::Store)
-            .action("queued")
-            .available(available.map(str::to_owned))
-            .detail("The Store is installing the update in the background.".to_string())
-            .emit(options, folded),
+        store::Outcome::Queued => Rung::Done(
+            Report::new("installing", EXIT_OK)
+                .route(Route::Store)
+                .action("queued")
+                .available(available.map(str::to_owned))
+                .detail("The Store is installing the update in the background.".to_string()),
+        ),
         store::Outcome::Finished { code, detail } => {
             if !store_keeps_watchdog(code) {
                 watchdog.cancel();
@@ -1246,58 +1239,93 @@ fn install_via_store(
             if let Some(detail) = detail {
                 report = report.detail(format!("The Store install failed ({detail})."));
             }
-            report.emit(options, folded)
-        }
-        store::Outcome::NotStarted(_) if allow_failover => {
-            watchdog.cancel();
-            install_via_winget(options, available, folded)
+            Rung::Done(report)
         }
         store::Outcome::NotStarted(detail) => {
             watchdog.cancel();
-            Report::new("needsUser", EXIT_NEEDS_USER)
-                .route(Route::Store)
-                .available(available.map(str::to_owned))
-                .detail(format!(
-                    "The Store did not start a silent install ({detail})."
-                ))
-                .emit(options, folded)
+            Rung::Declined(detail)
         }
     }
 }
 
 /// Route 3: hand the whole thing to `winget`, from the scheduled task so it
-/// survives the package going down. Skipped on a metered network — winget
-/// downloads regardless of the user's data settings.
-fn install_via_winget(options: &Options, available: Option<&str>, folded: Option<String>) -> i32 {
+/// survives the package going down.
+fn try_winget(options: &Options, available: Option<&str>) -> Rung {
     let Some(command) = relaunch::winget_command(fsw_core::STORE_PRODUCT_ID) else {
-        return Report::new("needsUser", EXIT_NEEDS_USER)
-            .route(Route::Notify)
-            .available(available.map(str::to_owned))
-            .detail("The Windows App Installer alias is unavailable.".to_string())
-            .emit(options, folded);
+        return Rung::Declined("the Windows App Installer alias is unavailable".to_string());
     };
     if store::network_is_metered() {
-        return Report::new("deferred", EXIT_AVAILABLE)
-            .route(Route::Winget)
-            .available(available.map(str::to_owned))
-            .detail("The network is metered.".to_string())
-            .emit(options, folded);
+        // Not a decline: winget downloads regardless of the user's data
+        // settings, so this is a deliberate stop rather than a rung that
+        // could not run. Falling through would defeat the whole point.
+        return Rung::Done(
+            Report::new("deferred", EXIT_AVAILABLE)
+                .route(Route::Winget)
+                .available(available.map(str::to_owned))
+                .detail("The network is metered.".to_string()),
+        );
     }
     let previous = previous_version();
     if relaunch::schedule_apply(&command, options.relaunch, &previous) {
-        Report::new("installing", EXIT_OK)
-            .route(Route::Winget)
-            .action("scheduled")
-            .available(available.map(str::to_owned))
-            .emit(options, folded)
+        Rung::Done(
+            Report::new("installing", EXIT_OK)
+                .route(Route::Winget)
+                .action("scheduled")
+                .available(available.map(str::to_owned)),
+        )
     } else {
-        Report::new("needsUser", EXIT_NEEDS_USER)
-            .route(Route::Notify)
-            .available(available.map(str::to_owned))
-            .emit(options, folded)
+        Rung::Declined("the update task could not be registered".to_string())
     }
 }
 
+/// Runs one rung by name.
+fn try_route(route: Route, options: &Options, available: Option<&str>) -> Rung {
+    match route {
+        Route::AppInstall => try_appinstall(options, available),
+        Route::Store => try_store(options, available),
+        Route::Winget => try_winget(options, available),
+        Route::Notify => Rung::Done(
+            Report::new("needsUser", EXIT_NEEDS_USER)
+                .route(Route::Notify)
+                .available(available.map(str::to_owned)),
+        ),
+    }
+}
+
+/// Walks the ladder, falling through every rung that declines before it
+/// queued anything, and stopping at the first that did something.
+fn install_via_ladder(
+    ladder: &[Route],
+    options: &Options,
+    available: Option<&str>,
+    folded: Option<String>,
+) -> i32 {
+    let mut declined = Vec::new();
+    for route in ladder {
+        match try_route(*route, options, available) {
+            Rung::Done(report) => return report.emit(options, folded),
+            Rung::Declined(detail) => declined.push(format!("{}: {detail}", route.name())),
+        }
+    }
+    // Every rung declined without queueing anything. Tell the user, who can
+    // still press Update in the Store themselves.
+    Report::new("needsUser", EXIT_NEEDS_USER)
+        .route(Route::Notify)
+        .available(available.map(str::to_owned))
+        .detail(format!(
+            "No install route was available ({}).",
+            declined.join("; ")
+        ))
+        .emit(options, folded)
+}
+
+/// Route 1, both phases.
+///
+/// 1a runs winget's sequence in-process from the packaged CLI: the spike found
+/// `AppInstallManager` activates and answers queries there, and whether the
+/// *install* is allowed is only knowable at runtime. Any failure before an item
+/// is queued — `E_ACCESSDENIED` above all — drops to 1b, the identity-less
+/// staged helper; a failure to even schedule that drops to route 2.
 fn report_for_code(code: i32, route: Route) -> Report {
     Report::new(state_for_code(code), code).route(route)
 }

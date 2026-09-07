@@ -248,7 +248,7 @@ a rung is only asked about once the rung above is out.
 
 | # | Route | Precondition | Runs in | Terminates the app |
 |---|---|---|---|---|
-| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`), watched for at most `ADMISSION_WINDOW` (3 min) | **never automatically** — only `--route appinstall` or `UpdateRoute=appinstall` (issue #98) | the packaged CLI, in-process | yes, by the Store |
+| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`), watched for at most `ADMISSION_WINDOW` (3 min) | **last rung**, after both sanctioned routes decline (issue #98) | the packaged CLI, in-process | yes, by the Store |
 | 1b | the same call from the staged helper | 1a failed before an item was queued (`E_ACCESSDENIED` above all) | the identity-less helper, from the scheduled task | yes |
 | 2 | `StoreContext` silent download + install | route 1 unavailable and `CanSilentlyDownloadStorePackageUpdates` | the packaged CLI | yes, when deployment lands |
 | 3 | `winget upgrade --id … --source msstore --silent --force` | winget present and the network unmetered | the scheduled task | yes |
@@ -266,15 +266,29 @@ gates before it invokes the CLI at all. Route 1's phase-1a call exists because
 the install itself is allowed there is only knowable at runtime, so it is tried
 and the identity-less path is the fallback, not the default.
 
-**The private API is out of the automatic ladder (issue #98).** Microsoft
-documents `AppInstallManager` as gated by a private capability restricted to
-its own apps, so nothing the product decides on its own may reach it.
-`route_for` no longer takes an `appinstall_available` input at all, and the
-automatic order is Store, then winget, then notify. It stays reachable by
-name, as a hand-set diagnostic escape hatch. Before this its probe was
-`has_package_identity() || helper_path().is_some()` — true on every real
-install — so route 1 was always chosen and the two rungs below it were never
-probed even once.
+**The routes are now genuine fallbacks for each other, and the private API is
+last (issue #98).** `auto_ladder` returns *every* rung an unforced install may
+try, in order, and `install_via_ladder` walks it: a rung that declines before
+queueing anything falls through to the next. `Rung::Declined` is the only
+outcome that licenses continuing — once a rung has queued work, deployment may
+already be under way and a second installer would race it, so everything else
+stops the walk.
+
+The order is sanctioned APIs first. `StoreContext` is the documented way for an
+app to install its own Store update, `winget` is the same service again, and
+`AppInstallManager` — which Microsoft documents as gated by a private
+capability restricted to its own apps — is the rung before giving up rather
+than the default. It is kept because a user who turned automatic updates on
+would rather have the update than a notification.
+
+Before this, route 1 was *first* and its probe was
+`has_package_identity() || helper_path().is_some()`, true on every real
+install, so it was always selected and neither sanctioned rung was ever
+evaluated once in the product's life. `route_for` is gone: `auto_ladder`
+supersedes it and says strictly more, since the ladder is the whole precedence
+rather than only its head. A forced `--route` or `UpdateRoute` still runs
+exactly one rung with no failover, which is what makes the escape hatch useful
+for diagnosis.
 
 **The hand-off bound belongs to every route that can block, not just route 1
 (issue #140).** `WaitPolicy`, `Verdict` and `verdict` live in the update module
