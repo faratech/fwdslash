@@ -608,8 +608,20 @@ framework.
   frame reads synchronously. `ensure_broker_running()` (which spins up to 2 s)
   is off-thread as well and reports back with `Msg::BrokerProbed`.
   `broker_state` uses a 250 ms timeout, `pwsh.exe` discovery is a process-wide
-  `OnceLock`, and navigating to About skips the refresh because it shows nothing
-  live.
+  `OnceLock`, and every page refreshes on navigation, About included — its
+  Components and Updates cards are live state.
+- **All app-update UI lives on the About page.** The Automatic updates toggle,
+  the last-check line, "Check now", the install button and the progress ring
+  with its caption are one card there, beside the version and the offer the
+  Components card already shows — an install button only means something next
+  to what it would replace. The card renders nothing at all on an unpackaged
+  build, which has no package to replace. `banners()` therefore keeps only the
+  terminal-integration upgrade bar, which belongs to Terminals rather than to
+  the app's own updates and is progress the user did not ask for and cannot act
+  on, the one thing that earns a standing row on every page. The dismissible
+  result bar stays shared: every feature reports through it. Note `self.pending`
+  is still a single global, so a check started from About disables the
+  bare-slash and integration controls on the other pages while it runs.
 - **Standing banners are Buttons, not InfoBar actions.** Reactor's `InfoBar`
   exposes no action-button slot, so the "Restart to update" action is an
   ordinary `Button` rendered directly beneath its bar, in a second fixed grid

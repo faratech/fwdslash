@@ -1660,7 +1660,7 @@ impl SettingsModel {
             Section::General => self.view_general(context),
             Section::Windows => self.view_windows(context),
             Section::Terminals => self.view_terminals(context),
-            Section::About => self.view_about(),
+            Section::About => self.view_about(context),
         };
 
         Border::new().padding(Thickness::uniform(24.0)).content(
@@ -1684,29 +1684,20 @@ impl SettingsModel {
     ///
     /// Reactor's `InfoBar` exposes no action-button slot, so each action is a
     /// `Button` rendered directly beneath its bar.
-    fn banners(&self, context: &mut ViewContext<Self>) -> View {
-        // Both flavors now: the Store build drives the Store's own installer
-        // through the CLI, the GitHub build registers the bundle it already
-        // downloaded.
-        let install_label = install_banner_label(
-            self.state.packaged,
-            self.state.store_flavor,
-            self.state.update_bundle_ready,
-            self.state.offer.is_some(),
-        );
-        let notice_action = self.notice.as_ref().and_then(|notice| notice.action);
-        if self.upgrade.is_none()
-            && install_label.is_none()
-            && notice_action.is_none()
-            && self.pending.is_none()
-        {
+    fn banners(&self, _context: &mut ViewContext<Self>) -> View {
+        // Terminal integrations only. Everything about updating the app itself
+        // moved onto the About page, next to the version and the last check,
+        // where an install button actually means something. What is left here
+        // is progress the user did not ask for and cannot act on, which is the
+        // only thing that earns a standing row on every page.
+        let Some(upgrade) = &self.upgrade else {
             return View::empty();
-        }
-
-        // Progress only -- there is no button, because there is no decision to
-        // make. The result lands in the dismissible notice above.
-        let upgrade_notice: View = match &self.upgrade {
-            Some(upgrade) => InfoBar::new()
+        };
+        StackPanel::new()
+            .spacing(8.0)
+            .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
+            .grid_row(1)
+            .children((InfoBar::new()
                 .title("Updating terminal integrations\u{2026}")
                 .message(format!(
                     "{} adapter \u{2192} {FSW_VERSION}",
@@ -1714,59 +1705,7 @@ impl SettingsModel {
                 ))
                 .severity(InfoBarSeverity::Informational)
                 .is_open(true)
-                .is_closable(false)
-                .into(),
-            None => View::empty(),
-        };
-        let install_action: View = match install_label {
-            Some(label) => Button::new()
-                .is_enabled(self.controls_enabled())
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .on_click(context.message(Msg::InstallUpdate))
-                .content(label),
-            None => View::empty(),
-        };
-        // Reactor's InfoBar has no action slot, so the notice's action is a
-        // button of its own directly under the bar.
-        let notice_action: View = match notice_action {
-            Some(action @ NoticeAction::OpenStore) => Button::new()
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .on_click(context.message(Msg::OpenStorePage))
-                .content(action.label()),
-            None => View::empty(),
-        };
-        let progress: View = if self.pending.is_some() {
-            let ring: View = ProgressRing::new()
-                .is_active(true)
-                .is_indeterminate(true)
-                .width(20.0)
-                .height(20.0)
-                .horizontal_alignment(HorizontalAlignment::Left)
-                .into();
-            // The two update verbs can legitimately take minutes, so the
-            // ring says what it is waiting for and the caller's ceiling says
-            // for how long at most (issue #140).
-            match pending_caption(self.pending) {
-                Some(caption) => StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(8.0)
-                    .children((
-                        ring,
-                        body(caption)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .foreground(ThemeBrush::TextSecondary),
-                    )),
-                None => ring,
-            }
-        } else {
-            View::empty()
-        };
-
-        StackPanel::new()
-            .spacing(8.0)
-            .margin(Thickness::new(0.0, 0.0, 0.0, 16.0))
-            .grid_row(1)
-            .children((upgrade_notice, notice_action, install_action, progress))
+                .is_closable(false),))
     }
 
     #[allow(clippy::too_many_lines)] // This page is deliberately one visual section.
@@ -1885,32 +1824,6 @@ impl SettingsModel {
                     folder_picker,
                 )),
             ),
-            // Automatic updates: both flavors, for any packaged build. The
-            // Store build asks the Store for its own update instead of
-            // GitHub, and is off by default — the Store already updates
-            // the app on its own schedule, so driving it from in here is
-            // something the user opts into.
-            if state.packaged {
-                toggle_card_detail(
-                    "Automatic updates",
-                    if state.store_flavor {
-                        "Let fwdslash install Store updates in the background. Off by \
-                             default; the Store still updates the app on its own schedule."
-                    } else {
-                        "Check GitHub daily and install new versions automatically."
-                    },
-                    Some(state.last_check_line()),
-                    ToggleSwitch::new()
-                        .is_on(state.auto_update)
-                        .is_enabled(self.controls_enabled())
-                        .automation_name("Automatic updates")
-                        .on_toggled(context.callback(Msg::SetAutoUpdate))
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center),
-                )
-            } else {
-                View::empty()
-            },
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(12.0)
@@ -1921,18 +1834,6 @@ impl SettingsModel {
                     Button::new()
                         .on_click(context.message(Msg::RefreshStatus))
                         .content("Refresh status"),
-                    // Independent of the Automatic updates switch: asking
-                    // once, now, is not the same decision as checking every
-                    // day. Hidden only where there is no package to update.
-                    if state.packaged {
-                        Button::new()
-                            .is_enabled(self.controls_enabled())
-                            .automation_name("Check for updates now")
-                            .on_click(context.message(Msg::CheckForUpdates))
-                            .content("Check now")
-                    } else {
-                        View::empty()
-                    },
                 )),
             body(state.status_text()).foreground(ThemeBrush::TextSecondary),
         ))
@@ -2049,6 +1950,102 @@ impl SettingsModel {
     ///
     /// Rendered from `State`, which `Msg::Navigate` refreshes for this page too:
     /// the broker line and the three adapter versions are live.
+    /// Everything about updating the app itself, in one place on About.
+    ///
+    /// It lives here rather than split between General and a banner row
+    /// visible on every page: the version, the last check and the offer are
+    /// already on this page, and an install button is only meaningful next to
+    /// them. `banners()` keeps the terminal-integration bar, which belongs to
+    /// Terminals rather than to the app's own updates.
+    fn updates_card(&self, context: &mut ViewContext<Self>) -> View {
+        let state = &self.state;
+        if !state.packaged {
+            // Nothing here applies to an unpackaged build: there is no package
+            // to replace, and a dev build must not offer to replace itself.
+            return View::empty();
+        }
+        let install_label = install_banner_label(
+            state.packaged,
+            state.store_flavor,
+            state.update_bundle_ready,
+            state.offer.is_some(),
+        );
+        let install_button: View = match install_label {
+            Some(label) => Button::new()
+                .is_enabled(self.controls_enabled())
+                .automation_name("Install the update")
+                .on_click(context.message(Msg::InstallUpdate))
+                .content(label),
+            None => View::empty(),
+        };
+        // The Store hand-off link, when the last install said the user has to
+        // finish it there. Reachable only through `install_notice`.
+        let store_button: View = if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.action == Some(NoticeAction::OpenStore))
+        {
+            Button::new()
+                .is_enabled(self.controls_enabled())
+                .on_click(context.message(Msg::OpenStorePage))
+                .content(NoticeAction::OpenStore.label())
+        } else {
+            View::empty()
+        };
+        let progress: View = match pending_caption(self.pending) {
+            Some(caption) => StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(8.0)
+                .children((
+                    ProgressRing::new()
+                        .is_active(true)
+                        .is_indeterminate(true)
+                        .width(20.0)
+                        .height(20.0),
+                    body(caption)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .foreground(ThemeBrush::TextSecondary),
+                )),
+            None => View::empty(),
+        };
+        card(
+            StackPanel::new().spacing(12.0).children((
+                toggle_card_detail(
+                    "Automatic updates",
+                    if state.store_flavor {
+                        "Let fwdslash install Store updates in the background. Off by \
+                     default; the Store still updates the app on its own schedule."
+                    } else {
+                        "Check GitHub daily and install new versions automatically."
+                    },
+                    Some(state.last_check_line()),
+                    ToggleSwitch::new()
+                        .is_on(state.auto_update)
+                        .is_enabled(self.controls_enabled())
+                        .automation_name("Automatic updates")
+                        .on_toggled(context.callback(Msg::SetAutoUpdate))
+                        .grid_column(1)
+                        .vertical_alignment(VerticalAlignment::Center),
+                ),
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        // Independent of the switch above: asking once, now, is
+                        // not the same decision as checking every day.
+                        Button::new()
+                            .is_enabled(self.controls_enabled())
+                            .automation_name("Check for updates now")
+                            .on_click(context.message(Msg::CheckForUpdates))
+                            .content("Check now"),
+                        install_button,
+                        store_button,
+                    )),
+                progress,
+            )),
+        )
+    }
+
     fn components_card(&self) -> View {
         let state = &self.state;
         card(
@@ -2077,7 +2074,7 @@ impl SettingsModel {
     // The only `expect`s in the crate: `navigate_uri` on a compile-time
     // constant string is infallible by construction.
     #[allow(clippy::expect_used)]
-    fn view_about(&self) -> View {
+    fn view_about(&self, context: &mut ViewContext<Self>) -> View {
         let subtitle = format!("Forward Slash Windows {}", Self::package_label());
         page_stack(16.0).children((
             // page_header demands &'static str; the subtitle is dynamic.
@@ -2090,6 +2087,7 @@ impl SettingsModel {
                 body(&subtitle).foreground(ThemeBrush::TextSecondary),
             )),
             self.components_card(),
+            self.updates_card(context),
             body(
                 "Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to either the \
                      WSL distribution list or your default distribution, on supported Windows \
