@@ -263,6 +263,116 @@ fn all_fourteen_documented_states_are_classified() {
 }
 
 #[test]
+fn a_foreground_wait_hands_off_on_progress_or_at_the_admission_window() {
+    use super::appinstall::{Verdict, WaitPolicy, verdict};
+    use std::time::Duration;
+    let policy = WaitPolicy::Foreground {
+        admission: Duration::from_secs(180),
+    };
+    assert_eq!(verdict(policy, Duration::ZERO, false), Verdict::Continue);
+    assert_eq!(
+        verdict(policy, Duration::from_secs(179), false),
+        Verdict::Continue
+    );
+    assert_eq!(
+        verdict(policy, Duration::from_secs(180), false),
+        Verdict::HandOff
+    );
+    // The Store started moving: leave now, before it force-closes us.
+    assert_eq!(
+        verdict(policy, Duration::from_secs(1), true),
+        Verdict::HandOff
+    );
+    // A foreground wait never reports a timeout: the item is the Store's now.
+    assert_ne!(
+        verdict(policy, Duration::from_hours(2), false),
+        Verdict::TimedOut
+    );
+}
+
+#[test]
+fn a_background_wait_polls_to_the_ceiling_whatever_the_progress() {
+    use super::appinstall::{Verdict, WaitPolicy, verdict};
+    use std::time::Duration;
+    let policy = WaitPolicy::Background {
+        ceiling: Duration::from_mins(45),
+    };
+    for progressed in [false, true] {
+        assert_eq!(
+            verdict(policy, Duration::from_mins(44), progressed),
+            Verdict::Continue
+        );
+        assert_eq!(
+            verdict(policy, Duration::from_mins(45), progressed),
+            Verdict::TimedOut
+        );
+    }
+}
+
+#[test]
+fn waiting_its_turn_is_not_progress_but_a_byte_is() {
+    use super::appinstall::shows_progress;
+    for state in [
+        AppInstallState::Pending,
+        AppInstallState::Starting,
+        AppInstallState::AcquiringLicense,
+        AppInstallState::ReadyToDownload,
+    ] {
+        assert!(!shows_progress(state, 0.0, 0), "state {}", state.0);
+        assert!(shows_progress(state, 0.5, 0), "state {}", state.0);
+        assert!(shows_progress(state, 0.0, 1), "state {}", state.0);
+    }
+    for state in [
+        AppInstallState::Downloading,
+        AppInstallState::RestoringData,
+        AppInstallState::Installing,
+        AppInstallState::Completed,
+    ] {
+        assert!(shows_progress(state, 0.0, 0), "state {}", state.0);
+    }
+}
+
+#[test]
+fn a_live_queue_item_is_adopted_and_a_dead_one_is_cleared() {
+    use super::appinstall::{Existing, existing_item};
+    for state in [
+        AppInstallState::Pending,
+        AppInstallState::Downloading,
+        AppInstallState::Installing,
+    ] {
+        assert_eq!(existing_item(state), Existing::Adopt, "state {}", state.0);
+    }
+    for state in [
+        AppInstallState::Completed,
+        AppInstallState::Canceled,
+        AppInstallState::Error,
+        AppInstallState::Paused,
+        AppInstallState::PausedWiFiRequired,
+    ] {
+        assert_eq!(existing_item(state), Existing::Clear, "state {}", state.0);
+    }
+}
+
+#[test]
+fn an_empty_answer_inside_the_scan_cooldown_keeps_the_cached_offer() {
+    use super::{STORE_SCAN_COOLDOWN_SECS, keep_cached_offer};
+    let now = 1_800_000_000;
+    assert!(keep_cached_offer(Some(now - 5), now));
+    assert!(keep_cached_offer(
+        Some(now - STORE_SCAN_COOLDOWN_SECS + 1),
+        now
+    ));
+    assert!(!keep_cached_offer(
+        Some(now - STORE_SCAN_COOLDOWN_SECS),
+        now
+    ));
+    assert!(!keep_cached_offer(None, now));
+    // A clock that went backwards reads as "just checked", which errs on the
+    // side of keeping the offer for one more cycle.
+    assert!(keep_cached_offer(Some(now + 60), now));
+}
+
+#[test]
 fn severity_orders_error_over_pause_over_success() {
     assert!(severity(EXIT_ERROR) > severity(EXIT_AVAILABLE));
     assert!(severity(EXIT_AVAILABLE) > severity(EXIT_OK));
@@ -664,9 +774,16 @@ fn watchdog_script_golden_app() {
     assert!(script.contains(
         "Start-Process -FilePath 'shell:AppsFolder\\32827MikeFara.fwdslash_t6j5qexy2jpp2!App'"
     ));
-    assert!(!script.contains("Get-Process -Name fswbroker"));
     // Same wait as every other mode: the relaunch is the only difference.
     assert!(script.contains("while ((Get-Date) -lt $deadline)"));
+    // ...and the same give-up: after the ceiling, the broker comes back
+    // whatever the mode, because the old package is still the product.
+    let (ready, timed_out) = script
+        .split_once("} else {")
+        .expect("a ready branch and a timeout branch");
+    assert!(!ready.contains("Get-Process -Name fswbroker"));
+    assert!(timed_out.contains("if (-not (Get-Process -Name fswbroker"));
+    assert!(timed_out.contains("fwdslash.exe') -ArgumentList 'start'"));
     assert!(script.ends_with("del /q \"%~f0\"\r\n"));
 }
 

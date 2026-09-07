@@ -173,13 +173,151 @@ pub struct BlockParams<'a> {
     pub original_non_empty: bool,
 }
 
+/// The lazy stub body the guarded block installs (#134).
+///
+/// Importing `ForwardSlashWindows.psm1` at profile time cost ~140 ms on every
+/// PowerShell session on the machine, including the overwhelming majority that
+/// never type a slash path — roughly half of it spent parsing the module's
+/// Authenticode block, which cannot be removed. So the block no longer imports
+/// anything. It defines small global stubs under the same alias names; each
+/// scans its own arguments for a leading-`/` string and, finding none, splats
+/// straight to the `Microsoft.PowerShell.Management\*` cmdlet — **no import and
+/// no registry read**. The first slash argument imports the module, whose
+/// `Set-Alias -Force` re-points the aliases onto the real wrappers, and the
+/// stub re-dispatches by name; every later call in that session goes to the
+/// real wrapper directly.
+///
+/// The `cd`/`chdir`/`sl` and `pushd` stubs are **global advanced functions**
+/// carrying the same `[CmdletBinding()]`/`param(…)`/`process{}` shape as the
+/// module's own wrappers, for the two reasons documented there: `Push-Location`
+/// run inside a module pushes onto *that module's* stack, and the proxy
+/// parameter metadata (`ValueFromPipeline` on `Path`, `-StackName`, `-PassThru`,
+/// `-UseTransaction`) has to survive so binding is unchanged before the flip.
+///
+/// `Test-FswStubParent` reproduces the `cd ..`-at-a-distribution-root trigger
+/// (#132) with string work on `Get-Location` alone, so that case still reaches
+/// the module without the module being loaded to decide it.
+///
+/// The aliases are installed through the **`alias:` provider** (`Set-Item`),
+/// not `Set-Alias`. The result is identical — same definition, same `AllScope`
+/// option, same global scope — but `Set-Alias` lives in
+/// `Microsoft.PowerShell.Utility`, and touching *any* Utility cmdlet costs
+/// ~70 ms of module load in a session that has not already paid it. The stubs
+/// only ever reach for `Microsoft.PowerShell.Management`, which they need for
+/// the native passthrough anyway.
+///
+/// This text is constant: no version, no transaction id, no payload directory
+/// that moves (#127).
+const STUB_BODY: &str = concat!(
+    "$global:FswStubModule = $m\r\n",
+    "function global:Import-FswStubModule {\r\n",
+    "    if ([System.IO.File]::Exists($global:FswStubModule)) {\r\n",
+    "        Import-Module -Name $global:FswStubModule -Global -Force\r\n",
+    "        return $true\r\n",
+    "    }\r\n",
+    "    return $false\r\n",
+    "}\r\n",
+    "function global:Test-FswStubSlash {\r\n",
+    "    param([object[]]$Arguments = @())\r\n",
+    "    foreach ($v in $Arguments) {\r\n",
+    "        if ($v -is [string]) {\r\n",
+    "            if ($v.StartsWith('/')) { return $true }\r\n",
+    "            continue\r\n",
+    "        }\r\n",
+    "        if ($v -is [System.Collections.IEnumerable]) {\r\n",
+    "            foreach ($i in $v) {\r\n",
+    "                if (($i -is [string]) -and $i.StartsWith('/')) { return $true }\r\n",
+    "            }\r\n",
+    "        }\r\n",
+    "    }\r\n",
+    "    return $false\r\n",
+    "}\r\n",
+    "function global:Test-FswStubParent {\r\n",
+    "    param([object[]]$Arguments = @())\r\n",
+    "    $found = $false\r\n",
+    "    foreach ($v in $Arguments) {\r\n",
+    "        if (($v -is [string]) -and ($v -eq '..' -or $v -eq '../' -or $v -eq '..\\')) { $found = $true }\r\n",
+    "    }\r\n",
+    "    if (-not $found) { return $false }\r\n",
+    "    $l = ''\r\n",
+    "    try { $l = [string](Get-Location).ProviderPath } catch { return $false }\r\n",
+    "    $t = $l.TrimEnd('\\')\r\n",
+    "    if (-not $t.StartsWith('\\\\')) { return $false }\r\n",
+    "    $s = $t.Substring(2).Split('\\')\r\n",
+    "    if ($s.Count -ne 2) { return $false }\r\n",
+    "    if ($s[0] -ne 'wsl.localhost' -and $s[0] -ne 'wsl$') { return $false }\r\n",
+    "    return ($s[1].Length -gt 0)\r\n",
+    "}\r\n",
+    "function global:Invoke-FswStubChildItem {\r\n",
+    "    if ((Test-FswStubSlash -Arguments $args) -and (Import-FswStubModule)) {\r\n",
+    "        Invoke-ForwardSlashWindowsChildItem @args\r\n",
+    "        return\r\n",
+    "    }\r\n",
+    "    Microsoft.PowerShell.Management\\Get-ChildItem @args\r\n",
+    "}\r\n",
+    "function global:Invoke-FswStubSetLocation {\r\n",
+    "    [CmdletBinding(DefaultParameterSetName = 'Path')]\r\n",
+    "    param(\r\n",
+    "        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]\r\n",
+    "        [string]$Path,\r\n",
+    "        [Parameter(Mandatory = $true, ParameterSetName = 'LiteralPath')]\r\n",
+    "        [string]$LiteralPath,\r\n",
+    "        [Parameter(Mandatory = $true, ParameterSetName = 'Stack')]\r\n",
+    "        [string]$StackName,\r\n",
+    "        [switch]$PassThru,\r\n",
+    "        [switch]$UseTransaction\r\n",
+    "    )\r\n",
+    "    process {\r\n",
+    "        $f = $PSBoundParameters\r\n",
+    "        $v = @($f.Values)\r\n",
+    "        if (((Test-FswStubSlash -Arguments $v) -or (Test-FswStubParent -Arguments $v)) -and (Import-FswStubModule)) {\r\n",
+    "            Invoke-ForwardSlashWindowsSetLocation @f\r\n",
+    "            return\r\n",
+    "        }\r\n",
+    "        Microsoft.PowerShell.Management\\Set-Location @f\r\n",
+    "    }\r\n",
+    "}\r\n",
+    "function global:Invoke-FswStubPushLocation {\r\n",
+    "    [CmdletBinding(DefaultParameterSetName = 'Path')]\r\n",
+    "    param(\r\n",
+    "        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]\r\n",
+    "        [string]$Path,\r\n",
+    "        [Parameter(Mandatory = $true, ParameterSetName = 'LiteralPath')]\r\n",
+    "        [string]$LiteralPath,\r\n",
+    "        [string]$StackName,\r\n",
+    "        [switch]$PassThru,\r\n",
+    "        [switch]$UseTransaction\r\n",
+    "    )\r\n",
+    "    process {\r\n",
+    "        $f = $PSBoundParameters\r\n",
+    "        $v = @($f.Values)\r\n",
+    "        if (((Test-FswStubSlash -Arguments $v) -or (Test-FswStubParent -Arguments $v)) -and (Import-FswStubModule)) {\r\n",
+    "            Invoke-ForwardSlashWindowsPushLocation @f\r\n",
+    "            return\r\n",
+    "        }\r\n",
+    "        Microsoft.PowerShell.Management\\Push-Location @f\r\n",
+    "    }\r\n",
+    "}\r\n",
+    "Set-Item -Path alias:dir -Value Invoke-FswStubChildItem -Options AllScope -Force\r\n",
+    "Set-Item -Path alias:ls -Value Invoke-FswStubChildItem -Options AllScope -Force\r\n",
+    "Set-Item -Path alias:cd -Value Invoke-FswStubSetLocation -Options AllScope -Force\r\n",
+    "Set-Item -Path alias:chdir -Value Invoke-FswStubSetLocation -Options AllScope -Force\r\n",
+    "Set-Item -Path alias:sl -Value Invoke-FswStubSetLocation -Options AllScope -Force\r\n",
+    "Set-Item -Path alias:pushd -Value Invoke-FswStubPushLocation -Options AllScope -Force\r\n",
+);
+
 /// The guarded profile block.
 ///
-/// Guarded three ways (#37): `Import-Module` runs only when the module file is
-/// present, so a pruned version directory can never throw the red
-/// `no valid module file` error; when the product-presence probe is gone the
-/// block hands off to the staged controller's self-clean; and the whole region
-/// is fenced so it can be found and replaced by marker, not by exact bytes.
+/// Guarded three ways (#37): the stubs are installed only when the module file
+/// is present, so a pruned version directory can never produce a stub that
+/// imports nothing; when the product-presence probe is gone the block hands off
+/// to the staged controller's self-clean; and the whole region is fenced so it
+/// can be found and replaced by marker, not by exact bytes.
+///
+/// Since #134 the block installs [`STUB_BODY`] rather than running
+/// `Import-Module`, so a session that never types a slash path pays only the
+/// parse of these few dozen lines instead of ~140 ms of module import.
+///
 /// The block is CRLF-terminated and prefixed with a blank CRLF line only when
 /// the original profile was non-empty.
 #[must_use]
@@ -199,7 +337,9 @@ pub fn block_text(params: &BlockParams) -> String {
          $p = '{probe}'\r\n\
          $a = '{alias}'\r\n\
          $c = '{controller}'\r\n\
-         if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) {{ if (Test-Path -LiteralPath $m) {{ Import-Module -Name $m -Global -Force }} }} elseif (Test-Path -LiteralPath $c) {{ Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }}\r\n\
+         if (([System.IO.Directory]::Exists($p)) -or ($a -and [System.IO.File]::Exists($a))) {{ if ([System.IO.File]::Exists($m)) {{\r\n\
+         {STUB_BODY}\
+         }} }} elseif ([System.IO.File]::Exists($c)) {{ Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }}\r\n\
          {FENCE_CLOSE}\r\n"
     )
 }
@@ -394,6 +534,12 @@ pub struct ParsedBlock {
     pub version: String,
     pub transaction_id: String,
     pub module_path: Option<String>,
+    /// The block's own text, open fence through close fence inclusive, with
+    /// the close fence's line terminator but **without** the blank-line prefix
+    /// `block_text` may add. Compared against the current [`block_text`] to
+    /// detect a block whose fence is stable but whose body is out of date
+    /// (#134) — the fence itself can never say so, by #127 design.
+    pub text: String,
 }
 
 impl ParsedBlock {
@@ -441,17 +587,23 @@ fn parse_blocks_text(text: &str) -> Vec<ParsedBlock> {
             }
             j += 1;
         }
+        // The region: from the open fence's first byte through the close
+        // fence's terminator, or through the last body line when the close
+        // fence is missing.
+        let closed = j < lines.len() && is_close_fence(&text[lines[j].start..lines[j].content_end]);
+        let last = if closed {
+            j
+        } else {
+            j.saturating_sub(1).max(i)
+        };
         blocks.push(ParsedBlock {
             version,
             transaction_id,
             module_path,
+            text: text[lines[i].start..lines[last].term_end].to_string(),
         });
         // Continue after the close fence when there is one.
-        i = if j < lines.len() && is_close_fence(&text[lines[j].start..lines[j].content_end]) {
-            j + 1
-        } else {
-            j
-        };
+        i = if closed { j + 1 } else { j };
     }
     blocks
 }
@@ -506,6 +658,13 @@ pub struct BlockPresence {
     /// The version stamped into the legacy fence; empty for a stable block.
     pub version: String,
     pub module_present: bool,
+    /// Whether the block's text is byte-identical to what [`block_text`] emits
+    /// today. `false` is **content drift** (#134): the fence is stable, so
+    /// nothing in it can say the body is stale, but the deployed block is an
+    /// older shape — the eager `Import-Module` an install made before the lazy
+    /// stubs landed, say. Without this the classifier calls such a block
+    /// `Healthy` forever and the change never reaches an existing install.
+    pub matches_current: bool,
 }
 
 impl BlockPresence {
@@ -542,6 +701,13 @@ pub enum ProfileHealth {
     /// form is a `Documents` write, which only an explicit user action is
     /// allowed to make. Carries the legacy fence's version.
     MigrationPending(String),
+    /// A single, working block on the **stable** fence whose body is not what
+    /// this build writes (#134). Like `MigrationPending` it is not a fault —
+    /// the deployed block still works — and like it, replacing it is a
+    /// `Documents` write only an explicit user action may make. The fence
+    /// deliberately carries no version (#127), so this is the *only* signal
+    /// that a block predates a change to the block's content.
+    UpdatePending,
     /// More than one fwdslash block.
     Duplicated,
 }
@@ -549,10 +715,17 @@ pub enum ProfileHealth {
 /// Classifies a profile from its blocks. Orphan (missing module) outranks the
 /// rest because it is the only state that throws a visible error.
 ///
-/// There is deliberately **no** version comparison here any more (#127): the
-/// stable block cannot go stale, so the payload version of record is the
-/// registry marker's `Version`, never the fence text. A block that still
-/// carries a version in its fence is a legacy block awaiting migration.
+/// There is deliberately **no** version comparison here (#127): the payload
+/// version of record is the registry marker's `Version`, never the fence text.
+/// A block that still carries a version in its fence is a legacy block awaiting
+/// migration.
+///
+/// The stable block *can* still go stale, though — not by version but by
+/// **content** (#134). `matches_current` is the comparison against what
+/// `block_text` emits today, and a stable, working, module-present block whose
+/// body differs is [`ProfileHealth::UpdatePending`]. An upgrade that does not
+/// change the block text leaves every deployed block matching, so it still
+/// writes nothing at all, which is the whole point of #127.
 #[must_use]
 pub fn classify_profile(blocks: &[BlockPresence]) -> ProfileHealth {
     if blocks.is_empty() {
@@ -566,7 +739,12 @@ pub fn classify_profile(blocks: &[BlockPresence]) -> ProfileHealth {
     }
     let only = &blocks[0];
     if only.is_legacy() {
+        // A legacy block is drifted too, but migrating it is the same rewrite
+        // and the more specific thing to say.
         return ProfileHealth::MigrationPending(only.version.clone());
+    }
+    if !only.matches_current {
+        return ProfileHealth::UpdatePending;
     }
     ProfileHealth::Healthy
 }
@@ -658,10 +836,14 @@ fn decide_profile_repair_unchecked(
                 ProfileAction::RemoveBlocks
             }
         }
-        // Orphan / legacy / duplicate: normalise to one current block when the
-        // adapter should be installed, otherwise strip it out entirely.
+        // Orphan / legacy / drifted / duplicate: normalise to one current
+        // block when the adapter should be installed, otherwise strip it out
+        // entirely. `decide_profile_repair` above then downgrades every one of
+        // these to `NeedsConfirmation` for a background sweep, so the broker
+        // never writes `Documents` (#127).
         ProfileHealth::Orphaned(_)
         | ProfileHealth::MigrationPending(_)
+        | ProfileHealth::UpdatePending
         | ProfileHealth::Duplicated => {
             if marker_installed {
                 restore_installed()
@@ -701,15 +883,18 @@ pub fn base64_utf16le(text: &str) -> String {
 }
 
 /// The in-shell verification the installer runs after writing the profile:
-/// both aliases must resolve to the adapter function. Exit 41 = wrong
-/// definition, 42 = an alias is missing.
+/// both aliases must resolve to an adapter function. Since #134 that is the
+/// lazy stub in a fresh session, and the real wrapper once the module has been
+/// imported, so either name passes. Exit 41 = wrong definition, 42 = an alias
+/// is missing.
 pub const VERIFY_SCRIPT: &str = concat!(
     "$ErrorActionPreference = 'Stop'\n",
     "try {\n",
     "    $dirAlias = Get-Alias -Name dir\n",
     "    $lsAlias = Get-Alias -Name ls\n",
-    "    if ($dirAlias.Definition -ne 'Invoke-ForwardSlashWindowsChildItem' -or\n",
-    "        $lsAlias.Definition -ne 'Invoke-ForwardSlashWindowsChildItem') {\n",
+    "    $ok = @('Invoke-FswStubChildItem', 'Invoke-ForwardSlashWindowsChildItem')\n",
+    "    if ($ok -notcontains $dirAlias.Definition -or\n",
+    "        $ok -notcontains $lsAlias.Definition) {\n",
     "        exit 41\n",
     "    }\n",
     "    exit 0\n",

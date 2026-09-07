@@ -28,10 +28,16 @@ use std::time::{Duration, Instant};
 use windows_core::HSTRING;
 use windows_future::{AsyncStatus, IAsyncOperation};
 
-/// How long to wait for the Store to finish before giving up. The Store's own
-/// queue can be slow enough that anything shorter turns a working install into
-/// a reported failure.
+/// How long the **background** helper waits for the Store to finish before
+/// giving up. The Store's own queue can be slow enough that anything shorter
+/// turns a working install into a reported failure.
 pub const INSTALL_CEILING: Duration = Duration::from_mins(45);
+/// How long the **foreground** phase-1a call watches a queued item before
+/// handing it to the Store and the watchdog. Long enough to catch the fast
+/// refusals (a licence error, a cancelled queue) and the zero-item no-op;
+/// short enough that a settings window or a broker waiting on this process is
+/// never held for the Store's own download schedule (issue #140).
+pub const ADMISSION_WINDOW: Duration = Duration::from_mins(3);
 /// How often the item statuses are re-read. One second is what winget uses.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// The entitlement and the start call are the only two awaits that must not
@@ -46,6 +52,12 @@ pub enum Outcome {
     /// An install was queued and polled to a conclusion. `code` is the verb's
     /// exit code and `result` is what the helper writes to its result file.
     Finished { code: i32, result: HelperResult },
+    /// An install is queued with the Store and still in flight when the
+    /// foreground wait ended — either it started moving, or the admission
+    /// window ran out with the item still waiting its turn. The Store owns it
+    /// from here and the watchdog owns the comeback; the caller must **not**
+    /// start another installer, and must not wait any longer.
+    Queued,
     /// Nothing was ever queued — activation, the options object or the start
     /// call refused. The string is the `0x…` HRESULT. **This is a route
     /// change**, not a failure to report: phase 1a answers it by falling to
@@ -75,6 +87,95 @@ fn block_on<T: windows_core::RuntimeType + 'static>(
             )));
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Who is waiting on the poll loop, and therefore how long it may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitPolicy {
+    /// The packaged CLI, with a settings window or the broker blocked on its
+    /// exit code. Hands the item off as soon as the Store starts moving it,
+    /// and no later than `admission` after it was queued.
+    Foreground { admission: Duration },
+    /// The identity-less helper, from the scheduled task, with nobody waiting.
+    /// Polls to a conclusion or to `ceiling`.
+    Background { ceiling: Duration },
+}
+
+/// What the poll loop does next when every queued item is still working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Read the statuses again next tick.
+    Continue,
+    /// Stop waiting and report [`Outcome::Queued`]: the Store has the item.
+    HandOff,
+    /// Stop waiting and report a pause: the ceiling passed with no conclusion.
+    TimedOut,
+}
+
+/// The wait rule, split out so both policies are testable without a Store.
+///
+/// `progressed` is whether any item has ever shown the Store actually working
+/// on it — see [`shows_progress`]. A foreground caller leaves as soon as that
+/// is true, because from that moment the Store may force-close the package at
+/// any time and the caller wants to close its window on its own terms first.
+#[must_use]
+pub fn verdict(policy: WaitPolicy, elapsed: Duration, progressed: bool) -> Verdict {
+    match policy {
+        WaitPolicy::Foreground { admission } => {
+            if progressed || elapsed >= admission {
+                Verdict::HandOff
+            } else {
+                Verdict::Continue
+            }
+        }
+        WaitPolicy::Background { ceiling } => {
+            if elapsed >= ceiling {
+                Verdict::TimedOut
+            } else {
+                Verdict::Continue
+            }
+        }
+    }
+}
+
+/// Whether one status proves the Store is working on the item rather than
+/// holding it in its queue. `Pending`, `Starting`, `AcquiringLicense` and
+/// `ReadyToDownload` are all "waiting its turn"; a byte downloaded or a state
+/// past the download's start is not.
+#[must_use]
+pub fn shows_progress(
+    state: AppInstallState,
+    percent_complete: f64,
+    bytes_downloaded: u64,
+) -> bool {
+    matches!(
+        state,
+        AppInstallState::Downloading
+            | AppInstallState::RestoringData
+            | AppInstallState::Installing
+            | AppInstallState::Completed
+    ) || percent_complete > 0.0
+        || bytes_downloaded > 0
+}
+
+/// What to do with an item the Store's queue already holds for this product
+/// before queueing another. Deciding this from the state alone keeps the
+/// rule testable and the loop below free of a second state table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existing {
+    /// The Store is still working on it: adopt it rather than queue a twin.
+    Adopt,
+    /// A leftover — finished, cancelled, failed or paused by an earlier
+    /// attempt. Cancel it so it cannot shadow the new request.
+    Clear,
+}
+
+#[must_use]
+pub fn existing_item(state: AppInstallState) -> Existing {
+    match code_for(state) {
+        Poll::Continue => Existing::Adopt,
+        Poll::Finished(_) => Existing::Clear,
     }
 }
 
@@ -157,13 +258,20 @@ fn install_options() -> Result<AppInstallOptions, Outcome> {
     Ok(options)
 }
 
-pub fn apply_store_update(product_id: &str) -> Outcome {
+pub fn apply_store_update(product_id: &str, policy: WaitPolicy) -> Outcome {
     let product = HSTRING::from(product_id);
     let empty = HSTRING::new();
 
     let Ok(manager) = AppInstallManager::new() else {
         return Outcome::NotStarted("0x80040154".to_string());
     };
+
+    // The Store's queue outlives the process that filled it. An item a
+    // previous attempt left there — still downloading, or parked in a
+    // terminal state — would either be duplicated or shadow the new request.
+    if let Some(outcome) = reconcile_queue(&manager, &product) {
+        return outcome;
+    }
 
     // Best effort: an account that already owns the app does not need this,
     // and a store that refuses it may still install.
@@ -213,8 +321,19 @@ pub fn apply_store_update(product_id: &str) -> Outcome {
             result: HelperResult::Completed,
         };
     }
+    poll_items(&items, count, policy)
+}
 
-    let deadline = Instant::now() + INSTALL_CEILING;
+/// Reads every queued item until all are terminal, one fails, or the wait
+/// policy says to stop. Split from [`apply_store_update`] so the queueing
+/// sequence and the wait can be read on their own.
+fn poll_items(
+    items: &windows_collections::IVectorView<super::install_control::AppInstallItem>,
+    count: u32,
+    policy: WaitPolicy,
+) -> Outcome {
+    let started = Instant::now();
+    let mut progressed = false;
     loop {
         let mut worst: Option<i32> = None;
         let mut error_code: Option<String> = None;
@@ -234,6 +353,11 @@ pub fn apply_store_update(product_id: &str) -> Outcome {
                 still_working = true;
                 continue;
             };
+            progressed |= shows_progress(
+                state,
+                status.PercentComplete().unwrap_or(0.0),
+                status.BytesDownloaded().unwrap_or(0),
+            );
             match code_for(state) {
                 Poll::Continue => still_working = true,
                 Poll::Finished(code) => {
@@ -269,14 +393,48 @@ pub fn apply_store_update(product_id: &str) -> Outcome {
                 result: HelperResult::Completed,
             };
         }
-        if Instant::now() >= deadline {
-            return Outcome::Finished {
-                code: EXIT_AVAILABLE,
-                result: HelperResult::Paused,
-            };
+        match verdict(policy, started.elapsed(), progressed) {
+            Verdict::Continue => {}
+            Verdict::HandOff => return Outcome::Queued,
+            Verdict::TimedOut => {
+                return Outcome::Finished {
+                    code: EXIT_AVAILABLE,
+                    result: HelperResult::Paused,
+                };
+            }
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Looks for this product in the Store's install queue before queueing it
+/// again. `Some` is an early answer: an item the Store is still working on is
+/// adopted as [`Outcome::Queued`]. A leftover in a terminal state is cancelled
+/// (best effort) and `None` lets the caller queue afresh.
+fn reconcile_queue(manager: &AppInstallManager, product: &HSTRING) -> Option<Outcome> {
+    let items = manager.AppInstallItems().ok()?;
+    let count = items.Size().ok()?;
+    for index in 0..count {
+        let Ok(item) = items.GetAt(index) else {
+            continue;
+        };
+        if item.ProductId().ok().as_ref() != Some(product) {
+            continue;
+        }
+        let Ok(state) = item
+            .GetCurrentStatus()
+            .and_then(|status| status.InstallState())
+        else {
+            continue;
+        };
+        match existing_item(state) {
+            Existing::Adopt => return Some(Outcome::Queued),
+            Existing::Clear => {
+                let _ = item.Cancel();
+            }
+        }
+    }
+    None
 }
 
 /// Error beats pause beats completion. Only used to pick the worst of several

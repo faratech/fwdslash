@@ -35,6 +35,7 @@
 pub mod install_control;
 
 pub mod appinstall;
+pub mod gc;
 pub mod helper;
 pub mod relaunch;
 pub mod store;
@@ -628,6 +629,7 @@ fn cmd_status(options: &Options) -> i32 {
         return Report::new("disabled", EXIT_OK).emit(options, None);
     }
     let folded = fold_result_file();
+    let _ = gc::collect();
     let available = fsw_core::update::cached_update_tag();
     let state = if available.is_some() {
         "available"
@@ -647,6 +649,9 @@ fn cmd_check(options: &Options) -> i32 {
         return Report::new("disabled", EXIT_OK).emit(options, None);
     }
     let folded = fold_result_file();
+    // Every packaged check — the broker's cycle, the settings window's launch
+    // — is also the moment leftovers from earlier attempts are collected.
+    let _ = gc::collect();
 
     if !options.force
         && !fsw_core::update::check_is_due(fsw_core::update::last_update_check(), now_unix())
@@ -689,6 +694,9 @@ fn cmd_check(options: &Options) -> i32 {
     }
 
     let _com = ComScope::new();
+    // Read before `note_check_attempt` moves it: this is the previous check's
+    // time, which decides whether an empty answer is inside the cooldown.
+    let previous_check = fsw_core::update::last_update_check();
     let _ = fsw_core::update::note_check_attempt();
     match store::check_store_updates() {
         Ok(versions) => {
@@ -696,6 +704,17 @@ fn cmd_check(options: &Options) -> i32 {
                 let _ = fsw_core::update::set_cached_update_tag(version);
                 Report::new("available", EXIT_AVAILABLE)
                     .available(Some(version.clone()))
+                    .emit(options, folded)
+            } else if let Some(cached) =
+                cached_newer_offer().filter(|_| keep_cached_offer(previous_check, now_unix()))
+            {
+                // An empty answer minutes after a real one is the Store's
+                // scan cache, not a withdrawal of the offer.
+                Report::new("available", EXIT_AVAILABLE)
+                    .available(Some(cached))
+                    .detail(
+                        "The Store answered from its cache; the earlier offer stands.".to_string(),
+                    )
                     .emit(options, folded)
             } else {
                 let _ = fsw_core::update::clear_cached_update_tag();
@@ -739,22 +758,47 @@ fn resolve_route(explicit: Option<Route>) -> (Route, bool) {
 /// *can* ask, is the cheap version.
 #[cfg(windows)]
 fn available_update() -> Option<String> {
-    if let Ok(versions) = store::check_store_updates() {
-        // A real answer: keep the cached notice honest while we have one.
-        let _ = fsw_core::update::note_check_attempt();
-        let first = versions.into_iter().next();
-        match &first {
-            Some(version) => {
-                let _ = fsw_core::update::set_cached_update_tag(version);
-            }
-            None => {
-                let _ = fsw_core::update::clear_cached_update_tag();
-            }
-        }
-        return first;
+    // What the last check recorded comes first. `install` runs seconds after
+    // `check` — the broker chains them, the settings window's button follows
+    // its own launch check — and the Store's install service rate-limits
+    // online scans per package family: a second ask that soon is answered
+    // from its cache ("Online scan not allowed due to cooldown period", 0
+    // applicable), which used to read as an authoritative "up to date" and
+    // erase the offer the user was about to install (issue #140).
+    let current = fsw_core::package_version()?;
+    if let Some(cached) = fsw_core::update::cached_update_tag()
+        .filter(|candidate| fsw_core::update::is_newer_available_version(&current, candidate))
+    {
+        return Some(cached);
     }
-    // Offline, or the Store refused: trust what the last successful check
-    // recorded rather than refusing an install the user just asked for.
+    // Nothing recorded: ask, once, from the process that can. An empty answer
+    // here is left to `check` to interpret — there is no cached notice to
+    // clear anyway.
+    let versions = store::check_store_updates().ok()?;
+    let _ = fsw_core::update::note_check_attempt();
+    let first = versions.into_iter().next()?;
+    let _ = fsw_core::update::set_cached_update_tag(&first);
+    Some(first)
+}
+
+/// The Store's install service refuses a second online scan for the same
+/// package family within a cooldown of roughly this length and answers from
+/// its cache instead — which says "nothing applicable" whatever the previous
+/// online scan found. Measured 2026-09-07 on 26100 (`Microsoft-Windows-Store/
+/// Operational`: "Online scan not allowed due to cooldown period"). Within it,
+/// an empty answer must not out-vote a newer offer the last real scan cached.
+pub const STORE_SCAN_COOLDOWN_SECS: u64 = 30 * 60;
+
+/// Whether an empty Store answer should leave a cached newer offer standing:
+/// yes while the previous check was recent enough to be inside the cooldown.
+/// Pure, so the rule is a test rather than a Store session.
+#[must_use]
+pub fn keep_cached_offer(last_check: Option<u64>, now: u64) -> bool {
+    last_check.is_some_and(|last| now.saturating_sub(last) < STORE_SCAN_COOLDOWN_SECS)
+}
+
+/// The cached `AvailableUpdate`, only if it is still newer than what runs.
+fn cached_newer_offer() -> Option<String> {
     let current = fsw_core::package_version()?;
     fsw_core::update::cached_update_tag()
         .filter(|candidate| fsw_core::update::is_newer_available_version(&current, candidate))
@@ -864,7 +908,19 @@ fn install_via_appinstall(
             .emit(options, folded);
     };
 
-    match appinstall::apply_store_update(fsw_core::STORE_PRODUCT_ID) {
+    let policy = appinstall::WaitPolicy::Foreground {
+        admission: appinstall::ADMISSION_WINDOW,
+    };
+    match appinstall::apply_store_update(fsw_core::STORE_PRODUCT_ID, policy) {
+        // The Store has the item and the watchdog has the comeback. Nothing
+        // waits on this process any longer: the settings window and the
+        // broker both key on this exit and go on with their day.
+        appinstall::Outcome::Queued => Report::new("installing", EXIT_OK)
+            .route(Route::AppInstall)
+            .action("queued")
+            .available(Some(available.to_string()))
+            .detail("The Store is installing the update in the background.".to_string())
+            .emit(options, folded),
         appinstall::Outcome::Finished { code, result } => {
             if !appinstall_keeps_watchdog(code) {
                 watchdog.cancel();
@@ -1017,10 +1073,20 @@ fn cmd_apply_store(options: &Options) -> i32 {
         return EXIT_USAGE;
     };
     let _com = ComScope::new();
-    match appinstall::apply_store_update(product) {
+    let policy = appinstall::WaitPolicy::Background {
+        ceiling: appinstall::INSTALL_CEILING,
+    };
+    match appinstall::apply_store_update(product, policy) {
         appinstall::Outcome::Finished { code, result } => {
             helper::write_result(&result);
             code
+        }
+        // Only a foreground wait hands off; the helper polls to a conclusion.
+        // Reaching here means the queue already held a live item from an
+        // earlier attempt, which is the same "still installing" a pause is.
+        appinstall::Outcome::Queued => {
+            helper::write_result(&HelperResult::Paused);
+            EXIT_AVAILABLE
         }
         appinstall::Outcome::NotStarted(detail) => {
             helper::write_result(&HelperResult::Error(detail));

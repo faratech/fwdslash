@@ -109,15 +109,29 @@ impl Drop for AttemptMutex {
 }
 
 impl AttemptLock {
+    #[cfg(windows)]
     fn acquire(owner: &str) -> Option<Self> {
         let directory = fsw_core::update::update_directory_path()?;
-        Self::acquire_in(&directory, owner, std::time::Duration::from_mins(65))
+        Self::acquire_in(
+            &directory,
+            owner,
+            std::time::Duration::from_mins(65),
+            &crate::scheduled_task::task_exists,
+        )
     }
 
+    /// `owner_alive` answers whether the task named in an existing token is
+    /// still registered. A token whose task is gone is an orphan — the
+    /// attempt was killed between registering and running, or the script
+    /// ran under a cancelled task and never reached its `findstr` line — and
+    /// it is reclaimed at once rather than after `stale_after`, which used to
+    /// fail every install for an hour with "the watchdog could not be
+    /// registered" (issue #140).
     fn acquire_in(
         directory: &std::path::Path,
         owner: &str,
         stale_after: std::time::Duration,
+        owner_alive: &dyn Fn(&str) -> bool,
     ) -> Option<Self> {
         use std::io::Write;
 
@@ -139,12 +153,16 @@ impl AttemptLock {
             // The XML limits every task to an hour. This mutex keeps the
             // stale observation, removal and replacement together so a
             // second contender cannot delete our fresh token.
-            let stale = std::fs::metadata(&path)
+            let aged_out = std::fs::metadata(&path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
                 .and_then(|modified| modified.elapsed().ok())
                 .is_some_and(|age| age > stale_after);
-            if !stale {
+            let orphaned = std::fs::read_to_string(&path)
+                .ok()
+                .map(|text| text.trim().to_string())
+                .is_some_and(|holder| !holder.is_empty() && !owner_alive(&holder));
+            if !aged_out && !orphaned {
                 return None;
             }
             let _ = std::fs::remove_file(&path);
@@ -165,6 +183,32 @@ impl AttemptLock {
     }
 }
 
+/// Removes an attempt token nobody can still be using: older than the
+/// scheduler's one-hour limit, or naming a task that is no longer registered.
+/// The decision mutex makes the look-then-delete indivisible with a
+/// concurrent [`AttemptLock::acquire`]. True when a token was removed.
+#[cfg(windows)]
+pub fn reclaim_stale_attempt_lock() -> bool {
+    let Some(directory) = fsw_core::update::update_directory_path() else {
+        return false;
+    };
+    let Some(_decision) = AttemptMutex::acquire(&directory) else {
+        return false;
+    };
+    let path = directory.join("update-attempt.lock");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let aged_out = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > std::time::Duration::from_mins(65));
+    let holder = text.trim();
+    let orphaned = holder.is_empty() || !crate::scheduled_task::task_exists(holder);
+    (aged_out || orphaned) && std::fs::remove_file(&path).is_ok()
+}
+
 /// Holds the same short decision mutex through uninstall's task inventory and
 /// storage sweep, preventing a fresh updater from acquiring a token between
 /// those destructive steps.
@@ -181,6 +225,12 @@ pub fn lock_update_storage_for_uninstall() -> Option<UninstallUpdateGuard> {
 
 /// The relaunch ceiling, in minutes, for the watchdog's poll loop.
 const WATCHDOG_MINUTES: u32 = 45;
+/// Starts the broker through the app-execution alias, only when none is
+/// running. Used both for a landed update in broker mode and, in every mode,
+/// after the watchdog gives up on one that did not land.
+const BROKER_RELAUNCH: &str = "if (-not (Get-Process -Name fswbroker -ErrorAction \
+     SilentlyContinue)) { Start-Process -FilePath (Join-Path $env:LOCALAPPDATA \
+     'Microsoft\\WindowsApps\\fwdslash.exe') -ArgumentList 'start' -WindowStyle Hidden }";
 /// Seconds between `Get-AppxPackage` polls.
 const WATCHDOG_POLL_SECONDS: u32 = 5;
 
@@ -262,11 +312,7 @@ pub fn watchdog_powershell(
         // The alias, never `shell:AppsFolder\...!App`: the package's App entry
         // point is the settings window, and the broker is a startup task that
         // only fires at logon.
-        RelaunchMode::Broker => "if (-not (Get-Process -Name fswbroker -ErrorAction \
-             SilentlyContinue)) { Start-Process -FilePath (Join-Path $env:LOCALAPPDATA \
-             'Microsoft\\WindowsApps\\fwdslash.exe') -ArgumentList 'start' -WindowStyle \
-             Hidden }"
-            .to_string(),
+        RelaunchMode::Broker => BROKER_RELAUNCH.to_string(),
         RelaunchMode::App => {
             format!("Start-Process -FilePath 'shell:AppsFolder\\{family}!App'")
         }
@@ -275,8 +321,15 @@ pub fn watchdog_powershell(
     // Only when nothing else has already reported. A helper that finished
     // with a `paused` verdict wrote this file first, and a timeout notice
     // written over it would turn a legitimate deferral into an error.
+    //
+    // Then bring the broker back regardless of mode. The old package is still
+    // the installed product; the caller closed the broker to make room for an
+    // install that did not land, and leaving the user without it until the
+    // next logon was the worst outcome of a stalled Store queue (issue #140).
+    // The Store may still close it again when its download finally arrives,
+    // which is what `AllowForcedAppRestart` permits.
     let timeout = format!(
-        "$result = Join-Path $env:LOCALAPPDATA 'ForwardSlashWindows\\update\\{}'; if (-not (Test-Path -LiteralPath $result)) {{ $null = New-Item -ItemType Directory -Force -Path (Split-Path $result); Set-Content -LiteralPath $result -Value 'error:0x800705B4' -NoNewline }}",
+        "$result = Join-Path $env:LOCALAPPDATA 'ForwardSlashWindows\\update\\{}'; if (-not (Test-Path -LiteralPath $result)) {{ $null = New-Item -ItemType Directory -Force -Path (Split-Path $result); Set-Content -LiteralPath $result -Value 'error:0x800705B4' -NoNewline }}; {BROKER_RELAUNCH}",
         fsw_core::update::UPDATE_RESULT_FILE
     );
     Some(format!(
@@ -759,7 +812,7 @@ mod attempt_lock_tests {
             let directory = directory.0.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                AttemptLock::acquire_in(&directory, owner, stale_after)
+                AttemptLock::acquire_in(&directory, owner, stale_after, &|_| true)
             })
         });
         let [first, second] = contenders;
@@ -778,10 +831,34 @@ mod attempt_lock_tests {
     }
 
     #[test]
+    fn a_fresh_token_whose_task_is_gone_is_reclaimed_at_once() {
+        let directory = directory("orphan");
+        let path = directory.0.join("update-attempt.lock");
+        std::fs::write(&path, "fwdslash-update-watchdog-18784-1")
+            .unwrap_or_else(|error| panic!("seed lock: {error}"));
+        let stale_after = Duration::from_hours(1);
+        // The task is still registered: the token is honoured.
+        assert!(AttemptLock::acquire_in(&directory.0, "owner-b", stale_after, &|_| true).is_none());
+        // The task is gone: the token is an orphan and the new attempt wins.
+        let lock = AttemptLock::acquire_in(&directory.0, "owner-b", stale_after, &|name| {
+            assert_eq!(name, "fwdslash-update-watchdog-18784-1");
+            false
+        })
+        .unwrap_or_else(|| panic!("orphan reclaimed"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("token: {error}")),
+            "owner-b"
+        );
+        lock.release();
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn release_never_deletes_a_foreign_owner_token() {
         let directory = directory("foreign-owner");
-        let owner = AttemptLock::acquire_in(&directory.0, "owner-a", Duration::from_secs(60))
-            .unwrap_or_else(|| panic!("first owner"));
+        let owner =
+            AttemptLock::acquire_in(&directory.0, "owner-a", Duration::from_secs(60), &|_| true)
+                .unwrap_or_else(|| panic!("first owner"));
         std::fs::write(&owner.path, "owner-b")
             .unwrap_or_else(|error| panic!("replace token for test: {error}"));
         owner.release();

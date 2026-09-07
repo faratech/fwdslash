@@ -34,7 +34,7 @@ use std::process::Command;
 
 /// `CREATE_NO_WINDOW`: no console flash for the `schtasks` children.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Whether `value` may be pasted into a `schtasks` argument or into the body of
 /// the batch file a task runs.
@@ -179,7 +179,7 @@ impl OneShotTask {
 /// The `.cmd` a task of this name runs, or `None` when `%LOCALAPPDATA%` is
 /// unset or the name is not a safe literal.
 #[cfg(windows)]
-fn script_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn script_path(name: &str) -> Option<PathBuf> {
     if !is_safe_task_literal(name) {
         return None;
     }
@@ -289,6 +289,31 @@ pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
         return None;
     }
     Some(())
+}
+
+/// Whether a task of this name is registered. `schtasks /query` exits 0 for a
+/// task it can show and 1 for one it cannot; a `schtasks` that cannot be found
+/// or run answers false, which the one caller (the attempt lock's orphan test)
+/// treats as "not proven alive" — the conservative answer there is to reclaim.
+#[cfg(windows)]
+#[must_use]
+pub fn task_exists(name: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    if !is_safe_task_literal(name) {
+        return false;
+    }
+    let Some(schtasks) = fsw_core::SystemBinary::Schtasks.path() else {
+        return false;
+    };
+    Command::new(schtasks)
+        .args(["/query", "/tn", name])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Removes a task and the `.cmd` [`register_and_run`] wrote for it — the exact

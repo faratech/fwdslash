@@ -195,8 +195,11 @@ const UPDATE_FIRST_DELAY_MS: u64 = 5 * 60 * 1_000;
 const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 /// Ceiling on `fwdslash update install`. The child only *starts* the install —
 /// the Store's own download runs in the Store's service, and the relaunch is a
-/// scheduled task — so this bounds a handful of `WinRT` calls, not a download.
-const UPDATE_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// scheduled task — so this bounds a handful of `WinRT` calls plus the CLI's
+/// three-minute admission window, not a download. Killing it past that leaves
+/// the queued item and the watchdog in place, so nothing is lost but the
+/// exit code.
+const UPDATE_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Consecutive `update install` errors before the broker says so out loud.
 /// One is noise (the Store was mid-something); two in a row is a state the
 /// user's own click can get out of.
