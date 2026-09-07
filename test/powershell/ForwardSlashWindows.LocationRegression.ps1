@@ -35,11 +35,86 @@ try {
         if ($null -ne $existing) { $aliases[$name] = $existing.Definition }
     }
     New-Item -ItemType Directory -Path $base, $resolved, $bracketed, $native | Out-Null
+    # ------------------------------------------------------------------
+    # #134: the profile block installs lazy STUBS, not an Import-Module. The
+    # stub text is owned by STUB_BODY in crates/fsw-cli/src/adapters/profile.rs,
+    # so it is extracted from there rather than duplicated here -- a change to
+    # the shipped block that breaks these cases fails this fixture.
+    # ------------------------------------------------------------------
+    $profileRs = Join-Path $PSScriptRoot '../../crates/fsw-cli/src/adapters/profile.rs'
+    $stubLines = New-Object System.Collections.Generic.List[string]
+    $inStub = $false
+    foreach ($rustLine in (Get-Content -LiteralPath $profileRs)) {
+        if (-not $inStub) {
+            if ($rustLine -match '^const STUB_BODY') { $inStub = $true }
+            continue
+        }
+        if ($rustLine -match '^\);') { break }
+        $piece = $rustLine.Trim()
+        if (-not $piece.StartsWith('"')) { continue }
+        $piece = $piece.Substring(1)
+        $piece = $piece.Substring(0, $piece.LastIndexOf('"'))
+        if ($piece.EndsWith('\r\n')) { $piece = $piece.Substring(0, $piece.Length - 4) }
+        $stubLines.Add($piece.Replace('\\', '\'))
+    }
+    if ($stubLines.Count -lt 20) { throw "STUB_BODY extraction found only $($stubLines.Count) lines." }
+    # The block must never reach for a Microsoft.PowerShell.Utility cmdlet: the
+    # first one costs ~70 ms of module load. Aliases go through the Management
+    # `alias:` provider instead (#134).
+    Assert-Equal -Expected $false -Actual ([bool](@($stubLines) -match 'Set-Alias')) -Message 'stub block uses no Utility cmdlet'
+    $stubScript = "`$m = '$($modulePath.Replace("'", "''"))'`r`n" + ($stubLines -join "`r`n")
+    . ([scriptblock]::Create($stubScript))
+
+    # Before any slash argument the aliases point at the stubs and the module
+    # has not been loaded at all -- this is the ~140 ms every session used to
+    # pay unconditionally.
+    Assert-Equal -Expected 'Invoke-FswStubChildItem' -Actual (Get-Alias -Name dir).Definition -Message 'dir is stubbed before first use'
+    Assert-Equal -Expected 'Invoke-FswStubSetLocation' -Actual (Get-Alias -Name cd).Definition -Message 'cd is stubbed before first use'
+    Assert-Equal -Expected 'Invoke-FswStubPushLocation' -Actual (Get-Alias -Name pushd).Definition -Message 'pushd is stubbed before first use'
+    Assert-Equal -Expected $null -Actual (Get-Module -Name ForwardSlashWindows) -Message 'stub block imports nothing at profile time'
+
+    # The stubs carry the same proxy parameter metadata as the real wrappers,
+    # so binding is identical before and after the flip.
+    foreach ($stubName in @('Invoke-FswStubSetLocation', 'Invoke-FswStubPushLocation')) {
+        $stubCommand = Get-Command $stubName
+        Assert-Equal -Expected $true -Actual $stubCommand.Parameters.ContainsKey('UseTransaction') -Message "$stubName preserves UseTransaction"
+        Assert-Equal -Expected $true -Actual $stubCommand.Parameters.ContainsKey('StackName') -Message "$stubName preserves StackName"
+        Assert-Equal -Expected $true -Actual $stubCommand.Parameters.ContainsKey('PassThru') -Message "$stubName preserves PassThru"
+        $stubPathAttribute = @($stubCommand.Parameters['Path'].Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] })[0]
+        Assert-Equal -Expected $true -Actual $stubPathAttribute.ValueFromPipeline -Message "$stubName Path preserves pipeline binding"
+    }
+
+    # Native passthrough: no slash argument, so no import and no registry read.
+    Microsoft.PowerShell.Management\Set-Location -LiteralPath $base
+    Invoke-FswStubSetLocation -Path $native -PassThru | Out-Null
+    Assert-Location -Expected $native -Message 'stub cd passes a native path straight through'
+    Invoke-FswStubPushLocation -LiteralPath $base -StackName fsw-stub -PassThru | Out-Null
+    Microsoft.PowerShell.Management\Pop-Location -StackName fsw-stub
+    Assert-Location -Expected $native -Message 'stub pushd keeps its caller named stack'
+    Invoke-FswStubChildItem -LiteralPath $base | Out-Null
+    Assert-Equal -Expected $null -Actual (Get-Module -Name ForwardSlashWindows) -Message 'native arguments never load the module'
+
+    # First slash argument: the module loads and its Set-Alias -Force re-points
+    # every alias onto the real wrappers. The resolver has no controller next to
+    # the module here, so it hands back $null and the native cmdlet runs -- what
+    # is under test is the flip, not the resolution.
+    Microsoft.PowerShell.Management\Set-Location -LiteralPath $base
+    Invoke-FswStubSetLocation -Path '/' 2>$null
+    Assert-Equal -Expected $true -Actual ($null -ne (Get-Module -Name ForwardSlashWindows)) -Message 'first slash argument imports the module'
+    Assert-Equal -Expected 'Invoke-ForwardSlashWindowsSetLocation' -Actual (Get-Alias -Name cd).Definition -Message 'cd alias flips to the real wrapper'
+    Assert-Equal -Expected 'Invoke-ForwardSlashWindowsChildItem' -Actual (Get-Alias -Name dir).Definition -Message 'dir alias flips to the real wrapper'
+    Assert-Equal -Expected 'Invoke-ForwardSlashWindowsPushLocation' -Actual (Get-Alias -Name pushd).Definition -Message 'pushd alias flips to the real wrapper'
+    foreach ($flippedName in @('Invoke-ForwardSlashWindowsSetLocation', 'Invoke-ForwardSlashWindowsPushLocation')) {
+        $flipped = Get-Command $flippedName
+        Assert-Equal -Expected $true -Actual $flipped.Parameters.ContainsKey('UseTransaction') -Message "$flippedName preserves UseTransaction after the flip"
+        $flippedPathAttribute = @($flipped.Parameters['Path'].Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] })[0]
+        Assert-Equal -Expected $true -Actual $flippedPathAttribute.ValueFromPipeline -Message "$flippedName Path preserves pipeline binding after the flip"
+    }
+
     $module = Import-Module -Name $modulePath -Force -PassThru
     & $module {
         param([string]$Target)
         $script:FswTestTarget = $Target
-        Set-Item -Path function:script:Test-ForwardSlashWindowsDisabled -Value { return $false }
         Set-Item -Path function:script:Resolve-ForwardSlashWindowsTarget -Value {
             param([string]$Path)
             return [pscustomobject]@{ Kind = 'path'; Target = $script:FswTestTarget; Distributions = @(); Message = ''; Informational = $false }
@@ -161,5 +236,9 @@ try {
     } else {
         Set-Item -Path function:global:Invoke-ForwardSlashWindowsPushLocation -Value $previousPushWrapper.ScriptBlock
     }
+    foreach ($stubName in @('Invoke-FswStubChildItem', 'Invoke-FswStubSetLocation', 'Invoke-FswStubPushLocation', 'Import-FswStubModule', 'Test-FswStubSlash', 'Test-FswStubParent')) {
+        Remove-Item -Path "function:global:$stubName" -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Path variable:global:FswStubModule -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

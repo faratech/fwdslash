@@ -801,7 +801,13 @@ activate.` when the probed broker is merely paused, rather than the misleading
   (`{"kind":"root|distribution|folder","target":…,"distributions":[…]}`) for the
   PowerShell module, so `ls /` costs a single spawn instead of a `resolve` plus
   a `status --json`. It answers from `Snapshot::current()` alone: no broker
-  round trip, no filter-port probe.
+  round trip, no filter-port probe. That snapshot includes the **global pause**,
+  so a paused product comes back as `kind:"native"` (#135) and the module no
+  longer opens `HKCU\Software\ForwardSlashWindows\Settings` itself — the key
+  path is now defined only in `include/fsw_user_protocol.h` and
+  `crates/fsw-core/src/lib.rs`. The trade-off: while the product is paused a
+  slash argument costs one spawn rather than a registry read. Only slash
+  arguments pay it, because the argument scan gates first.
 - **`fwdslash cmd-list <input>`** — the target for the cmd `DIR`/`LS` macros.
 - **The exit-3 contract.** Every shell verb returns **3** for "run your own
   command unchanged" — resolution is paused, the input is not a slash path, or
@@ -842,11 +848,12 @@ activate.` when the probed broker is merely paused, rather than the misleading
 The adapter hardens the whole lifecycle so an upgrade or an MSIX uninstall can
 never leave a broken shell:
 
-- **The profile block is guarded, fenced, and self-cleaning.** `block_text`
-  emits `$m`/`$p`/`$a`/`$c` (module, product-presence probe, app-execution
-  alias, staged controller) and
-  `if ((Test-Path $p) -or (Test-Path $a)) { if (Test-Path $m) { Import-Module … } }
-  elseif (Test-Path $c) { Start-Process $c uninstall --orphaned }`. A pruned
+- **The profile block is guarded, fenced, self-cleaning — and lazy.**
+  `block_text` emits `$m`/`$p`/`$a`/`$c` (module, product-presence probe,
+  app-execution alias, staged controller) and
+  `if ((Test-Path $p) -or (Test-Path $a)) { if (Test-Path $m) { <stubs> } }
+  elseif (Test-Path $c) { Start-Process $c uninstall --orphaned }`. Since #134
+  `<stubs>` is `STUB_BODY`, **not** an `Import-Module`: see §3a below. A pruned
   module directory can no longer throw the red `no valid module file` error,
   and a product that was uninstalled with no code run (MSIX) is cleaned up by
   the leftover hook on the next shell start — launched detached, so a shell
@@ -962,6 +969,135 @@ never leave a broken shell:
   `repair-adapters` — two stranded `cmd.removing-*` directories were found on a
   live host — skipping only the directory an in-flight cmd uninstall recorded in
   its `RemovalPath`.
+
+### 3a. The profile block loads the module lazily (#134)
+
+Importing `ForwardSlashWindows.psm1` from the profile cost **~140 ms on every
+PowerShell session on the machine** that does not pass `-NoProfile` — measured
+on ARM64 against the packaged 0.0.8 install: `powershell -NoProfile -Command
+exit` 167.8 ms, the same with the module imported 307.3 ms. Roughly half of it
+is the parser walking the 39 KB signed module, about half of *that* the
+Authenticode block, which is the module's only integrity evidence and cannot be
+removed. The overwhelming majority of those sessions never type a slash path.
+
+Moving the module's logic into Rust was rejected on measurement, not taste:
+`fwdslash shell-resolve /etc` costs 20.9 ms against 21.4 ms for a bare
+`fwdslash --version`, so the resolution work is already free and every piece
+moved to the CLI would **add** a process spawn.
+
+So the block imports nothing. `profile::STUB_BODY` installs six global
+functions and re-points the same six aliases:
+
+| Stub | Aliases |
+|---|---|
+| `Invoke-FswStubChildItem` | `dir`, `ls` |
+| `Invoke-FswStubSetLocation` | `cd`, `chdir`, `sl` |
+| `Invoke-FswStubPushLocation` | `pushd` |
+
+plus the three helpers they share (`Import-FswStubModule`, `Test-FswStubSlash`,
+`Test-FswStubParent`). Each stub scans its own arguments for a leading-`/`
+string; finding none it splats straight to the matching
+`Microsoft.PowerShell.Management\*` cmdlet — **no import, no registry read, no
+spawn**. The first slash argument runs `Import-Module -Name $m -Global -Force`,
+whose `Set-Alias -Force` re-points every alias onto the real wrapper, and the
+stub re-dispatches by name; every later call in that session reaches the real
+wrapper directly.
+
+Three properties are load-bearing and pinned by tests:
+
+- **The `cd` and `pushd` stubs are global advanced functions** carrying the same
+  `[CmdletBinding()]` / `param(…)` / `process{}` shape as the module's wrappers,
+  for the two reasons already documented for `pushd` — `Push-Location` inside a
+  module pushes onto *that module's* stack, and the proxy parameter metadata
+  (`ValueFromPipeline` on `Path`, `-StackName`, `-PassThru`, `-UseTransaction`)
+  has to survive so binding is identical before and after the flip.
+- **`Test-FswStubParent` reproduces the `cd ..`-at-a-distribution-root trigger**
+  (#132) from `Get-Location` alone — pure string work, no import — so that case
+  still reaches the module without the module deciding it.
+- **The orphan self-clean arm survives into the stub block.** Without it an
+  uninstalled product's stub would itself become the orphan.
+
+**The aliases go through the `alias:` provider, not `Set-Alias`.** Same
+definition, same `AllScope` option, same global scope — but `Set-Alias` lives in
+`Microsoft.PowerShell.Utility`, and the first Utility cmdlet of a session costs
+~70 ms of module load all by itself (`Get-Date` alone measures the same). The
+stubs reach only for `Microsoft.PowerShell.Management`, which the native
+passthrough needs anyway. Do not "simplify" this back to `Set-Alias`.
+
+Measured on the same host, x64, 15 runs, median, dot-sourcing a scratch block
+against a module padded to the installed 39 KB (an unsigned copy — the harness
+runs under `-ExecutionPolicy Bypass`, so this counts parse cost only, not
+signature verification):
+
+| | median |
+|---|---|
+| bare session, no profile | 163.7 ms |
+| harness floor (dot-source an empty file) | 163.0 ms |
+| **old block** (`Import-Module`) | **290.2 ms** |
+| **new stub block** | **214.3 ms** |
+| new stub block + a native `cd <dir>` | 227.6 ms |
+| old block + first `cd /etc` | 368.4 ms |
+| new stub block + first `cd /etc` | 378.8 ms |
+
+So the per-session cost drops from ~127 ms to ~51 ms — a ~76 ms saving on every
+session, not the whole ~140 ms. The residual is **not** the stub text: six
+global function definitions measure at the noise floor (+1 ms). It is the
+Management module load that the `alias:` writes trigger, which any actual `dir`
+or `cd` in that session would pay regardless. Removing it would mean not
+installing aliases at all.
+
+The first slash path costs ~10 ms more than before (the import now happens
+mid-command instead of at startup) and every later one is free.
+
+The block is still byte-identical across releases (#127): no version, no
+transaction id, and the paths point at the version-free `payload` directory.
+It is ~4.3 KB of PowerShell against the module's 39 KB.
+
+`VERIFY_SCRIPT` therefore accepts **either** name for the `dir`/`ls` alias —
+the stub in a fresh session, the real wrapper once the module has loaded.
+
+`test/powershell/ForwardSlashWindows.LocationRegression.ps1` extracts
+`STUB_BODY` out of `crates/fsw-cli/src/adapters/profile.rs` rather than
+duplicating it, and covers the pre-load native passthrough, the stub metadata,
+the first-slash flip, and the metadata after the flip.
+
+**Content drift, and why the classifier had to learn about it.** #127 took the
+version out of the fence so an upgrade would stop rewriting `Documents`. The
+cost is that a stable fence can no longer say anything about the block's body:
+`classify_profile` called every non-legacy, module-present block `Healthy`, and
+nothing anywhere compared the deployed block's text against `block_text`. A
+machine already carrying the eager-import block on this same version would have
+been classified healthy forever and never rewritten — the lazy-stub change would
+have shipped and reached only fresh installs.
+
+So `ParsedBlock` now carries `text`, the fence-to-fence region (no blank-line
+prefix, so it is directly comparable to `block_text(params)` with
+`original_non_empty: false`), `BlockPresence` carries `matches_current`, and a
+single stable, module-present block whose body differs is
+`ProfileHealth::UpdatePending`. The ranking is unchanged above it: an orphan
+outranks it (the only state that throws), a duplicate outranks it, and a legacy
+fence outranks it because migration names the more specific repair.
+
+`UpdatePending` is routed through the **existing** confirmation rule, not around
+it: `decide_profile_repair` still downgrades every profile-writing verdict to
+`NeedsConfirmation` for a background sweep, so the broker's startup sweep and
+the settings window's launch sweep report it and write nothing. It is applied
+only by an explicit `fwdslash integration <id> enable` or the settings toggle —
+`current_version_noop` treats it exactly like a pending migration, which is what
+makes a same-version deploy reach an existing install at all.
+`fwdslash integrations` reports it as *"installed, but the profile block needs
+an update"*, deliberately not as a legacy block.
+
+The #127 property survives intact and is pinned by
+`an_unchanged_block_text_writes_nothing`: an upgrade that does not change the
+block text leaves every deployed block matching, so the health is `Healthy` and
+the action is `Nothing` — for a user action and a sweep alike. Drift detection
+adds a comparison, never a write.
+
+`upgrade()` already did a content comparison of its own
+(`find_subslice(&current, &desired)`), but only on the version-bump path, so it
+could never fire for a same-version change and never reported anything on the
+sweep path. It is unchanged; the classifier is now the general answer.
 
 ### 4. Registry string decoding and 0.0.2-era upgrades
 
