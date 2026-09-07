@@ -3,10 +3,22 @@
 //! `Uninstall-PowerShellAdapter.ps1`. Pure functions — no I/O.
 //!
 //! The block the adapter writes is a **fenced region** delimited by two marker
-//! comment lines (`# >>> Forward Slash Windows <ver> <id> >>>` … `# <<< … <<<`).
+//! comment lines (`# >>> Forward Slash Windows >>>` … `# <<< … <<<`).
 //! Everything here that has to survive an upgrade — the idempotent strip, the
 //! block parser, the health classifier — keys off those fence lines, never off
 //! an exact byte-for-byte copy of a specific version's block (#37).
+//!
+//! Since #127 the fence text carries **no version and no transaction id**, and
+//! the paths inside the block name a version-free payload directory, so
+//! [`block_text`] is byte-identical across releases and an upgrade no longer
+//! has to rewrite a file under `Documents` — which Controlled Folder Access
+//! guards. The parser still recognises the legacy
+//! `# >>> Forward Slash Windows <ver> <id> >>>` form so an existing install can
+//! be found, migrated and removed.
+
+// This parser validates byte lengths and line offsets before indexing. Keeping
+// the direct slices makes those paired boundary checks auditable as a unit.
+#![allow(clippy::indexing_slicing)]
 
 /// The text encodings a profile may legally use. BOM detection order is a
 /// preserved quirk of the original script: UTF-32 is tested before UTF-16, so
@@ -23,11 +35,19 @@ pub enum ProfileEncoding {
 }
 
 pub fn detect_encoding(bytes: &[u8]) -> ProfileEncoding {
-    if bytes.len() >= 4 && bytes[0] == 0x00 && bytes[1] == 0x00 && bytes[2] == 0xFE && bytes[3] == 0xFF
+    if bytes.len() >= 4
+        && bytes[0] == 0x00
+        && bytes[1] == 0x00
+        && bytes[2] == 0xFE
+        && bytes[3] == 0xFF
     {
         return ProfileEncoding::Utf32Be;
     }
-    if bytes.len() >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0x00 && bytes[3] == 0x00
+    if bytes.len() >= 4
+        && bytes[0] == 0xFF
+        && bytes[1] == 0xFE
+        && bytes[2] == 0x00
+        && bytes[3] == 0x00
     {
         return ProfileEncoding::Utf32Le;
     }
@@ -58,11 +78,13 @@ fn decode(bytes: &[u8], encoding: ProfileEncoding) -> Option<String> {
     match encoding {
         ProfileEncoding::Utf8 => std::str::from_utf8(bytes).ok().map(str::to_owned),
         ProfileEncoding::Utf16Le | ProfileEncoding::Utf16Be => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 return None;
             }
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| match encoding {
                     ProfileEncoding::Utf16Be => u16::from_be_bytes([pair[0], pair[1]]),
                     _ => u16::from_le_bytes([pair[0], pair[1]]),
@@ -71,13 +93,15 @@ fn decode(bytes: &[u8], encoding: ProfileEncoding) -> Option<String> {
             String::from_utf16(&units).ok()
         }
         ProfileEncoding::Utf32Le | ProfileEncoding::Utf32Be => {
-            if bytes.len() % 4 != 0 {
+            if !bytes.len().is_multiple_of(4) {
                 return None;
             }
             let mut text = String::with_capacity(bytes.len() / 4);
-            for quad in bytes.chunks_exact(4) {
+            for quad in bytes.as_chunks::<4>().0 {
                 let value = match encoding {
-                    ProfileEncoding::Utf32Be => u32::from_be_bytes([quad[0], quad[1], quad[2], quad[3]]),
+                    ProfileEncoding::Utf32Be => {
+                        u32::from_be_bytes([quad[0], quad[1], quad[2], quad[3]])
+                    }
                     _ => u32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]),
                 };
                 text.push(char::from_u32(value)?);
@@ -93,16 +117,16 @@ fn decode(bytes: &[u8], encoding: ProfileEncoding) -> Option<String> {
 #[must_use]
 pub fn encode(text: &str, encoding: ProfileEncoding) -> Vec<u8> {
     match encoding {
-        ProfileEncoding::Utf16Le => text
-            .encode_utf16()
-            .flat_map(|unit| unit.to_le_bytes())
+        ProfileEncoding::Utf16Le => text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ProfileEncoding::Utf16Be => text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+        ProfileEncoding::Utf32Le => text
+            .chars()
+            .flat_map(|c| u32::from(c).to_le_bytes())
             .collect(),
-        ProfileEncoding::Utf16Be => text
-            .encode_utf16()
-            .flat_map(|unit| unit.to_be_bytes())
+        ProfileEncoding::Utf32Be => text
+            .chars()
+            .flat_map(|c| u32::from(c).to_be_bytes())
             .collect(),
-        ProfileEncoding::Utf32Le => text.chars().flat_map(|c| u32::from(c).to_le_bytes()).collect(),
-        ProfileEncoding::Utf32Be => text.chars().flat_map(|c| u32::from(c).to_be_bytes()).collect(),
         ProfileEncoding::Utf8 => text.bytes().collect(),
     }
 }
@@ -118,14 +142,19 @@ fn escape_single_quoted(value: &str) -> String {
 const FENCE_OPEN_PREFIX: &str = "# >>> Forward Slash Windows";
 const FENCE_CLOSE_PREFIX: &str = "# <<< Forward Slash Windows";
 
+/// The fence lines this build writes: constant, so the whole block is
+/// byte-identical across releases (#127). Legacy fences carrying a version and
+/// a transaction id still parse and still strip.
+pub const FENCE_OPEN: &str = "# >>> Forward Slash Windows >>>";
+pub const FENCE_CLOSE: &str = "# <<< Forward Slash Windows <<<";
+
 /// Everything the guarded profile block needs. Grouped into a struct rather
 /// than a long positional argument list because the block now carries the
 /// product-presence probe and the staged-controller path for the self-clean
 /// branch (#37 addendum).
 pub struct BlockParams<'a> {
-    pub version: &'a str,
-    pub transaction_id: &'a str,
-    /// The deployed `ForwardSlashWindows.psm1`.
+    /// The deployed `ForwardSlashWindows.psm1`, in the version-free payload
+    /// directory (#127).
     pub module_path: &'a str,
     /// A path that exists while the product is installed: the package's own
     /// app-data folder (packaged) or the controller's directory (unpackaged).
@@ -159,17 +188,19 @@ pub fn block_text(params: &BlockParams) -> String {
     let probe = escape_single_quoted(params.probe_path);
     let alias = escape_single_quoted(params.alias_path);
     let controller = escape_single_quoted(params.controller_path);
-    let prefix = if params.original_non_empty { "\r\n" } else { "" };
-    let version = params.version;
-    let id = params.transaction_id;
+    let prefix = if params.original_non_empty {
+        "\r\n"
+    } else {
+        ""
+    };
     format!(
-        "{prefix}# >>> Forward Slash Windows {version} {id} >>>\r\n\
+        "{prefix}{FENCE_OPEN}\r\n\
          $m = '{module}'\r\n\
          $p = '{probe}'\r\n\
          $a = '{alias}'\r\n\
          $c = '{controller}'\r\n\
          if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) {{ if (Test-Path -LiteralPath $m) {{ Import-Module -Name $m -Global -Force }} }} elseif (Test-Path -LiteralPath $c) {{ Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }}\r\n\
-         # <<< Forward Slash Windows {version} {id} <<<\r\n"
+         {FENCE_CLOSE}\r\n"
     )
 }
 
@@ -178,7 +209,8 @@ pub fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    (0..=haystack.len() - needle.len()).find(|&start| &haystack[start..start + needle.len()] == needle)
+    (0..=haystack.len() - needle.len())
+        .find(|&start| &haystack[start..start + needle.len()] == needle)
 }
 
 /// Removes one occurrence of `block` from `current`. `None` when absent. Kept
@@ -200,6 +232,7 @@ pub fn should_delete_profile(remaining_len: usize, original_present: bool) -> bo
 }
 
 /// Keep empty originals, but discard files consisting only of orphaned blocks.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn original_profile_present(existed: bool, original: &[u8], cleaned: &[u8]) -> bool {
     existed && (original.is_empty() || !cleaned.is_empty())
 }
@@ -352,14 +385,24 @@ pub fn strip_fwdslash_blocks(bytes: &[u8]) -> Vec<u8> {
 }
 
 /// A fwdslash block parsed out of a profile: the version and transaction id
-/// from its open fence, and the first single-quoted literal in its body — the
-/// module path, from either the new `$m = '…'` line or an old one-line
-/// `Import-Module -Name '…'` block.
+/// from its open fence — **empty for a block this build wrote**, since the
+/// stable fence carries neither (#127) — and the first single-quoted literal in
+/// its body, the module path, from either the `$m = '…'` line or an old
+/// one-line `Import-Module -Name '…'` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedBlock {
     pub version: String,
     pub transaction_id: String,
     pub module_path: Option<String>,
+}
+
+impl ParsedBlock {
+    /// Whether this block came from a release that stamped its version into the
+    /// fence — the form that has to be migrated to the stable one.
+    #[must_use]
+    pub fn is_legacy(&self) -> bool {
+        !self.version.is_empty()
+    }
 }
 
 /// Parses every fwdslash block in `bytes` (encoding-aware).
@@ -420,8 +463,7 @@ fn parse_open_fence(content: &str) -> (String, String) {
     let inner = trimmed
         .strip_prefix(FENCE_OPEN_PREFIX)
         .and_then(|rest| rest.trim().strip_suffix(">>>"))
-        .map(str::trim)
-        .unwrap_or("");
+        .map_or("", str::trim);
     let mut parts = inner.split_whitespace();
     let version = parts.next().unwrap_or("").to_string();
     let id = parts.collect::<Vec<_>>().join(" ");
@@ -444,12 +486,12 @@ fn first_single_quoted(line: &str) -> Option<String> {
             return Some(out);
         }
         // Push the char starting at byte i (handles multi-byte UTF-8).
-        if let Some(chunk) = line.get(i..) {
-            if let Some(ch) = chunk.chars().next() {
-                out.push(ch);
-                i += ch.len_utf8();
-                continue;
-            }
+        if let Some(chunk) = line.get(i..)
+            && let Some(ch) = chunk.chars().next()
+        {
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
         }
         break;
     }
@@ -461,8 +503,26 @@ fn first_single_quoted(line: &str) -> Option<String> {
 /// caller fills `module_present`; the classifier stays pure.
 #[derive(Debug, Clone)]
 pub struct BlockPresence {
+    /// The version stamped into the legacy fence; empty for a stable block.
     pub version: String,
     pub module_present: bool,
+}
+
+impl BlockPresence {
+    fn is_legacy(&self) -> bool {
+        !self.version.is_empty()
+    }
+}
+
+/// How a legacy block's version is named in user-facing text when the fence did
+/// not carry one (an externally hand-edited block, say).
+#[must_use]
+pub fn version_label(version: &str) -> &str {
+    if version.is_empty() {
+        "an earlier version"
+    } else {
+        version
+    }
 }
 
 /// The health of a single edition's profile with respect to its fwdslash
@@ -475,19 +535,26 @@ pub enum ProfileHealth {
     /// Exactly one block, current version, module present.
     Healthy,
     /// A block whose module file is missing — the red-error orphan. Carries
-    /// the offending block's version.
+    /// the offending block's version (empty for a stable block).
     Orphaned(String),
-    /// A single block whose version differs from the current payload. Carries
-    /// that version.
-    Stale(String),
+    /// A single, working block still in the legacy versioned form (#127). It
+    /// keeps working, so this is not a fault — but rewriting it to the stable
+    /// form is a `Documents` write, which only an explicit user action is
+    /// allowed to make. Carries the legacy fence's version.
+    MigrationPending(String),
     /// More than one fwdslash block.
     Duplicated,
 }
 
 /// Classifies a profile from its blocks. Orphan (missing module) outranks the
 /// rest because it is the only state that throws a visible error.
+///
+/// There is deliberately **no** version comparison here any more (#127): the
+/// stable block cannot go stale, so the payload version of record is the
+/// registry marker's `Version`, never the fence text. A block that still
+/// carries a version in its fence is a legacy block awaiting migration.
 #[must_use]
-pub fn classify_profile(blocks: &[BlockPresence], current_version: &str) -> ProfileHealth {
+pub fn classify_profile(blocks: &[BlockPresence]) -> ProfileHealth {
     if blocks.is_empty() {
         return ProfileHealth::Clean;
     }
@@ -498,8 +565,8 @@ pub fn classify_profile(blocks: &[BlockPresence], current_version: &str) -> Prof
         return ProfileHealth::Duplicated;
     }
     let only = &blocks[0];
-    if only.version != current_version {
-        return ProfileHealth::Stale(only.version.clone());
+    if only.is_legacy() {
+        return ProfileHealth::MigrationPending(only.version.clone());
     }
     ProfileHealth::Healthy
 }
@@ -519,13 +586,49 @@ pub enum ProfileAction {
     /// The adapter should be installed but its current module is missing: a
     /// full redeploy is required.
     Reinstall,
+    /// A profile write is required, but this run is a background sweep and may
+    /// not touch `Documents` (#127). The caller reports it and leaves the
+    /// existing block — legacy or not — working until the user confirms.
+    NeedsConfirmation,
+}
+
+impl ProfileAction {
+    /// Whether performing this action writes the user's `profile.ps1`.
+    #[must_use]
+    pub fn writes_profile(self) -> bool {
+        matches!(
+            self,
+            Self::RemoveBlocks | Self::WriteCurrentBlock | Self::Reinstall
+        )
+    }
 }
 
 /// The repair verdict. `marker_installed` is whether the edition's marker says
 /// `installed`; `current_module_present` is whether the *current* payload's
-/// module file exists on disk.
+/// module file exists on disk; `user_initiated` is whether a person asked for
+/// this (an explicit `fwdslash integration <id> enable|repair`) rather than a
+/// broker/settings background sweep.
+///
+/// **A background sweep never writes a profile** (#127): every profile-writing
+/// verdict becomes [`ProfileAction::NeedsConfirmation`], which the caller
+/// surfaces instead of silently tripping Controlled Folder Access.
 #[must_use]
 pub fn decide_profile_repair(
+    health: &ProfileHealth,
+    marker_installed: bool,
+    current_module_present: bool,
+    user_initiated: bool,
+) -> ProfileAction {
+    let action = decide_profile_repair_unchecked(health, marker_installed, current_module_present);
+    if !user_initiated && action.writes_profile() {
+        return ProfileAction::NeedsConfirmation;
+    }
+    action
+}
+
+/// The verdict before the background-sweep gate — what the repair *would* do.
+#[must_use]
+fn decide_profile_repair_unchecked(
     health: &ProfileHealth,
     marker_installed: bool,
     current_module_present: bool,
@@ -555,9 +658,11 @@ pub fn decide_profile_repair(
                 ProfileAction::RemoveBlocks
             }
         }
-        // Orphan / stale / duplicate: normalise to one current block when the
+        // Orphan / legacy / duplicate: normalise to one current block when the
         // adapter should be installed, otherwise strip it out entirely.
-        ProfileHealth::Orphaned(_) | ProfileHealth::Stale(_) | ProfileHealth::Duplicated => {
+        ProfileHealth::Orphaned(_)
+        | ProfileHealth::MigrationPending(_)
+        | ProfileHealth::Duplicated => {
             if marker_installed {
                 restore_installed()
             } else {
@@ -573,15 +678,12 @@ const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 /// `-EncodedCommand` expects. Hand-rolled to keep the crate dependency-free.
 #[must_use]
 pub fn base64_utf16le(text: &str) -> String {
-    let bytes: Vec<u8> = text
-        .encode_utf16()
-        .flat_map(|unit| unit.to_le_bytes())
-        .collect();
+    let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
         let triple = (b0 << 16) | (b1 << 8) | b2;
         out.push(BASE64[(triple >> 18) as usize & 0x3F] as char);
         out.push(BASE64[(triple >> 12) as usize & 0x3F] as char);

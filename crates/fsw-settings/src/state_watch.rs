@@ -271,14 +271,16 @@ pub(crate) fn wait() -> Wake {
 
 #[cfg(not(windows))]
 pub(crate) fn wait() -> Wake {
-    std::thread::sleep(std::time::Duration::from_millis(u64::from(POLL_INTERVAL_MS)));
+    std::thread::sleep(std::time::Duration::from_millis(u64::from(
+        POLL_INTERVAL_MS,
+    )));
     Wake::Poll
 }
 
 /// Whether the settings window is on screen right now.
 ///
 /// A window that has not been created yet counts as visible: the first poll
-/// can land before WinUI has materialized it, and skipping the read then would
+/// can land before `WinUI` has materialized it, and skipping the read then would
 /// leave the first frame's state unrefreshed for another interval.
 #[cfg(windows)]
 pub(crate) fn window_visible() -> bool {
@@ -353,6 +355,6 @@ mod tests {
     /// window is open; keep it visibly slow.
     #[test]
     fn the_poll_stays_infrequent() {
-        assert!(POLL_INTERVAL_MS >= 5_000);
+        const { assert!(POLL_INTERVAL_MS >= 5_000) };
     }
 }

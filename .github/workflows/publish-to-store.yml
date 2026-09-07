@@ -36,8 +36,8 @@ name: Publish to Microsoft Store
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to publish (e.g. 0.0.4) — must have an existing GitHub release with a *-store-unsigned.msixbundle asset'
+      release_tag:
+        description: 'Release tag to publish (e.g. v0.0.4) — must have an existing GitHub release with its exact Store bundle asset'
         required: true
       release_notes:
         description: 'Store "What''s new" text (optional — defaults to the GitHub release body, plain-texted and truncated to the Store limit)'
@@ -48,6 +48,7 @@ env:
   # Store ID for fwdslash. Public (it is in the README and the Store URL), so
   # it lives here rather than in a secret.
   STORE_APP_ID: 9P51CM0MTMK2
+  RELEASE_TAG: ${{ github.event.inputs.release_tag }}
 
 permissions:
   contents: read
@@ -64,6 +65,12 @@ jobs:
       run:
         shell: pwsh
     steps:
+      - name: Validate release tag
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Invalid release tag '$env:RELEASE_TAG'. Expected v<major>.<minor>.<patch>."
+          }
+
       # Fail before touching Partner Center rather than halfway through a
       # submission: msstore reconfigure accepts an empty --sellerId and then
       # every later call 401s with an opaque message.
@@ -93,20 +100,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $version = '${{ github.event.inputs.version }}'
-          Write-Host "Downloading the Store submission asset from release v$version..."
+          $version = $env:RELEASE_TAG.Substring(1)
+          $expectedBundle = "fwdslash-$version.0-store-unsigned.msixbundle"
+          Write-Host "Downloading the Store submission asset from release $env:RELEASE_TAG..."
 
           # Only the *-store-unsigned bundle. The other .msixbundle on the
           # release is Trusted Signing-signed with the GitHub flavor's
           # publisher and would be rejected by Partner Center.
-          gh release download "v$version" --repo ${{ github.repository }} --pattern '*-store-unsigned.msixbundle'
-          if ($LASTEXITCODE -ne 0) { throw "gh release download failed for v$version." }
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $expectedBundle
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $env:RELEASE_TAG." }
 
-          $downloaded = @(Get-ChildItem -Filter '*-store-unsigned.msixbundle')
+          $downloaded = @(Get-ChildItem -LiteralPath $expectedBundle -File -ErrorAction SilentlyContinue)
           if ($downloaded.Count -ne 1) {
-              throw ("Expected exactly one *-store-unsigned.msixbundle on release v$version; found " +
-                     "$($downloaded.Count). The release job attaches it as " +
-                     "fwdslash-<version>.0-store-unsigned.msixbundle.")
+              throw "Expected Store bundle '$expectedBundle' on release $env:RELEASE_TAG."
           }
           Write-Host "Downloaded: $($downloaded[0].Name) ($($downloaded[0].Length) bytes)"
 
@@ -118,10 +124,11 @@ jobs:
           STORE_TENANT_ID: ${{ secrets.STORE_TENANT_ID || secrets.AZURE_TENANT_ID }}
           STORE_CLIENT_ID: ${{ secrets.STORE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
           STORE_CLIENT_SECRET: ${{ secrets.STORE_CLIENT_SECRET || secrets.AZURE_CLIENT_SECRET }}
+          STORE_SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
         run: |
           msstore reconfigure `
             --tenantId $env:STORE_TENANT_ID `
-            --sellerId ${{ secrets.STORE_SELLER_ID }} `
+            --sellerId $env:STORE_SELLER_ID `
             --clientId $env:STORE_CLIENT_ID `
             --clientSecret $env:STORE_CLIENT_SECRET
           if ($LASTEXITCODE -ne 0) { throw 'msstore reconfigure failed.' }
@@ -131,7 +138,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NOTES_INPUT: ${{ github.event.inputs.release_notes }}
         run: |
-          $version = '${{ github.event.inputs.version }}'
           $notes = $env:NOTES_INPUT
 
           if (-not $notes) {
@@ -145,7 +151,7 @@ jobs:
             # string (a no-op if gh already returned one) so IndexOf/Substring
             # below are unambiguous String operations, not IList.IndexOf
             # (which matches whole array ELEMENTS, not a text offset).
-            $bodyRaw = gh release view "v$version" --repo ${{ github.repository }} --json body -q .body
+            $bodyRaw = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json body -q .body
             $body = $bodyRaw -join "`n"
             if ($body) {
               # Drop the asset guide release.yml appends — Store "What's new"
@@ -208,7 +214,7 @@ jobs:
             # the flag explicitly engages the option parser and sets a real
             # timeout on v0.4.x, and remains harmless on versions that gain
             # the corrected default.
-            msstore publish "$($bundleFile.FullName)" --appId ${{ env.STORE_APP_ID }} --noCommit --uploadTimeout 600
+            msstore publish "$($bundleFile.FullName)" --appId $env:STORE_APP_ID --noCommit --uploadTimeout 600
             if ($LASTEXITCODE -eq 0) { $succeeded = $true; break }
             Write-Warning "msstore publish failed (exit $LASTEXITCODE)."
             if ($attempt -lt $maxAttempts) {
@@ -225,7 +231,7 @@ jobs:
           # Best-effort: release notes are cosmetic — a failure here must not
           # block the release, the commit step below still ships the package.
           try {
-            $raw = (msstore submission get ${{ env.STORE_APP_ID }} | Out-String)
+            $raw = (msstore submission get $env:STORE_APP_ID | Out-String)
             $start = $raw.IndexOf('{')
             $end = $raw.LastIndexOf('}')
             if ($start -lt 0 -or $end -le $start) { throw "No JSON in 'submission get' output" }
@@ -242,7 +248,7 @@ jobs:
             # full get -> patch -> update round-trip is required (per msstore
             # CLI docs) — never send a partial JSON here.
             $json = $submission | ConvertTo-Json -Depth 64 -Compress
-            msstore submission update ${{ env.STORE_APP_ID }} $json --skipInitialPolling
+            msstore submission update $env:STORE_APP_ID $json --skipInitialPolling
             if ($LASTEXITCODE -ne 0) { throw 'msstore submission update failed' }
             Write-Host "Release notes applied to $($langs.Count) listing(s): $($langs -join ', ')"
           } catch {
@@ -251,6 +257,6 @@ jobs:
 
       - name: Commit submission to the Store
         run: |
-          msstore submission publish ${{ env.STORE_APP_ID }}
+          msstore submission publish $env:STORE_APP_ID
           if ($LASTEXITCODE -ne 0) { throw 'msstore submission publish failed' }
-          msstore submission poll ${{ env.STORE_APP_ID }}
+          msstore submission poll $env:STORE_APP_ID

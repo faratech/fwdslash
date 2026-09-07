@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -22,7 +23,7 @@ jobs:
       matrix:
         preset: [x64-debug, arm64-debug, x86-debug]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         shell: pwsh
         run: cmake --preset ${{ matrix.preset }}
@@ -38,7 +39,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # These fixtures import the adapter but never install it, use no profile,
       # and mock every installer/network/package action. Invoke the Windows
       # PowerShell 5.1 executable explicitly: pwsh has different binding and
@@ -72,7 +73,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build unsigned x64 driver package
         shell: pwsh
         run: .\tools\Build-Driver.ps1 -Architecture x64 -Configuration Debug
@@ -85,7 +86,7 @@ jobs:
       matrix:
         platform: [Win32, x64, ARM64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build WinUI 3 settings app
         shell: pwsh
         run: |
@@ -96,14 +97,12 @@ jobs:
   # The Rust tree is the shipping product; this job is what the "CI asserts …"
   # claims in docs/dependencies.md and docs/size-baseline.md refer to.
   #
-  # Deliberately NOT `cargo clippy -- -D warnings`: clippy is not clean on the
-  # current tree (the workspace turns on `pedantic`), and a gate that fails on
-  # arrival teaches people to ignore the job. Add it once the backlog is clear.
+  # Formatting and both Windows Clippy targets must remain warning-clean.
   rust:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Every version literal outside the workspace manifest is registered in
       # tools/bump_version.py; --check fails the job the moment one drifts.
@@ -116,6 +115,8 @@ jobs:
       - name: Test the version bumper
         run: python3 -m unittest tools.test_bump_version
 
+      # Models check-store-submission.yml's HTTP/JSON response guard against a
+      # loopback server; it never contacts Partner Center.
       - name: Test Store-submission HTTP verifier
         run: |
           command -v python3
@@ -127,6 +128,10 @@ jobs:
         uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: x86_64-pc-windows-msvc,aarch64-pc-windows-msvc
+          components: rustfmt,clippy
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
 
       # The two library crates are host-portable: fsw-path has no dependencies
       # at all and fsw-core is #[cfg(windows)]-gated with non-Windows
@@ -167,10 +172,10 @@ jobs:
 
       # `cargo check` links nothing, so the MSVC targets type-check here
       # without a linker or the Windows SDK.
-      - name: Check x64 (all targets)
-        run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc --locked
-      - name: Check ARM64 (all targets)
-        run: cargo check --workspace --all-targets --target aarch64-pc-windows-msvc --locked
+      - name: Clippy x64 (all targets)
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc --locked -- -D warnings
+      - name: Clippy ARM64 (all targets)
+        run: cargo clippy --workspace --all-targets --target aarch64-pc-windows-msvc --locked -- -D warnings
 
   # Everything that needs a real MSVC linker: the CLI's bin tests (which also
   # have to *run*, so they need a Windows host) and the release build the size
@@ -183,7 +188,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.98.1
         with:
@@ -212,13 +217,11 @@ jobs:
           git diff --exit-code -- crates/fsw-cli/src/update/install_control.rs
           if ($LASTEXITCODE -ne 0) { throw 'install_control.rs is stale: run python tools/regen_install_control.py' }
 
-      - name: Test CLI, broker, and settings binaries
+      - name: Run the Windows workspace tests
         env:
-          # The update integration executable probes installer state. On a
-          # hosted non-elevated runner, prevent that child process from asking
-          # for elevation; this applies only to this test process tree.
+          # Keep installer-state probes non-elevated on hosted runners.
           __COMPAT_LAYER: RunAsInvoker
-        run: cargo test -p fwdslash -p fswbroker -p fswsettings --bins --target x86_64-pc-windows-msvc --locked
+        run: cargo test --workspace --all-targets --target x86_64-pc-windows-msvc --locked
 
       - name: Release build
         run: cargo build --release --workspace --target x86_64-pc-windows-msvc --locked

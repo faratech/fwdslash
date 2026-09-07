@@ -46,6 +46,7 @@ pub const PINS: &[Option<&str>] = &[
 
 pub const DEFAULTS: &[Option<&str>] = &[None, Some("Ubuntu"), Some("Dev Distro"), Some("")];
 
+#[allow(dead_code)]
 pub fn snapshot(resolved: Resolved<'_>) -> (String, String, String) {
     (
         resolved.distribution().unwrap_or_default().to_owned(),
@@ -54,6 +55,7 @@ pub fn snapshot(resolved: Resolved<'_>) -> (String, String, String) {
     )
 }
 
+#[allow(dead_code)]
 pub trait TestRegistry {
     fn is_registered_for_test(&self, name: &str) -> bool;
 }
@@ -63,8 +65,14 @@ impl TestRegistry for &[&str] {
     }
 }
 
-/// A faithful transcription of the C++ `ResolveSlashPathWithBareSlashMode`:
-/// build `"/" + target + input` and re-parse. Kept only as the oracle.
+/// A transcription of the C++ `ResolveSlashPathWithBareSlashMode` build-`"/"+target+input`
+/// and re-parse oracle, updated for the folder-shadowing rule: in
+/// default-distribution mode the input is *always* relative to the pinned or
+/// default distribution, even when its first segment names a registered
+/// distribution (the C++ still passes those through — see docs/divergences.md).
+/// Strict-resolution errors other than `UnregisteredDistribution` keep their
+/// original spelling for both rules.
+#[allow(dead_code)]
 pub fn reference_rewrite(
     input: &str,
     mode: BareSlashMode,
@@ -78,7 +86,7 @@ pub fn reference_rewrite(
         return direct.map(snapshot);
     }
     let passes_through = match &direct {
-        Ok(resolved) => !resolved.is_wsl_root(),
+        Ok(_) => false,
         Err(error) => *error != ResolveError::UnregisteredDistribution,
     };
     if passes_through {
@@ -101,23 +109,26 @@ pub fn reference_rewrite(
 
 /// Every (input × pin × default × mode) combination, for tests that want the
 /// full corpus rather than a single case.
-pub fn contexts() -> impl Iterator<Item = (&'static str, Context<'static, [ &'static str]>)> {
+pub fn contexts() -> impl Iterator<Item = (&'static str, Context<'static, [&'static str]>)> {
     LEADING.iter().flat_map(|input| {
         PINS.iter().flat_map(move |pref| {
             DEFAULTS.iter().flat_map(move |def| {
-                [BareSlashMode::DistributionList, BareSlashMode::DefaultDistribution]
-                    .into_iter()
-                    .map(move |mode| {
-                        (
-                            *input,
-                            Context {
-                                registry: REGISTERED,
-                                mode,
-                                preferred: *pref,
-                                wsl_default: *def,
-                            },
-                        )
-                    })
+                [
+                    BareSlashMode::DistributionList,
+                    BareSlashMode::DefaultDistribution,
+                ]
+                .into_iter()
+                .map(move |mode| {
+                    (
+                        *input,
+                        Context {
+                            registry: REGISTERED,
+                            mode,
+                            preferred: *pref,
+                            wsl_default: *def,
+                        },
+                    )
+                })
             })
         })
     })

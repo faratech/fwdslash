@@ -91,24 +91,24 @@ fn steady_state_resolution_allocates_nothing() {
 
     // Same promise for the single hot case repeated hard.
     let hot = common::LEADING.iter().find(|input| **input == "/tmp");
-    let Some(hot) = hot else {
-        panic!("corpus lost its /tmp case");
-    };
-    let ctx = fsw_path::Context {
-        registry: common::REGISTERED,
-        mode: fsw_path::BareSlashMode::DefaultDistribution,
-        preferred: Some("Ubuntu"),
-        wsl_default: Some("Ubuntu"),
-    };
-    reset_allocations();
-    for _ in 0..10_000 {
-        let _ = std::hint::black_box(resolve(hot, &ctx, &mut buf));
+    assert!(hot.is_some(), "corpus lost its /tmp case");
+    if let Some(hot) = hot {
+        let ctx = fsw_path::Context {
+            registry: common::REGISTERED,
+            mode: fsw_path::BareSlashMode::DefaultDistribution,
+            preferred: Some("Ubuntu"),
+            wsl_default: Some("Ubuntu"),
+        };
+        reset_allocations();
+        for _ in 0..10_000 {
+            let _ = std::hint::black_box(resolve(hot, &ctx, &mut buf));
+        }
+        assert_eq!(
+            allocations(),
+            0,
+            "hot-path resolution allocated across 10,000 resolves"
+        );
     }
-    assert_eq!(
-        allocations(),
-        0,
-        "hot-path resolution allocated across 10,000 resolves"
-    );
 }
 
 #[test]

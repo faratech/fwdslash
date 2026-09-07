@@ -1,10 +1,19 @@
 //! The Windows PowerShell 5.1 and PowerShell 7 adapters: deploys the module
-//! (`ForwardSlashWindows.psm1` + a controller copy) into a shared
-//! `%LOCALAPPDATA%\ForwardSlashWindows\PowerShell\<version>` directory, adds
-//! a guarded import block to the edition's `profile.ps1`, and verifies the
-//! aliases load in a real child shell. Ported from the retired
+//! (`ForwardSlashWindows.psm1` + a controller copy) into the shared,
+//! **version-free** `%LOCALAPPDATA%\ForwardSlashWindows\PowerShell\payload`
+//! directory, adds a guarded import block to the edition's `profile.ps1`, and
+//! verifies the aliases load in a real child shell. Ported from the retired
 //! `tools/Install-PowerShellAdapter.ps1` / `Uninstall-PowerShellAdapter.ps1`
 //! with registry writes routed through `reg.exe`.
+//!
+//! The payload directory used to be named for the payload version, which put
+//! the version into `$m` and `$c` and made every release rewrite a file under
+//! `Documents` — where Controlled Folder Access silently refused it (#127).
+//! It is now swapped in place by the same rename-aside transaction the cmd
+//! adapter uses, so the profile block is byte-identical across releases and an
+//! upgrade is a `%LOCALAPPDATA%` operation alone. The pre-#127
+//! `PowerShell\<version>` directories stay put until an explicit
+//! `fwdslash integration <id> enable` migrates the block that names them.
 
 use super::{AdapterError, Edition, profile, reg, state};
 #[cfg(windows)]
@@ -14,11 +23,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const MARKER_ROOT: &str = "Software\\ForwardSlashWindows\\PowerShellAdapter";
+/// The version-free payload directory (#127). Its name must never change
+/// again: it is spelled into every deployed profile block.
+const PAYLOAD_DIR_NAME: &str = "payload";
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 /// The policy probe runs a single cmdlet in a `-NoProfile` shell, so it is
 /// bounded by process start-up alone. Shorter than the verification budget on
 /// purpose: it runs before anything has been written, and a hung probe must
 /// fall through to the old behaviour rather than stall an install.
+const POLICY_TIMEOUT: Duration = Duration::from_secs(10);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Installs the adapter for `edition`. `controller` is the running
@@ -39,26 +52,19 @@ pub fn install(edition: Edition, controller: &Path) -> Result<(), AdapterError> 
     if let Some(error) = execution_policy_refusal(edition) {
         return Err(error);
     }
-
-    install_after_policy_preflight(edition, controller)
-}
-
-/// Finishes an install after `execution_policy_refusal` has run. Upgrades use
-/// this after their early preflight, before they remove the prior adapter.
-pub(super) fn install_after_policy_preflight(
-    edition: Edition,
-    controller: &Path,
-) -> Result<(), AdapterError> {
-    let mut transaction = match begin_install(edition)? {
-        Some(transaction) => transaction,
-        // Already installed: the scripts reported it and exited 0.
-        None => {
-            println!(
-                "The {} adapter is already installed.",
-                edition.display_name()
-            );
-            return Ok(());
-        }
+    // A prior blocked/interrupted removal must be resumable from enable too.
+    // Uninstall retains its marker and recovery files if it still cannot
+    // modify the profile; never force the marker away to bypass that failure.
+    if read_marker_state(&marker_key(edition)).as_deref() == Some("removing") {
+        uninstall(edition)?;
+    }
+    // Already installed: the scripts reported it and exited 0.
+    let Some(mut transaction) = begin_install(edition)? else {
+        println!(
+            "The {} adapter is already installed.",
+            edition.display_name()
+        );
+        return Ok(());
     };
     if let Err(error) = commit_install(&mut transaction) {
         transaction.undo();
@@ -71,12 +77,120 @@ pub(super) fn install_after_policy_preflight(
     Ok(())
 }
 
+/// `%LOCALAPPDATA%\ForwardSlashWindows\PowerShell`.
+fn install_root() -> Result<PathBuf, AdapterError> {
+    Ok(super::local_app_data()?
+        .join("ForwardSlashWindows")
+        .join("PowerShell"))
+}
+
+/// The deployed module, in the version-free payload directory.
+fn deployed_module_path() -> Result<PathBuf, AdapterError> {
+    Ok(install_root()?
+        .join(PAYLOAD_DIR_NAME)
+        .join("ForwardSlashWindows.psm1"))
+}
+
+/// The staged controller copy beside the module.
+fn deployed_controller_path() -> Result<PathBuf, AdapterError> {
+    Ok(install_root()?.join(PAYLOAD_DIR_NAME).join("fwdslash.exe"))
+}
+
+/// The rename-aside swap of the shared payload directory — the cmd adapter's
+/// mechanism, reused rather than reinvented (#127): stage a fresh copy beside
+/// the live one, rename the live one to `payload.removing-<id>`, rename the
+/// staging directory into place, then drop the old one.
+///
+/// `undo` puts the previous directory back, so a failure anywhere after the
+/// swap leaves the working payload exactly as it was.
+struct PayloadSwap {
+    root: PathBuf,
+    staging: PathBuf,
+    rollback: PathBuf,
+    deployed: bool,
+    renamed: bool,
+}
+
+impl PayloadSwap {
+    fn new() -> Result<Self, AdapterError> {
+        let root = install_root()?.join(PAYLOAD_DIR_NAME);
+        let id = super::new_transaction_id();
+        Ok(Self {
+            staging: PathBuf::from(format!("{}.staging-{id}", root.display())),
+            rollback: PathBuf::from(format!("{}.removing-{id}", root.display())),
+            root,
+            deployed: false,
+            renamed: false,
+        })
+    }
+
+    /// Deploys the payload unless the live directory already holds exactly
+    /// these bytes. Skipping matters: the two editions share one directory, so
+    /// enabling the second must not rename a payload the first is loading.
+    fn ensure(&mut self, controller: &Path) -> Result<(), AdapterError> {
+        let module_source =
+            super::payload_source_dir("powershell")?.join("ForwardSlashWindows.psm1");
+        if payload_matches(&self.root, &module_source, controller) {
+            return Ok(());
+        }
+        if let Some(parent) = self.root.parent() {
+            super::real_make_dir(parent)?;
+        }
+        super::real_make_dir(&self.staging)?;
+        super::real_copy_file(&module_source, &self.staging)?;
+        super::real_copy_file(controller, &self.staging)?;
+        if self.root.exists() {
+            std::fs::rename(&self.root, &self.rollback)?;
+            self.renamed = true;
+        }
+        std::fs::rename(&self.staging, &self.root)?;
+        self.deployed = true;
+        Ok(())
+    }
+
+    /// Drops the renamed-aside copy once the transaction has committed.
+    fn finish(&mut self) {
+        if self.renamed {
+            let _ = std::fs::remove_dir_all(&self.rollback);
+            self.renamed = false;
+        }
+    }
+
+    fn undo(&mut self) {
+        if self.deployed {
+            let _ = std::fs::remove_dir_all(&self.root);
+            self.deployed = false;
+        }
+        if self.renamed {
+            let _ = std::fs::rename(&self.rollback, &self.root);
+            self.renamed = false;
+        }
+        let _ = std::fs::remove_dir_all(&self.staging);
+    }
+}
+
+/// Whether the deployed payload already is this build's: both files present and
+/// the same size as their sources. Size is what `real_copy_file` already checks
+/// for a truncated deploy, and it separates one release's exe from another's.
+fn payload_matches(root: &Path, module_source: &Path, controller: &Path) -> bool {
+    let same_size = |deployed: &Path, source: &Path| match (
+        std::fs::metadata(deployed),
+        std::fs::metadata(source),
+    ) {
+        (Ok(left), Ok(right)) => left.len() == right.len(),
+        _ => false,
+    };
+    root.is_dir()
+        && same_size(&root.join("ForwardSlashWindows.psm1"), module_source)
+        && same_size(&root.join("fwdslash.exe"), controller)
+}
+
+// These flags independently record rollback milestones in the original script.
+#[allow(clippy::struct_excessive_bools)]
 struct InstallTransaction {
     edition: Edition,
     transaction_id: String,
-    module_root: PathBuf,
-    module_staging: PathBuf,
-    module_deployed: bool,
+    payload: PayloadSwap,
     state_root: PathBuf,
     state_staging: PathBuf,
     state_deployed: bool,
@@ -90,7 +204,7 @@ struct InstallTransaction {
 /// `None` = already installed (friendly no-op).
 fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, AdapterError> {
     let marker_key = marker_key(edition);
-    let marker_state = read_marker_state(&marker_key)?;
+    let marker_state = read_marker_state(&marker_key);
     match state::decide_ps_install(
         marker_state.is_some(),
         marker_state.map_or(state::MarkerState::Unknown, |text| state::classify(&text)),
@@ -108,10 +222,7 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
 
     let documents = super::documents_dir()?;
     let profile_path = documents.join(edition.folder_name()).join("profile.ps1");
-    let install_root = super::local_app_data()?
-        .join("ForwardSlashWindows")
-        .join("PowerShell");
-    let module_root = install_root.join(super::PAYLOAD_VERSION);
+    let install_root = install_root()?;
     let transaction_id = super::new_transaction_id();
 
     let original_present = profile_path.is_file();
@@ -124,13 +235,7 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
     Ok(Some(InstallTransaction {
         edition,
         transaction_id,
-        module_root: module_root.clone(),
-        module_staging: PathBuf::from(format!(
-            "{}.staging-{}",
-            module_root.display(),
-            super::new_transaction_id()
-        )),
-        module_deployed: false,
+        payload: PayloadSwap::new()?,
         state_root: install_root.join("state").join(edition.folder_name()),
         state_staging: PathBuf::from(format!(
             "{}.staging-{}",
@@ -156,23 +261,11 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     let running = std::env::current_exe()
         .map_err(|error| AdapterError::new(&format!("could not locate fwdslash.exe ({error}).")))?;
 
-    // Shared module directory: deploy once, skip if the other edition (or a
-    // previous install) already deployed it. Real-process copies — the real
+    // Shared payload directory, swapped by rename-aside and skipped entirely
+    // when it already holds these bytes. Real-process copies — the real
     // powershell.exe child must be able to load the module, so it cannot be
     // allowed to land in this process's virtualized view.
-    if !transaction.module_root.is_dir() {
-        if let Some(parent) = transaction.module_root.parent() {
-            super::real_make_dir(parent)?;
-        }
-        super::real_make_dir(&transaction.module_staging)?;
-        super::real_copy_file(
-            &super::payload_source_dir("powershell")?.join("ForwardSlashWindows.psm1"),
-            &transaction.module_staging,
-        )?;
-        super::real_copy_file(&running, &transaction.module_staging)?;
-        std::fs::rename(&transaction.module_staging, &transaction.module_root)?;
-        transaction.module_deployed = true;
-    }
+    transaction.payload.ensure(&running)?;
 
     // The *true* original is the profile with every prior fwdslash block
     // stripped: installing over a profile a previous version (or a duplicate
@@ -180,11 +273,7 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     // stale one, and uninstall must be able to restore the genuine pre-fwdslash
     // profile (#37). The raw bytes stay on the transaction for exact rollback.
     let true_original = profile::strip_fwdslash_blocks(&transaction.original_bytes);
-    let true_original_present = profile::original_profile_present(
-        transaction.original_present,
-        &transaction.original_bytes,
-        &true_original,
-    );
+    let true_original_present = !true_original.is_empty();
 
     // State directory with the recovery files, staged then renamed.
     if let Some(parent) = transaction.state_root.parent() {
@@ -195,19 +284,8 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
         transaction.state_staging.join("profile.original"),
         &true_original,
     )?;
-    let module_path = transaction.module_root.join("ForwardSlashWindows.psm1");
-    let controller_path = transaction.module_root.join("fwdslash.exe");
     let probe_path = super::product_probe_path(&running);
-    let alias_path = super::app_execution_alias().unwrap_or_default();
-    let block = profile::block_text(&profile::BlockParams {
-        version: super::PAYLOAD_VERSION,
-        transaction_id: &transaction.transaction_id,
-        module_path: &module_path.display().to_string(),
-        probe_path: &probe_path.display().to_string(),
-        alias_path: &alias_path.display().to_string(),
-        controller_path: &controller_path.display().to_string(),
-        original_non_empty: !true_original.is_empty(),
-    });
+    let block = block_for(true_original_present)?;
     let encoding = profile::detect_encoding(&true_original);
     transaction.block_bytes = profile::encode(&block, encoding);
     std::fs::write(
@@ -233,24 +311,48 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
         &transaction.state_root.display().to_string(),
     )?;
     reg::set_string(&key, "ProductProbe", &probe_path.display().to_string())?;
-    // An originally empty file must survive; an orphaned block-only file need not.
+    // OriginalPresent tracks whether there is *genuine* content to restore, so
+    // a profile that was purely our own block(s) is deleted on removal, not
+    // left as an empty file.
     reg::set_dword(&key, "OriginalPresent", u32::from(true_original_present))?;
 
-    // Installed profile = true original + one current guarded block.
+    // Installed profile = true original + one current guarded block. A write
+    // that would not change a byte is skipped outright: `Documents` is a
+    // Controlled Folder Access target and there is nothing to gain by touching
+    // it (#127).
     let mut installed_bytes = true_original;
     installed_bytes.extend_from_slice(&transaction.block_bytes);
-    super::write_atomic(&transaction.profile_path, &installed_bytes).map_err(|error| {
-        super::explain_file_error(
-            &error,
-            "The PowerShell profile update",
-            &transaction.profile_path,
-        )
-    })?;
-    transaction.profile_changed = true;
+    if installed_bytes != transaction.original_bytes || !transaction.original_present {
+        super::write_atomic(&transaction.profile_path, &installed_bytes).map_err(|error| {
+            super::explain_file_error(
+                &error,
+                "The PowerShell profile update",
+                &transaction.profile_path,
+            )
+        })?;
+        transaction.profile_changed = true;
+    }
 
     reg::set_string(&key, "State", "installed")?;
     verify_aliases(edition)?;
+    transaction.payload.finish();
     Ok(())
+}
+
+/// The guarded block this build writes, for `original_non_empty` originals.
+/// Constant across releases by construction: every path in it is version-free.
+fn block_for(original_non_empty: bool) -> Result<String, AdapterError> {
+    let running = std::env::current_exe()
+        .map_err(|error| AdapterError::new(&format!("could not locate fwdslash.exe ({error}).")))?;
+    let probe_path = super::product_probe_path(&running);
+    let alias_path = super::app_execution_alias().unwrap_or_default();
+    Ok(profile::block_text(&profile::BlockParams {
+        module_path: &deployed_module_path()?.display().to_string(),
+        probe_path: &probe_path.display().to_string(),
+        alias_path: &alias_path.display().to_string(),
+        controller_path: &deployed_controller_path()?.display().to_string(),
+        original_non_empty,
+    }))
 }
 
 impl InstallTransaction {
@@ -269,17 +371,14 @@ impl InstallTransaction {
             let _ = std::fs::remove_dir_all(&self.state_root);
         }
         let _ = std::fs::remove_dir_all(&self.state_staging);
-        if self.module_deployed {
-            let _ = std::fs::remove_dir_all(&self.module_root);
-        }
-        let _ = std::fs::remove_dir_all(&self.module_staging);
+        self.payload.undo();
     }
 }
 
 /// Removes the adapter for `edition`, restoring the guarded profile.
 pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
     let key = marker_key(edition);
-    let Some(values) = read_marker(&key)? else {
+    let Some(values) = read_marker(&key) else {
         println!("The {} adapter is not installed.", edition.display_name());
         return Ok(());
     };
@@ -309,7 +408,10 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
     let block_bytes = std::fs::read(&block_file)?;
     reg::set_string(&key, "State", "removing")?;
 
-    if values.profile_path.is_file() {
+    let profile_removal = (|| -> Result<(), AdapterError> {
+        if !values.profile_path.try_exists()? {
+            return Ok(());
+        }
         let current = std::fs::read(&values.profile_path)?;
         // Fast path: excise the exact block we recorded. Belt and braces: then
         // strip every remaining fwdslash fence (an older version, a duplicate,
@@ -324,6 +426,23 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
         } else {
             super::write_atomic(&values.profile_path, &cleaned)?;
         }
+        Ok(())
+    })();
+    if let Err(error) = profile_removal {
+        // Neither atomic replacement nor a failed deletion changed the old
+        // profile. Restore its previous transaction state and retain every
+        // recovery artifact. A pre-existing removing marker stays retryable.
+        let error = super::explain_file_error(
+            &error,
+            "The PowerShell profile removal",
+            &values.profile_path,
+        );
+        if let Err(restore_error) = reg::set_string(&key, "State", &values.state) {
+            return Err(AdapterError::new(&format!(
+                "{error} The previous adapter state could not be restored ({restore_error}); recovery files were retained."
+            )));
+        }
+        return Err(error);
     }
 
     reg::delete_tree(&key)?;
@@ -331,23 +450,24 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
         std::fs::remove_dir_all(&state_root)?;
     }
 
-    // The shared module directory goes away with this edition unless the
-    // other edition's marker records the SAME version. Its name is the payload
-    // version this install deployed, not the one this build ships: an upgrade
-    // removes the directory it actually created.
+    // The shared payload goes away with this edition unless the other edition
+    // still has a marker. Both the version-free `payload` directory and any
+    // legacy `PowerShell\<version>` directory this install deployed are
+    // considered: an upgrade removes the directory it actually created.
     let deployed_version = marker_version(&values);
     let other_marker = marker_key(state::other_edition(edition));
-    let other_version = read_marker(&other_marker)?
-        .as_ref()
-        .map(marker_version)
-        .map(str::to_owned);
+    let other = read_marker(&other_marker);
+    let other_version = other.as_ref().map(marker_version).map(str::to_owned);
     if state::remove_shared_module(other_version.as_deref(), deployed_version) {
-        let module_root = super::local_app_data()?
-            .join("ForwardSlashWindows")
-            .join("PowerShell")
-            .join(deployed_version);
+        let module_root = install_root()?.join(deployed_version);
         if module_root.exists() {
             std::fs::remove_dir_all(&module_root)?;
+        }
+    }
+    if other.is_none() {
+        let payload_root = install_root()?.join(PAYLOAD_DIR_NAME);
+        if payload_root.exists() {
+            std::fs::remove_dir_all(&payload_root)?;
         }
     }
     // Belt and braces: a version directory no marker names must never survive
@@ -399,12 +519,57 @@ pub fn prune_orphaned_module_dirs() {
         return;
     }
 
-    // Versions a marker still points at. A marker that cannot be read counts
-    // as absent, which is the same conservative answer uninstall uses.
+    // Unreadable or incomplete ownership is not permission to delete. In
+    // particular, interrupted upgrades still need their old recovery payload.
     let mut referenced: Vec<String> = Vec::new();
+    let Ok(documents) = super::documents_dir() else {
+        return;
+    };
     for edition in [Edition::WindowsPowerShell, Edition::PowerShell] {
-        if let Ok(Some(values)) = read_marker(&marker_key(edition)) {
-            referenced.push(marker_version(&values).to_string());
+        let default_profile = documents.join(edition.folder_name()).join("profile.ps1");
+        let profile_path = match windows_registry::CURRENT_USER.open(marker_key(edition)) {
+            Ok(key) => {
+                let Ok(marker_state) = key.get_string("State") else {
+                    return;
+                };
+                if marker_state != "installed" {
+                    return;
+                }
+                // Read as an integrity check only: an unreadable or empty
+                // marker is incomplete ownership, and incomplete ownership is
+                // not permission to delete. It is deliberately NOT pushed into
+                // `referenced` — since #127 `Version` is the version of record
+                // and names no directory, so treating it as a reference would
+                // strand the directory matching the current version forever.
+                let Ok(version) = key.get_string("Version") else {
+                    return;
+                };
+                if version.is_empty() {
+                    return;
+                }
+                let Ok(path) = key.get_string("ProfilePath") else {
+                    return;
+                };
+                if path.is_empty() {
+                    return;
+                }
+                PathBuf::from(path)
+            }
+            Err(error) if error.code().0.cast_unsigned() == 0x8007_0002 => default_profile,
+            Err(_) => return,
+        };
+        // A surviving profile block can still load an older module even when
+        // a previous broken repair deleted its registry marker.
+        match std::fs::read(profile_path) {
+            Ok(bytes) => {
+                referenced.extend(
+                    profile::parse_blocks(&bytes)
+                        .into_iter()
+                        .map(|block| block.version),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return,
         }
     }
 
@@ -413,11 +578,19 @@ pub fn prune_orphaned_module_dirs() {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        if !entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+        {
             continue;
         }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
+        if name == PAYLOAD_DIR_NAME {
+            // The version-free payload is referenced by every stable block and
+            // is removed by uninstall, never by this sweep (#127).
+            continue;
+        }
         if name == "state" {
             // The per-edition state directories are removed by uninstall; the
             // parent goes only when the last one is gone.
@@ -429,26 +602,35 @@ pub fn prune_orphaned_module_dirs() {
         if referenced.iter().any(|version| version == name) {
             continue;
         }
+        // This sweep owns version payloads, not arbitrary user directories or
+        // staging directories that another installer may still be using.
+        let parts: Vec<&str> = name.split('.').collect();
+        if parts.len() != 3
+            || !parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
         let _ = std::fs::remove_dir_all(&path);
     }
 }
 
-fn read_marker(key: &str) -> Result<Option<MarkerValues>, AdapterError> {
+fn read_marker(key: &str) -> Option<MarkerValues> {
     use windows_registry::CURRENT_USER;
 
     // An absent marker key means "not installed" — not an error.
-    let key = match CURRENT_USER.open(key) {
-        Ok(opened) => opened,
-        Err(_) => return Ok(None),
+    let Ok(key) = CURRENT_USER.open(key) else {
+        return None;
     };
-    Ok(Some(MarkerValues {
+    Some(MarkerValues {
         state: key.get_string("State").unwrap_or_default(),
         version: key.get_string("Version").unwrap_or_default(),
         profile_path: PathBuf::from(key.get_string("ProfilePath").unwrap_or_default()),
         state_directory: PathBuf::from(key.get_string("StateDirectory").unwrap_or_default()),
         original_present: key.get_u32("OriginalPresent").unwrap_or(0) != 0,
         product_probe: key.get_string("ProductProbe").unwrap_or_default(),
-    }))
+    })
 }
 
 #[derive(Debug, Default, Clone)]
@@ -465,12 +647,12 @@ struct MarkerValues {
     product_probe: String,
 }
 
-fn read_marker_state(key: &str) -> Result<Option<String>, AdapterError> {
+fn read_marker_state(key: &str) -> Option<String> {
     use windows_registry::CURRENT_USER;
 
     match CURRENT_USER.open(key) {
-        Ok(key) => Ok(Some(key.get_string("State").unwrap_or_default())),
-        Err(_) => Ok(None),
+        Ok(key) => Some(key.get_string("State").unwrap_or_default()),
+        Err(_) => None,
     }
 }
 
@@ -486,7 +668,7 @@ struct Inspection {
 }
 
 fn inspect(edition: Edition) -> Result<Inspection, AdapterError> {
-    let marker = read_marker(&marker_key(edition))?;
+    let marker = read_marker(&marker_key(edition));
     let marker_installed = marker
         .as_ref()
         .is_some_and(|values| state::classify(&values.state) == state::MarkerState::Installed);
@@ -501,12 +683,7 @@ fn inspect(edition: Edition) -> Result<Inspection, AdapterError> {
             .join("profile.ps1"),
     };
 
-    let current_module = super::local_app_data()?
-        .join("ForwardSlashWindows")
-        .join("PowerShell")
-        .join(super::PAYLOAD_VERSION)
-        .join("ForwardSlashWindows.psm1");
-    let current_module_present = current_module.is_file();
+    let current_module_present = deployed_module_path()?.is_file();
 
     let (profile_exists, bytes) = if profile_path.is_file() {
         (true, std::fs::read(&profile_path).unwrap_or_default())
@@ -524,7 +701,7 @@ fn inspect(edition: Edition) -> Result<Inspection, AdapterError> {
                 .is_some_and(|path| Path::new(path).is_file()),
         })
         .collect();
-    let health = profile::classify_profile(&presence, super::PAYLOAD_VERSION);
+    let health = profile::classify_profile(&presence);
 
     Ok(Inspection {
         health,
@@ -570,23 +747,29 @@ pub fn profile_write_blocked(edition: Edition) -> bool {
 /// input to the orphan self-clean's slow confirm.
 pub fn recorded_probe(edition: Edition) -> Option<String> {
     read_marker(&marker_key(edition))
-        .ok()
-        .flatten()
         .map(|values| values.product_probe)
         .filter(|probe| !probe.is_empty())
 }
 
 /// Detect-and-repair for one edition (#37). Returns the health that was found
 /// *before* any repair, so the caller can report what it fixed.
-pub fn repair(edition: Edition, controller: &Path) -> Result<profile::ProfileHealth, AdapterError> {
+pub fn repair(
+    edition: Edition,
+    controller: &Path,
+    user_initiated: bool,
+) -> Result<profile::ProfileHealth, AdapterError> {
     let inspection = inspect(edition)?;
     let action = profile::decide_profile_repair(
         &inspection.health,
         inspection.marker_installed,
         inspection.current_module_present,
+        user_initiated,
     );
     match action {
-        profile::ProfileAction::Nothing => {}
+        // `NeedsConfirmation`: a background sweep found work it may not do. The
+        // existing block keeps working and the caller reports that the user has
+        // to confirm (#127) — so, like `Nothing`, this changes nothing here.
+        profile::ProfileAction::Nothing | profile::ProfileAction::NeedsConfirmation => {}
         profile::ProfileAction::RemoveBlocks => remove_blocks_from_profile(&inspection)?,
         // Both "write one current block" and "reinstall" mean the adapter
         // should be installed: the transactional uninstall+install strips the
@@ -611,18 +794,116 @@ fn remove_blocks_from_profile(inspection: &Inspection) -> Result<(), AdapterErro
         return Ok(());
     }
     if cleaned.is_empty() {
-        std::fs::remove_file(&inspection.profile_path)?;
+        std::fs::remove_file(&inspection.profile_path).map_err(|error| {
+            super::explain_file_error(
+                &AdapterError::from(error),
+                "The PowerShell profile update",
+                &inspection.profile_path,
+            )
+        })?;
     } else {
-        super::write_atomic(&inspection.profile_path, &cleaned)?;
+        super::write_atomic(&inspection.profile_path, &cleaned).map_err(|error| {
+            super::explain_file_error(
+                &error,
+                "The PowerShell profile update",
+                &inspection.profile_path,
+            )
+        })?;
     }
     Ok(())
 }
 
-/// A clean-slate reinstall used by repair: tear the adapter down (best effort),
-/// force the marker away so `begin_install` proceeds, then install fresh.
+/// What an in-place upgrade managed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpgradeOutcome {
+    /// The payload is now this build's and the marker records it.
+    Upgraded,
+    /// The profile carries a block this build would have to rewrite — a legacy
+    /// versioned block, a duplicate, an orphan — and this run is a background
+    /// sweep, which may not write `Documents` (#127). Nothing was changed.
+    NeedsConfirmation,
+}
+
+/// Brings an installed adapter up to this build **without touching the user's
+/// profile** whenever that is possible (#127).
+///
+/// The block is byte-identical across releases, so the ordinary upgrade is:
+/// swap the `%LOCALAPPDATA%` payload directory, refresh the recovery copy of
+/// the block, and record the new `Version`. Only a profile that still carries a
+/// pre-#127 versioned block (or a duplicate, or an orphan) needs a `Documents`
+/// write, and that runs solely from an explicit user action.
+pub fn upgrade(
+    edition: Edition,
+    controller: &Path,
+    user_initiated: bool,
+) -> Result<UpgradeOutcome, AdapterError> {
+    let key = marker_key(edition);
+    let Some(values) = read_marker(&key) else {
+        // No marker to upgrade from: a plain install is the whole job.
+        return install(edition, controller).map(|()| UpgradeOutcome::Upgraded);
+    };
+    let profile_path = if values.profile_path.as_os_str().is_empty() {
+        super::documents_dir()?
+            .join(edition.folder_name())
+            .join("profile.ps1")
+    } else {
+        values.profile_path.clone()
+    };
+    let current = std::fs::read(&profile_path).unwrap_or_default();
+    let encoding = profile::detect_encoding(&current);
+    let desired = profile::encode(&block_for(values.original_present)?, encoding);
+    let blocks = profile::parse_blocks(&current);
+    let stable = blocks.len() == 1
+        && blocks.first().is_some_and(|block| !block.is_legacy())
+        && profile::find_subslice(&current, &desired).is_some();
+    if !stable {
+        if !user_initiated {
+            return Ok(UpgradeOutcome::NeedsConfirmation);
+        }
+        return migrate(edition, controller).map(|()| UpgradeOutcome::Upgraded);
+    }
+
+    // Payload-only upgrade. Nothing under Documents is opened, let alone
+    // written, so Controlled Folder Access is never consulted.
+    let mut payload = PayloadSwap::new()?;
+    if let Err(error) = payload.ensure(controller) {
+        payload.undo();
+        return Err(error);
+    }
+    payload.finish();
+
+    // Keep the recovery copy of the block in step so uninstall still excises
+    // exactly what is deployed. It lives in %LOCALAPPDATA%, not Documents.
+    if values.state_directory.is_dir() {
+        std::fs::write(values.state_directory.join("profile.block"), &desired)?;
+    }
+    let running = std::env::current_exe().unwrap_or_else(|_| controller.to_path_buf());
+    reg::set_string(&key, "Version", super::PAYLOAD_VERSION)?;
+    reg::set_string(
+        &key,
+        "ProductProbe",
+        &super::product_probe_path(&running).display().to_string(),
+    )?;
+    println!(
+        "The {} adapter payload is now on {}. Your PowerShell profile was not modified.",
+        edition.display_name(),
+        super::PAYLOAD_VERSION
+    );
+    Ok(UpgradeOutcome::Upgraded)
+}
+
+/// The one remaining `Documents` write: rewrites a legacy versioned block to
+/// the stable form, through the ordinary transactional uninstall+install so the
+/// byte-exact snapshot and restore guarantees are unchanged. Only ever called
+/// for an explicit user action (#127).
+pub fn migrate(edition: Edition, controller: &Path) -> Result<(), AdapterError> {
+    reinstall(edition, controller)
+}
+
+/// Reinstall only after successful removal. A blocked removal must retain its
+/// marker and recovery files rather than orphaning the still-active profile.
 fn reinstall(edition: Edition, controller: &Path) -> Result<(), AdapterError> {
-    let _ = uninstall(edition);
-    let _ = reg::delete_tree(&marker_key(edition));
+    uninstall(edition)?;
     install(edition, controller)
 }
 
@@ -632,16 +913,9 @@ fn reinstall(edition: Edition, controller: &Path) -> Result<(), AdapterError> {
 fn shell_path(edition: Edition) -> Option<String> {
     match edition {
         Edition::PowerShell => search_path("pwsh.exe"),
-        Edition::WindowsPowerShell => {
-            let system_root =
-                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-            Some(
-                Path::new(&system_root)
-                    .join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-                    .display()
-                    .to_string(),
-            )
-        }
+        Edition::WindowsPowerShell => fsw_core::SystemBinary::PowerShell
+            .path()
+            .map(|path| path.display().to_string()),
     }
 }
 
@@ -654,11 +928,6 @@ fn shell_path(edition: Edition) -> Option<String> {
 /// `verify_aliases` runs under. `Get-ExecutionPolicy` is a cmdlet, not a
 /// script, so it answers even under Restricted.
 pub fn effective_execution_policy(edition: Edition) -> Option<String> {
-    if edition == Edition::WindowsPowerShell {
-        return fsw_core::probe_windows_powershell()
-            .ok()
-            .map(|policy| policy.as_str().to_string());
-    }
     use std::io::Read;
 
     let shell = shell_path(edition)?;
@@ -676,7 +945,7 @@ pub fn effective_execution_policy(edition: Edition) -> Option<String> {
         .spawn()
         .ok()?;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + POLICY_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -716,18 +985,7 @@ pub fn execution_policy_verdict(edition: Edition) -> Option<(String, state::Poli
 
 /// The install-time refusal for a blocking policy, or `None` when the policy
 /// allows scripts or could not be read.
-pub(super) fn execution_policy_refusal(edition: Edition) -> Option<AdapterError> {
-    if edition == Edition::WindowsPowerShell {
-        return match fsw_core::probe_windows_powershell() {
-            Ok(fsw_core::ExecutionPolicy::Restricted) => {
-                Some(AdapterError::new(fsw_core::restricted_policy_message()))
-            }
-            Ok(policy) => state::classify_execution_policy(edition, policy.as_str())
-                .blocked()
-                .map(|block| AdapterError::new(&state::policy_install_error(block))),
-            Err(error) => Some(AdapterError::new(&error.to_string())),
-        };
-    }
+fn execution_policy_refusal(edition: Edition) -> Option<AdapterError> {
     let (_, verdict) = execution_policy_verdict(edition)?;
     let block = verdict.blocked()?;
     Some(AdapterError::new(&state::policy_install_error(block)))
@@ -768,13 +1026,12 @@ fn verify_aliases(edition: Edition) -> Result<(), AdapterError> {
                 // nothing useful about it, so re-ask the shell and explain
                 // (#45). The preflight normally gets here first; this covers a
                 // policy that changed mid-install or differs by scope.
-                if status.code() == Some(42) {
-                    if let Some(block) = execution_policy_verdict(edition)
+                if status.code() == Some(42)
+                    && let Some(block) = execution_policy_verdict(edition)
                         .as_ref()
                         .and_then(|(_, verdict)| verdict.blocked())
-                    {
-                        return Err(AdapterError::new(&state::policy_verify_error(block)));
-                    }
+                {
+                    return Err(AdapterError::new(&state::policy_verify_error(block)));
                 }
                 return Err(AdapterError::new(&format!(
                     "{} did not load the Forward Slash Windows profile adapter. The installation was rolled back.",

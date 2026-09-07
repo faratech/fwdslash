@@ -94,9 +94,16 @@ bool RegistryStringEquals(const std::wstring& path, const wchar_t* name,
   std::wstring value;
   if (status == ERROR_SUCCESS &&
       (type == REG_SZ || type == REG_EXPAND_SZ) && bytes >= sizeof(wchar_t)) {
-    value.resize(bytes / sizeof(wchar_t));
+    // The registry can report an odd byte count for a malformed value. Size
+    // the buffer in whole wchar_t units (plus one NUL slot) while telling the
+    // API the true allocation, so it can never write past the heap buffer.
+    const DWORD wchar_capacity = (bytes / sizeof(wchar_t)) + 1;
+    value.resize(wchar_capacity);
+    DWORD read_bytes = wchar_capacity * sizeof(wchar_t);
     status = RegQueryValueExW(key, name, nullptr, &type,
-                              reinterpret_cast<BYTE*>(value.data()), &bytes);
+                              reinterpret_cast<BYTE*>(value.data()), &read_bytes);
+    value.resize(bytes < read_bytes ? bytes / sizeof(wchar_t)
+                                    : read_bytes / sizeof(wchar_t));
     while (!value.empty() && value.back() == L'\0') {
       value.pop_back();
     }
@@ -697,7 +704,7 @@ class SettingsWindow {
 
   void BuildAbout(const Grid& surface) {
     StackPanel stack = PageStack();
-    stack.Children().Append(PageHeader(L"About", L"Forward Slash Windows 0.0.6"));
+    stack.Children().Append(PageHeader(L"About", L"Forward Slash Windows 0.0.8"));
     stack.Children().Append(Text(
         L"Maps /Distro/path to \\\\wsl.localhost\\Distro\\path, and / to "
         L"either the WSL distribution list or your default distribution, on "

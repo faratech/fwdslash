@@ -28,10 +28,16 @@ fn resolve_str(input: &str, snap: &Snapshot) -> Result<String, ResolveError> {
 }
 
 #[test]
-fn explicit_distribution_wins_over_the_root_in_both_modes() {
-    for mode in [BareSlashMode::DistributionList, BareSlashMode::DefaultDistribution] {
+fn the_chosen_folder_root_wins_over_distro_names_in_both_modes() {
+    for mode in [
+        BareSlashMode::DistributionList,
+        BareSlashMode::DefaultDistribution,
+    ] {
         let snap = snapshot(mode, None, Some(r"C:\code"));
-        assert_eq!(resolve_str("/Ubuntu/home", &snap).as_deref(), Ok(r"\\wsl.localhost\Ubuntu\home"));
+        assert_eq!(
+            resolve_str("/Ubuntu/home", &snap).as_deref(),
+            Ok(r"C:\code\Ubuntu\home")
+        );
     }
 }
 
@@ -45,19 +51,19 @@ fn bare_slash_targets_the_folder_in_list_mode() {
 fn bare_slash_targets_the_folder_in_default_mode() {
     let snap = snapshot(BareSlashMode::DefaultDistribution, None, Some(r"C:\code"));
     assert_eq!(resolve_str("/", &snap).as_deref(), Ok(r"C:\code"));
-    // The pin still applies to distro claims, but non-distro input goes to
-    // the folder, not to the pinned distribution.
-    assert_eq!(
-        resolve_str("/tmp", &snap).as_deref(),
-        Ok(r"C:\code\tmp")
-    );
+    // A configured root outranks the default-distribution mode entirely:
+    // every first segment is content under the root, distro name or not.
+    assert_eq!(resolve_str("/tmp", &snap).as_deref(), Ok(r"C:\code\tmp"));
 }
 
 #[test]
 fn unregistered_first_segment_targets_the_folder_in_list_mode() {
     let snap = snapshot(BareSlashMode::DistributionList, None, Some(r"C:\code"));
     // Today: Err(UnregisteredDistribution). With a root: the folder.
-    assert_eq!(resolve_str("/tmp/build", &snap).as_deref(), Ok(r"C:\code\tmp\build"));
+    assert_eq!(
+        resolve_str("/tmp/build", &snap).as_deref(),
+        Ok(r"C:\code\tmp\build")
+    );
 }
 
 #[test]
@@ -73,8 +79,14 @@ fn no_default_distribution_falls_through_to_the_folder() {
 fn input_shape_errors_are_not_intercepted() {
     let snap = snapshot(BareSlashMode::DistributionList, None, Some(r"C:\code"));
     assert_eq!(resolve_str("tmp", &snap), Err(ResolveError::NotASlashPath));
-    assert_eq!(resolve_str("//tmp", &snap), Err(ResolveError::DoubleLeadingSlash));
-    assert_eq!(resolve_str("/a\\b", &snap), Err(ResolveError::BackslashNotAllowed));
+    assert_eq!(
+        resolve_str("//tmp", &snap),
+        Err(ResolveError::DoubleLeadingSlash)
+    );
+    assert_eq!(
+        resolve_str("/a\\b", &snap),
+        Err(ResolveError::BackslashNotAllowed)
+    );
     // The funnel used to slice `input[1..]` before these checks: an empty
     // input was out of bounds and a multi-byte first character was not a char
     // boundary. Under `panic = "abort"` either aborted the process, so
@@ -91,7 +103,10 @@ fn input_shape_errors_are_not_intercepted() {
 #[test]
 fn input_shape_errors_survive_without_a_configured_root() {
     // Same inputs, no root: the shape check is in the funnel, not the root.
-    for mode in [BareSlashMode::DistributionList, BareSlashMode::DefaultDistribution] {
+    for mode in [
+        BareSlashMode::DistributionList,
+        BareSlashMode::DefaultDistribution,
+    ] {
         let snap = snapshot(mode, None, None);
         for input in ["", "\u{fc}", "tmp"] {
             assert_eq!(
@@ -106,16 +121,26 @@ fn input_shape_errors_survive_without_a_configured_root() {
 #[test]
 fn traversal_above_the_folder_root_is_rejected() {
     let snap = snapshot(BareSlashMode::DefaultDistribution, None, Some(r"C:\code"));
-    assert_eq!(resolve_str("/..", &snap), Err(ResolveError::TraversalAboveRoot));
+    assert_eq!(
+        resolve_str("/..", &snap),
+        Err(ResolveError::TraversalAboveRoot)
+    );
     // Traversal *inside* the root still works, clamped at the root.
-    assert_eq!(resolve_str("/a/b/../../c", &snap).as_deref(), Ok(r"C:\code\c"));
+    assert_eq!(
+        resolve_str("/a/b/../../c", &snap).as_deref(),
+        Ok(r"C:\code\c")
+    );
 }
 
 #[test]
 fn invalid_stored_root_is_ignored() {
     // A malformed value — however it got into the registry — must degrade to
     // today's behavior, not poison every resolve.
-    let snap = snapshot(BareSlashMode::DistributionList, None, Some("relative\\junk"));
+    let snap = snapshot(
+        BareSlashMode::DistributionList,
+        None,
+        Some("relative\\junk"),
+    );
     assert_eq!(resolve_str("/", &snap).as_deref(), Ok(r"\\wsl.localhost"));
     let snap = snapshot(BareSlashMode::DistributionList, None, Some(""));
     assert_eq!(resolve_str("/", &snap).as_deref(), Ok(r"\\wsl.localhost"));
@@ -125,16 +150,28 @@ fn invalid_stored_root_is_ignored() {
 
 #[test]
 fn without_a_root_resolution_is_unchanged() {
-    for mode in [BareSlashMode::DistributionList, BareSlashMode::DefaultDistribution] {
+    for mode in [
+        BareSlashMode::DistributionList,
+        BareSlashMode::DefaultDistribution,
+    ] {
         let snap = snapshot(mode, None, None);
         match mode {
             BareSlashMode::DistributionList => {
                 assert_eq!(resolve_str("/", &snap).as_deref(), Ok(r"\\wsl.localhost"));
-                assert_eq!(resolve_str("/tmp", &snap), Err(ResolveError::UnregisteredDistribution));
+                assert_eq!(
+                    resolve_str("/tmp", &snap),
+                    Err(ResolveError::UnregisteredDistribution)
+                );
             }
             BareSlashMode::DefaultDistribution => {
-                assert_eq!(resolve_str("/", &snap).as_deref(), Ok(r"\\wsl.localhost\Ubuntu"));
-                assert_eq!(resolve_str("/tmp", &snap).as_deref(), Ok(r"\\wsl.localhost\Ubuntu\tmp"));
+                assert_eq!(
+                    resolve_str("/", &snap).as_deref(),
+                    Ok(r"\\wsl.localhost\Ubuntu")
+                );
+                assert_eq!(
+                    resolve_str("/tmp", &snap).as_deref(),
+                    Ok(r"\\wsl.localhost\Ubuntu\tmp")
+                );
             }
         }
     }

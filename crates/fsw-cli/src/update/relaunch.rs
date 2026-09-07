@@ -29,6 +29,7 @@
 //! rather than a mangled one.
 
 use crate::scheduled_task::{OneShotTask, is_safe_task_literal};
+use std::path::Path;
 
 /// Prefix for unique task names. Each attempt gets an immutable script and a
 /// distinct Scheduler definition under this prefix.
@@ -110,7 +111,7 @@ impl Drop for AttemptMutex {
 impl AttemptLock {
     fn acquire(owner: &str) -> Option<Self> {
         let directory = fsw_core::update::update_directory_path()?;
-        Self::acquire_in(&directory, owner, std::time::Duration::from_secs(65 * 60))
+        Self::acquire_in(&directory, owner, std::time::Duration::from_mins(65))
     }
 
     fn acquire_in(
@@ -124,33 +125,29 @@ impl AttemptLock {
         std::fs::create_dir_all(directory).ok()?;
         let path = directory.join("update-attempt.lock");
         for _ in 0..2 {
-            match std::fs::OpenOptions::new()
+            if let Ok(mut file) = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(mut file) => {
-                    file.write_all(owner.as_bytes()).ok()?;
-                    return Some(Self {
-                        path,
-                        owner: owner.to_string(),
-                    });
-                }
-                Err(_) => {
-                    // The XML limits every task to an hour. This mutex keeps
-                    // the stale observation, removal and replacement together
-                    // so a second contender cannot delete our fresh token.
-                    let stale = std::fs::metadata(&path)
-                        .ok()
-                        .and_then(|metadata| metadata.modified().ok())
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > stale_after);
-                    if !stale {
-                        return None;
-                    }
-                    let _ = std::fs::remove_file(&path);
-                }
+                file.write_all(owner.as_bytes()).ok()?;
+                return Some(Self {
+                    path,
+                    owner: owner.to_string(),
+                });
             }
+            // The XML limits every task to an hour. This mutex keeps the
+            // stale observation, removal and replacement together so a
+            // second contender cannot delete our fresh token.
+            let stale = std::fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > stale_after);
+            if !stale {
+                return None;
+            }
+            let _ = std::fs::remove_file(&path);
         }
         None
     }
@@ -275,8 +272,11 @@ pub fn watchdog_powershell(
         }
         RelaunchMode::None => String::new(),
     };
+    // Only when nothing else has already reported. A helper that finished
+    // with a `paused` verdict wrote this file first, and a timeout notice
+    // written over it would turn a legitimate deferral into an error.
     let timeout = format!(
-        "$result = Join-Path $env:LOCALAPPDATA 'ForwardSlashWindows\\update\\{}'; $null = New-Item -ItemType Directory -Force -Path (Split-Path $result); Set-Content -LiteralPath $result -Value 'error:0x800705B4' -NoNewline",
+        "$result = Join-Path $env:LOCALAPPDATA 'ForwardSlashWindows\\update\\{}'; if (-not (Test-Path -LiteralPath $result)) {{ $null = New-Item -ItemType Directory -Force -Path (Split-Path $result); Set-Content -LiteralPath $result -Value 'error:0x800705B4' -NoNewline }}",
         fsw_core::update::UPDATE_RESULT_FILE
     );
     Some(format!(
@@ -284,15 +284,20 @@ pub fn watchdog_powershell(
     ))
 }
 
-/// The `winget upgrade` command line route 3 runs from the task. Plain enough
-/// that `cmd.exe` needs nothing quoted, and every flag is there to stop winget
-/// asking a question nobody is present to answer.
+/// The `winget upgrade` command line route 3 runs from the task with the
+/// absolute App Installer alias path and every flag needed to prevent prompts.
 #[must_use]
-pub fn winget_command(product_id: &str) -> String {
-    format!(
-        "winget.exe upgrade --id {product_id} --source msstore --exact --silent --force \
+pub fn winget_command(product_id: &str) -> Option<String> {
+    let winget = fsw_core::SystemBinary::Winget.path()?;
+    winget_command_for(product_id, &winget)
+}
+
+pub(super) fn winget_command_for(product_id: &str, winget: &Path) -> Option<String> {
+    let winget = batch_quoted_path(winget)?;
+    Some(format!(
+        "{winget} upgrade --id {product_id} --source msstore --exact --silent --force \
          --accept-package-agreements --accept-source-agreements --disable-interactivity"
-    )
+    ))
 }
 
 /// The full `.cmd` body: an optional lead command, the watchdog, then the
@@ -303,10 +308,17 @@ pub fn winget_command(product_id: &str) -> String {
 /// system path, which by definition contains characters
 /// [`is_safe_task_literal`] rejects. It is built here, from `current_exe()` and
 /// the update directory, and never from user input.
+#[derive(Clone, Copy)]
+struct ScriptLaunch<'a> {
+    lead: Option<&'a str>,
+    powershell: Option<&'a Path>,
+    schtasks: Option<&'a Path>,
+}
+
 #[must_use]
 fn build_script_for_task(
     task_name: &str,
-    lead: Option<&str>,
+    launch: ScriptLaunch<'_>,
     family: &str,
     identity_name: &str,
     previous_version: &str,
@@ -324,19 +336,25 @@ fn build_script_for_task(
         None => return None,
     };
     let mut script = String::from("@echo off\r\n");
-    if let Some(lead) = lead {
+    if let Some(lead) = launch.lead {
         script.push_str(lead);
         script.push_str("\r\n");
     }
     if let Some(watchdog) = watchdog {
+        let powershell = launch.powershell?;
+        let powershell = batch_quoted_path(powershell)?;
         // Inline `-Command`, so no execution policy can block it, and
         // `powershell.exe` rather than `pwsh` because `Get-AppxPackage` lives
         // in Windows PowerShell.
-        script.push_str("powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command ");
+        script.push_str(&powershell);
+        script.push_str(" -NoProfile -NonInteractive -WindowStyle Hidden -Command ");
         script.push_str(&watchdog);
         script.push_str("\r\n");
     }
-    script.push_str("schtasks /delete /tn \"");
+    let schtasks = launch.schtasks?;
+    let schtasks = batch_quoted_path(schtasks)?;
+    script.push_str(&schtasks);
+    script.push_str(" /delete /tn \"");
     script.push_str(task_name);
     script.push_str("\" /f >nul 2>&1\r\n");
     if let Some(lock) = lock {
@@ -358,8 +376,11 @@ fn build_script_for_task(
     Some(script)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_script(
     lead: Option<&str>,
+    powershell: Option<&Path>,
+    schtasks: Option<&Path>,
     family: &str,
     identity_name: &str,
     previous_version: &str,
@@ -367,7 +388,11 @@ fn build_script(
 ) -> Option<String> {
     build_script_for_task(
         WATCHDOG_TASK_NAME,
-        lead,
+        ScriptLaunch {
+            lead,
+            powershell,
+            schtasks,
+        },
         family,
         identity_name,
         previous_version,
@@ -376,30 +401,67 @@ fn build_script(
     )
 }
 
+fn batch_quoted_path(path: &Path) -> Option<String> {
+    let path = path.to_str()?;
+    if path.is_empty()
+        || path.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'"' | b'%' | b'&' | b'|' | b'^' | b'<' | b'>' | b'\r' | b'\n'
+            )
+        })
+    {
+        return None;
+    }
+    Some(format!("\"{path}\""))
+}
+
 /// The watchdog on its own: nothing to run first, just wait and relaunch.
 /// This is the script phase 1a registers before it calls the Store in-process.
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub fn watchdog_script(
+    powershell: Option<&Path>,
+    schtasks: Option<&Path>,
     family: &str,
     identity_name: &str,
     previous_version: &str,
     mode: RelaunchMode,
 ) -> Option<String> {
-    build_script(None, family, identity_name, previous_version, mode)
+    build_script(
+        None,
+        powershell,
+        schtasks,
+        family,
+        identity_name,
+        previous_version,
+        mode,
+    )
 }
 
 /// The watchdog with a lead command in front of it: the staged helper, or
 /// `winget`. One task, so the thing that installs and the thing that comes back
 /// afterwards cannot be separated by a package shutdown landing between them.
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub fn apply_script(
     command: &str,
+    powershell: Option<&Path>,
+    schtasks: Option<&Path>,
     family: &str,
     identity_name: &str,
     previous_version: &str,
     mode: RelaunchMode,
 ) -> Option<String> {
-    build_script(Some(command), family, identity_name, previous_version, mode)
+    build_script(
+        Some(command),
+        powershell,
+        schtasks,
+        family,
+        identity_name,
+        previous_version,
+        mode,
+    )
 }
 
 /// The package family and identity name the watchdog polls for. Both flavors
@@ -415,7 +477,7 @@ fn package_names() -> (String, String) {
 /// Registers the relaunch watchdog.
 ///
 /// `run_now` decides whether it starts polling immediately or waits for its
-/// delayed backstop trigger. Phase 1a delays it beyond the bounded WinRT
+/// delayed backstop trigger. Phase 1a delays it beyond the bounded `WinRT`
 /// admission calls; fallback uses a distinct immutable apply task, never an
 /// overwrite. Route 2 starts it immediately because deployment can terminate
 /// us at any moment.
@@ -461,14 +523,22 @@ pub fn schedule_watchdog(
             lock: None,
         });
     }
+    let powershell = if mode == RelaunchMode::None {
+        None
+    } else {
+        Some(fsw_core::SystemBinary::PowerShell.path()?)
+    };
+    let schtasks = fsw_core::SystemBinary::Schtasks.path()?;
     let (family, identity) = package_names();
     let name = task_name("watchdog");
-    let Some(lock) = AttemptLock::acquire(&name) else {
-        return None;
-    };
+    let lock = AttemptLock::acquire(&name)?;
     let Some(script) = build_script_for_task(
         &name,
-        None,
+        ScriptLaunch {
+            lead: None,
+            powershell: powershell.as_deref(),
+            schtasks: Some(&schtasks),
+        },
         &family,
         &identity,
         previous_version,
@@ -498,6 +568,17 @@ pub fn schedule_watchdog(
 /// command it leads with is the install, and nothing else is going to start it.
 #[cfg(windows)]
 pub fn schedule_apply(command: &str, mode: RelaunchMode, previous_version: &str) -> bool {
+    let powershell = if mode == RelaunchMode::None {
+        None
+    } else {
+        let Some(powershell) = fsw_core::SystemBinary::PowerShell.path() else {
+            return false;
+        };
+        Some(powershell)
+    };
+    let Some(schtasks) = fsw_core::SystemBinary::Schtasks.path() else {
+        return false;
+    };
     let (family, identity) = package_names();
     let name = task_name("apply");
     let Some(lock) = AttemptLock::acquire(&name) else {
@@ -505,7 +586,11 @@ pub fn schedule_apply(command: &str, mode: RelaunchMode, previous_version: &str)
     };
     let Some(script) = build_script_for_task(
         &name,
-        Some(command),
+        ScriptLaunch {
+            lead: Some(command),
+            powershell: powershell.as_deref(),
+            schtasks: Some(&schtasks),
+        },
         &family,
         &identity,
         previous_version,
@@ -524,7 +609,79 @@ pub fn schedule_apply(command: &str, mode: RelaunchMode, previous_version: &str)
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod script_lock_tests {
+    use super::{AttemptLock, RelaunchMode, ScriptLaunch, build_script_for_task};
+    use crate::update::tests::{assert_batch_safe, powershell_line};
+    use std::path::{Path, PathBuf};
+
+    /// The only golden that exercises the lock-release tail. Nothing else
+    /// builds a script with a token to release, so the `findstr` line and the
+    /// PowerShell text in front of it are otherwise unchecked together.
+    #[test]
+    fn a_script_that_releases_its_own_token_is_still_batch_safe() {
+        let lock = AttemptLock {
+            path: PathBuf::from(
+                r"C:\Users\me\AppData\Local\ForwardSlashWindows\update\update-attempt.lock",
+            ),
+            owner: "fwdslash-update-watchdog-1234-7".to_string(),
+        };
+        let script = build_script_for_task(
+            "fwdslash-update-watchdog-1234-7",
+            ScriptLaunch {
+                lead: None,
+                powershell: Some(Path::new(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                )),
+                schtasks: Some(Path::new(r"C:\Windows\System32\schtasks.exe")),
+            },
+            "32827MikeFara.fwdslash_t6j5qexy2jpp2",
+            "32827MikeFara.fwdslash",
+            "0.0.4.0",
+            RelaunchMode::Broker,
+            Some(&lock),
+        )
+        .expect("safe literals");
+        // The whole batch scaffolding, line by line. The PowerShell body has
+        // goldens of its own, so only its wrapper is pinned here.
+        let lines: Vec<&str> = script.lines().collect();
+        assert_eq!(lines.first().copied(), Some("@echo off"));
+        assert!(lines.get(1).is_some_and(|line| line.starts_with(
+            "\"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" \
+             -NoProfile -NonInteractive -WindowStyle Hidden -Command "
+        )));
+        assert_eq!(
+            lines.get(2).copied(),
+            Some(
+                "\"C:\\Windows\\System32\\schtasks.exe\" \
+                 /delete /tn \"fwdslash-update-watchdog-1234-7\" /f >nul 2>&1"
+            )
+        );
+        // The token is released only by the script that owns it: `findstr`
+        // gates the delete on this attempt's own owner line.
+        assert_eq!(
+            lines.get(3).copied(),
+            Some(
+                "findstr /x /c:\"fwdslash-update-watchdog-1234-7\" \
+                 \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\update\\update-attempt.lock\" \
+                 >nul && del /q \
+                 \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\update\\update-attempt.lock\" \
+                 >nul 2>&1"
+            )
+        );
+        assert_eq!(
+            lines.get(4).copied(),
+            Some("del /q \"%~dpn0.xml\" >nul 2>&1")
+        );
+        assert_eq!(lines.get(5).copied(), Some("del /q \"%~f0\""));
+        assert_eq!(lines.len(), 6);
+        assert_batch_safe(powershell_line(&script).expect("a powershell line"));
+    }
+}
+
 #[cfg(all(test, windows))]
+#[allow(clippy::panic)]
 mod attempt_lock_tests {
     use super::AttemptLock;
     use std::os::windows::io::AsRawHandle;
@@ -545,10 +702,11 @@ mod attempt_lock_tests {
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock after epoch")
+                .unwrap_or_else(|error| panic!("clock after epoch: {error}"))
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&path).expect("test directory");
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|error| panic!("create test directory: {error}"));
         TestDirectory(path)
     }
 
@@ -560,17 +718,17 @@ mod attempt_lock_tests {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
-            .expect("stale lock file");
+            .unwrap_or_else(|error| panic!("open stale lock file: {error}"));
         let mut now = FILETIME {
             dwLowDateTime: 0,
             dwHighDateTime: 0,
         };
         // SAFETY: GetSystemTimeAsFileTime initializes the provided FILETIME.
-        unsafe { GetSystemTimeAsFileTime(&mut now) };
+        unsafe { GetSystemTimeAsFileTime(&raw mut now) };
         let ticks = (u64::from(now.dwHighDateTime) << 32) | u64::from(now.dwLowDateTime);
         let old = ticks - 2 * 60 * 60 * 10_000_000;
         let old = FILETIME {
-            dwLowDateTime: old as u32,
+            dwLowDateTime: u32::try_from(old & u64::from(u32::MAX)).unwrap_or_default(),
             dwHighDateTime: (old >> 32) as u32,
         };
         // SAFETY: the file handle is live for this call and the FILETIME points
@@ -581,7 +739,7 @@ mod attempt_lock_tests {
                     file.as_raw_handle(),
                     std::ptr::null(),
                     std::ptr::null(),
-                    &old,
+                    &raw const old,
                 )
             },
             0
@@ -592,10 +750,10 @@ mod attempt_lock_tests {
     fn two_contenders_cannot_replace_a_fresh_reclaimed_owner() {
         let directory = directory("contention");
         let path = directory.0.join("update-attempt.lock");
-        std::fs::write(&path, "dead-owner").expect("seed lock");
+        std::fs::write(&path, "dead-owner").unwrap_or_else(|error| panic!("seed lock: {error}"));
         make_genuinely_old(&path);
         let barrier = Arc::new(Barrier::new(2));
-        let stale_after = Duration::from_secs(60 * 60);
+        let stale_after = Duration::from_hours(1);
         let contenders = ["owner-a", "owner-b"].map(|owner| {
             let barrier = Arc::clone(&barrier);
             let directory = directory.0.clone();
@@ -605,15 +763,15 @@ mod attempt_lock_tests {
             })
         });
         let [first, second] = contenders;
-        let first = first.join().expect("first contender");
-        let second = second.join().expect("second contender");
+        let first = first.join().unwrap_or_else(|_| panic!("first contender"));
+        let second = second.join().unwrap_or_else(|_| panic!("second contender"));
         assert_eq!(
             usize::from(first.is_some()) + usize::from(second.is_some()),
             1
         );
-        let winner = first.or(second).expect("one winner");
+        let winner = first.or(second).unwrap_or_else(|| panic!("one winner"));
         assert_eq!(
-            std::fs::read_to_string(&path).expect("winner token"),
+            std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("winner token: {error}")),
             winner.owner
         );
         winner.release();
@@ -623,12 +781,13 @@ mod attempt_lock_tests {
     fn release_never_deletes_a_foreign_owner_token() {
         let directory = directory("foreign-owner");
         let owner = AttemptLock::acquire_in(&directory.0, "owner-a", Duration::from_secs(60))
-            .expect("first owner");
-        std::fs::write(&owner.path, "owner-b").expect("replace token for test");
+            .unwrap_or_else(|| panic!("first owner"));
+        std::fs::write(&owner.path, "owner-b")
+            .unwrap_or_else(|error| panic!("replace token for test: {error}"));
         owner.release();
         assert_eq!(
             std::fs::read_to_string(directory.0.join("update-attempt.lock"))
-                .expect("foreign token"),
+                .unwrap_or_else(|error| panic!("foreign token: {error}")),
             "owner-b"
         );
     }

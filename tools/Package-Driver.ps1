@@ -309,13 +309,20 @@ foreach ($target in $targets) {
     # Build-Driver.ps1 writes to out\driver\<arch>\<config> on the
     # command-line WDK path and to driver\fswfilter\<Arch>\<config> when the
     # Visual Studio WDK project component is registered. Both are accepted.
+    # Whichever produced the NEWEST fswfilter.sys wins: first-found ordering
+    # let a stale output from one pipeline mask a fresh one from the other.
     $buildDirectory = $null
+    $newestWrite = [datetime]::MinValue
     foreach ($candidate in @(
             (Join-Path $repo "out\driver\$outputName\$Configuration"),
             (Join-Path $repo "driver\fswfilter\$target\$Configuration"))) {
-        if (Test-Path -LiteralPath (Join-Path $candidate 'fswfilter.sys')) {
-            $buildDirectory = $candidate
-            break
+        $sys = Join-Path $candidate 'fswfilter.sys'
+        if (Test-Path -LiteralPath $sys -PathType Leaf) {
+            $writeTime = (Get-Item -LiteralPath $sys).LastWriteTimeUtc
+            if ($writeTime -gt $newestWrite) {
+                $newestWrite = $writeTime
+                $buildDirectory = $candidate
+            }
         }
     }
     if ($null -eq $buildDirectory) {

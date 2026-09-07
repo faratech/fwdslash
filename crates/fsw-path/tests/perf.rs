@@ -19,6 +19,8 @@ use fsw_path::{RenderBuf, resolve};
 #[test]
 #[ignore = "timing smoke; run with --release -- --ignored"]
 fn resolver_throughput() {
+    const PASSES: u32 = 1_000;
+
     let mut buf = RenderBuf::with_capacity(512);
     let contexts: Vec<_> = common::contexts().collect();
 
@@ -27,12 +29,11 @@ fn resolver_throughput() {
         let _ = resolve(input, ctx, &mut buf);
     }
 
-    const PASSES: u32 = 1_000;
     let started = Instant::now();
     let mut checksum = 0_u64;
     for _ in 0..PASSES {
         for (input, ctx) in &contexts {
-            checksum += resolve(input, ctx, &mut buf).is_ok() as u64;
+            checksum += u64::from(resolve(input, ctx, &mut buf).is_ok());
         }
     }
     let elapsed = started.elapsed();

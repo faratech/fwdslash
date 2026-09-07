@@ -64,7 +64,7 @@ jobs:
       # must match it exactly for the package to install.
       TS_PUBLISHER: 'CN=Mike Fara, O=Mike Fara, L=White Plains, S=ny, C=US'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.98.1
@@ -95,10 +95,12 @@ jobs:
           "short=$workspace" >> $env:GITHUB_OUTPUT
 
       - name: Build (ARM64)
-        run: cargo build --release --target aarch64-pc-windows-msvc --workspace
+        # --locked: a release must be exactly what Cargo.lock pins, the same
+        # dependency graph every other workflow tested.
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc --workspace
 
       - name: Build (x64)
-        run: cargo build --release --target x86_64-pc-windows-msvc --workspace
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --workspace
 
       - name: Restore the Trusted Signing dlib
         run: .\signing\install-dlib.ps1
@@ -181,6 +183,9 @@ jobs:
           .\tools\Test-StoreBundle.ps1 -Bundle '${{ steps.store.outputs.bundle }}' `
               -Version '${{ steps.version.outputs.version }}'
 
+      # Provenance is best-effort by policy (an attestation outage must not
+      # block a signed release), marked here so the tolerance is visibly
+      # deliberate rather than accidental.
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
         continue-on-error: true
@@ -192,7 +197,7 @@ jobs:
             out\package\*.zip
 
       - name: Upload workflow artifacts (always, for inspection)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fwdslash-release
           path: |
@@ -261,10 +266,10 @@ jobs:
       - name: Trigger the Store publish workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: v${{ needs.release.outputs.short }}
         run: |
-          VERSION="${{ needs.release.outputs.short }}"
-          echo "Triggering publish-to-store for v$VERSION..."
+          echo "Triggering publish-to-store for $RELEASE_TAG..."
           gh workflow run publish-to-store.yml \
-            --repo "${{ github.repository }}" \
-            -f version="$VERSION"
+            --repo "$GITHUB_REPOSITORY" \
+            -f release_tag="$RELEASE_TAG"
           echo "Store publish workflow dispatched."

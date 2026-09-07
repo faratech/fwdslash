@@ -60,6 +60,7 @@ pub fn is_safe_task_literal(value: &str) -> bool {
 /// One minute rather than zero because `schtasks` refuses a start time that has
 /// already passed; wrapping rather than clamping because `24:00` is not a time
 /// `schtasks` accepts.
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub fn task_start_time(hour: u32, minute: u32) -> String {
     let next = (hour * 60 + minute + 1) % (24 * 60);
@@ -71,7 +72,7 @@ pub fn task_start_time(hour: u32, minute: u32) -> String {
 #[must_use]
 pub fn task_start_boundary(year: u16, month: u16, day: u16, hour: u16, minute: u16) -> String {
     fn leap(year: u16) -> bool {
-        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
     }
     fn days(year: u16, month: u16) -> u16 {
         match month {
@@ -134,6 +135,7 @@ pub fn task_xml_args(task_name: &str, xml_path: &str) -> Vec<String> {
 
 /// The `schtasks /create` argument vector. `/tr` is a bare quoted script path —
 /// no embedded command line — so `schtasks`' own quoting rules cannot bite.
+#[cfg_attr(not(test), allow(dead_code))]
 #[must_use]
 pub fn task_args(task_name: &str, script_path: &str, start_time: &str) -> Vec<String> {
     vec![
@@ -202,7 +204,8 @@ pub fn register_and_run(task: &OneShotTask) -> Option<()> {
 
     register(task)?;
     // Fire it now; the scheduled trigger is only the backstop.
-    let started = Command::new("schtasks.exe")
+    let schtasks = fsw_core::SystemBinary::Schtasks.path()?;
+    let started = Command::new(schtasks)
         .args(["/run", "/tn", &task.name])
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
@@ -234,7 +237,7 @@ pub fn register(task: &OneShotTask) -> Option<()> {
 }
 
 /// Registers after a bounded number of minutes. The updater uses five minutes
-/// for admission watchdogs because its WinRT calls can each take two minutes.
+/// for admission watchdogs because its `WinRT` calls can each take two minutes.
 #[cfg(windows)]
 #[must_use]
 pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
@@ -257,11 +260,11 @@ pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
     let mut boundary = task_start_boundary(now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute);
     for _ in 1..delay_minutes {
         let bytes = boundary.as_bytes();
-        let year = std::str::from_utf8(&bytes[0..4]).ok()?.parse().ok()?;
-        let month = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
-        let day = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
-        let hour = std::str::from_utf8(&bytes[11..13]).ok()?.parse().ok()?;
-        let minute = std::str::from_utf8(&bytes[14..16]).ok()?.parse().ok()?;
+        let year = std::str::from_utf8(bytes.get(0..4)?).ok()?.parse().ok()?;
+        let month = std::str::from_utf8(bytes.get(5..7)?).ok()?.parse().ok()?;
+        let day = std::str::from_utf8(bytes.get(8..10)?).ok()?.parse().ok()?;
+        let hour = std::str::from_utf8(bytes.get(11..13)?).ok()?.parse().ok()?;
+        let minute = std::str::from_utf8(bytes.get(14..16)?).ok()?.parse().ok()?;
         boundary = task_start_boundary(year, month, day, hour, minute);
     }
     let definition = task_xml(&script.display().to_string(), &boundary);
@@ -273,7 +276,8 @@ pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
     std::fs::write(&xml, utf16).ok()?;
     let args = task_xml_args(&task.name, &xml.display().to_string());
 
-    let created = Command::new("schtasks.exe")
+    let schtasks = fsw_core::SystemBinary::Schtasks.path()?;
+    let created = Command::new(schtasks)
         .args(&args)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
@@ -299,9 +303,12 @@ pub fn delete_task(name: &str) -> bool {
     if !is_safe_task_literal(name) {
         return false;
     }
+    let Some(schtasks) = fsw_core::SystemBinary::Schtasks.path() else {
+        return false;
+    };
     // Stop a script which Task Scheduler has already started before removing
     // its definition and releasing the updater's ownership lock.
-    let _ = Command::new("schtasks.exe")
+    let _ = Command::new(&schtasks)
         .args(["/end", "/tn", name])
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
@@ -312,7 +319,7 @@ pub fn delete_task(name: &str) -> bool {
         let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_file(script.with_extension("xml"));
     }
-    Command::new("schtasks.exe")
+    Command::new(schtasks)
         .args(["/delete", "/tn", name, "/f"])
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
@@ -454,6 +461,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "requires an interactive Task Scheduler; run explicitly after setting the test process compatibility layer"]
+    #[allow(clippy::items_after_statements)]
     fn xml_registration_runs_an_isolated_harmless_task() {
         use std::time::{Duration, Instant};
 

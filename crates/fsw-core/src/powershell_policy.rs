@@ -122,7 +122,7 @@ fn native_windows_powershell() -> Result<String, ProbeError> {
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
     let mut buffer = [0u16; 260];
-    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), 260) };
     if length == 0 || length as usize >= buffer.len() {
         return Err(ProbeError::Unavailable);
     }
@@ -149,7 +149,7 @@ pub fn probe_windows_powershell() -> Result<ExecutionPolicy, ProbeError> {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20))
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Ok(None) => {
                 let _ = child.kill();

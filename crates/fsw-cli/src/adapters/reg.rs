@@ -9,18 +9,18 @@
 //! correct and can also see values written by the unpackaged dev build.
 //!
 //! `read_raw_string` exists because `windows-registry`'s string conversions
-//! accept expanded `REG_EXPAND_SZ` data (RegQueryValueExW without
-//! RRF_NOEXPAND expands), which would corrupt the kind-preserving AutoRun
+//! accept expanded `REG_EXPAND_SZ` data (`RegQueryValueExW` without
+//! `RRF_NOEXPAND` expands), which would corrupt the kind-preserving `AutoRun`
 //! snapshot.
 
 use super::AdapterError;
-use std::process::{Command, Stdio};
+use fsw_core::SystemBinary;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+use std::process::{Command, Stdio};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// RRF_NOEXPAND: return REG_EXPAND_SZ data verbatim.
+/// `RRF_NOEXPAND`: return `REG_EXPAND_SZ` data verbatim.
 const RRF_NOEXPAND: u32 = 0x1000_0000;
 
 /// Registry value kinds the adapters may write or preserve.
@@ -63,18 +63,29 @@ impl RegKind {
     }
 }
 
-fn reg_exe() -> Result<String, AdapterError> {
-    let mut buffer = [0u16; 260];
-    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
-    if len == 0 || len as usize >= buffer.len() {
-        return Err(AdapterError::new(
-            "could not locate the System directory for reg.exe",
-        ));
+fn reg_exe() -> Result<std::path::PathBuf, AdapterError> {
+    SystemBinary::Reg
+        .path()
+        .ok_or_else(|| AdapterError::new("could not locate the System directory for reg.exe"))
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::reg_exe;
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn registry_writer_resolves_the_closed_system_binary() {
+        let path = reg_exe().expect("Windows must report a system-directory reg.exe path");
+        assert!(path.is_absolute());
+        assert!(path.is_file());
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("reg.exe")
+        );
     }
-    Ok(format!(
-        "{}\\reg.exe",
-        String::from_utf16_lossy(&buffer[..len as usize])
-    ))
 }
 
 fn run(arguments: &[&str]) -> Result<(), AdapterError> {
@@ -153,13 +164,7 @@ pub fn set_dword(subkey: &str, name: &str, value: u32) -> Result<(), AdapterErro
 
 /// Deletes a value; deleting an absent value succeeds.
 pub fn delete_value(subkey: &str, name: &str) -> Result<(), AdapterError> {
-    run(&[
-        "delete",
-        &format!("HKCU\\{subkey}"),
-        "/v",
-        name,
-        "/f",
-    ])
+    run(&["delete", &format!("HKCU\\{subkey}"), "/v", name, "/f"])
 }
 
 /// Deletes a key and everything under it.
@@ -168,7 +173,7 @@ pub fn delete_tree(subkey: &str) -> Result<(), AdapterError> {
 }
 
 /// Reads a string value from the real-hive merged view WITHOUT expanding
-/// `REG_EXPAND_SZ` data — the AutoRun snapshot must preserve `%VAR%`
+/// `REG_EXPAND_SZ` data — the `AutoRun` snapshot must preserve `%VAR%`
 /// references exactly. `Ok(None)` when the value does not exist; other types
 /// than `REG_SZ`/`REG_EXPAND_SZ` read as their raw text and are rejected by
 /// the caller's kind check.
@@ -177,7 +182,7 @@ pub fn read_raw_string(
     name: &str,
 ) -> Result<Option<(RegKind, String)>, AdapterError> {
     use windows_sys::Win32::System::Registry::{
-        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+        HKEY_CURRENT_USER, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegGetValueW,
     };
 
     const ERROR_MORE_DATA: u32 = 234;
@@ -196,9 +201,9 @@ pub fn read_raw_string(
             subkey.as_ptr(),
             name.as_ptr(),
             RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
-            &mut kind,
+            &raw mut kind,
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
         );
         if status == ERROR_FILE_NOT_FOUND {
             return Ok(None);
@@ -214,9 +219,9 @@ pub fn read_raw_string(
                     subkey.as_ptr(),
                     name.as_ptr(),
                     RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
-                    &mut kind2,
+                    &raw mut kind2,
                     data.as_mut_ptr().cast(),
-                    &mut len,
+                    &raw mut len,
                 );
                 if status == ERROR_MORE_DATA {
                     size = len;

@@ -1,15 +1,15 @@
 //! The cmd adapter: installs `fsw-autorun.cmd` + the DIR/CD/PUSHD helpers +
 //! a copy of the controller into `%LOCALAPPDATA%\ForwardSlashWindows\cmd`
-//! and appends the AutoRun hook to `Command Processor`. A faithful port of
+//! and appends the `AutoRun` hook to `Command Processor`. A faithful port of
 //! the retired `tools/Install-CmdAdapter.ps1` / `Uninstall-CmdAdapter.ps1`,
 //! with every registry write routed through `reg.exe` (real hive) and every
 //! read through the merged view.
 
-use super::{reg, state, AdapterError};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use super::{AdapterError, reg, state};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const COMMAND_PROCESSOR: &str = r"Software\Microsoft\Command Processor";
 const MARKER_KEY: &str = fsw_core::CMD_ADAPTER_KEY;
@@ -19,7 +19,7 @@ fn payload_source_dir() -> Result<PathBuf, AdapterError> {
     super::payload_source_dir("cmd")
 }
 
-fn kind_from_raw(kind: &super::reg::RegKind) -> Option<&'static str> {
+fn kind_from_raw(kind: super::reg::RegKind) -> Option<&'static str> {
     match kind {
         super::reg::RegKind::Sz => Some(super::reg::RegKind::Sz.marker_label()),
         super::reg::RegKind::ExpandSz => Some(super::reg::RegKind::ExpandSz.marker_label()),
@@ -33,6 +33,9 @@ fn kind_label(kind: &str) -> super::reg::RegKind {
 
 /// Rollback state for the install transaction; `undo` mirrors the script's
 /// catch block in the exact same order.
+// Each flag records an independent completed rollback step; collapsing them
+// would make an interrupted install restore resources it never changed.
+#[allow(clippy::struct_excessive_bools)]
 struct InstallState {
     transaction_id: String,
     staging: PathBuf,
@@ -118,7 +121,7 @@ fn begin_install(controller: &Path) -> Result<InstallState, AdapterError> {
     };
 
     // Idempotence and interrupted-transaction refusal (marker read first).
-    let marker_state = marker_state()?;
+    let marker_state = marker_state();
     let decision = state::decide_cmd_install(
         marker_state.is_some(),
         marker_state
@@ -169,24 +172,31 @@ fn begin_install(controller: &Path) -> Result<InstallState, AdapterError> {
     // uninstall runs no code) can leave `call "…fsw-autorun.cmd"` in AutoRun,
     // and snapshotting that would make a later uninstall "restore" our own hook
     // and let installed_autorun compose `call fsw & call fsw` (#37).
-    let (raw_present, raw_value, original_kind) =
-        match reg::read_raw_string(COMMAND_PROCESSOR, AUTORUN_VALUE)? {
-            Some((kind, value)) => {
-                let Some(label) = kind_from_raw(&kind) else {
-                    return Err(AdapterError::new(
-                        "The existing Command Processor AutoRun value is not a string. No changes were made.",
-                    ));
-                };
-                (true, value, label.to_string())
-            }
-            None => (false, String::new(), super::reg::RegKind::Sz.marker_label().to_string()),
-        };
+    let (raw_present, raw_value, original_kind) = match reg::read_raw_string(
+        COMMAND_PROCESSOR,
+        AUTORUN_VALUE,
+    )? {
+        Some((kind, value)) => {
+            let Some(label) = kind_from_raw(kind) else {
+                return Err(AdapterError::new(
+                    "The existing Command Processor AutoRun value is not a string. No changes were made.",
+                ));
+            };
+            (true, value, label.to_string())
+        }
+        None => (
+            false,
+            String::new(),
+            super::reg::RegKind::Sz.marker_label().to_string(),
+        ),
+    };
     let original_value = state::strip_fwdslash_autorun(&raw_value);
     // Preserve empty originals and their kind, but discard orphaned hook-only values.
-    let original_present = state::original_autorun_present(raw_present, &raw_value, &original_value);
+    let original_present =
+        state::original_autorun_present(raw_present, &raw_value, &original_value);
     state.original_present = original_present;
-    state.original_value = original_value.clone();
-    state.original_kind = original_kind.clone();
+    state.original_value.clone_from(&original_value);
+    state.original_kind.clone_from(&original_kind);
     state.marker_value = Some(format!(
         "call \"{}\"",
         install_root.join("fsw-autorun.cmd").display()
@@ -198,15 +208,22 @@ fn commit_install(state: &mut InstallState) -> Result<(), AdapterError> {
     let Some(marker_value) = state.marker_value.clone() else {
         return Err(AdapterError::new("installer was not prepared"));
     };
-    let installed_value =
-        state::installed_autorun(&state.original_value, &marker_value);
+    let installed_value = state::installed_autorun(&state.original_value, &marker_value);
 
     // Marker first (prepared), with the full snapshot for recovery.
     reg::set_string(MARKER_KEY, "State", "prepared")?;
     reg::set_string(MARKER_KEY, "Version", super::PAYLOAD_VERSION)?;
     reg::set_string(MARKER_KEY, "TransactionId", &state.transaction_id)?;
-    reg::set_string(MARKER_KEY, "InstallDirectory", &state.install_root.display().to_string())?;
-    reg::set_dword(MARKER_KEY, "OriginalPresent", u32::from(state.original_present))?;
+    reg::set_string(
+        MARKER_KEY,
+        "InstallDirectory",
+        &state.install_root.display().to_string(),
+    )?;
+    reg::set_dword(
+        MARKER_KEY,
+        "OriginalPresent",
+        u32::from(state.original_present),
+    )?;
     reg::set_string(MARKER_KEY, "OriginalKind", &state.original_kind)?;
     reg::set_string(MARKER_KEY, "OriginalAutoRun", &state.original_value)?;
     reg::set_string(MARKER_KEY, "InstalledAutoRun", &installed_value)?;
@@ -237,7 +254,7 @@ fn commit_install(state: &mut InstallState) -> Result<(), AdapterError> {
     Ok(())
 }
 
-/// Removes the cmd adapter and restores the previous AutoRun value.
+/// Removes the cmd adapter and restores the previous `AutoRun` value.
 pub fn uninstall() -> Result<(), AdapterError> {
     let Some((text, values)) = marker_snapshot()? else {
         println!("Forward Slash Windows cmd adapter is not installed.");
@@ -323,7 +340,10 @@ pub fn uninstall() -> Result<(), AdapterError> {
 
     reg::delete_tree(MARKER_KEY)?;
     if renamed && Path::new(&removal_path).exists() {
-        let _ = Command::new("cmd.exe")
+        let Some(cmd) = fsw_core::SystemBinary::Cmd.path() else {
+            return Err(AdapterError::new("cmd.exe was not found."));
+        };
+        let _ = Command::new(cmd)
             .args(["/c", "rmdir", "/s", "/q"])
             .arg(&removal_path)
             .creation_flags(0x0800_0000)
@@ -338,13 +358,12 @@ pub fn uninstall() -> Result<(), AdapterError> {
 
 /// Reads the cmd marker key: `(State, values)` or `None` when absent.
 #[allow(clippy::type_complexity)]
-fn marker_snapshot()
--> Result<Option<(String, CmdMarkerValues)>, AdapterError> {
+fn marker_snapshot() -> Result<Option<(String, CmdMarkerValues)>, AdapterError> {
     use windows_registry::CURRENT_USER;
 
     let key = CURRENT_USER
         .open(MARKER_KEY)
-        .map_err(|error| super::registry_error(error))?;
+        .map_err(super::registry_error)?;
     Ok(Some((
         key.get_string("State").unwrap_or_default(),
         CmdMarkerValues {
@@ -368,7 +387,7 @@ struct CmdMarkerValues {
     removal_path: String,
 }
 
-/// The generated AutoRun hook (#37). Baking the product-presence probe in lets
+/// The generated `AutoRun` hook (#37). Baking the product-presence probe in lets
 /// the hook install the macros only while the product is present, self-clean
 /// when it is gone, and cost nothing (one `if exist`) on a normal shell start —
 /// with the macros never routing through an orphaned controller copy.
@@ -403,17 +422,17 @@ pub enum CmdHealth {
     Orphaned,
 }
 
-/// Read-only classification of the cmd adapter's AutoRun state.
+/// Read-only classification of the cmd adapter's `AutoRun` state.
 pub fn health() -> CmdHealth {
     let raw = match reg::read_raw_string(COMMAND_PROCESSOR, AUTORUN_VALUE) {
         Ok(Some((_, value))) => value,
         _ => String::new(),
     };
     if state::autorun_references_fwdslash(&raw) {
-        if let Some(path) = state::fwdslash_autorun_path(&raw) {
-            if Path::new(&path).exists() {
-                return CmdHealth::Healthy;
-            }
+        if let Some(path) = state::fwdslash_autorun_path(&raw)
+            && Path::new(&path).exists()
+        {
+            return CmdHealth::Healthy;
         }
         return CmdHealth::Orphaned;
     }
@@ -471,14 +490,14 @@ pub fn strip_autorun_hook() -> Result<(), AdapterError> {
 
 /// Detect-and-repair for the cmd adapter (#37). Detection is the point; when
 /// the hook is orphaned *and* the marker is still present, the existing
-/// transactional uninstall restores the true AutoRun (refusing if a third party
+/// transactional uninstall restores the true `AutoRun` (refusing if a third party
 /// changed it). If our hook survives that — a refusal, or a marker-less
 /// dangling hook — strip just our own segment so the console is never left
 /// calling a script that no longer exists. Returns the health *after* the
 /// repair attempt.
 pub fn repair() -> Result<CmdHealth, AdapterError> {
     if health() == CmdHealth::Orphaned {
-        if marker_state()?.is_some() {
+        if marker_state().is_some() {
             let _ = uninstall();
         }
         // Only strip a hook whose target is actually gone: a healthy hook is
@@ -490,7 +509,7 @@ pub fn repair() -> Result<CmdHealth, AdapterError> {
     Ok(health())
 }
 
-/// Whether the `fsw-autorun.cmd` the live AutoRun points at exists on disk.
+/// Whether the `fsw-autorun.cmd` the live `AutoRun` points at exists on disk.
 fn hook_target_exists() -> bool {
     let Ok(Some((_, current))) = reg::read_raw_string(COMMAND_PROCESSOR, AUTORUN_VALUE) else {
         return false;
@@ -498,13 +517,31 @@ fn hook_target_exists() -> bool {
     state::fwdslash_autorun_path(&current).is_some_and(|path| Path::new(&path).exists())
 }
 
+/// The `RemovalPath` a cmd uninstall is currently using, or `None`.
+///
+/// The rename-aside prune (#127) must never delete the directory an in-flight
+/// (or interrupted-but-resumable) uninstall recorded: while the marker says
+/// `removing`, that directory is recovery state.
+pub fn active_removal_path() -> Option<String> {
+    use windows_registry::CURRENT_USER;
+
+    let key = CURRENT_USER.open(MARKER_KEY).ok()?;
+    if state::classify(&key.get_string("State").unwrap_or_default()) != state::MarkerState::Removing
+    {
+        return None;
+    }
+    key.get_string("RemovalPath")
+        .ok()
+        .filter(|path| !path.is_empty())
+}
+
 /// The marker `State` text, or `None` when the key is absent.
-pub fn marker_state() -> Result<Option<String>, AdapterError> {
+pub fn marker_state() -> Option<String> {
     use windows_registry::CURRENT_USER;
 
     // An absent marker key means "not installed" — not an error.
     match CURRENT_USER.open(MARKER_KEY) {
-        Ok(key) => Ok(Some(key.get_string("State").unwrap_or_default())),
-        Err(_) => Ok(None),
+        Ok(key) => Some(key.get_string("State").unwrap_or_default()),
+        Err(_) => None,
     }
 }

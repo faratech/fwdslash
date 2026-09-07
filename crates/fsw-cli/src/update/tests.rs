@@ -10,13 +10,13 @@
 // The workspace denies `expect` because `panic = "abort"` makes one in a window
 // proc or a COM callback an instant process death. A test binary has neither,
 // and a failed `expect` here is exactly the report wanted.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 use super::appinstall::{Poll, code_for, result_for, severity};
 use super::install_control::AppInstallState;
 use super::relaunch::{
     RelaunchMode, WATCHDOG_TASK_NAME, apply_script, watchdog_powershell, watchdog_script,
-    winget_command,
+    winget_command_for,
 };
 use super::{
     EXIT_AVAILABLE, EXIT_ERROR, EXIT_NEEDS_USER, EXIT_NOTHING, EXIT_OK, Fold, HelperResult,
@@ -24,10 +24,12 @@ use super::{
     install_precheck, parse_args, parse_helper_result, render_json, route_for, state_for_code,
 };
 use crate::scheduled_task::is_safe_task_literal;
+use std::path::Path;
 
 const FAMILY: &str = "32827MikeFara.fwdslash_t6j5qexy2jpp2";
 const IDENTITY: &str = "32827MikeFara.fwdslash";
 const PREVIOUS: &str = "0.0.4.0";
+const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 
 fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_string()).collect()
@@ -505,16 +507,16 @@ fn json_escapes_a_detail_that_carries_quotes() {
 // ---------------------------------------------------------------------------
 
 /// The PowerShell text out of a generated script: everything after the
-/// `-Command` on the one `powershell.exe` line.
-fn powershell_line(script: &str) -> Option<&str> {
+/// `-Command` on the one system PowerShell line.
+pub(super) fn powershell_line(script: &str) -> Option<&str> {
     script
         .lines()
-        .find(|line| line.starts_with("powershell.exe"))?
+        .find(|line| line.contains(" -Command "))?
         .split_once(" -Command ")
         .map(|(_, text)| text)
 }
 
-fn assert_batch_safe(text: &str) {
+pub(super) fn assert_batch_safe(text: &str) {
     // `%` would be expanded by cmd.exe as a variable, and `%` is legal inside
     // a PowerShell string, so the corruption would be silent.
     assert!(!text.contains('%'), "PowerShell text contains %: {text}");
@@ -534,15 +536,25 @@ fn assert_batch_safe(text: &str) {
 
 #[test]
 fn watchdog_script_golden_broker() {
-    let script =
-        watchdog_script(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::Broker).expect("safe literals");
-    assert!(script.starts_with("@echo off\r\npowershell.exe"));
-    assert!(script.contains("Get-AppxPackage -Name '32827MikeFara.fwdslash'"));
+    let script = watchdog_script(
+        Some(Path::new(POWERSHELL)),
+        Some(Path::new(r"C:\Windows\System32\schtasks.exe")),
+        FAMILY,
+        IDENTITY,
+        PREVIOUS,
+        RelaunchMode::Broker,
+    )
+    .expect("safe literals");
     assert!(
         script.contains("$package.PackageFamilyName -eq '32827MikeFara.fwdslash_t6j5qexy2jpp2'")
     );
-    assert!(script.contains("if ($ready) { if (-not (Get-Process"));
     assert!(script.contains("error:0x800705B4"));
+    assert!(script.contains("del /q \"%~dpn0.xml\" >nul 2>&1"));
+    assert!(
+        script
+            .contains("\"C:\\Windows\\System32\\schtasks.exe\" /delete /tn \"fwdslash-update\" /f")
+    );
+    assert!(script.starts_with("@echo off\r\n\"C:\\Windows\\System32\\WindowsPowerShell"));
     assert_batch_safe(powershell_line(&script).expect("a powershell line"));
     // The relaunch goes through the app-execution alias, never the App entry
     // point: the package's App is the settings window, and the broker is a
@@ -565,6 +577,9 @@ fn watchdog_does_not_relaunch_an_unready_or_wrong_family_package() {
     assert!(script.contains("if ($ready) { Start-Process"));
     assert!(script.contains(fsw_core::update::UPDATE_RESULT_FILE));
     assert!(script.contains("error:0x800705B4"));
+    // The timeout notice never overwrites a verdict the helper already wrote:
+    // a `paused` result must survive the watchdog giving up.
+    assert!(script.contains("if (-not (Test-Path -LiteralPath $result))"));
 }
 
 #[cfg(windows)]
@@ -598,7 +613,10 @@ fn generated_watchdog_powershell_runs_with_mocked_appx_commands() {
     let harness = format!(
         "function Get-AppxPackage {{ param($Name) [pscustomobject]@{{ PackageFamilyName = '{FAMILY}'; Version = '0.0.5.0' }} }}; function Get-Process {{ param($Name) $null }}; function Start-Process {{ param($FilePath) Set-Content -LiteralPath '{marker}' -Value $FilePath }}; {watchdog}"
     );
-    let mut child = Command::new("powershell.exe")
+    let powershell = fsw_core::SystemBinary::PowerShell
+        .path()
+        .expect("system Windows PowerShell");
+    let mut child = Command::new(powershell)
         .args(["-NoProfile", "-NonInteractive", "-Command", &harness])
         .env("LOCALAPPDATA", &local_app_data)
         .stdin(Stdio::null())
@@ -631,8 +649,15 @@ fn generated_watchdog_powershell_runs_with_mocked_appx_commands() {
 
 #[test]
 fn watchdog_script_golden_app() {
-    let script =
-        watchdog_script(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::App).expect("safe literals");
+    let script = watchdog_script(
+        Some(Path::new(POWERSHELL)),
+        Some(Path::new(r"C:\Windows\System32\schtasks.exe")),
+        FAMILY,
+        IDENTITY,
+        PREVIOUS,
+        RelaunchMode::App,
+    )
+    .expect("safe literals");
     assert_batch_safe(powershell_line(&script).expect("a powershell line"));
     // The app mode is the settings window coming back, which is the App entry
     // point and therefore the AppsFolder moniker.
@@ -650,12 +675,19 @@ fn watchdog_script_golden_none() {
     // `none` still produces a script, because the task is what the caller was
     // going to register anyway -- but it carries no watchdog at all, so it
     // self-cleans immediately instead of holding a task for 45 minutes.
-    let script =
-        watchdog_script(FAMILY, IDENTITY, PREVIOUS, RelaunchMode::None).expect("safe literals");
+    let script = watchdog_script(
+        Some(Path::new(POWERSHELL)),
+        Some(Path::new(r"C:\Windows\System32\schtasks.exe")),
+        FAMILY,
+        IDENTITY,
+        PREVIOUS,
+        RelaunchMode::None,
+    )
+    .expect("safe literals");
     assert_eq!(
         script,
         "@echo off\r\n\
-         schtasks /delete /tn \"fwdslash-update\" /f >nul 2>&1\r\n\
+         \"C:\\Windows\\System32\\schtasks.exe\" /delete /tn \"fwdslash-update\" /f >nul 2>&1\r\n\
          del /q \"%~dpn0.xml\" >nul 2>&1\r\n\
          del /q \"%~f0\"\r\n"
     );
@@ -669,19 +701,25 @@ fn watchdog_script_golden_none() {
 #[test]
 fn the_apply_script_runs_the_lead_command_before_the_watchdog() {
     let command = r#""C:\u\fwdslash-helper.exe" update apply-store --product 9P51CM0MTMK2"#;
-    let script = apply_script(command, FAMILY, IDENTITY, PREVIOUS, RelaunchMode::Broker)
-        .expect("safe literals");
+    let script = apply_script(
+        command,
+        Some(Path::new(POWERSHELL)),
+        Some(Path::new(r"C:\Windows\System32\schtasks.exe")),
+        FAMILY,
+        IDENTITY,
+        PREVIOUS,
+        RelaunchMode::Broker,
+    )
+    .expect("safe literals");
     let lines: Vec<&str> = script.lines().collect();
     assert_eq!(lines.first().copied(), Some("@echo off"));
     assert_eq!(lines.get(1).copied(), Some(command));
-    assert!(
-        lines
-            .get(2)
-            .is_some_and(|line| line.starts_with("powershell.exe"))
-    );
+    assert!(lines.get(2).is_some_and(|line| line.starts_with('"')));
     // The install and the comeback are one task, so a package shutdown cannot
     // land between them.
-    assert!(script.contains("schtasks /delete /tn \"fwdslash-update\""));
+    assert!(
+        script.contains("\"C:\\Windows\\System32\\schtasks.exe\" /delete /tn \"fwdslash-update\"")
+    );
     assert_batch_safe(powershell_line(&script).expect("a powershell line"));
 }
 
@@ -697,15 +735,48 @@ fn an_unsafe_literal_produces_no_script_at_all() {
         (FAMILY, IDENTITY, ""),
     ] {
         assert_eq!(
-            watchdog_script(family, identity, previous, RelaunchMode::Broker),
+            watchdog_script(
+                Some(Path::new(POWERSHELL)),
+                Some(Path::new(r"C:\Windows\System32\schtasks.exe")),
+                family,
+                identity,
+                previous,
+                RelaunchMode::Broker,
+            ),
             None,
             "{family:?} {identity:?} {previous:?}"
         );
         assert_eq!(
-            apply_script("cmd", family, identity, previous, RelaunchMode::App),
+            apply_script(
+                "cmd",
+                Some(Path::new(POWERSHELL)),
+                Some(Path::new(r"C:\Windows\System32\schtasks.exe")),
+                family,
+                identity,
+                previous,
+                RelaunchMode::App,
+            ),
             None
         );
     }
+}
+
+#[test]
+fn an_unsafe_powershell_path_produces_no_script_at_all() {
+    // The resolver supplies this path in production, but it still crosses a
+    // batch parser. A metacharacter must refuse scheduling, not become part of
+    // the command line.
+    assert_eq!(
+        watchdog_script(
+            Some(Path::new(r"C:\Windows&evil\powershell.exe")),
+            Some(Path::new(r"C:\Windows\System32\schtasks.exe")),
+            FAMILY,
+            IDENTITY,
+            PREVIOUS,
+            RelaunchMode::Broker,
+        ),
+        None
+    );
 }
 
 #[test]
@@ -731,10 +802,14 @@ fn relaunch_modes_round_trip() {
 
 #[test]
 fn the_winget_command_answers_every_prompt_in_advance() {
-    let command = winget_command(fsw_core::STORE_PRODUCT_ID);
+    let command = winget_command_for(
+        fsw_core::STORE_PRODUCT_ID,
+        Path::new(r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\winget.exe"),
+    )
+    .unwrap_or_else(|| panic!("safe alias path"));
     assert_eq!(
         command,
-        "winget.exe upgrade --id 9P51CM0MTMK2 --source msstore --exact --silent --force \
+        "\"C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\winget.exe\" upgrade --id 9P51CM0MTMK2 --source msstore --exact --silent --force \
          --accept-package-agreements --accept-source-agreements --disable-interactivity"
     );
     // It runs from a scheduled task with no console: anything that could ask a
@@ -747,6 +822,13 @@ fn the_winget_command_answers_every_prompt_in_advance() {
     ] {
         assert!(command.contains(flag), "missing {flag}");
     }
-    // And it must survive being pasted into a batch file unquoted.
-    assert_batch_safe(&command);
+    // The executable path is the only quoted field; every remaining token is
+    // a fixed literal and no batch chaining/expansion metacharacter survives.
+    assert_eq!(command.matches('"').count(), 2);
+    for character in ['%', '<', '>', '&', '|', '^'] {
+        assert!(
+            !command.contains(character),
+            "batch command contains {character}"
+        );
+    }
 }

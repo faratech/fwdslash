@@ -94,18 +94,22 @@ pub fn apply_bundle_command(helper: &Path, bundle: &Path, previous_version: &str
     )
 }
 
-/// The final automatic rung after the identity-less AppInstall API refuses
+/// The final automatic rung after the identity-less `AppInstall` API refuses
 /// before it queues work. This is deliberately a direct child of the already
 /// running apply task: its watchdog remains in the surrounding batch file, and
-/// no second installer is launched after an AppInstall queue was accepted.
+/// no second installer is launched after an `AppInstall` queue was accepted.
 #[cfg(windows)]
+#[allow(dead_code)]
 #[must_use]
 pub fn run_winget_upgrade(product_id: &str) -> bool {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    Command::new("winget.exe")
+    let Some(winget) = fsw_core::SystemBinary::Winget.path() else {
+        return false;
+    };
+    Command::new(winget)
         .args([
             "upgrade",
             "--id",
@@ -151,31 +155,46 @@ pub fn write_result(result: &HelperResult) {
 
 /// Registers a downloaded bundle over the running package.
 ///
-/// `-ForceApplicationShutdown` because the broker is resident: without it the
-/// registration is deferred to a launch that would never come. Windows
-/// PowerShell rather than `pwsh`, because `Add-AppxPackage` lives there, and
-/// through a real child process so the deployment is not attributed to a
-/// package that is about to stop existing.
+/// Uses `PackageManager`, not PowerShell's `Add-AppxPackage`: package
+/// deployment remains subject to Windows signature verification and no shell
+/// parser or executable lookup participates in the update boundary.
 #[cfg(windows)]
-#[must_use]
-pub fn register_bundle(bundle: &Path) -> bool {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
+pub fn register_bundle(bundle: &Path) -> Result<(), fsw_core::update::UpdateVerificationError> {
+    use fsw_core::update::UpdateVerificationError;
+    use windows::Foundation::Uri;
+    use windows::Management::Deployment::{DeploymentOptions, PackageManager};
+    use windows_core::HSTRING;
+    use windows_future::AsyncStatus;
 
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    if !bundle.is_file() {
-        return false;
+    let verified = super::verification::verify_staged_bundle(bundle)?;
+    let uri = Uri::CreateUri(&HSTRING::from(verified.uri_text()?))
+        .map_err(|_| UpdateVerificationError::IoFailure)?;
+    let manager = PackageManager::new().map_err(|_| UpdateVerificationError::SignatureFailure)?;
+    let operation = manager
+        .AddPackageAsync(&uri, None, DeploymentOptions::ForceApplicationShutdown)
+        .map_err(|_| UpdateVerificationError::SignatureFailure)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(15);
+    while let AsyncStatus::Started = operation
+        .Status()
+        .map_err(|_| UpdateVerificationError::SignatureFailure)?
+    {
+        if std::time::Instant::now() >= deadline {
+            let _ = operation.Cancel();
+            return Err(UpdateVerificationError::TimedOut);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    // Single-quoted PowerShell strings escape a quote by doubling it.
-    let quoted = bundle.to_string_lossy().replace('\'', "''");
-    let script = format!("Add-AppxPackage -Path '{quoted}' -ForceApplicationShutdown");
-    Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let result = operation
+        .GetResults()
+        .map_err(|_| UpdateVerificationError::SignatureFailure)?;
+    if result
+        .ExtendedErrorCode()
+        .map_err(|_| UpdateVerificationError::SignatureFailure)?
+        .0
+        == 0
+    {
+        Ok(())
+    } else {
+        Err(UpdateVerificationError::SignatureFailure)
+    }
 }

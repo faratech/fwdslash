@@ -41,7 +41,10 @@ param(
     # relative path is resolved against the repository root.
     [string]$OutputRoot,
 
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+
+    # Explicit opt-in for locally signed beta revisions, never Store uploads.
+    [switch]$LocalBeta
 )
 
 $ErrorActionPreference = 'Stop'
@@ -98,7 +101,16 @@ if (-not $Version) {
         $Version = '{0}.{1}.{2}.0' -f $Matches[1], $Matches[2], $Matches[3]
     }
 }
-if ($Version -notmatch '^\d+\.\d+\.\d+\.0$') {
+if ($LocalBeta) {
+    if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+        throw "Local beta MSIX version must have four numeric components: $Version"
+    }
+    $parsedVersion = [version]$Version
+    if (@($parsedVersion.Major, $parsedVersion.Minor, $parsedVersion.Build, $parsedVersion.Revision | Where-Object { $_ -gt 65535 }).Count) {
+        throw "MSIX version components must not exceed 65535: $Version"
+    }
+    Write-Warning 'LOCAL BETA: this package is for sideloading only, not Store submission.'
+} elseif ($Version -notmatch '^\d+\.\d+\.\d+\.0$') {
     throw "MSIX version must be Major.Minor.Build.0 (the Store reserves the revision field): $Version"
 }
 
@@ -196,6 +208,17 @@ foreach ($target in $Architecture) {
         $source = Join-Path $binaries $file
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             throw "Required payload file is missing from the build: $source"
+        }
+        # The manifest's identity must describe the binaries it wraps: a
+        # -SkipBuild after a version bump, or a stale binary source, otherwise
+        # ships old code under a new version and every current check passes.
+        # Rust exes stamp a three-part FileVersion ("0.0.8") while the package
+        # is four-part ("0.0.8.0"), so the prefix is what must match.
+        $parsedVersion = [version]$Version
+        $shortVersion = '{0}.{1}.{2}' -f $parsedVersion.Major, $parsedVersion.Minor, $parsedVersion.Build
+        $stagedVersion = (Get-Item -LiteralPath $source).VersionInfo.FileVersion
+        if ($stagedVersion -ne $Version -and $stagedVersion -ne $shortVersion) {
+            throw "Staged $file reports FileVersion '$stagedVersion', expected '$Version'. Rebuild or fix the binary source."
         }
         Copy-Item -LiteralPath $source -Destination $stage
     }

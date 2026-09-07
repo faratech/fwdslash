@@ -21,7 +21,7 @@ mirroring the C++ `ResolveSlashPath`).
 | **R5** | A bare `/` is the provider root (`Resolved::WslRoot`, rendered `\\wsl.localhost`) — but only in distribution-list mode with no custom folder root; see R7-R9. |
 | **R6** | A trailing `/` on an input longer than one character is *captured* as `had_trailing_separator`; whether it survives is R12. In default-distribution mode it is captured from the rewritten string, which is why bare `/` reports `true` there (Settings-independent; see Resolver §5). |
 | **R7** | The leading segment is everything from index 1 up to the next `/`, or to the end. |
-| **R8** | If that segment is a **registered** distribution (case-insensitively, per Resolver §1), the input is an explicit distribution path and resolves against it. A registered distribution always wins over a same-named folder. |
+| **R8** | If that segment is a **registered** distribution (case-insensitively, per Resolver §1), the input is an explicit distribution path and resolves against it — **but only in distribution-list mode with no configured folder root** (R9). Where the default distribution or a chosen folder root owns `/`, the first segment is filesystem content of that root: a folder named like any installed distribution resolves under the root instead of being shadowed by it (2026-09-06; the C++ resolver still shadows — see §6). |
 | **R9** | Otherwise the bare-slash mode decides: *distribution list* → bare `/` is R5 and anything else is `UnregisteredDistribution`; *default distribution* → the pinned distribution, else the WSL default, else `NoDefaultDistribution`. A configured folder root pre-empts both (Resolver §6). |
 | **R10** | Components are normalized during the render: an empty component and `.` are dropped, `..` truncates back to the previous separator. No component vector is built. |
 | **R11** | A `..` that would leave the distribution (or folder) root is `TraversalAboveRoot`. Traversal *to* exactly the root is allowed. |
@@ -140,9 +140,13 @@ settings key, and the funnel in `fsw-core::resolve_user_slash_path` then routes
 every input whose first segment is not a registered distribution to
 `fsw_path::resolve_under_root`: a bare `/` opens the root, `/foo` resolves to
 root\foo, `..` clamps at the root (`TraversalAboveRoot`), in **either**
-bare-slash mode. Registered-distribution inputs keep WSL semantics — that is
-the escape hatch back to `\\wsl.localhost`. No new `ResolveError` variant
-exists, so the C++ wire contract is untouched.
+bare-slash mode. Since 2026-09-06 registered-distribution inputs resolve under
+the root like everything else — the root owns `/` completely, so a folder that
+shares its name with an installed distribution is reachable, and cross-distro
+access is the full `\\wsl.localhost\\Distro\\path` spelling. The C++ resolver
+still gives registered first segments WSL semantics; that divergence is
+deliberate. No new `ResolveError` variant exists, so the C++ wire contract is
+untouched.
 
 Deliberate details:
 - `BareSlashRoot` is **not** a third `BareSlashMode` value. Both resolvers read
@@ -719,7 +723,13 @@ three, and this section is the whole list.
   logged `event=adapter_upgrade_deferred` and **silent**, because the marker key
   still reads the old version and the next broker start or settings launch tries
   again; only a retry that *ran and refused* is `NeedsUser` and earns the
-  warning balloon. The whole sweep is serialised against the settings window's
+  warning balloon. Two refusals are answered on the **first** attempt, because
+  retrying them cannot change anything (#127): exit 4 is `NeedsConfirmation` —
+  the payload is current but the profile carries a block only the user may
+  authorise rewriting, logged `event=adapter_upgrade_needs_confirmation` and
+  ballooned as information, not a failure — and exit 5 is `Blocked`, a profile
+  write Controlled Folder Access refused, logged
+  `event=adapter_upgrade_blocked` and ballooned naming CFA and what to do. The whole sweep is serialised against the settings window's
   launch sweep by the named mutex `Local\ForwardSlashWindows.AdapterSweep`
   (`fsw_core::FSW_ADAPTER_SWEEP_MUTEX`, held for existence rather than
   ownership, exactly like the two singleton mutexes): whoever finds it already
@@ -776,9 +786,21 @@ three, and this section is the whole list.
   `event=state_changed`, `event=hook_unavailable`, and — new with the
   self-update and #56 — `event=adapter_upgrade_retry`,
   `event=adapter_upgrade_deferred`, `event=adapter_sweep_busy`,
+  — new with #127 — `event=adapter_upgrade_needs_confirmation` and
+  `event=adapter_upgrade_blocked`,
   `event=update_cycle_started`, `event=update_available`,
   `event=update_installing`, `event=update_cycle_failed`,
-  `event=update_cycle_skipped`. The C++'s `event=enter_handler_failed` has no
+  `event=update_cycle_skipped`, and — new with the #121/#122 hook-thread work —
+  `event=enter_replayed_unattested` (the worker, not the hook, attests, so a
+  window that fails attestation has its swallowed Enter replayed),
+  `event=enter_replayed_paused` (renamed from `event=enter_dropped_paused`: a
+  pause landing after the hook swallowed the key now replays it),
+  `event=enter_replayed_focus_unavailable`,
+  `event=browser_enter_replayed_focus_unavailable` (renamed from
+  `event=browser_enter_dropped_focus_unavailable`, same reason), and
+  `event=driver_namespace_rejected` (once per process; it replaced an
+  `eprintln!` that a GUI-subsystem process sent nowhere and the health timer
+  repeated every tick). The C++'s `event=enter_handler_failed` has no
   Rust counterpart. None of them carries a version, a path or anything the user
   typed.
 - **It re-reads the settings on a state-changed broadcast** (#55). The tray
@@ -842,10 +864,13 @@ payload is frozen at install time. The Rust CLI adds:
   the argument list carries no slash path.
 - **Adapters self-upgrade.** `PAYLOAD_VERSION` derives from
   `CARGO_PKG_VERSION`, and an `installed` marker whose `Version` differs from
-  it makes `fwdslash integration <name> enable` run the uninstall transaction
-  for the deployed payload followed by the install transaction for this one —
-  same rollback guarantees, and the PowerShell uninstall removes the module
-  directory it actually created rather than the one this build would create.
+  it makes `fwdslash integration <name> enable` bring the payload up to date.
+  For cmd that is the uninstall transaction for the deployed payload followed by
+  the install transaction for this one — same rollback guarantees. For
+  PowerShell it is a **payload swap alone** since #127: the block is
+  byte-identical across releases, so `powershell::upgrade` renames the new
+  `payload` directory into place, refreshes the `profile.block` recovery copy in
+  `%LOCALAPPDATA%`, records the new `Version`, and never opens the profile.
   `fwdslash integrations` prints `installed (update available)` for such an
   adapter and reports it in `--json`. Nobody has to run it by hand: the broker
   sweeps at startup and the settings window sweeps on launch, and the verb is
@@ -866,8 +891,11 @@ lifecycle so an upgrade or an MSIX uninstall can never leave a broken shell:
   module directory can no longer throw the red `no valid module file` error,
   and a product that was uninstalled with no code run (MSIX) is cleaned up by
   the leftover hook on the next shell start — launched detached, so a shell
-  never blocks on it. The region is delimited by
-  `# >>> Forward Slash Windows <ver> <id> >>>` / `# <<< … <<<` fence lines.
+  never blocks on it. The region is delimited by the **constant**
+  `# >>> Forward Slash Windows >>>` / `# <<< Forward Slash Windows <<<` fence
+  lines (#127); the parser still recognises the legacy
+  `# >>> Forward Slash Windows <ver> <id> >>>` form so an existing block can be
+  found, migrated and removed.
 - **The probe is the package's app-data folder, not the alias.** A packaged
   install records `%LOCALAPPDATA%\Packages\<family>` (from the actual
   `fsw_core::package_family()` at install time, so either flavor works); an
@@ -888,10 +916,25 @@ lifecycle so an upgrade or an MSIX uninstall can never leave a broken shell:
 - **Detect-and-repair.** `fwdslash repair-adapters` (run by the broker startup
   sweep and the settings launch sweep) and the per-adapter
   `fwdslash integration <id> repair` classify each profile — orphaned (missing
-  module), stale (wrong version), duplicated — and repair to exactly one current
-  block when the adapter should be installed, or strip it out when it should
-  not. `fwdslash doctor` and `fwdslash integrations` print a
-  `shell integration health:` line per adapter.
+  module), migration-pending (a legacy versioned block), duplicated — and repair
+  to exactly one current block when the adapter should be installed, or strip it
+  out when it should not. `fwdslash doctor` and `fwdslash integrations` print a
+  `shell integration health:` line per adapter. There is no `Stale` state any
+  more (#127): a constant block cannot go stale, and the payload version of
+  record is the registry marker's `Version`, never the fence text.
+- **A background sweep never writes a file under `Documents` (#127).**
+  `decide_profile_repair` takes a `user_initiated` flag, and every verdict that
+  would write the profile becomes `NeedsConfirmation` when it is false. The
+  broker's startup sweep and the settings window's launch sweep pass
+  `--background` on `fwdslash integration <id> enable`, so they may swap the
+  `%LOCALAPPDATA%` payload — which is the whole upgrade — but a legacy block, a
+  duplicate or an orphan is *reported* (exit 4, the explanation on stderr, an
+  information balloon, an `InfoBar`) and left working. The one remaining
+  `Documents` write runs only from an explicit
+  `fwdslash integration <id> enable|repair` or the settings toggle, and it goes
+  through the ordinary uninstall+install transaction, so the byte-exact
+  snapshot, the byte-exact restore, and the refusal to touch a third-party
+  change are all unchanged.
 - **cmd never snapshots its own hook.** `begin_install` strips any
   `call "…ForwardSlashWindows…fsw-autorun.cmd"` segment from the observed
   `AutoRun` before recording the original, so an MSIX-leftover hook is not
@@ -941,6 +984,25 @@ lifecycle so an upgrade or an MSIX uninstall can never leave a broken shell:
   otherwise not writable". The same explanation reaches the settings InfoBar —
   `run_controller` captures the controller's stderr — and `doctor` /
   `integrations` report an installed adapter whose profile cannot be written.
+  Since #127 the failure is also **typed**: `AdapterError::blocked` marks it, a
+  bare `io::ErrorKind::PermissionDenied` is mapped to it automatically, and
+  `fwdslash integration <id> enable` exits **5** for it rather than the generic
+  1, which is what lets the broker balloon name Controlled Folder Access
+  instead of saying "could not be updated".
+- **Version-free payload directories, swapped by rename-aside (#127).** The
+  PowerShell module and its controller copy live in
+  `%LOCALAPPDATA%\ForwardSlashWindows\PowerShell\payload`, not
+  `…\PowerShell\<version>`, so `$m` and `$c` in the block never change. The
+  swap is the cmd adapter's mechanism: stage into `payload.staging-<id>`, rename
+  the live directory to `payload.removing-<id>`, rename staging in, drop the old
+  one — with a rollback that puts the previous directory back. A payload whose
+  two files already match their sources by size is left alone, so enabling the
+  second edition never renames a directory the first is loading. Both adapters
+  now prune their own `*.removing-*` / `*.staging-*` / `*.rollback-*` leftovers
+  (`is_prunable_leftover`) after every successful enable, on uninstall and from
+  `repair-adapters` — two stranded `cmd.removing-*` directories were found on a
+  live host — skipping only the directory an in-flight cmd uninstall recorded in
+  its `RemovalPath`.
 
 ## Product behaviour (landing later — recorded here so the list stays in one place)
 

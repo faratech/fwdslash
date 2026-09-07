@@ -19,7 +19,7 @@
 //!   its writes would be invisible. It reports through
 //!   [`fsw_core::update::UPDATE_RESULT_FILE`] instead, and the next packaged
 //!   `update check`/`update status` folds that file into the registry.
-//! * **Nothing here may panic.** `panic = "abort"` plus a WinRT surface that
+//! * **Nothing here may panic.** `panic = "abort"` plus a `WinRT` surface that
 //!   fails in ways no dev host reproduces means every call goes through
 //!   `let Ok(..) = .. else` or `if let Ok(..)`.
 //!
@@ -38,6 +38,8 @@ pub mod appinstall;
 pub mod helper;
 pub mod relaunch;
 pub mod store;
+#[cfg(windows)]
+mod verification;
 
 #[cfg(test)]
 mod tests;
@@ -131,6 +133,7 @@ impl Route {
 
     /// `Some(None)` is the valid spelling of "no override" (`auto`); a plain
     /// `None` is an unrecognised name.
+    #[allow(clippy::option_option)]
     #[must_use]
     pub fn parse(name: &str) -> Option<Option<Self>> {
         match name {
@@ -219,6 +222,9 @@ pub fn parse_args(arguments: &[String]) -> Option<Options> {
 /// process can try it in-process (phase 1a) *or* the identity-less helper can
 /// be staged for it (phase 1b). `metered` suppresses only winget, because that
 /// is the one rung that downloads without consulting the user's data settings.
+// This pure truth table is intentionally exposed to the update tests with its
+// inputs named after the independently probed capabilities.
+#[allow(clippy::fn_params_excessive_bools)]
 #[must_use]
 pub fn route_for(
     override_route: Option<Route>,
@@ -319,6 +325,7 @@ pub enum HelperResult {
 /// or foreign file must not be mistaken for a verdict.
 #[must_use]
 pub fn parse_helper_result(text: &str) -> Option<HelperResult> {
+    const ERROR: &str = "error:";
     let text = text.trim();
     if text.eq_ignore_ascii_case("completed") {
         return Some(HelperResult::Completed);
@@ -326,7 +333,6 @@ pub fn parse_helper_result(text: &str) -> Option<HelperResult> {
     if text.eq_ignore_ascii_case("paused") {
         return Some(HelperResult::Paused);
     }
-    const ERROR: &str = "error:";
     if !text
         .get(..ERROR.len())
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ERROR))
@@ -517,7 +523,7 @@ impl Report {
 // COM
 // ---------------------------------------------------------------------------
 
-/// MTA for the duration of one update verb, so a blocking wait on a WinRT
+/// MTA for the duration of one update verb, so a blocking wait on a `WinRT`
 /// operation needs no message pump. Scoped, because `fwdslash` is a
 /// short-lived CLI whose other verbs must not pay for COM at all.
 ///
@@ -613,10 +619,15 @@ pub fn run(arguments: &[String]) -> i32 {
 
 /// Everything the registry already knows, and no network at all.
 fn cmd_status(options: &Options) -> i32 {
-    let folded = fold_result_file();
+    // Mirror cmd_check's order: the one-shot helper result must only ever be
+    // consumed by a packaged process. An unpackaged run that folds first
+    // deletes the verdict and half-applies it — `clear_cached_update_tag`
+    // writes the real hive only, leaving the package hive shadowing the
+    // merged view.
     if !fsw_core::has_package_identity() {
-        return Report::new("disabled", EXIT_OK).emit(options, folded);
+        return Report::new("disabled", EXIT_OK).emit(options, None);
     }
+    let folded = fold_result_file();
     let available = fsw_core::update::cached_update_tag();
     let state = if available.is_some() {
         "available"
@@ -640,12 +651,17 @@ fn cmd_check(options: &Options) -> i32 {
     if !options.force
         && !fsw_core::update::check_is_due(fsw_core::update::last_update_check(), now_unix())
     {
-        return match fsw_core::update::cached_update_tag() {
-            Some(tag) => Report::new("available", EXIT_AVAILABLE)
+        let current =
+            fsw_core::package_version().unwrap_or_else(|| fsw_core::FSW_VERSION.to_string());
+        if let Some(tag) = fsw_core::update::cached_update_tag()
+            .filter(|candidate| fsw_core::update::is_newer_available_version(&current, candidate))
+        {
+            return Report::new("available", EXIT_AVAILABLE)
                 .available(Some(tag))
-                .emit(options, folded),
-            None => Report::new("notDue", EXIT_OK).emit(options, folded),
-        };
+                .emit(options, folded);
+        }
+        let _ = fsw_core::update::clear_cached_update_tag();
+        return Report::new("notDue", EXIT_OK).emit(options, folded);
     }
 
     if !fsw_core::is_store_flavor() {
@@ -657,6 +673,11 @@ fn cmd_check(options: &Options) -> i32 {
             }
             fsw_core::update::UpdateOutcome::Unavailable => {
                 Report::new("unavailable", EXIT_OK).emit(options, folded)
+            }
+            fsw_core::update::UpdateOutcome::VerificationFailed(error) => {
+                Report::new("error", EXIT_ERROR)
+                    .detail(error.message().to_string())
+                    .emit(options, folded)
             }
             fsw_core::update::UpdateOutcome::UpToDate => {
                 Report::new("upToDate", EXIT_OK).emit(options, folded)
@@ -670,18 +691,17 @@ fn cmd_check(options: &Options) -> i32 {
     let _com = ComScope::new();
     let _ = fsw_core::update::note_check_attempt();
     match store::check_store_updates() {
-        Ok(versions) => match versions.first() {
-            Some(version) => {
+        Ok(versions) => {
+            if let Some(version) = versions.first() {
                 let _ = fsw_core::update::set_cached_update_tag(version);
                 Report::new("available", EXIT_AVAILABLE)
                     .available(Some(version.clone()))
                     .emit(options, folded)
-            }
-            None => {
+            } else {
                 let _ = fsw_core::update::clear_cached_update_tag();
                 Report::new("upToDate", EXIT_OK).emit(options, folded)
             }
-        },
+        }
         // A check that could not run is not a failure the user should be shown:
         // the Store is offline, or the account has no license yet. Exit 0.
         Err(code) => Report::new("unavailable", EXIT_OK)
@@ -690,17 +710,21 @@ fn cmd_check(options: &Options) -> i32 {
     }
 }
 
-/// Picks the rung, probing lazily. The lower rungs cost WinRT round trips, so
+/// Picks the rung, probing lazily. The lower rungs cost `WinRT` round trips, so
 /// they are only asked about once the rung above is out; [`route_for`] still
 /// sees the whole row and remains the single definition of precedence.
-fn resolve_route(explicit: Option<Route>) -> Route {
+fn resolve_route(explicit: Option<Route>) -> (Route, bool) {
     let override_route = explicit.or_else(route_override);
     let probing = override_route.is_none();
     let appinstall = probing && helper::appinstall_available();
     let silent = probing && !appinstall && store::can_silently_download();
-    let winget = probing && !appinstall && !silent && fsw_core::executable_available("winget.exe");
+    let winget =
+        probing && !appinstall && !silent && fsw_core::SystemBinary::Winget.path().is_some();
     let metered = winget && store::network_is_metered();
-    route_for(override_route, appinstall, silent, winget, metered)
+    (
+        route_for(override_route, appinstall, silent, winget, metered),
+        override_route.is_some(),
+    )
 }
 
 /// What the Store is offering, or — when it cannot be reached — whatever the
@@ -715,25 +739,25 @@ fn resolve_route(explicit: Option<Route>) -> Route {
 /// *can* ask, is the cheap version.
 #[cfg(windows)]
 fn available_update() -> Option<String> {
-    match store::check_store_updates() {
-        Ok(versions) => {
-            // A real answer: keep the cached notice honest while we have one.
-            let _ = fsw_core::update::note_check_attempt();
-            let first = versions.into_iter().next();
-            match &first {
-                Some(version) => {
-                    let _ = fsw_core::update::set_cached_update_tag(version);
-                }
-                None => {
-                    let _ = fsw_core::update::clear_cached_update_tag();
-                }
+    if let Ok(versions) = store::check_store_updates() {
+        // A real answer: keep the cached notice honest while we have one.
+        let _ = fsw_core::update::note_check_attempt();
+        let first = versions.into_iter().next();
+        match &first {
+            Some(version) => {
+                let _ = fsw_core::update::set_cached_update_tag(version);
             }
-            first
+            None => {
+                let _ = fsw_core::update::clear_cached_update_tag();
+            }
         }
-        // Offline, or the Store refused: trust what the last successful check
-        // recorded rather than refusing an install the user just asked for.
-        Err(_) => fsw_core::update::cached_update_tag(),
+        return first;
     }
+    // Offline, or the Store refused: trust what the last successful check
+    // recorded rather than refusing an install the user just asked for.
+    let current = fsw_core::package_version()?;
+    fsw_core::update::cached_update_tag()
+        .filter(|candidate| fsw_core::update::is_newer_available_version(&current, candidate))
 }
 
 fn cmd_install(options: &Options) -> i32 {
@@ -766,9 +790,10 @@ fn cmd_install(options: &Options) -> i32 {
             .emit(options, folded);
     }
 
-    match resolve_route(options.route) {
-        Route::AppInstall => install_via_appinstall(options, &available, folded),
-        Route::Store => install_via_store(options, &available, folded),
+    let (route, forced_route) = resolve_route(options.route);
+    match route {
+        Route::AppInstall => install_via_appinstall(options, &available, folded, !forced_route),
+        Route::Store => install_via_store(options, &available, folded, !forced_route),
         Route::Winget => install_via_winget(options, &available, folded),
         Route::Notify => Report::new("needsUser", EXIT_NEEDS_USER)
             .route(Route::Notify)
@@ -821,8 +846,16 @@ fn install_github_bundle(options: &Options, folded: Option<String>) -> i32 {
 /// *install* is allowed is only knowable at runtime. Any failure before an item
 /// is queued — `E_ACCESSDENIED` above all — drops to 1b, the identity-less
 /// staged helper; a failure to even schedule that drops to route 2.
-fn install_via_appinstall(options: &Options, available: &str, folded: Option<String>) -> i32 {
+fn install_via_appinstall(
+    options: &Options,
+    available: &str,
+    folded: Option<String>,
+    allow_failover: bool,
+) -> i32 {
     let previous = previous_version();
+    // Registered but deliberately NOT run yet. Its backstop trigger is a minute
+    // out, which is longer than the 1a/1b decision takes, so the script 1b may
+    // replace is never a file `cmd.exe` already has open.
     let Some(watchdog) = relaunch::schedule_watchdog(options.relaunch, &previous, false) else {
         return Report::new("error", EXIT_ERROR)
             .route(Route::AppInstall)
@@ -833,15 +866,14 @@ fn install_via_appinstall(options: &Options, available: &str, folded: Option<Str
 
     match appinstall::apply_store_update(fsw_core::STORE_PRODUCT_ID) {
         appinstall::Outcome::Finished { code, result } => {
-            // A completed or paused queue can still deploy after this process
-            // returns. In particular, settings stopped the broker before
-            // invoking us and depends on the watchdog to restore it.
             if !appinstall_keeps_watchdog(code) {
                 watchdog.cancel();
             }
-            if code == EXIT_OK {
+            if code == EXIT_OK || code == EXIT_NOTHING {
                 // We are still alive, so the Store did not force-restart us;
-                // either way the cached notice is spent.
+                // either way the cached notice is spent. `EXIT_NOTHING` counts:
+                // the Store reporting nothing to install means the package is
+                // already current, so a standing notice would repeat forever.
                 let _ = fsw_core::update::clear_cached_update_tag();
             }
             let mut report =
@@ -865,17 +897,32 @@ fn install_via_appinstall(options: &Options, available: &str, folded: Option<Str
                         .emit(options, folded);
                 }
             }
-            // 1b is out too: continue down the ladder rather than reporting a
-            // failure the user cannot act on.
-            install_via_store(options, available, folded)
+            if allow_failover {
+                // 1b is out too: continue down the ladder rather than
+                // reporting a failure the user cannot act on.
+                install_via_store(options, available, folded, true)
+            } else {
+                Report::new("needsUser", EXIT_NEEDS_USER)
+                    .route(Route::AppInstall)
+                    .available(Some(available.to_string()))
+                    .detail(format!("The App Install route did not start ({detail})."))
+                    .emit(options, folded)
+            }
         }
     }
 }
 
 /// Route 2: `StoreContext`, which only downloads silently when the user's Store
 /// is set to update apps automatically and the network is unmetered.
-fn install_via_store(options: &Options, available: &str, folded: Option<String>) -> i32 {
+fn install_via_store(
+    options: &Options,
+    available: &str,
+    folded: Option<String>,
+    allow_failover: bool,
+) -> i32 {
     let previous = previous_version();
+    // This one can terminate the package the moment deployment starts, so its
+    // watchdog runs immediately rather than waiting for the backstop trigger.
     let Some(watchdog) = relaunch::schedule_watchdog(options.relaunch, &previous, true) else {
         return Report::new("error", EXIT_ERROR)
             .route(Route::Store)
@@ -885,27 +932,29 @@ fn install_via_store(options: &Options, available: &str, folded: Option<String>)
     };
 
     match store::silent_download_and_install() {
-        Ok(code) => {
-            // `EXIT_OK` can mean Store deployment is still queued, so its
-            // watchdog owns the lock until it observes the new version. Every
-            // other returned result is terminal in this process.
+        store::Outcome::Finished { code, detail } => {
             if !store_keeps_watchdog(code) {
                 watchdog.cancel();
             }
-            report_for_code(code, Route::Store)
-                .available(Some(available.to_string()))
-                .emit(options, folded)
+            let mut report =
+                report_for_code(code, Route::Store).available(Some(available.to_string()));
+            if let Some(detail) = detail {
+                report = report.detail(format!("The Store install failed ({detail})."));
+            }
+            report.emit(options, folded)
         }
-        Err(_detail) if options.route.is_none() => {
+        store::Outcome::NotStarted(_) if allow_failover => {
             watchdog.cancel();
             install_via_winget(options, available, folded)
         }
-        Err(detail) => {
+        store::Outcome::NotStarted(detail) => {
             watchdog.cancel();
             Report::new("needsUser", EXIT_NEEDS_USER)
-                .route(Route::Notify)
+                .route(Route::Store)
                 .available(Some(available.to_string()))
-                .detail(format!("The Store declined a silent install ({detail})."))
+                .detail(format!(
+                    "The Store did not start a silent install ({detail})."
+                ))
                 .emit(options, folded)
         }
     }
@@ -915,6 +964,13 @@ fn install_via_store(options: &Options, available: &str, folded: Option<String>)
 /// survives the package going down. Skipped on a metered network — winget
 /// downloads regardless of the user's data settings.
 fn install_via_winget(options: &Options, available: &str, folded: Option<String>) -> i32 {
+    let Some(command) = relaunch::winget_command(fsw_core::STORE_PRODUCT_ID) else {
+        return Report::new("needsUser", EXIT_NEEDS_USER)
+            .route(Route::Notify)
+            .available(Some(available.to_string()))
+            .detail("The Windows App Installer alias is unavailable.".to_string())
+            .emit(options, folded);
+    };
     if store::network_is_metered() {
         return Report::new("deferred", EXIT_AVAILABLE)
             .route(Route::Winget)
@@ -923,11 +979,7 @@ fn install_via_winget(options: &Options, available: &str, folded: Option<String>
             .emit(options, folded);
     }
     let previous = previous_version();
-    if relaunch::schedule_apply(
-        &relaunch::winget_command(fsw_core::STORE_PRODUCT_ID),
-        options.relaunch,
-        &previous,
-    ) {
+    if relaunch::schedule_apply(&command, options.relaunch, &previous) {
         Report::new("installing", EXIT_OK)
             .route(Route::Winget)
             .action("scheduled")
@@ -971,19 +1023,8 @@ fn cmd_apply_store(options: &Options) -> i32 {
             code
         }
         appinstall::Outcome::NotStarted(detail) => {
-            // No item was queued, so it is safe to continue the automatic
-            // ladder from the identity-less helper. Metered networks remain a
-            // deferral: winget does not honour the Store's data-cost setting.
-            if store::network_is_metered() {
-                helper::write_result(&HelperResult::Paused);
-                EXIT_AVAILABLE
-            } else if helper::run_winget_upgrade(product) {
-                helper::write_result(&HelperResult::Completed);
-                EXIT_OK
-            } else {
-                helper::write_result(&HelperResult::Error(detail));
-                EXIT_ERROR
-            }
+            helper::write_result(&HelperResult::Error(detail));
+            EXIT_ERROR
         }
     }
 }
@@ -993,14 +1034,14 @@ fn cmd_apply_bundle(options: &Options) -> i32 {
         eprintln!("usage: fwdslash update apply-bundle --bundle <path>");
         return EXIT_USAGE;
     };
-    if helper::register_bundle(std::path::Path::new(bundle)) {
-        helper::write_result(&HelperResult::Completed);
-        EXIT_OK
-    } else {
-        // No HRESULT is available from a PowerShell exit status; the folded
-        // detail only has to say "it failed", and the user-facing route is the
-        // Store page either way.
-        helper::write_result(&HelperResult::Error("0x80070643".to_string()));
-        EXIT_ERROR
+    match helper::register_bundle(std::path::Path::new(bundle)) {
+        Ok(()) => {
+            helper::write_result(&HelperResult::Completed);
+            EXIT_OK
+        }
+        Err(error) => {
+            helper::write_result(&HelperResult::Error(error.code().to_string()));
+            EXIT_ERROR
+        }
     }
 }

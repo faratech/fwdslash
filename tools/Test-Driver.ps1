@@ -111,7 +111,7 @@ $script:DriverLoaded = $false
 $script:Cli = $null
 $script:StartTime = Get-Date
 
-$script:AliasRoot = "C:\$Distribution"
+$script:AliasRoot = "C:\fwdslash\$Distribution"
 $script:UncRoot = "\\wsl.localhost\$Distribution"
 $script:AliasNativeBaseline = $false
 # Set by the -FakeShare Lxss seeding in step a (issue #39 follow-up); removed
@@ -488,7 +488,7 @@ namespace FswLab {
 # from Marshal.SizeOf so the padding after the name array stays correct.
 function New-MappingBuffer {
     param(
-        [uint32]$Version = 2,
+        [uint32]$Version = 3,
         [uint32]$Size = 0,
         [uint32]$Operation = 1,
         [uint32]$Reserved = 0,
@@ -728,7 +728,7 @@ Invoke-Step 'ping protocol version' {
         Add-Skip 'ping reports the loaded protocol version' 'the driver returned no output for the ping (pre-reply-contract build)'
     } else {
         Write-Host "   loaded driver protocol: v$protocol"
-        Assert-True ($protocol -eq 2) 'ping reports protocol v2' "(got v$protocol)" | Out-Null
+        Assert-True ($protocol -eq 3) 'ping reports protocol v3' "(got v$protocol)" | Out-Null
     }
 }
 

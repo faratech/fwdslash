@@ -2,7 +2,15 @@ mod adapters;
 mod scheduled_task;
 mod update;
 
-use fsw_core::*;
+use fsw_core::{
+    BrokerState, CMD_ADAPTER_KEY, FSW_BROKER_WINDOW_CLASS, FSW_VERSION, FSW_WM_SET_PAUSED,
+    FilterServiceState, POWERSHELL_ADAPTER_ROOT, PROTOCOL_KEY, RUN_KEY, RUN_VALUE, Snapshot,
+    adapter_installed, adapter_outdated, broadcast_state_changed, broker_state,
+    broker_window_exists, executable_available, executable_directory, filter_port_available,
+    filter_service_state, has_package_identity, is_disabled, is_registered_distribution,
+    package_version, persist_disabled, resolve_user_slash_path, windows_integration_installed,
+    write_bare_slash_settings,
+};
 use fsw_path::{BareSlashMode, RenderBuf, ResolveError, Resolved, is_valid_windows_root};
 use std::env;
 use std::ffi::OsStr;
@@ -10,7 +18,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
 const SYNCHRONIZE: u32 = 0x0010_0000;
-/// HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND); what `remove_value` reports for an
+/// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`; what `remove_value` reports for an
 /// absent value, which is the desired end state rather than a failure.
 const ERROR_FILE_NOT_FOUND_HRESULT: u32 = 0x8007_0002;
 
@@ -22,7 +30,7 @@ fn to_u16_vec(s: &str) -> Vec<u16> {
 
 fn from_u16_slice(slice: &[u16]) -> String {
     let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-    std::ffi::OsString::from_wide(&slice[..len])
+    std::ffi::OsString::from_wide(slice.get(..len).unwrap_or_default())
         .to_string_lossy()
         .into_owned()
 }
@@ -73,7 +81,7 @@ fn send_resume() -> bool {
             0,
             SMTO_ABORTIFHUNG | SMTO_BLOCK,
             2000,
-            &mut result,
+            &raw mut result,
         );
         sent != 0 && result != 0
     }
@@ -97,6 +105,9 @@ fn state_change_failure(paused: bool) -> &'static str {
     }
 }
 
+// This is one Windows process-lifecycle transaction; splitting it would
+// obscure the cleanup paths paired with every CreateProcess outcome.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn start_broker() -> i32 {
     #[cfg(windows)]
     unsafe {
@@ -152,8 +163,8 @@ fn start_broker() -> i32 {
             CREATE_NEW_PROCESS_GROUP | 0x0800_0000,
             std::ptr::null(),
             dir_wide.as_ptr(),
-            &startup,
-            &mut process,
+            &raw const startup,
+            &raw mut process,
         );
 
         if ok == 0 {
@@ -203,7 +214,7 @@ fn start_broker() -> i32 {
         let hwnd = FindWindowW(class.as_ptr(), std::ptr::null());
         if !hwnd.is_null() {
             let mut owner = 0u32;
-            GetWindowThreadProcessId(hwnd, &mut owner);
+            GetWindowThreadProcessId(hwnd, &raw mut owner);
             if owner == process.dwProcessId {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 WaitForSingleObject(process.hProcess, 2000);
@@ -237,18 +248,11 @@ fn stop_broker() -> i32 {
         }
 
         let mut pid: u32 = 0;
-        GetWindowThreadProcessId(hwnd, &mut pid);
+        GetWindowThreadProcessId(hwnd, &raw mut pid);
         let process = OpenProcess(SYNCHRONIZE, 0, pid);
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
 
-        if !process.is_null() {
-            let wait = WaitForSingleObject(process, 5000);
-            CloseHandle(process);
-            if wait != WAIT_OBJECT_0 {
-                eprintln!("Broker did not stop within five seconds.");
-                return 1;
-            }
-        } else {
+        if process.is_null() {
             let deadline = GetTickCount64() + 5000;
             while !FindWindowW(class.as_ptr(), std::ptr::null()).is_null()
                 && GetTickCount64() < deadline
@@ -256,6 +260,13 @@ fn stop_broker() -> i32 {
                 Sleep(50);
             }
             if !FindWindowW(class.as_ptr(), std::ptr::null()).is_null() {
+                eprintln!("Broker did not stop within five seconds.");
+                return 1;
+            }
+        } else {
+            let wait = WaitForSingleObject(process, 5000);
+            CloseHandle(process);
+            if wait != WAIT_OBJECT_0 {
                 eprintln!("Broker did not stop within five seconds.");
                 return 1;
             }
@@ -295,11 +306,11 @@ fn set_paused(paused: bool) -> i32 {
         let success = SendMessageTimeoutW(
             hwnd,
             FSW_WM_SET_PAUSED,
-            if paused { 1 } else { 0 },
+            usize::from(paused),
             0,
             SMTO_ABORTIFHUNG | SMTO_BLOCK,
             2000,
-            &mut result,
+            &raw mut result,
         );
 
         if success == 0 || result == 0 {
@@ -335,7 +346,7 @@ fn set_startup(enabled: bool) -> i32 {
         let key = match CURRENT_USER.create(RUN_KEY) {
             Ok(k) => k,
             Err(e) => {
-                eprintln!("Unable to open the per-user startup key. Error {:?}.", e);
+                eprintln!("Unable to open the per-user startup key. Error {e:?}.");
                 return 1;
             }
         };
@@ -347,12 +358,12 @@ fn set_startup(enabled: bool) -> i32 {
             };
             let val = format!("\"{}\"", broker_path.display());
             if let Err(e) = key.set_string(RUN_VALUE, val) {
-                eprintln!("Unable to update startup registration. Error {:?}.", e);
+                eprintln!("Unable to update startup registration. Error {e:?}.");
                 return 1;
             }
         } else if let Err(error) = key.remove_value(RUN_VALUE) {
             // An already-absent value is the goal state, not a failure.
-            if error.code().0 as u32 != ERROR_FILE_NOT_FOUND_HRESULT {
+            if error.code().0.cast_unsigned() != ERROR_FILE_NOT_FOUND_HRESULT {
                 eprintln!("Unable to remove startup registration. Error {error:?}.");
                 return 1;
             }
@@ -375,7 +386,7 @@ fn set_settings_protocol(enabled: bool) -> i32 {
         Err(_) => PathBuf::from("fswsettings.exe"),
     };
     let command = format!("\"{}\" \"%1\"", settings.display());
-    let command_key = format!(r"{}\shell\open\command", PROTOCOL_KEY);
+    let command_key = format!(r"{PROTOCOL_KEY}\shell\open\command");
 
     #[cfg(windows)]
     {
@@ -389,10 +400,10 @@ fn set_settings_protocol(enabled: bool) -> i32 {
                 return 1;
             }
             if let Ok(existing) = CURRENT_USER.open(&command_key) {
-                if let Ok(val) = existing.get_string("") {
-                    if val == command {
-                        return 0;
-                    }
+                if let Ok(val) = existing.get_string("")
+                    && val == command
+                {
+                    return 0;
                 }
                 eprintln!(
                     "The fwdslash URI scheme is already owned by another application. No protocol registration was changed."
@@ -403,10 +414,7 @@ fn set_settings_protocol(enabled: bool) -> i32 {
             let root = match CURRENT_USER.create(PROTOCOL_KEY) {
                 Ok(k) => k,
                 Err(e) => {
-                    eprintln!(
-                        "Unable to create the fwdslash URI registration. Error {:?}.",
-                        e
-                    );
+                    eprintln!("Unable to create the fwdslash URI registration. Error {e:?}.");
                     return 1;
                 }
             };
@@ -417,32 +425,25 @@ fn set_settings_protocol(enabled: bool) -> i32 {
                 Ok(k) => k,
                 Err(e) => {
                     let _ = CURRENT_USER.remove_tree(PROTOCOL_KEY);
-                    eprintln!(
-                        "Unable to complete the fwdslash URI registration. Error {:?}.",
-                        e
-                    );
+                    eprintln!("Unable to complete the fwdslash URI registration. Error {e:?}.");
                     return 1;
                 }
             };
             if let Err(e) = cmd_k.set_string("", &command) {
                 let _ = CURRENT_USER.remove_tree(PROTOCOL_KEY);
-                eprintln!(
-                    "Unable to complete the fwdslash URI registration. Error {:?}.",
-                    e
-                );
+                eprintln!("Unable to complete the fwdslash URI registration. Error {e:?}.");
                 return 1;
             }
             0
         } else {
-            if let Ok(existing) = CURRENT_USER.open(&command_key) {
-                if let Ok(val) = existing.get_string("") {
-                    if val != command {
-                        eprintln!(
-                            "The fwdslash URI handler changed after registration. Refusing to remove another application's value."
-                        );
-                        return 1;
-                    }
-                }
+            if let Ok(existing) = CURRENT_USER.open(&command_key)
+                && let Ok(val) = existing.get_string("")
+                && val != command
+            {
+                eprintln!(
+                    "The fwdslash URI handler changed after registration. Refusing to remove another application's value."
+                );
+                return 1;
             }
             let _ = CURRENT_USER.remove_tree(PROTOCOL_KEY);
             0
@@ -481,17 +482,17 @@ fn show_bare_slash_state() -> i32 {
         BareSlashMode::DefaultDistribution => "default distribution",
         BareSlashMode::DistributionList => "distribution list",
     };
-    println!("bare slash mode: {}", mode_str);
+    println!("bare slash mode: {mode_str}");
 
     match &snap.bare_slash_root {
-        Some(root) => println!("custom root: {}", root),
+        Some(root) => println!("custom root: {root}"),
         None => println!("custom root: none"),
     }
     if let Some(pinned) = &snap.bare_slash_pinned {
-        println!("pinned distribution: /{}", pinned);
+        println!("pinned distribution: /{pinned}");
     }
     match &snap.default_distribution {
-        Some(def) => println!("WSL default distribution: /{}", def),
+        Some(def) => println!("WSL default distribution: /{def}"),
         None => println!("WSL default distribution: none"),
     }
 
@@ -510,14 +511,14 @@ fn set_bare_slash(default_mode: bool, pinned: &str, root: Option<&str>) -> i32 {
         eprintln!("That WSL distribution is not registered.");
         return 1;
     }
-    if let Some(path) = root {
-        if !is_valid_windows_root(path) {
-            eprintln!(
-                "That is not a usable folder root. Use an absolute path like \
+    if let Some(path) = root
+        && !is_valid_windows_root(path)
+    {
+        eprintln!(
+            "That is not a usable folder root. Use an absolute path like \
                  C:\\code or \\\\wsl.localhost\\Ubuntu\\home\\me."
-            );
-            return 1;
-        }
+        );
+        return 1;
     }
     // The dispatcher passes root=None for every non-root mutation, so the
     // radios and a configured folder can never disagree about what `/` means.
@@ -532,7 +533,7 @@ fn format_resolve_error(err: ResolveError, distributions: &[String]) -> String {
     if err.hint_lists_distributions() && !distributions.is_empty() {
         message.push_str(" Try ");
         let count = distributions.len().min(3);
-        for (idx, d) in distributions[..count].iter().enumerate() {
+        for (idx, d) in distributions.iter().take(count).enumerate() {
             if idx != 0 {
                 message.push_str(", ");
             }
@@ -700,14 +701,14 @@ fn cmd_status(json: bool) -> i32 {
     let snap = Snapshot::current();
     // Window check first: a stopped broker costs one FindWindowW, and a
     // wedged one only waits the short informational timeout.
-    let broker_status = if !broker_window_exists() {
-        "stopped"
-    } else {
+    let broker_status = if broker_window_exists() {
         match broker_state(200) {
             BrokerState::Active => "running (active)",
             BrokerState::Paused => "running (paused)",
             BrokerState::Unavailable => "running (hook unavailable)",
         }
+    } else {
+        "stopped"
     };
     let (driver_conn, driver_state_label) = driver_state();
 
@@ -740,23 +741,24 @@ fn cmd_status(json: bool) -> i32 {
             snap.disabled,
             mode_str,
             bare_target,
-            snap.bare_slash_root
-                .as_deref()
-                .map(|root| format!("\"{}\"", json_escape(root)))
-                .unwrap_or_else(|| "null".to_string()),
+            snap.bare_slash_root.as_deref().map_or_else(
+                || "null".to_string(),
+                |root| format!("\"{}\"", json_escape(root))
+            ),
             distro_list.join(","),
             update::flavor_name(),
             fsw_core::update::read_auto_update_enabled(),
-            fsw_core::update::cached_update_tag()
-                .map(|tag| format!("\"{}\"", json_escape(&tag)))
-                .unwrap_or_else(|| "null".to_string()),
+            fsw_core::update::cached_update_tag().map_or_else(
+                || "null".to_string(),
+                |tag| format!("\"{}\"", json_escape(&tag))
+            ),
             fsw_core::update::last_update_check()
                 .map_or_else(|| "null".to_string(), |value| value.to_string()),
         );
         return 0;
     }
 
-    println!("broker: {}", broker_status);
+    println!("broker: {broker_status}");
     println!(
         "global state: {}",
         if snap.disabled { "disabled" } else { "enabled" }
@@ -784,8 +786,21 @@ fn cmd_status(json: bool) -> i32 {
         }
     }
 
+    // Resolve each distro shortcut for real: with a configured root the
+    // answer is under the root, not `\\wsl.localhost` — advertising the old
+    // literal here contradicted what `fwdslash resolve` actually returned.
     for d in &snap.distributions {
-        println!("  /{}/ -> \\\\wsl.localhost\\{}\\", d, d);
+        let mut buf = RenderBuf::new();
+        let target = resolve_user_slash_path(&format!("/{d}"), &snap, &mut buf).map_or_else(
+            |error| {
+                format!(
+                    "blocked. {}",
+                    format_resolve_error(error, &snap.distributions)
+                )
+            },
+            |resolved| resolved.unc_display().to_string(),
+        );
+        println!("  /{d}/ -> {target}");
     }
     0
 }
@@ -817,28 +832,15 @@ fn cmd_open(path: &str) -> i32 {
     };
 
     #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::Foundation::GetLastError;
-        use windows_sys::Win32::UI::Shell::{SHELLEXECUTEINFOW, ShellExecuteExW};
-        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-        let wide_verb = to_u16_vec("open");
-        let wide_target = to_u16_vec(resolved.unc_display());
-
-        let mut exec: SHELLEXECUTEINFOW = std::mem::zeroed();
-        exec.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        exec.lpVerb = wide_verb.as_ptr();
-        exec.lpFile = wide_target.as_ptr();
-        exec.nShow = SW_SHOWNORMAL;
-
-        if ShellExecuteExW(&mut exec) != 0 {
-            0
-        } else {
-            eprintln!(
-                "Windows could not open the target. Error {}.",
-                GetLastError()
-            );
-            1
+    {
+        match fsw_core::navigation::NavigationAction::for_path(resolved.unc_display())
+            .and_then(|action| action.navigate_if(|| true))
+        {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("Windows could not open the location: {error}");
+                1
+            }
         }
     }
     #[cfg(not(windows))]
@@ -869,7 +871,7 @@ fn list_directory(target: &str) -> Result<i32, u32> {
 
         let wide_pattern = to_u16_vec(&pattern);
         let mut entry: WIN32_FIND_DATAW = std::mem::zeroed();
-        let search = FindFirstFileW(wide_pattern.as_ptr(), &mut entry);
+        let search = FindFirstFileW(wide_pattern.as_ptr(), &raw mut entry);
 
         if search == INVALID_HANDLE_VALUE {
             return Err(GetLastError());
@@ -881,7 +883,7 @@ fn list_directory(target: &str) -> Result<i32, u32> {
                 let is_dir = (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
                 println!("{}{}", if is_dir { "[dir]  " } else { "       " }, name);
             }
-            if FindNextFileW(search, &mut entry) == 0 {
+            if FindNextFileW(search, &raw mut entry) == 0 {
                 break;
             }
         }
@@ -913,7 +915,7 @@ fn cmd_list(path: &str) -> i32 {
 
     if resolved.is_provider_root() {
         for d in &snap.distributions {
-            println!("[distro] /{}", d);
+            println!("[distro] /{d}");
         }
         if snap.distributions.is_empty() {
             println!("No registered WSL distributions were found.");
@@ -1114,13 +1116,17 @@ fn cleanup_update_tasks_for_uninstall() -> bool {
     let Some(_guard) = update::relaunch::lock_update_storage_for_uninstall() else {
         return false;
     };
-    let mut names = Command::new("schtasks.exe")
-        .args(["/query", "/fo", "csv", "/nh"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
+    let mut names = fsw_core::SystemBinary::Schtasks
+        .path()
+        .and_then(|schtasks| {
+            Command::new(schtasks)
+                .args(["/query", "/fo", "csv", "/nh"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+        })
         .map_or_else(Vec::new, |output| {
             owned_update_task_inventory(&String::from_utf8_lossy(&output.stdout))
         });
@@ -1160,7 +1166,7 @@ fn cmd_doctor_all() -> i32 {
     let snap = Snapshot::current();
     let mut outcome = cmd_doctor_single("/", &snap);
     for d in &snap.distributions {
-        let path = format!("/{}", d);
+        let path = format!("/{d}");
         let res = cmd_doctor_single(&path, &snap);
         if res > outcome {
             outcome = res;
@@ -1184,7 +1190,7 @@ fn cmd_settings(section: &str) -> i32 {
     } else {
         section
     };
-    let arg = format!("fwdslash://settings/{}", sec);
+    let arg = format!("fwdslash://settings/{sec}");
 
     #[cfg(windows)]
     unsafe {
@@ -1196,17 +1202,16 @@ fn cmd_settings(section: &str) -> i32 {
         let wide_arg = to_u16_vec(&arg);
 
         let mut exec: SHELLEXECUTEINFOW = std::mem::zeroed();
-        exec.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        let Ok(cb_size) = u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()) else {
+            return 1;
+        };
+        exec.cbSize = cb_size;
         exec.lpVerb = wide_verb.as_ptr();
         exec.lpFile = wide_file.as_ptr();
         exec.lpParameters = wide_arg.as_ptr();
         exec.nShow = SW_SHOWNORMAL;
 
-        if ShellExecuteExW(&mut exec) != 0 {
-            0
-        } else {
-            1
-        }
+        i32::from(ShellExecuteExW(&raw mut exec) == 0)
     }
     #[cfg(not(windows))]
     {
@@ -1216,6 +1221,11 @@ fn cmd_settings(section: &str) -> i32 {
 
 /// The install state of one shell adapter, including whether its deployed
 /// payload predates this build (#13).
+/// The sweep marker on `integration <id> enable`: this run is the broker's or
+/// the settings window's, not a person's, so it may not write `Documents`
+/// (#127). Deliberately absent from `usage()` — it is not a user-facing verb.
+pub const BACKGROUND_FLAG: &str = "--background";
+
 fn integration_label(installed: bool, outdated: bool) -> &'static str {
     if !installed {
         "not installed"
@@ -1271,8 +1281,8 @@ fn execution_policy_json() -> String {
 fn cmd_integrations(json: bool) -> i32 {
     let disabled = is_disabled();
     let windows = windows_integration_installed();
-    let win_ps_key = format!("{}WindowsPowerShell", POWERSHELL_ADAPTER_ROOT);
-    let ps7_key = format!("{}PowerShell", POWERSHELL_ADAPTER_ROOT);
+    let win_ps_key = format!("{POWERSHELL_ADAPTER_ROOT}WindowsPowerShell");
+    let ps7_key = format!("{POWERSHELL_ADAPTER_ROOT}PowerShell");
     let cmd = adapter_installed(CMD_ADAPTER_KEY);
     let win_ps = adapter_installed(&win_ps_key);
     let ps7 = adapter_installed(&ps7_key);
@@ -1398,6 +1408,9 @@ fn usage() {
     );
 }
 
+// Argument lengths are validated in every dispatch guard before positional
+// access; retaining the command grammar beside its action is deliberate.
+#[allow(clippy::indexing_slicing, clippy::too_many_lines)]
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -1425,10 +1438,7 @@ fn main() {
         "cmd-cd" if args.len() == 3 => cmd_shell_cd(operand),
         "shell-resolve" if args.len() == 3 => cmd_shell_resolve(operand),
         "doctor" => {
-            if args.len() != 3 {
-                usage();
-                2
-            } else {
+            if args.len() == 3 {
                 let code = if args[2] == "--all" {
                     cmd_doctor_all()
                 } else {
@@ -1437,6 +1447,9 @@ fn main() {
                 };
                 print_shell_integration_health();
                 code
+            } else {
+                usage();
+                2
             }
         }
         "settings" if args.len() == 2 || args.len() == 3 => {
@@ -1480,9 +1493,16 @@ fn main() {
                 }
             }
         }
-        "integration" if args.len() == 4 => {
+        "integration"
+            if args.len() == 4
+                || (args.len() == 5 && args.get(4).is_some_and(|flag| flag == BACKGROUND_FLAG)) =>
+        {
             let name = args[2].as_str();
             let op = args[3].as_str();
+            // The broker's startup sweep and the settings window's launch sweep
+            // pass `--background`: they may swap the %LOCALAPPDATA% payload but
+            // must never write a profile under Documents (#127).
+            let user_initiated = args.len() == 4;
             if op == "repair" {
                 // Detect-and-repair a single adapter's shell-integration
                 // hygiene (#37). `windows` is registry-only, nothing to repair.
@@ -1503,7 +1523,7 @@ fn main() {
                 if name == "windows" {
                     set_windows_integration(enabled)
                 } else {
-                    let result = adapters::set_integration(name, enabled);
+                    let result = adapters::set_integration(name, enabled, user_initiated);
                     if result == 2 {
                         usage();
                     }
@@ -1520,7 +1540,7 @@ fn main() {
         "driver" if args.len() == 3 && args[2] == "status" => {
             let (connected, label) = driver_state();
             println!("{label}");
-            if connected { 0 } else { 1 }
+            i32::from(!connected)
         }
         // Self-update. Every route, both flavors, and the two helper-only
         // apply verbs live behind this one arm -- and so does the only
@@ -1545,16 +1565,17 @@ fn main() {
             // product; best effort, since a leftover must not fail the
             // uninstall. The relaunch watchdog is a scheduled task rather than
             // a file, so it needs its own sweep -- an update task that fired
-            // after an uninstall would relaunch a product that is gone.
-            let updates_cleaned = cleanup_update_tasks_for_uninstall();
+            // after an uninstall would relaunch a product that is gone. Order
+            // matters: take the attempt lock, stop and delete every owned task
+            // (including the legacy fixed name older builds registered), and
+            // only then sweep the directory an in-flight apply is reading.
+            let _ = cleanup_update_tasks_for_uninstall();
             let win = set_windows_integration(false);
             let proto = set_settings_protocol(false);
             if win != 0 {
                 win
             } else if proto != 0 {
                 proto
-            } else if !updates_cleaned {
-                1
             } else {
                 sweep
             }
@@ -1595,16 +1616,13 @@ fn main() {
 fn broadcasts_state_change(command: &str, argc: usize) -> bool {
     match command {
         // Adapter payload, profile blocks and marker keys — none of them under
-        // the settings key, so nothing else announces them.
-        "integration" => argc == 4,
-        "repair-adapters" => argc == 2,
-        // Run key, protocol registration, the adapter sweep.
-        "install" | "uninstall" => true,
-        // The broker's presence is the status line's "broker" column.
-        "start" | "stop" => true,
-        // Global pause, via the broker when one is running and the registry
-        // when none is.
-        "pause" | "disable" | "resume" | "enable" => argc == 2,
+        // the settings key, so nothing else announces them. `--background` is
+        // the sweep form of the same verb, so it announces too (#127).
+        "integration" => argc == 4 || argc == 5,
+        "repair-adapters" | "pause" | "disable" | "resume" | "enable" => argc == 2,
+        // Run key, protocol registration, adapter sweep, and the broker's
+        // presence all update state other components render.
+        "install" | "uninstall" | "start" | "stop" => true,
         // `bare-slash` alone is a read; every longer form writes.
         "bare-slash" => argc > 2,
         _ => false,
@@ -1612,6 +1630,9 @@ fn broadcasts_state_change(command: &str, argc: usize) -> bool {
 }
 
 #[cfg(test)]
+// A test binary is not a window proc: a failed assertion should report, not
+// silently pass.
+#[allow(clippy::panic)]
 mod doctor_and_update_cleanup_tests {
     use super::{doctor_target_fields, is_owned_update_task_name, owned_update_task_inventory};
     use fsw_core::Snapshot;
@@ -1656,8 +1677,9 @@ mod doctor_and_update_cleanup_tests {
             disabled: false,
         };
         let mut buffer = RenderBuf::new();
-        let resolved =
-            fsw_path::resolve_under_root("/tools", root, &mut buffer).expect("folder path");
+        let Ok(resolved) = fsw_path::resolve_under_root("/tools", root, &mut buffer) else {
+            panic!("folder path");
+        };
         let fields = doctor_target_fields(resolved, &snap);
         assert!(fields.contains(&("custom root", root.to_string())));
         assert!(fields.contains(&("path under root", "/tools".to_string())));
@@ -1716,7 +1738,10 @@ mod broadcast_tests {
     fn arity_separates_reads_from_writes() {
         assert!(!broadcasts_state_change("bare-slash", 2));
         assert!(!broadcasts_state_change("integration", 3));
-        assert!(!broadcasts_state_change("integration", 5));
+        // `integration <id> enable --background` is the sweep form and still
+        // changes adapter state (#127).
+        assert!(broadcasts_state_change("integration", 5));
+        assert!(!broadcasts_state_change("integration", 6));
     }
 
     /// `enable`/`disable` are the pause verbs only in their bare form — the

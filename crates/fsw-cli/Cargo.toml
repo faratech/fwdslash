@@ -19,6 +19,8 @@ windows-registry = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
     "Win32_System_Com",
     "Win32_Storage_FileSystem",
     "Win32_System_LibraryLoader",
@@ -42,13 +44,17 @@ windows = { workspace = true, features = [
     "Foundation",
     "Foundation_Collections",
     "ApplicationModel",
+    "Management_Deployment",
     "Networking_Connectivity",
     "Win32_System_Com",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_UI_Shell",
 ] }
 # What crates/fsw-cli/src/update/install_control.rs is generated against.
 windows-core = { workspace = true }
 windows-future = { workspace = true }
 windows-collections = { workspace = true }
+sha2 = "0.11"
 
 [build-dependencies]
 embed-resource = { workspace = true }

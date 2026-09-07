@@ -47,7 +47,7 @@ const ROOT_ACTION: &str = "Bare slash opens the chosen folder";
 const UPGRADE_ACTION: &str = "Terminal integration upgrade";
 
 /// The `pending` phrase for an explicit "Check now". It only disables the
-/// controls and shows the ProgressRing; the answer arrives as
+/// controls and shows the `ProgressRing`; the answer arrives as
 /// `Msg::UpdateCheckFinished`, never as `ControllerFinished`.
 const CHECK_ACTION: &str = "Update check";
 
@@ -582,7 +582,7 @@ enum Msg {
         terminal: bool,
         succeeded: bool,
         /// The controller's stderr, so an actionable failure — a Controlled
-        /// Folder Access block, say — reaches the InfoBar instead of the
+        /// Folder Access block, say — reaches the `InfoBar` instead of the
         /// generic "failed" (#37).
         detail: String,
     },
@@ -660,8 +660,8 @@ struct Upgrade {
     queue: Vec<Integration>,
     /// Adapters the CLI reported success for.
     done: Vec<Integration>,
-    /// At least one step failed; the summary becomes an error.
-    failed: bool,
+    /// Failed adapters and their actionable controller diagnostics.
+    failures: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -670,13 +670,13 @@ struct SettingsModel {
     pane_open: bool,
     color_scheme: ColorScheme,
     state: State,
-    /// The TextBox draft for the custom root; committed only by Apply.
+    /// The `TextBox` draft for the custom root; committed only by Apply.
     root_draft: String,
     /// The folder radio is selected but not yet committed (no root stored).
     /// UI intent only — the stored root is what survives a restart.
     folder_selected: bool,
     /// The current notice is the update-available notice: dismissing it must
-    /// also clear the persisted AvailableUpdate value.
+    /// also clear the persisted `AvailableUpdate` value.
     notice_is_update: bool,
     notice: Option<Notice>,
     /// The `show_result` phrase of the controller invocation in flight, or
@@ -736,11 +736,15 @@ impl SettingsModel {
         });
     }
 
+    /// A prefix match, so the launch sweep's
+    /// `integration windows-powershell enable --background` form gets the same
+    /// execution-policy preflight the toggle does (#127).
     fn is_windows_powershell_enable(arguments: &[String]) -> bool {
-        arguments
-            .iter()
-            .map(String::as_str)
-            .eq(["integration", "windows-powershell", "enable"])
+        arguments.iter().take(3).map(String::as_str).eq([
+            "integration",
+            "windows-powershell",
+            "enable",
+        ])
     }
 
     fn preflight_windows_powershell_enable<F>(
@@ -842,15 +846,17 @@ impl SettingsModel {
             current,
             queue,
             done: Vec::new(),
-            failed: false,
+            failures: Vec::new(),
         });
         self.start_upgrade_step(context, current);
     }
 
-    /// `integration <id> enable` on an installed-but-outdated marker reinstalls
-    /// the payload, so one enable per adapter is the whole upgrade. It is
-    /// transactional and idempotent: if the broker already ran it at logon,
-    /// this exits 0 with nothing to do, which is a success.
+    /// `integration <id> enable --background` on an installed-but-outdated
+    /// marker swaps the payload directory, so one enable per adapter is the
+    /// whole upgrade. It is transactional and idempotent: if the broker already
+    /// ran it at logon, this exits 0 with nothing to do, which is a success.
+    /// A profile change it is not allowed to make comes back as exit 4 with the
+    /// explanation on stderr, which lands in the failure `InfoBar` (#127).
     fn start_upgrade_step(&mut self, context: &ComponentContext<Self>, integration: Integration) {
         self.start_controller(
             context,
@@ -860,20 +866,34 @@ impl SettingsModel {
                 "integration".to_string(),
                 integration.id().to_string(),
                 "enable".to_string(),
+                // The launch sweep is not a user action: it may swap the
+                // %LOCALAPPDATA% payload, but a change to the PowerShell
+                // profile under Documents waits for the user to toggle the
+                // integration themselves (#127).
+                "--background".to_string(),
             ],
         );
     }
 
     /// Records one finished step and either starts the next or reports the
     /// whole upgrade once.
-    fn advance_upgrade(&mut self, succeeded: bool, context: &ComponentContext<Self>) {
+    fn advance_upgrade(&mut self, succeeded: bool, detail: &str, context: &ComponentContext<Self>) {
         let Some(mut upgrade) = self.upgrade.take() else {
             return;
         };
         if succeeded {
             upgrade.done.push(upgrade.current);
         } else {
-            upgrade.failed = true;
+            let detail = detail.trim();
+            upgrade.failures.push(format!(
+                "{}: {}",
+                upgrade.current.display_name(),
+                if detail.is_empty() {
+                    "The integration controller failed without diagnostic details."
+                } else {
+                    detail
+                }
+            ));
         }
         if let Some(next) = upgrade.queue.pop() {
             upgrade.current = next;
@@ -881,14 +901,7 @@ impl SettingsModel {
             self.start_upgrade_step(context, next);
             return;
         }
-        self.notice = Some(if upgrade.failed {
-            Notice::new(
-                InfoBarSeverity::Error,
-                "Some terminal integrations could not be updated",
-                "Turn the affected integration off and on again on the Terminals page, \
-                 or press Repair integrations.",
-            )
-        } else {
+        self.notice = Some(if upgrade.failures.is_empty() {
             let names: Vec<&str> = upgrade
                 .done
                 .iter()
@@ -899,6 +912,12 @@ impl SettingsModel {
                 InfoBarSeverity::Success,
                 "Terminal integrations updated",
                 format!("{} {verb} now on {FSW_VERSION}", names.join(", ")),
+            )
+        } else {
+            Notice::new(
+                InfoBarSeverity::Error,
+                "Some terminal integrations could not be updated",
+                upgrade.failures.join("\n"),
             )
         });
         // Not the update-available notice, so dismissal must not clear the
@@ -1006,6 +1025,7 @@ impl Component for SettingsModel {
         model
     }
 
+    #[allow(clippy::too_many_lines)] // The reactor message dispatcher is intentionally co-located.
     fn update(&mut self, message: Self::Message, context: &ComponentContext<Self>) {
         match message {
             Msg::Navigate(Some(tag)) => {
@@ -1092,7 +1112,6 @@ impl Component for SettingsModel {
                 // Deterministic re-render: every other view-input change ends
                 // in a refresh, so this one must too (divergences #5 flow).
                 Self::refresh(context);
-                return;
             }
             Msg::RootTextChanged(text) => {
                 if self.root_draft == text {
@@ -1105,7 +1124,7 @@ impl Component for SettingsModel {
                 let Some(path) = folder_picker::pick_folder() else {
                     return; // cancelled
                 };
-                self.root_draft = path.clone();
+                self.root_draft.clone_from(&path);
                 self.folder_selected = true;
                 if !is_valid_windows_root(&path)
                     || Some(path.as_str()) == self.state.root.as_deref()
@@ -1432,7 +1451,7 @@ impl Component for SettingsModel {
                 self.pending = None;
                 if action == UPGRADE_ACTION {
                     // The upgrade reports itself once, when the queue drains.
-                    self.advance_upgrade(succeeded, context);
+                    self.advance_upgrade(succeeded, &detail, context);
                     return;
                 }
                 if succeeded && action == ROOT_ACTION {
@@ -1668,8 +1687,7 @@ impl SettingsModel {
                 .is_enabled(self.controls_enabled())
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .on_click(context.message(Msg::InstallUpdate))
-                .content(label)
-                .into(),
+                .content(label),
             None => View::empty(),
         };
         // Reactor's InfoBar has no action slot, so the notice's action is a
@@ -1678,8 +1696,7 @@ impl SettingsModel {
             Some(action @ NoticeAction::OpenStore) => Button::new()
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .on_click(context.message(Msg::OpenStorePage))
-                .content(action.label())
-                .into(),
+                .content(action.label()),
             None => View::empty(),
         };
         let progress: View = if self.pending.is_some() {
@@ -1701,6 +1718,7 @@ impl SettingsModel {
             .children((upgrade_notice, notice_action, install_action, progress))
     }
 
+    #[allow(clippy::too_many_lines)] // This page is deliberately one visual section.
     fn view_general(&self, context: &mut ViewContext<Self>) -> View {
         let state = &self.state;
         // The folder choice: the app's first free-form input. Reactor's
@@ -1861,7 +1879,6 @@ impl SettingsModel {
                             .automation_name("Check for updates now")
                             .on_click(context.message(Msg::CheckForUpdates))
                             .content("Check now")
-                            .into()
                     } else {
                         View::empty()
                     },
@@ -2128,6 +2145,7 @@ fn should_restore_broker_after_install(code: i32, broker_window_before_install: 
 /// last check recorded, which is all the Store flavor ever has locally. Either
 /// one is enough: the CLI decides what "install" actually means.
 #[must_use]
+#[allow(clippy::fn_params_excessive_bools)] // These flags mirror the independently readable update state.
 fn install_banner_label(
     packaged: bool,
     store_flavor: bool,
@@ -2261,7 +2279,7 @@ where
 
 /// Runs the controller and returns `(succeeded, stderr)`. The stderr text is
 /// what carries an actionable explanation — a Controlled Folder Access block,
-/// a missing PowerShell 7 — to the InfoBar (#37).
+/// a missing PowerShell 7 — to the `InfoBar` (#37).
 fn run_controller_detailed<I, S>(arguments: I) -> (bool, String)
 where
     I: IntoIterator<Item = S>,
@@ -2581,7 +2599,7 @@ fn to_wide(value: &str) -> Vec<u16> {
 ///
 /// Closing the window exits the process (the reactor routes `Window.Closed` to
 /// `exit_ui_thread`), so a live mutex holder always has a window to raise --
-/// after the poll below, which covers the beat WinUI takes to materialize it.
+/// after the poll below, which covers the beat `WinUI` takes to materialize it.
 ///
 /// The mutex handle is intentionally leaked so it lives until process exit;
 /// the kernel releases it when the owning process terminates.
@@ -2662,13 +2680,19 @@ unsafe fn find_settings_window() -> windows_sys::Win32::Foundation::HWND {
         unsafe {
             let state = &mut *(lparam as *mut Match);
             let length = GetWindowTextLengthW(window);
-            if length <= 0 {
+            let Ok(length) = usize::try_from(length) else {
                 return 1;
-            }
-            let mut text = vec![0u16; (length as usize) + 1];
-            GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32);
+            };
+            let Some(capacity) = length
+                .checked_add(1)
+                .and_then(|value| i32::try_from(value).ok())
+            else {
+                return 1;
+            };
+            let mut text = vec![0u16; length + 1];
+            GetWindowTextW(window, text.as_mut_ptr(), capacity);
             // `title` carries its NUL; compare the caption against the rest.
-            if text.get(..length as usize) != state.title.get(..state.title.len() - 1) {
+            if text.get(..length) != state.title.get(..state.title.len() - 1) {
                 return 1;
             }
             let mut owner = 0u32;
@@ -2704,9 +2728,14 @@ unsafe fn process_image_is_settings(pid: u32) -> bool {
         return false;
     }
     let mut image = [0u16; 1024];
-    let mut length = image.len() as u32;
+    let mut length = 1024;
     let queried = unsafe {
-        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, image.as_mut_ptr(), &mut length)
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            image.as_mut_ptr(),
+            &raw mut length,
+        )
     };
     unsafe { CloseHandle(handle) };
     if queried == 0 {
@@ -2753,7 +2782,7 @@ fn close_broker_window() {
 fn close_broker_window() {}
 
 /// Requests the ordinary shutdown by closing our own window. The reactor's only
-/// process-exit route is WinUI's `Window.Closed`, so `WM_CLOSE` -- never
+/// process-exit route is `WinUI`'s `Window.Closed`, so `WM_CLOSE` -- never
 /// `DestroyWindow` -- is how this app exits.
 #[cfg(windows)]
 fn request_close() {
@@ -2824,10 +2853,16 @@ mod tests {
         );
         assert_eq!(result, Ok(()));
         assert_eq!(probes.get(), 1);
+        // The launch sweep's `--background` form is the same enable and gets
+        // the same preflight (#127).
+        let mut swept = integration_arguments("windows-powershell", "enable");
+        swept.push("--background".to_owned());
+        assert!(SettingsModel::is_windows_powershell_enable(&swept));
     }
 
     #[test]
     fn only_windows_powershell_enable_dispatches_a_policy_probe() {
+        let probes = std::cell::Cell::new(0_u32);
         for arguments in [
             integration_arguments("windows-powershell", "disable"),
             integration_arguments("powershell", "enable"),
@@ -2835,12 +2870,14 @@ mod tests {
         ] {
             let result = SettingsModel::preflight_windows_powershell_enable(
                 SettingsModel::is_windows_powershell_enable(&arguments),
-                || -> Result<ExecutionPolicy, fsw_core::ProbeError> {
-                    panic!("non-enable integration action must not probe")
+                || {
+                    probes.set(probes.get() + 1);
+                    Ok(ExecutionPolicy::RemoteSigned)
                 },
             );
             assert_eq!(result, Ok(()));
         }
+        assert_eq!(probes.get(), 0);
     }
 
     #[test]
@@ -2856,7 +2893,7 @@ mod tests {
         let timed_out = SettingsModel::preflight_windows_powershell_enable(true, || {
             Err(fsw_core::ProbeError::TimedOut)
         });
-        assert!(timed_out.unwrap_err().contains("timed out"));
+        assert!(timed_out.is_err_and(|message| message.contains("timed out")));
     }
 
     /// A line in the exact shape `render_json` produces.
