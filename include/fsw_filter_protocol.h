@@ -1,9 +1,12 @@
 #pragma once
 
 #define FSW_FILTER_PORT_NAME L"\\FswFilterPort"
-#define FSW_PROTOCOL_VERSION 2u
+#define FSW_PROTOCOL_VERSION 3u
 #define FSW_MAX_DISTRIBUTIONS 32u
 #define FSW_MAX_DISTRIBUTION_NAME 128u
+
+/* Mappings are exposed only below C:\\fwdslash\\<distribution>. */
+#define FSW_NAMESPACE_ROOT L"fwdslash"
 
 typedef enum _FSW_MESSAGE_OPERATION {
   FswOperationReplaceMappings = 1,

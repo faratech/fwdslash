@@ -5,6 +5,8 @@
 typedef struct _FSW_CONNECTION_CONTEXT {
   PFLT_PORT ClientPort;
   ULONG SessionId;
+  LUID LogonId;
+  ULONG IntegrityLevel;
   ULONG SidLength;
   UCHAR Sid[SECURITY_MAX_SID_SIZE];
 } FSW_CONNECTION_CONTEXT, *PFSW_CONNECTION_CONTEXT;
@@ -12,6 +14,8 @@ typedef struct _FSW_CONNECTION_CONTEXT {
 typedef struct _FSW_SESSION_MAPPINGS {
   PFSW_CONNECTION_CONTEXT Owner;
   ULONG SessionId;
+  LUID LogonId;
+  ULONG IntegrityLevel;
   ULONG SidLength;
   UCHAR Sid[SECURITY_MAX_SID_SIZE];
   ULONGLONG Generation;
@@ -26,6 +30,8 @@ typedef struct _FSW_SESSION_MAPPINGS {
 //
 typedef struct _FSW_REQUESTOR_IDENTITY {
   ULONG SessionId;
+  LUID LogonId;
+  ULONG IntegrityLevel;
   ULONG SidLength;
   UCHAR Sid[SECURITY_MAX_SID_SIZE];
 } FSW_REQUESTOR_IDENTITY, *PFSW_REQUESTOR_IDENTITY;
@@ -83,9 +89,9 @@ static NTSTATUS FswBuildPortSecurityDescriptor(
     _Outptr_result_maybenull_ PSECURITY_DESCRIPTOR* Descriptor);
 _Must_inspect_result_
 _IRQL_requires_max_(APC_LEVEL)
-static BOOLEAN FswSplitFirstComponent(_In_ PCUNICODE_STRING RelativeName,
-                                      _Out_ PUNICODE_STRING FirstComponent,
-                                      _Out_ PUNICODE_STRING Remainder);
+static BOOLEAN FswSplitNamespace(_In_ PCUNICODE_STRING RelativeName,
+                                 _Out_ PUNICODE_STRING Distribution,
+                                 _Out_ PUNICODE_STRING Remainder);
 _Must_inspect_result_
 _IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN FswIsCandidateDistribution(
@@ -121,7 +127,7 @@ CONST FLT_REGISTRATION Registration = {
 #pragma alloc_text(PAGE, FswIsValidDistributionName)
 #pragma alloc_text(PAGE, FswClearMappingsForOwner)
 #pragma alloc_text(PAGE, FswBuildPortSecurityDescriptor)
-#pragma alloc_text(PAGE, FswSplitFirstComponent)
+#pragma alloc_text(PAGE, FswSplitNamespace)
 #pragma alloc_text(PAGE, FswIsCandidateDistribution)
 #pragma alloc_text(PAGE, FswOwnsDistribution)
 #pragma alloc_text(PAGE, FswBuildTargetName)
@@ -166,8 +172,10 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
                           _Out_ PBOOLEAN Eligible) {
   PACCESS_TOKEN token;
   PVOID userInformation = NULL;
+  PVOID statisticsInformation = NULL;
   PVOID integrityInformation = NULL;
   PTOKEN_USER tokenUser;
+  PTOKEN_STATISTICS tokenStatistics;
   ULONG sessionId = 0;
   ULONG integrityLevel;
   ULONG sidLength;
@@ -188,10 +196,15 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
     status = SeQueryInformationToken(token, TokenUser, &userInformation);
   }
   if (NT_SUCCESS(status)) {
-    if (userInformation == NULL) {
+    status = SeQueryInformationToken(token, TokenStatistics,
+                                     &statisticsInformation);
+  }
+  if (NT_SUCCESS(status)) {
+    if (userInformation == NULL || statisticsInformation == NULL) {
       status = STATUS_INVALID_SID;
     } else {
       tokenUser = (PTOKEN_USER)userInformation;
+      tokenStatistics = (PTOKEN_STATISTICS)statisticsInformation;
       if (!RtlValidSid(tokenUser->User.Sid)) {
         status = STATUS_INVALID_SID;
       } else {
@@ -200,6 +213,7 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
           status = STATUS_INVALID_SID;
         } else {
           Identity->SessionId = sessionId;
+          Identity->LogonId = tokenStatistics->AuthenticationId;
           Identity->SidLength = sidLength;
           status = RtlCopySid(SECURITY_MAX_SID_SIZE, (PSID)Identity->Sid,
                               tokenUser->User.Sid);
@@ -222,11 +236,15 @@ FswQueryRequestorIdentity(_In_ PEPROCESS Process,
         integrityLevel >= SECURITY_MANDATORY_MEDIUM_RID &&
         integrityLevel <= SECURITY_MANDATORY_PROTECTED_PROCESS_RID &&
         Identity->SessionId != 0) {
+      Identity->IntegrityLevel = integrityLevel;
       *Eligible = TRUE;
     }
   }
   if (userInformation != NULL) {
     ExFreePool(userInformation);
+  }
+  if (statisticsInformation != NULL) {
+    ExFreePool(statisticsInformation);
   }
   PsDereferencePrimaryToken(token);
   return status;
@@ -348,15 +366,16 @@ FswBuildPortSecurityDescriptor(
 _Must_inspect_result_
 _IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN
-FswSplitFirstComponent(_In_ PCUNICODE_STRING RelativeName,
-                       _Out_ PUNICODE_STRING FirstComponent,
-                       _Out_ PUNICODE_STRING Remainder) {
+FswSplitNamespace(_In_ PCUNICODE_STRING RelativeName,
+                  _Out_ PUNICODE_STRING Distribution,
+                  _Out_ PUNICODE_STRING Remainder) {
+  const UNICODE_STRING namespaceRoot = RTL_CONSTANT_STRING(FSW_NAMESPACE_ROOT);
   UNICODE_STRING body = *RelativeName;
   USHORT characterCount;
   USHORT index;
 
   PAGED_CODE();
-  RtlZeroMemory(FirstComponent, sizeof(*FirstComponent));
+  RtlZeroMemory(Distribution, sizeof(*Distribution));
   RtlZeroMemory(Remainder, sizeof(*Remainder));
 
   while (body.Length >= sizeof(WCHAR) && body.Buffer != NULL &&
@@ -374,15 +393,44 @@ FswSplitFirstComponent(_In_ PCUNICODE_STRING RelativeName,
       break;
     }
   }
+  if (index == 0) {
+    return FALSE;
+  }
+  {
+    UNICODE_STRING component;
+    component.Buffer = body.Buffer;
+    component.Length = (USHORT)(index * sizeof(WCHAR));
+    component.MaximumLength = component.Length;
+    if (!RtlEqualUnicodeString(&component, &namespaceRoot, TRUE)) {
+      return FALSE;
+    }
+  }
+  body.Buffer += index;
+  body.Length -= (USHORT)(index * sizeof(WCHAR));
+  body.MaximumLength = body.Length;
+  while (body.Length >= sizeof(WCHAR) && body.Buffer[0] == L'\\') {
+    body.Buffer += 1;
+    body.Length -= sizeof(WCHAR);
+    body.MaximumLength = body.Length;
+  }
+  if (body.Length == 0) {
+    return FALSE;
+  }
+  characterCount = (USHORT)(body.Length / sizeof(WCHAR));
+  for (index = 0; index < characterCount; ++index) {
+    if (body.Buffer[index] == L'\\') {
+      break;
+    }
+  }
   if (index == 0 || (ULONG)index > (FSW_MAX_DISTRIBUTION_NAME - 1u)) {
     return FALSE;
   }
-  FirstComponent->Buffer = body.Buffer;
-  FirstComponent->Length = (USHORT)(index * sizeof(WCHAR));
-  FirstComponent->MaximumLength = FirstComponent->Length;
+  Distribution->Buffer = body.Buffer;
+  Distribution->Length = (USHORT)(index * sizeof(WCHAR));
+  Distribution->MaximumLength = Distribution->Length;
 
   Remainder->Buffer = body.Buffer + index;
-  Remainder->Length = (USHORT)(body.Length - FirstComponent->Length);
+  Remainder->Length = (USHORT)(body.Length - Distribution->Length);
   Remainder->MaximumLength = Remainder->Length;
   characterCount = (USHORT)(Remainder->Length / sizeof(WCHAR));
   for (index = 0; index < characterCount; ++index) {
@@ -446,6 +494,10 @@ FswOwnsDistribution(_In_ PFSW_REQUESTOR_IDENTITY Identity,
        ++slotIndex) {
     PFSW_SESSION_MAPPINGS slot = &Globals.Mappings[slotIndex];
     if (slot->Owner == NULL || slot->SessionId != Identity->SessionId ||
+        slot->LogonId.LowPart != Identity->LogonId.LowPart ||
+        slot->LogonId.HighPart != Identity->LogonId.HighPart ||
+        slot->IntegrityLevel != Identity->IntegrityLevel ||
+        slot->SidLength != Identity->SidLength ||
         !RtlEqualSid((PSID)slot->Sid, (PSID)Identity->Sid)) {
       continue;
     }
@@ -629,7 +681,7 @@ FswPreCreate(_Inout_ PFLT_CALLBACK_DATA Data,
       nameInfo->Name.Buffer + nameInfo->Volume.Length / sizeof(WCHAR);
   relativeName.Length = nameInfo->Name.Length - nameInfo->Volume.Length;
   relativeName.MaximumLength = relativeName.Length;
-  if (!FswSplitFirstComponent(&relativeName, &firstComponent, &remainder) ||
+  if (!FswSplitNamespace(&relativeName, &firstComponent, &remainder) ||
       !FswIsCandidateDistribution(&firstComponent)) {
     FltReleaseFileNameInformation(nameInfo);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -690,18 +742,19 @@ FswPortConnect(_In_ PFLT_PORT ClientPort,
   RtlZeroMemory(context, sizeof(*context));
   context->ClientPort = ClientPort;
   //
-  //  Eligibility is deliberately ignored here: the port DACL already limits
-  //  connections to SYSTEM, administrators and interactive users, and a
-  //  broker's own integrity level is not what decides whether a *create* is
-  //  redirected.  Only the identity matters, and session 0 never gets a slot.
+  //  A low-integrity controller cannot publish mappings. The token-derived
+  //  identity is copied into its slot, and the create path requires the same
+  //  session, logon identity, and integrity level.
   //
   status = FswQueryRequestorIdentity(PsGetCurrentProcess(), &identity,
                                      &eligible);
-  if (!NT_SUCCESS(status) || identity.SessionId == 0) {
+  if (!NT_SUCCESS(status) || !eligible || identity.SessionId == 0) {
     ExFreePoolWithTag(context, FSW_POOL_TAG);
     return NT_SUCCESS(status) ? STATUS_ACCESS_DENIED : status;
   }
   context->SessionId = identity.SessionId;
+  context->LogonId = identity.LogonId;
+  context->IntegrityLevel = identity.IntegrityLevel;
   context->SidLength = identity.SidLength;
   RtlCopyMemory(context->Sid, identity.Sid, identity.SidLength);
   *ConnectionPortCookie = context;
@@ -751,7 +804,6 @@ FswPortMessage(_In_opt_ PVOID PortCookie,
   PFSW_SESSION_MAPPINGS ownSlot = NULL;
   PFSW_SESSION_MAPPINGS identitySlot = NULL;
   PFSW_SESSION_MAPPINGS freeSlot = NULL;
-  BOOLEAN takeover = FALSE;
   NTSTATUS status = STATUS_SUCCESS;
   PAGED_CODE();
 
@@ -812,11 +864,9 @@ FswPortMessage(_In_opt_ PVOID PortCookie,
   KeEnterCriticalRegion();
   ExAcquirePushLockExclusive(&Globals.MappingsLock);
   //
-  //  One slot per (session, SID).  A broker that crashed leaves its slot owned
-  //  by a connection whose disconnect callback has not run yet; the
-  //  replacement broker connects with the same identity and must take that
-  //  slot over rather than consume a second one, or sixteen crashes would
-  //  exhaust the table.
+  //  One slot per active (session, logon, SID, integrity) controller. A second
+  //  live port with the same identity cannot take over the first controller's
+  //  mappings and must wait for its disconnect callback to clear the slot.
   //
   for (ULONG index = 0; index < FSW_MAX_INTERACTIVE_SESSIONS; ++index) {
     PFSW_SESSION_MAPPINGS candidate = &Globals.Mappings[index];
@@ -830,6 +880,10 @@ FswPortMessage(_In_opt_ PVOID PortCookie,
       }
     } else if (identitySlot == NULL &&
                candidate->SessionId == context->SessionId &&
+               candidate->LogonId.LowPart == context->LogonId.LowPart &&
+               candidate->LogonId.HighPart == context->LogonId.HighPart &&
+               candidate->IntegrityLevel == context->IntegrityLevel &&
+               candidate->SidLength == context->SidLength &&
                RtlEqualSid((PSID)candidate->Sid, (PSID)context->Sid)) {
       identitySlot = candidate;
     }
@@ -837,14 +891,15 @@ FswPortMessage(_In_opt_ PVOID PortCookie,
   if (ownSlot != NULL) {
     slot = ownSlot;
   } else if (identitySlot != NULL) {
-    slot = identitySlot;
-    takeover = TRUE;
+    status = STATUS_SHARING_VIOLATION;
+  } else if (message->Operation == FswOperationClearMappings) {
+    status = STATUS_NOT_FOUND;
   } else {
     slot = freeSlot;
   }
-  if (slot == NULL) {
+  if (NT_SUCCESS(status) && slot == NULL) {
     status = STATUS_INSUFFICIENT_RESOURCES;
-  } else if (!takeover && ownSlot != NULL &&
+  } else if (NT_SUCCESS(status) && ownSlot != NULL &&
              message->Generation < slot->Generation) {
     //
     //  Monotonic only against the same owner.  A new broker process restarts
@@ -853,12 +908,14 @@ FswPortMessage(_In_opt_ PVOID PortCookie,
     //  connection is a stale message.
     //
     status = STATUS_REVISION_MISMATCH;
-  } else if (message->Operation == FswOperationClearMappings) {
+  } else if (NT_SUCCESS(status) && message->Operation == FswOperationClearMappings) {
     RtlZeroMemory(slot, sizeof(*slot));
-  } else {
+  } else if (NT_SUCCESS(status)) {
     RtlZeroMemory(slot, sizeof(*slot));
     slot->Owner = context;
     slot->SessionId = context->SessionId;
+    slot->LogonId = context->LogonId;
+    slot->IntegrityLevel = context->IntegrityLevel;
     slot->SidLength = context->SidLength;
     RtlCopyMemory(slot->Sid, context->Sid, context->SidLength);
     slot->Generation = message->Generation;

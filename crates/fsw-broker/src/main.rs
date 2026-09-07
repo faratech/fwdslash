@@ -1,14 +1,24 @@
 #![windows_subsystem = "windows"]
 
-use fsw_core::*;
+mod browser;
+
+use fsw_core::navigation::NavigationAction;
+use fsw_core::{
+    BrokerState, CMD_ADAPTER_KEY, FSW_ADAPTER_SWEEP_MUTEX, FSW_BROKER_WINDOW_CLASS,
+    FSW_FILTER_MAX_DISTRIBUTIONS, FSW_FILTER_PORT_NAME, FSW_FILTER_PROTOCOL_VERSION, FSW_VERSION,
+    FSW_WM_QUERY_STATE, FSW_WM_SET_PAUSED, FSW_WM_SHOW_SETTINGS, POWERSHELL_ADAPTER_ROOT, Snapshot,
+    adapter_outdated, executable_directory, has_package_identity, is_disabled, is_store_flavor,
+    list_registered_distributions, package_version, persist_disabled, resolve_user_slash_path,
+    resolve_user_target, state_changed_message, sync_settings_to_real_hive, update,
+};
 use fsw_path::{RenderBuf, eq_ignore_case};
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::sync::{mpsc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, mpsc};
 
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance,
@@ -17,21 +27,28 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Variant::{VARIANT, VT_BSTR};
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern,
-    IUIAutomationValuePattern, UIA_ComboBoxControlTypeId, UIA_EditControlTypeId,
-    UIA_LegacyIAccessiblePatternId, UIA_ValuePatternId, UIA_ValueValuePropertyId,
+    IUIAutomationValuePattern, UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId,
+    UIA_EditControlTypeId, UIA_LegacyIAccessiblePatternId, UIA_ToolBarControlTypeId,
+    UIA_ValuePatternId, UIA_ValueValuePropertyId,
 };
 use windows::Win32::UI::Shell::{IShellWindows, IWebBrowser2, ShellWindows};
 use windows::core::{BOOL, BSTR, Interface};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
-    LRESULT, POINT, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, HWND,
+    INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, WPARAM,
 };
+use windows_sys::Win32::Security::{
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
+    TOKEN_QUERY, TokenIntegrityLevel,
+};
+use windows_sys::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    CreateMutexW, GetCurrentProcess, GetCurrentThreadId, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, SendInput, VK_ESCAPE, VK_RETURN,
@@ -41,12 +58,14 @@ use windows_sys::Win32::UI::Shell::{
     NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
     SEE_MASK_ASYNCOK, SEE_MASK_FLAG_NO_UI, SHELLEXECUTEINFOW, Shell_NotifyIconW, ShellExecuteExW,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::QS_SENDMESSAGE;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, FindWindowExW, GetClassNameW, GetCursorPos, GetDlgItem,
-    GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HHOOK, HICON, HWND_MESSAGE,
-    IDC_ARROW, KBDLLHOOKSTRUCT, KillTimer, LLKHF_UP, LoadCursorW, LoadIconW, MF_CHECKED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, PostThreadMessageW,
+    DestroyWindow, DispatchMessageW, FindWindowExW, GA_ROOT, GetAncestor, GetClassNameW,
+    GetCursorPos, GetDlgItem, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HHOOK,
+    HICON, HWND_MESSAGE, IDC_ARROW, KBDLLHOOKSTRUCT, KillTimer, LLKHF_LOWER_IL_INJECTED, LLKHF_UP,
+    LoadCursorW, LoadIconW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    MsgWaitForMultipleObjectsEx, PostMessageW, PostQuitMessage, PostThreadMessageW,
     RegisterClassExW, RegisterWindowMessageW, SW_SHOWNORMAL, SetForegroundWindow,
     SetMenuDefaultItem, SetTimer, SetWindowsHookExW, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_CLOSE,
@@ -56,19 +75,74 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const MUTEX_NAME: &str = "Local\\ForwardSlashWindows.Broker";
+/// Explicit opt-in for the isolated browser harness.  Normal package
+/// activation never supplies this environment value.
+#[cfg(debug_assertions)]
+const INTEGRATION_TEST_ENV: &str = "FSW_INTEGRATION_TEST_MODE";
+const INTEGRATION_TEST_TARGET_HWND_ENV: &str = "FSW_INTEGRATION_TEST_TARGET_HWND";
+const INTEGRATION_TEST_TARGET_PID_ENV: &str = "FSW_INTEGRATION_TEST_TARGET_PID";
+const INTEGRATION_TEST_MUTEX_NAME: &str = "Local\\ForwardSlashWindows.Broker.E2E";
+const INTEGRATION_TEST_WINDOW_CLASS: &str = "ForwardSlashWindows.Broker.E2E";
 /// Class of the worker window. Never discovered by anyone: the worker HWND
 /// travels through `WORKER_WINDOW`, not `FindWindowW`.
 const WORKER_WINDOW_CLASS: &str = "ForwardSlashWindows.BrokerWorker";
+const INTEGRATION_TEST_WORKER_WINDOW_CLASS: &str = "ForwardSlashWindows.BrokerWorker.E2E";
+
+/// Packaged Search and Start run at Low IL on supported Windows builds. They
+/// are the sole exception to the broker's ordinary equal-integrity boundary.
+/// `cw5n1h2txyewy` is the publisher ID for Windows system packages. Windows
+/// has moved `SearchHost` between those packages before, so its package family
+/// is bound to its canonical `SystemApps` directory rather than frozen to one
+/// release's package name.
+const WINDOWS_SYSTEM_PUBLISHER_ID: &str = "_cw5n1h2txyewy";
+const LOW_INTEGRITY_LEVEL: u32 = 0x1000;
+const MEDIUM_INTEGRITY_LEVEL: u32 = 0x2000;
 
 /// Tray callback (broker window).
 const TRAY_MESSAGE: u32 = WM_APP + 1;
-/// Hook -> worker: `wParam` is a [`SurfaceKind`], `lParam` the foreground HWND.
+/// Hook -> worker: `wParam` is the classified foreground HWND, `lParam` the
+/// key generation. Attestation deliberately happens on the worker (issue
+/// #121); the hook proves nothing but the window class.
 const PROCESS_ENTER: u32 = WM_APP + 2;
 /// UI thread -> worker: `lParam` owns a `Box<String>` with the path to open.
 const WORKER_OPEN_PATH: u32 = WM_APP + 3;
 /// Persist thread -> broker window: show the "could not be saved" balloon on
 /// the thread that owns the icon.
 const PERSIST_FAILED: u32 = WM_APP + 4;
+/// `WinEvent` callback -> worker: re-attest and probe an engine-neutral browser
+/// surface. The callback only posts this message and never touches UIA.
+const BROWSER_DISCOVERY_PROBE: u32 = WM_APP + 5;
+/// Hook -> worker: consume the worker-attested browser cache only after an
+/// exact foreground HWND match made with atomic reads in the hook.
+const PROCESS_CACHED_BROWSER_ENTER: u32 = WM_APP + 6;
+/// Any thread -> worker: install (`wParam` = 1) or remove (`wParam` = 0) the
+/// browser-discovery `WinEvent` hooks. They must be created and destroyed on
+/// the thread that pumps their callbacks, which is the worker (issue #121),
+/// and pausing must take them down (issue #122).
+const WORKER_SET_DISCOVERY: u32 = WM_APP + 7;
+
+const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+const EVENT_OBJECT_FOCUS: u32 = 0x8005;
+const WINEVENT_OUTOFCONTEXT: u32 = 0;
+const WINEVENT_SKIPOWNPROCESS: u32 = 2;
+
+type WinEventProc = unsafe extern "system" fn(isize, u32, HWND, i32, i32, u32, u32);
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    #[link_name = "SetWinEventHook"]
+    fn set_win_event_hook(
+        event_min: u32,
+        event_max: u32,
+        module: isize,
+        callback: Option<WinEventProc>,
+        process_id: u32,
+        thread_id: u32,
+        flags: u32,
+    ) -> isize;
+    #[link_name = "UnhookWinEvent"]
+    fn unhook_win_event(hook: isize) -> i32;
+}
 
 const TRAY_ID: usize = 1;
 const HEALTH_TIMER: usize = 1;
@@ -121,7 +195,7 @@ const UPDATE_FIRST_DELAY_MS: u64 = 5 * 60 * 1_000;
 const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 /// Ceiling on `fwdslash update install`. The child only *starts* the install —
 /// the Store's own download runs in the Store's service, and the relaunch is a
-/// scheduled task — so this bounds a handful of WinRT calls, not a download.
+/// scheduled task — so this bounds a handful of `WinRT` calls, not a download.
 const UPDATE_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// Consecutive `update install` errors before the broker says so out loud.
 /// One is noise (the Store was mid-something); two in a row is a state the
@@ -194,29 +268,35 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// The classification the hook made, carried to the worker in the
-/// `PROCESS_ENTER` `wParam` so the worker never re-runs `classify_surface`.
+/// The supported UI flows. This is deliberately only one field of
+/// [`TrustedSurface`], never an authorization decision on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(usize)]
 enum SurfaceKind {
-    Unknown = 0,
-    Explorer = 1,
-    Run = 2,
-    Search = 3,
-    CommonDialog = 4,
+    Explorer,
+    Run,
+    Search,
+    CommonDialog,
+    Browser,
 }
 
-impl SurfaceKind {
-    const fn from_wparam(value: usize) -> Self {
-        match value {
-            1 => Self::Explorer,
-            2 => Self::Run,
-            3 => Self::Search,
-            4 => Self::CommonDialog,
-            _ => Self::Unknown,
-        }
-    }
+/// The immutable facts that bind an Enter request to the foreground process.
+/// The worker repeats this attestation before touching UIA or navigating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrustedSurface {
+    kind: SurfaceKind,
+    foreground: HWND,
+    pid: u32,
+    canonical_image: String,
+    package_identity: Option<String>,
+    session_id: u32,
+    integrity_level: u32,
 }
+
+// SAFETY: this record owns no pointed-to memory. `foreground` is an opaque
+// Win32 window identity, not a dereferenceable pointer; all consumers compare
+// it or pass it back to Win32 and revalidate PID/session/integrity immediately
+// before use. The remaining fields are owned values.
+unsafe impl Send for TrustedSurface {}
 
 static PAUSED: AtomicBool = AtomicBool::new(false);
 /// Pause writes started but not yet finished, so [`reload_settings`] can tell
@@ -231,6 +311,7 @@ static PAUSED: AtomicBool = AtomicBool::new(false);
 static PERSIST_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
 static ENTER_DOWN: AtomicBool = AtomicBool::new(false);
 static SUPPRESS_ENTER_UP: AtomicBool = AtomicBool::new(false);
+static KEYDOWN_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
 static BROKER_WINDOW: AtomicIsize = AtomicIsize::new(0);
@@ -243,6 +324,12 @@ static WORKER_WINDOW: AtomicIsize = AtomicIsize::new(0);
 static WORKER_THREAD: AtomicU32 = AtomicU32::new(0);
 static WORKER_STOPPED: AtomicBool = AtomicBool::new(false);
 static WORKER_JOIN: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+/// Full browser attestation lives behind this worker-only cache. The keyboard
+/// hook never locks it; it consults only [`CACHED_BROWSER_FOREGROUND`].
+static DISCOVERED_BROWSER_SURFACE: Mutex<Option<TrustedSurface>> = Mutex::new(None);
+static CACHED_BROWSER_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
+static FOREGROUND_EVENT_HOOK: AtomicIsize = AtomicIsize::new(0);
+static FOCUS_EVENT_HOOK: AtomicIsize = AtomicIsize::new(0);
 /// One FIFO writer prevents rapid pause/resume toggles from completing their
 /// registry writes out of order. The sender is intentionally unbounded: a
 /// tray command must never wait for a slow `reg.exe` child.
@@ -302,24 +389,133 @@ fn to_u16_vec(s: &str) -> Vec<u16> {
     v
 }
 
+/// A development broker used by the visible browser harness must coexist with
+/// the installed broker while remaining inert outside the hook/UIA path it is
+/// measuring. Keep this an exact opt-in value so a non-empty inherited
+/// environment cannot enable it.
+#[must_use]
+fn integration_test_mode() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var(INTEGRATION_TEST_ENV).as_deref() == Ok("1"))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[must_use]
+fn broker_mutex_name() -> &'static str {
+    if integration_test_mode() {
+        INTEGRATION_TEST_MUTEX_NAME
+    } else {
+        MUTEX_NAME
+    }
+}
+
+#[must_use]
+fn broker_window_class() -> &'static str {
+    if integration_test_mode() {
+        INTEGRATION_TEST_WINDOW_CLASS
+    } else {
+        FSW_BROKER_WINDOW_CLASS
+    }
+}
+
+#[must_use]
+fn worker_window_class() -> &'static str {
+    if integration_test_mode() {
+        INTEGRATION_TEST_WORKER_WINDOW_CLASS
+    } else {
+        WORKER_WINDOW_CLASS
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IntegrationTestTarget {
+    foreground: isize,
+    pid: u32,
+}
+
+/// Test mode is never a second desktop-wide hotkey broker. The harness starts
+/// the isolated browser first, discovers its exact top-level HWND/PID, and
+/// binds this process to that one window before the hook is installed.
+#[must_use]
+fn integration_test_target() -> Option<IntegrationTestTarget> {
+    static TARGET: std::sync::OnceLock<Option<IntegrationTestTarget>> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let foreground = std::env::var(INTEGRATION_TEST_TARGET_HWND_ENV)
+            .ok()?
+            .parse::<isize>()
+            .ok()?;
+        let pid = std::env::var(INTEGRATION_TEST_TARGET_PID_ENV)
+            .ok()?
+            .parse::<u32>()
+            .ok()?;
+        (foreground != 0 && pid != 0).then_some(IntegrationTestTarget { foreground, pid })
+    })
+}
+
+#[must_use]
+fn integration_target_matches(foreground: HWND) -> bool {
+    if !integration_test_mode() {
+        return true;
+    }
+    let Some(target) = integration_test_target() else {
+        return false;
+    };
+    if foreground as isize != target.foreground {
+        return false;
+    }
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(foreground, &raw mut pid);
+    }
+    pid == target.pid
+}
+
 fn from_u16_slice(slice: &[u16]) -> String {
     let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-    std::ffi::OsString::from_wide(&slice[..len])
+    std::ffi::OsString::from_wide(slice.get(..len).unwrap_or_default())
         .to_string_lossy()
         .into_owned()
 }
 
+fn fixed_size_u32<T>() -> Option<u32> {
+    u32::try_from(std::mem::size_of::<T>()).ok()
+}
+
+fn fixed_size_i32<T>() -> Option<i32> {
+    i32::try_from(std::mem::size_of::<T>()).ok()
+}
+
+fn tray_id() -> Option<u32> {
+    u32::try_from(TRAY_ID).ok()
+}
+
+/// Copies UTF-16 text into a zero-initialized Win32 fixed buffer, reserving
+/// its final word for the mandatory terminator.
+fn copy_wide_truncated(destination: &mut [u16], source: &[u16]) {
+    let length = source.len().min(destination.len().saturating_sub(1));
+    if let (Some(destination), Some(source)) = (destination.get_mut(..length), source.get(..length))
+    {
+        destination.copy_from_slice(source);
+    }
+}
+
 fn log_diagnostic(msg: &str) {
-    if let Ok(path) = std::env::var("FSW_DIAGNOSTIC_LOG") {
-        if !path.is_empty() {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-            {
-                let _ = writeln!(f, "{msg}");
-            }
+    if let Ok(path) = std::env::var("FSW_DIAGNOSTIC_LOG")
+        && !path.is_empty()
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{msg}");
         }
     }
 }
@@ -333,40 +529,251 @@ fn signed_word(value: usize, shift: u32) -> i32 {
     i32::from(i16::from_ne_bytes(word.to_ne_bytes()))
 }
 
-fn process_name(process_id: u32) -> String {
+fn process_image(process: HANDLE) -> Option<String> {
     unsafe {
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id);
-        if process.is_null() {
-            return String::new();
-        }
-        // 1024 units, not MAX_PATH-extended: this runs behind the class check
-        // now, but it still runs on the hook thread. A path longer than the
-        // buffer fails with ERROR_INSUFFICIENT_BUFFER and is treated as an
-        // unnamed process, which classifies as Unknown — a pass-through.
         let mut image = [0u16; 1024];
-        let mut length = image.len() as u32;
-        let success = QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &mut length);
-        CloseHandle(process);
-        if success == 0 {
-            return String::new();
+        let mut length = u32::try_from(image.len()).ok()?;
+        if QueryFullProcessImageNameW(process, 0, image.as_mut_ptr(), &raw mut length) == 0 {
+            return None;
         }
-        let full_path = from_u16_slice(&image[..length as usize]);
-        Path::new(&full_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string()
+        let image = from_u16_slice(image.get(..usize::try_from(length).ok()?)?);
+        // QueryFullProcessImageNameW is bound to the process handle. Resolve
+        // it once more so comparisons are against the canonical on-disk image
+        // rather than a caller-controlled spelling of the same path.
+        Some(
+            std::fs::canonicalize(&image)
+                .ok()
+                .map_or(image.clone(), |path| path.to_string_lossy().into_owned()),
+        )
     }
+}
+
+fn package_identity(process: HANDLE) -> Option<String> {
+    unsafe {
+        let mut length = 0u32;
+        if GetPackageFamilyName(process, &raw mut length, std::ptr::null_mut())
+            != ERROR_INSUFFICIENT_BUFFER
+            || length == 0
+        {
+            return None;
+        }
+        let mut name = vec![0u16; usize::try_from(length).ok()?];
+        if GetPackageFamilyName(process, &raw mut length, name.as_mut_ptr()) != 0 {
+            return None;
+        }
+        Some(from_u16_slice(&name))
+    }
+}
+
+fn process_integrity_level(process: HANDLE) -> Option<u32> {
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &raw mut token) == 0 {
+            return None;
+        }
+        let mut bytes = 0u32;
+        let probe = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::null_mut(),
+            0,
+            &raw mut bytes,
+        );
+        if probe != 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0 {
+            CloseHandle(token);
+            return None;
+        }
+        let Ok(storage_bytes) = usize::try_from(bytes) else {
+            CloseHandle(token);
+            return None;
+        };
+        // Token information contains pointer-aligned fields. A `Vec<usize>`
+        // gives the returned `TOKEN_MANDATORY_LABEL` its required alignment.
+        let mut storage = vec![0usize; storage_bytes.div_ceil(std::mem::size_of::<usize>())];
+        if GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            storage.as_mut_ptr().cast(),
+            bytes,
+            &raw mut bytes,
+        ) == 0
+        {
+            CloseHandle(token);
+            return None;
+        }
+        let label = &*storage.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
+        let count = GetSidSubAuthorityCount(label.Label.Sid);
+        let level = if count.is_null() || *count == 0 {
+            None
+        } else {
+            let rid = GetSidSubAuthority(label.Label.Sid, u32::from(*count - 1));
+            (!rid.is_null()).then(|| *rid)
+        };
+        CloseHandle(token);
+        level
+    }
+}
+
+fn canonical_image_ends_with(image: &str, suffix: &str) -> bool {
+    image
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+        .ends_with(suffix)
+}
+
+/// Captures the process facts that make an HWND meaningful. Surface family is
+/// deliberately decided separately: known Windows surfaces use class/product
+/// recognition, while browser discovery proves the focused UIA control.
+fn attest_foreground_identity(foreground: HWND) -> Option<(u32, String, Option<String>, u32, u32)> {
+    if foreground.is_null() {
+        return None;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(foreground, &raw mut pid) };
+    if pid == 0 {
+        return None;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let image = process_image(process);
+        let package = package_identity(process);
+        let integrity_level = process_integrity_level(process);
+        CloseHandle(process);
+        let image = image?;
+        let integrity_level = integrity_level?;
+
+        let mut session_id = 0u32;
+        let mut own_session = 0u32;
+        if ProcessIdToSessionId(pid, &raw mut session_id) == 0
+            || ProcessIdToSessionId(std::process::id(), &raw mut own_session) == 0
+            || session_id != own_session
+        {
+            log_diagnostic(&format!(
+                "event=foreground_rejected pid={pid} reason=session"
+            ));
+            return None;
+        }
+
+        Some((pid, image, package, session_id, integrity_level))
+    }
+}
+
+/// True only for OS-owned Search and Start executable locations. A package
+/// family cannot be inferred from a process basename: it must be a Windows
+/// system publisher family and agree with the canonical `SystemApps` directory
+/// returned from the opened foreground PID. This permits a future Microsoft
+/// repackage of `SearchHost` without accepting a user package.
+fn trusted_windows_search_identity(image: &str, package: Option<&str>) -> bool {
+    let Some(package) = package else {
+        return false;
+    };
+    let package = package.to_ascii_lowercase();
+    let image = image.replace('/', "\\").to_ascii_lowercase();
+    let expected_directory = format!("\\windows\\systemapps\\{package}\\");
+    package.ends_with(WINDOWS_SYSTEM_PUBLISHER_ID)
+        && image.contains(&expected_directory)
+        && (image.ends_with("\\searchhost.exe") || image.ends_with("\\startmenuexperiencehost.exe"))
+}
+
+/// Search and Start are `AppContainer` UI processes and legitimately use Low
+/// IL. No other lower-integrity process is accepted. Their package and image
+/// have already been bound by [`trusted_windows_search_identity`]; accepting
+/// only Low or Medium prevents an unexpected elevated process from becoming a
+/// privileged UIA target.
+fn trusted_windows_search_integrity(level: u32) -> bool {
+    matches!(level, LOW_INTEGRITY_LEVEL | MEDIUM_INTEGRITY_LEVEL)
+}
+
+fn equal_integrity(level: u32) -> bool {
+    process_integrity_level(unsafe { GetCurrentProcess() }) == Some(level)
+}
+
+fn attest_foreground_surface(foreground: HWND) -> Option<TrustedSurface> {
+    let (pid, image, package, session_id, integrity_level) =
+        attest_foreground_identity(foreground)?;
+    let class = window_class(foreground);
+    let is_explorer_window =
+        eq_ignore_case(&class, "CabinetWClass") || eq_ignore_case(&class, "ExploreWClass");
+    let is_dialog = eq_ignore_case(&class, "#32770");
+    let is_core_window = eq_ignore_case(&class, "Windows.UI.Core.CoreWindow");
+    let kind = if is_explorer_window
+        && canonical_image_ends_with(&image, "\\windows\\explorer.exe")
+        && equal_integrity(integrity_level)
+    {
+        SurfaceKind::Explorer
+    } else if is_dialog
+        && canonical_image_ends_with(&image, "\\windows\\explorer.exe")
+        && equal_integrity(integrity_level)
+    {
+        SurfaceKind::Run
+    } else if is_dialog && equal_integrity(integrity_level) && dialog_has_path_control(foreground) {
+        SurfaceKind::CommonDialog
+    } else if is_core_window
+        && trusted_windows_search_identity(&image, package.as_deref())
+        && trusted_windows_search_integrity(integrity_level)
+    {
+        SurfaceKind::Search
+    } else if browser_window_class(&class) && equal_integrity(integrity_level) {
+        // Window family is a compatibility hint, not an identity claim.
+        // Acceptance additionally requires the attested PID/session/IL
+        // and an address control outside any web document.
+        SurfaceKind::Browser
+    } else {
+        return None;
+    };
+
+    Some(TrustedSurface {
+        kind,
+        foreground,
+        pid,
+        canonical_image: image,
+        package_identity: package,
+        session_id,
+        integrity_level,
+    })
+}
+
+/// Browser engines do not expose a stable process or top-level window class
+/// contract. Their address control, however, is discoverable through UIA.
+/// This captures the same immutable process facts as known surfaces; the
+/// caller must still prove an address bar before caching or navigating it.
+fn attest_browser_surface(foreground: HWND) -> Option<TrustedSurface> {
+    let (pid, canonical_image, package_identity, session_id, integrity_level) =
+        attest_foreground_identity(foreground)?;
+    if !equal_integrity(integrity_level) {
+        log_diagnostic(&format!(
+            "event=foreground_rejected pid={pid} reason=browser_integrity"
+        ));
+        return None;
+    }
+    Some(TrustedSurface {
+        kind: SurfaceKind::Browser,
+        foreground,
+        pid,
+        canonical_image,
+        package_identity,
+        session_id,
+        integrity_level,
+    })
 }
 
 fn window_class(window: HWND) -> String {
     unsafe {
         let mut buf = [0u16; 256];
-        let len = GetClassNameW(window, buf.as_mut_ptr(), buf.len() as i32);
+        let Ok(capacity) = i32::try_from(buf.len()) else {
+            return String::new();
+        };
+        let len = GetClassNameW(window, buf.as_mut_ptr(), capacity);
         if len <= 0 {
             return String::new();
         }
-        from_u16_slice(&buf[..len as usize])
+        usize::try_from(len)
+            .ok()
+            .and_then(|len| buf.get(..len))
+            .map_or_else(String::new, from_u16_slice)
     }
 }
 
@@ -376,14 +783,7 @@ fn window_class(window: HWND) -> String {
 fn dialog_has_path_control(dialog: HWND) -> bool {
     unsafe {
         let dui = to_u16_vec("DUIViewWndClassName");
-        if !FindWindowExW(
-            dialog,
-            std::ptr::null_mut(),
-            dui.as_ptr(),
-            std::ptr::null(),
-        )
-        .is_null()
-        {
+        if !FindWindowExW(dialog, std::ptr::null_mut(), dui.as_ptr(), std::ptr::null()).is_null() {
             return true;
         }
         !GetDlgItem(dialog, DIALOG_PATH_COMBO).is_null()
@@ -395,50 +795,6 @@ fn dialog_has_path_control(dialog: HWND) -> bool {
 /// window class — a fixed-size read of the calling process's own memory —
 /// gates everything else. Only when the class is one of the four the product
 /// supports is the process image worth an `OpenProcess`.
-fn classify_surface(foreground: HWND) -> SurfaceKind {
-    if foreground.is_null() {
-        return SurfaceKind::Unknown;
-    }
-    let class = window_class(foreground);
-    let is_browser = eq_ignore_case(&class, "CabinetWClass") || eq_ignore_case(&class, "ExploreWClass");
-    let is_dialog = eq_ignore_case(&class, "#32770");
-    let is_core_window = eq_ignore_case(&class, "Windows.UI.Core.CoreWindow");
-    if !is_browser && !is_dialog && !is_core_window {
-        return SurfaceKind::Unknown;
-    }
-
-    let mut process_id = 0u32;
-    unsafe {
-        GetWindowThreadProcessId(foreground, &mut process_id);
-    }
-    let proc = process_name(process_id);
-
-    if eq_ignore_case(&proc, "SearchHost.exe")
-        || eq_ignore_case(&proc, "SearchApp.exe")
-        || eq_ignore_case(&proc, "StartMenuExperienceHost.exe")
-    {
-        return SurfaceKind::Search;
-    }
-
-    if eq_ignore_case(&proc, "explorer.exe") {
-        if is_browser {
-            return SurfaceKind::Explorer;
-        }
-        if is_dialog {
-            return SurfaceKind::Run;
-        }
-    }
-
-    // Every Win32 dialog is a `#32770`. Claiming them all made the broker
-    // swallow Enter in Find boxes and rewrite their search text; only a
-    // dialog that actually carries a path control qualifies.
-    if is_dialog && dialog_has_path_control(foreground) {
-        return SurfaceKind::CommonDialog;
-    }
-
-    SurfaceKind::Unknown
-}
-
 fn send_virtual_key(key: u16) -> bool {
     unsafe {
         let mut inputs: [INPUT; 2] = std::mem::zeroed();
@@ -451,35 +807,44 @@ fn send_virtual_key(key: u16) -> bool {
         inputs[1].Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
         inputs[1].Anonymous.ki.dwExtraInfo = REPLAY_MARKER;
 
-        SendInput(2, inputs.as_mut_ptr(), std::mem::size_of::<INPUT>() as i32) == 2
+        fixed_size_i32::<INPUT>().is_some_and(|size| SendInput(2, inputs.as_mut_ptr(), size) == 2)
     }
 }
 
 fn replay_enter() {
+    #[cfg(test)]
+    if CAPTURE_REPLAY_ENTER.load(Ordering::Acquire) {
+        REPLAY_ENTER_CAPTURED.store(true, Ordering::Release);
+        return;
+    }
     if !send_virtual_key(VK_RETURN) {
         log_diagnostic("event=replay_enter_failed");
     }
 }
 
+#[cfg(test)]
+static CAPTURE_REPLAY_ENTER: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static REPLAY_ENTER_CAPTURED: AtomicBool = AtomicBool::new(false);
+
 fn read_focused_value(focused: &IUIAutomationElement) -> Option<String> {
     unsafe {
-        if let Ok(variant) = focused.GetCurrentPropertyValue(UIA_ValueValuePropertyId) {
-            if variant.vt() == VT_BSTR {
-                let s = variant.Anonymous.Anonymous.Anonymous.bstrVal.to_string();
-                if !s.is_empty() {
-                    return Some(s);
-                }
+        if let Ok(variant) = focused.GetCurrentPropertyValue(UIA_ValueValuePropertyId)
+            && variant.vt() == VT_BSTR
+        {
+            let s = variant.Anonymous.Anonymous.Anonymous.bstrVal.to_string();
+            if !s.is_empty() {
+                return Some(s);
             }
         }
 
         if let Ok(legacy) = focused.GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
             UIA_LegacyIAccessiblePatternId,
-        ) {
-            if let Ok(bstr) = legacy.CurrentValue() {
-                let s = bstr.to_string();
-                if !s.is_empty() {
-                    return Some(s);
-                }
+        ) && let Ok(bstr) = legacy.CurrentValue()
+        {
+            let s = bstr.to_string();
+            if !s.is_empty() {
+                return Some(s);
             }
         }
         None
@@ -534,36 +899,395 @@ fn open_resolved_path(path: &str) -> bool {
         let wide_verb = to_u16_vec("open");
         let wide_file = to_u16_vec(path);
         let mut exec: SHELLEXECUTEINFOW = std::mem::zeroed();
-        exec.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        let Some(size) = fixed_size_u32::<SHELLEXECUTEINFOW>() else {
+            return false;
+        };
+        exec.cbSize = size;
         exec.fMask = SEE_MASK_ASYNCOK | SEE_MASK_FLAG_NO_UI;
         exec.lpVerb = wide_verb.as_ptr();
         exec.lpFile = wide_file.as_ptr();
         exec.nShow = SW_SHOWNORMAL;
+        ShellExecuteExW(&raw mut exec) != 0
+    }
+}
 
-        if ShellExecuteExW(&mut exec) != 0 {
-            true
-        } else {
-            log_diagnostic(&format!("event=shell_open_failed error={}", GetLastError()));
-            false
+fn surface_is_current(surface: &TrustedSurface) -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    let current = if surface.kind == SurfaceKind::Browser {
+        attest_browser_surface(foreground)
+    } else {
+        attest_foreground_surface(foreground)
+    };
+    current.is_some_and(|current| current == *surface)
+}
+
+fn browser_window_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("Chrome_WidgetWin_1")
+        || class.eq_ignore_ascii_case("MozillaWindowClass")
+}
+
+fn address_identity(name: &str, automation_id: &str, accelerator: &str) -> (bool, bool) {
+    let id = automation_id.to_ascii_lowercase();
+    let accelerator = accelerator.to_ascii_lowercase().replace(' ', "");
+    let stable = matches!(
+        id.as_str(),
+        "addresseditbox" | "urlbar-input" | "urlbar" | "omnibox"
+    ) || matches!(accelerator.as_str(), "ctrl+l" | "alt+d");
+    let name = name.to_ascii_lowercase();
+    (
+        stable,
+        name.contains("address") || name.contains("location") || name.contains("url"),
+    )
+}
+
+fn focused_belongs_to_surface(focused: &IUIAutomationElement, surface: &TrustedSurface) -> bool {
+    let Some(automation) = AUTOMATION.with_borrow(Option::clone) else {
+        return false;
+    };
+    let Ok(walker) = (unsafe { automation.ControlViewWalker() }) else {
+        return false;
+    };
+    let mut node = focused.clone();
+    // Chromium address bars are virtual UIA elements (HWND == 0). Walk to
+    // their native ancestor while requiring the same attested PID throughout.
+    for _ in 0..32 {
+        if unsafe { node.CurrentProcessId() }
+            .ok()
+            .and_then(|pid| u32::try_from(pid).ok())
+            != Some(surface.pid)
+        {
+            return false;
+        }
+        if surface.kind == SurfaceKind::Browser
+            && unsafe { node.CurrentControlType() }.ok() == Some(UIA_DocumentControlTypeId)
+        {
+            return false;
+        }
+        let Ok(native) = (unsafe { node.CurrentNativeWindowHandle() }) else {
+            return false;
+        };
+        if !native.0.is_null() {
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(native.0, &raw mut pid) };
+            return pid == surface.pid
+                && unsafe { GetAncestor(native.0, GA_ROOT) } == surface.foreground;
+        }
+        let Ok(parent) = (unsafe { walker.GetParentElement(&node) }) else {
+            return false;
+        };
+        node = parent;
+    }
+    false
+}
+
+fn is_browser_address_bar(focused: &IUIAutomationElement) -> bool {
+    let name = unsafe { focused.CurrentName() }
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let id = unsafe { focused.CurrentAutomationId() }
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let accelerator = unsafe { focused.CurrentAcceleratorKey() }
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let (stable, named) = address_identity(&name, &id, &accelerator);
+    if !stable && !named {
+        return false;
+    }
+    let Some(automation) = AUTOMATION.with_borrow(Option::clone) else {
+        return false;
+    };
+    let Ok(walker) = (unsafe { automation.ControlViewWalker() }) else {
+        return false;
+    };
+    let Ok(pid) = (unsafe { focused.CurrentProcessId() }) else {
+        return false;
+    };
+    let mut node = focused.clone();
+    let mut toolbar = false;
+    for _ in 0..32 {
+        if unsafe { node.CurrentProcessId() }.ok() != Some(pid) {
+            return false;
+        }
+        let Ok(kind) = (unsafe { node.CurrentControlType() }) else {
+            return false;
+        };
+        if kind == UIA_DocumentControlTypeId {
+            return false;
+        }
+        toolbar |= kind == UIA_ToolBarControlTypeId;
+        if let Ok(native) = unsafe { node.CurrentNativeWindowHandle() }
+            && !native.0.is_null()
+        {
+            return stable || (named && toolbar);
+        }
+        let Ok(parent) = (unsafe { walker.GetParentElement(&node) }) else {
+            return false;
+        };
+        node = parent;
+    }
+    false
+}
+
+fn trusted_editable_value_pattern(
+    focused: &IUIAutomationElement,
+    surface: &TrustedSurface,
+) -> Option<IUIAutomationValuePattern> {
+    if !focused_belongs_to_surface(focused, surface)
+        || (surface.kind == SurfaceKind::Browser && !is_browser_address_bar(focused))
+    {
+        return None;
+    }
+    editable_value_pattern(focused)
+}
+
+fn clear_discovered_browser_surface() {
+    // The mutex serializes against `cache_discovered_browser_surface`, so the
+    // atomic must be zeroed while holding it: zeroing before the lock let a
+    // concurrent cache repopulate the pair as (stale atomic, empty mutex),
+    // which the hook read as a hit and the worker read as a miss.
+    if let Ok(mut cached) = DISCOVERED_BROWSER_SURFACE.lock() {
+        *cached = None;
+        CACHED_BROWSER_FOREGROUND.store(0, Ordering::Release);
+    }
+}
+
+fn cache_discovered_browser_surface(surface: TrustedSurface) {
+    CACHED_BROWSER_FOREGROUND.store(0, Ordering::Release);
+    if let Ok(mut cached) = DISCOVERED_BROWSER_SURFACE.lock() {
+        let foreground = surface.foreground;
+        *cached = Some(surface);
+        CACHED_BROWSER_FOREGROUND.store(foreground as isize, Ordering::Release);
+    }
+}
+
+/// Drop the fast-path publication, but only when it names this window: the
+/// cache is a single slot and clearing it unconditionally would throw away a
+/// different window's still-valid attestation.
+fn invalidate_cached_browser_surface(window: HWND) {
+    if !window.is_null() && CACHED_BROWSER_FOREGROUND.load(Ordering::Acquire) == window as isize {
+        clear_discovered_browser_surface();
+    }
+}
+
+fn cached_browser_surface(foreground: HWND) -> Option<TrustedSurface> {
+    if CACHED_BROWSER_FOREGROUND.load(Ordering::Acquire) != foreground as isize {
+        return None;
+    }
+    DISCOVERED_BROWSER_SURFACE.lock().ok().and_then(|cached| {
+        cached
+            .as_ref()
+            .filter(|surface| surface.foreground == foreground)
+            .cloned()
+    })
+}
+
+/// Worker-only probe for arbitrary browser engines. The `WinEvent` callback is
+/// intentionally limited to posting an HWND; all process/UIA calls happen
+/// here on the existing STA worker.
+fn probe_browser_surface(candidate: HWND) {
+    let foreground = unsafe { GetForegroundWindow() };
+    let root = unsafe { GetAncestor(candidate, GA_ROOT) };
+    // Every rejection below also *invalidates* (issue #122): focus moving from
+    // the omnibox to an ordinary page field is a focus event inside the very
+    // window the cache names, and leaving the entry valid there is what made
+    // the hook swallow an Enter meant for a web form.
+    if root.is_null() || root != foreground {
+        invalidate_cached_browser_surface(root);
+        return;
+    }
+    let Some(surface) = attest_browser_surface(root) else {
+        invalidate_cached_browser_surface(root);
+        return;
+    };
+    let Some(automation) = AUTOMATION.with_borrow(Option::clone) else {
+        invalidate_cached_browser_surface(root);
+        return;
+    };
+    let Ok(focused) = (unsafe { automation.GetFocusedElement() }) else {
+        invalidate_cached_browser_surface(root);
+        return;
+    };
+    if trusted_editable_value_pattern(&focused, &surface).is_some()
+        && request_control_is_current(&automation, &focused, &surface)
+    {
+        cache_discovered_browser_surface(surface);
+    } else {
+        invalidate_cached_browser_surface(root);
+    }
+}
+
+fn process_cached_browser_enter(foreground: HWND, generation: u64) {
+    // A focus event from any application can invalidate the cache between the
+    // hook's cache hit and this read, swallowing the Enter into nothing. The
+    // sink re-attests instead: when the same window is still foreground and
+    // still attests, the transaction proceeds exactly as the cached path
+    // would have; otherwise the drop is at least logged.
+    let surface = cached_browser_surface(foreground).or_else(|| {
+        let reattested = attest_foreground_surface(foreground)
+            .filter(|surface| surface.kind == SurfaceKind::Browser);
+        if reattested.is_none() {
+            log_diagnostic("event=browser_enter_dropped_cache_miss");
+        }
+        reattested
+    });
+    let Some(surface) = surface else {
+        replay_enter_for_window(foreground, generation);
+        return;
+    };
+    process_enter_request(&surface, generation);
+}
+
+unsafe extern "system" fn browser_discovery_event_proc(
+    _hook: isize,
+    _event: u32,
+    hwnd: HWND,
+    _object_id: i32,
+    _child_id: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    if hwnd.is_null() {
+        return;
+    }
+    // Only browser-engine windows can ever become a discovered surface. The
+    // desktop-wide focus stream would otherwise wake the worker (and its
+    // process/UIA probes) for every unrelated window focus change — a pure
+    // energy and CPU cost. Class comparison runs on the stack, no allocation.
+    let mut class_buf = [0u16; 64];
+    let Ok(capacity) = i32::try_from(class_buf.len()) else {
+        return;
+    };
+    let class_len = unsafe { GetClassNameW(hwnd, class_buf.as_mut_ptr(), capacity) };
+    let class_len = usize::try_from(class_len).unwrap_or(0).min(class_buf.len());
+    let is_browser_engine = {
+        let chars = class_buf.get(..class_len).unwrap_or(&[]);
+        let matches_ci = |expected: &str| {
+            expected.len() == chars.len()
+                && expected
+                    .bytes()
+                    .zip(chars)
+                    .all(|(e, c)| u8::try_from(*c).is_ok_and(|c| e.eq_ignore_ascii_case(&c)))
+        };
+        matches_ci("Chrome_WidgetWin_1") || matches_ci("MozillaWindowClass")
+    };
+    if !is_browser_engine {
+        return;
+    }
+    // Focus and foreground are asynchronous with physical input. An event from
+    // *outside* the attested window invalidates immediately; one from inside it
+    // cannot, because focus churn (caret, child element, tab switch within the
+    // same frame) would tear down the cache the hook is mid-way through using.
+    // Either way the worker re-proves the address bar, and `probe_browser_surface`
+    // invalidates when the new focus is not one (issue #122).
+    let cached = CACHED_BROWSER_FOREGROUND.load(Ordering::Acquire);
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    if cached == 0 || root.is_null() || root as isize != cached {
+        CACHED_BROWSER_FOREGROUND.store(0, Ordering::Release);
+    }
+    let worker = WORKER_WINDOW.load(Ordering::Acquire) as HWND;
+    if !worker.is_null() {
+        unsafe {
+            PostMessageW(worker, BROWSER_DISCOVERY_PROBE, hwnd as WPARAM, 0);
         }
     }
 }
 
-/// Hands a path to the worker to open. Menu commands arrive on the UI thread,
-/// which is also the hook thread, and must not sit inside `ShellExecuteExW`.
+/// Ask the worker to install or remove the `WinEvent` hooks. `SetWinEventHook`
+/// binds the hook to the calling thread's message pump, so both calls have to
+/// happen there: installing them from the thread that owns the keyboard hook
+/// turned every desktop focus change into a callback on the hook thread
+/// (issue #121).
+fn request_browser_discovery(enabled: bool) {
+    let worker = WORKER_WINDOW.load(Ordering::Acquire) as HWND;
+    if !worker.is_null() {
+        unsafe {
+            PostMessageW(worker, WORKER_SET_DISCOVERY, usize::from(enabled), 0);
+        }
+    }
+}
+
+/// Worker thread only — see [`request_browser_discovery`].
+fn install_browser_discovery() {
+    if WORKER_WINDOW.load(Ordering::Acquire) == 0
+        || FOREGROUND_EVENT_HOOK.load(Ordering::Acquire) != 0
+        || FOCUS_EVENT_HOOK.load(Ordering::Acquire) != 0
+    {
+        return;
+    }
+    let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    let foreground = unsafe {
+        set_win_event_hook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            0,
+            Some(browser_discovery_event_proc),
+            0,
+            0,
+            flags,
+        )
+    };
+    if foreground == 0 {
+        log_diagnostic("event=browser_discovery_foreground_hook_failed");
+        return;
+    }
+    let focus = unsafe {
+        set_win_event_hook(
+            EVENT_OBJECT_FOCUS,
+            EVENT_OBJECT_FOCUS,
+            0,
+            Some(browser_discovery_event_proc),
+            0,
+            0,
+            flags,
+        )
+    };
+    if focus == 0 {
+        unsafe {
+            unhook_win_event(foreground);
+        }
+        log_diagnostic("event=browser_discovery_focus_hook_failed");
+        return;
+    }
+    FOREGROUND_EVENT_HOOK.store(foreground, Ordering::Release);
+    FOCUS_EVENT_HOOK.store(focus, Ordering::Release);
+}
+
+/// Worker thread only — see [`request_browser_discovery`].
+fn remove_browser_discovery() {
+    let foreground = FOREGROUND_EVENT_HOOK.swap(0, Ordering::AcqRel);
+    let focus = FOCUS_EVENT_HOOK.swap(0, Ordering::AcqRel);
+    if foreground != 0 {
+        unsafe {
+            unhook_win_event(foreground);
+        }
+    }
+    if focus != 0 {
+        unsafe {
+            unhook_win_event(focus);
+        }
+    }
+    clear_discovered_browser_surface();
+}
+
+/// Opens only a directory or selects a file, never invoking an association.
+fn perform_navigation(action: &NavigationAction) -> bool {
+    let result = action.navigate_if(|| true);
+    if result.is_err() {
+        log_diagnostic("event=navigation_failed");
+    }
+    result.is_ok()
+}
+
+/// Post to the worker; a missing worker must never block the keyboard hook.
 fn request_open_path(path: String) {
     let worker = WORKER_WINDOW.load(Ordering::Relaxed) as HWND;
     let owned = Box::into_raw(Box::new(path));
     if !worker.is_null()
         && unsafe { PostMessageW(worker, WORKER_OPEN_PATH, 0, owned as LPARAM) } != 0
     {
-        // The worker owns the allocation now and frees it in `worker_proc`.
         return;
     }
-    // Never run ShellExecuteEx on the broker (hook-owning) thread. A null
-    // worker HWND can make PostMessageW target this thread's queue, and a WSL
-    // path can block while its distribution starts, so dropping is safer than
-    // a late inline fallback. Reclaim the ownership we could not hand over.
     drop(unsafe { Box::from_raw(owned) });
     log_diagnostic("event=worker_open_path_dropped");
     show_notification("The location could not be opened right now.", NIIF_ERROR);
@@ -572,12 +1296,9 @@ fn request_open_path(path: String) {
 fn navigate_explorer_window(
     automation: &IUIAutomation,
     focused: &IUIAutomationElement,
-    foreground: HWND,
+    surface: &TrustedSurface,
     path: &str,
 ) -> bool {
-    if !request_control_is_current(automation, focused, foreground) {
-        return false;
-    }
     unsafe {
         let Ok(shell_windows) =
             CoCreateInstance::<_, IShellWindows>(&ShellWindows, None, CLSCTX_LOCAL_SERVER)
@@ -587,38 +1308,31 @@ fn navigate_explorer_window(
         let Ok(count) = shell_windows.Count() else {
             return false;
         };
-
         for i in 0..count {
-            let item_var = VARIANT::from(i);
-            if let Ok(disp) = shell_windows.Item(&item_var) {
-                if let Ok(browser) = disp.cast::<IWebBrowser2>() {
-                    if let Ok(hwnd_num) = browser.HWND() {
-                        if hwnd_num.0 == foreground as isize {
-                            // Every call above can cross into Explorer's COM
-                            // apartment. Do not navigate a window whose focus
-                            // or foreground changed while it was answering.
-                            if !request_control_is_current(automation, focused, foreground) {
-                                return false;
-                            }
-                            let target_var = VARIANT::from(path);
-                            let empty = VARIANT::default();
-                            let res = browser.Navigate2(
-                                &target_var,
-                                Some(&empty),
-                                Some(&empty),
-                                Some(&empty),
-                                Some(&empty),
-                            );
-                            if res.is_ok() {
-                                return true;
-                            }
-                        }
-                    }
+            let item = VARIANT::from(i);
+            if let Ok(dispatch) = shell_windows.Item(&item)
+                && let Ok(browser) = dispatch.cast::<IWebBrowser2>()
+                && let Ok(hwnd) = browser.HWND()
+                && hwnd.0 == surface.foreground as isize
+            {
+                if !request_control_is_current(automation, focused, surface) {
+                    return false;
                 }
+                let target = VARIANT::from(path);
+                let empty = VARIANT::default();
+                return browser
+                    .Navigate2(
+                        &raw const target,
+                        Some(&raw const empty),
+                        Some(&raw const empty),
+                        Some(&raw const empty),
+                        Some(&raw const empty),
+                    )
+                    .is_ok();
             }
         }
-        false
     }
+    false
 }
 
 fn show_notification(message: &str, flags: u32) {
@@ -630,37 +1344,29 @@ fn show_notification(message: &str, flags: u32) {
     }
     unsafe {
         let mut icon: NOTIFYICONDATAW = std::mem::zeroed();
-        icon.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        let Some(icon_size) = fixed_size_u32::<NOTIFYICONDATAW>() else {
+            log_diagnostic("event=notification_data_size_unrepresentable");
+            return;
+        };
+        let Some(tray_id) = tray_id() else {
+            log_diagnostic("event=tray_id_unrepresentable");
+            return;
+        };
+        icon.cbSize = icon_size;
         icon.hWnd = broker_wnd;
-        icon.uID = TRAY_ID as u32;
+        icon.uID = tray_id;
         icon.uFlags = NIF_INFO;
         icon.dwInfoFlags = flags;
 
         let title = to_u16_vec("Forward Slash Windows");
         let msg_wide = to_u16_vec(message);
 
-        let title_len = title.len().min(icon.szInfoTitle.len() - 1);
-        icon.szInfoTitle[..title_len].copy_from_slice(&title[..title_len]);
+        copy_wide_truncated(&mut icon.szInfoTitle, &title);
 
-        let msg_len = msg_wide.len().min(icon.szInfo.len() - 1);
-        icon.szInfo[..msg_len].copy_from_slice(&msg_wide[..msg_len]);
+        copy_wide_truncated(&mut icon.szInfo, &msg_wide);
 
-        Shell_NotifyIconW(NIM_MODIFY, &icon);
+        Shell_NotifyIconW(NIM_MODIFY, &raw const icon);
     }
-}
-
-/// Runs on the worker thread. Everything here can block for seconds — UIA
-/// cross-process calls, a WSL bind, a shell navigation — which is why the
-/// hook thread only classifies and posts.
-fn request_window_is_current(foreground: HWND) -> bool {
-    if !request_target_is_current(foreground, unsafe { GetForegroundWindow() }) {
-        // The user moved on while this request was queued. Replaying Enter now
-        // would inject it into whatever they switched to — a half-written chat
-        // message sent, a half-typed command run. Drop it instead.
-        log_diagnostic("event=enter_dropped_foreground_changed");
-        return false;
-    }
-    true
 }
 
 #[must_use]
@@ -673,175 +1379,453 @@ fn should_swallow_enter(worker_present: bool, post_succeeded: bool) -> bool {
     worker_present && post_succeeded
 }
 
-/// UIA calls can block while the target application is busy. Do not let the
-/// request resume against a new focused field when they return: both the
-/// captured foreground window and the exact focused element must still match.
+/// Revalidate both the exact focused element and the attested foreground
+/// process after every potentially blocking UIA/native navigation preparation.
 fn request_control_is_current(
     automation: &IUIAutomation,
     focused: &IUIAutomationElement,
-    foreground: HWND,
+    surface: &TrustedSurface,
 ) -> bool {
-    if !request_window_is_current(foreground) {
+    if !request_target_is_current(surface.foreground, unsafe { GetForegroundWindow() })
+        || !surface_is_current(surface)
+    {
         return false;
     }
     let Ok(current) = (unsafe { automation.GetFocusedElement() }) else {
-        log_diagnostic("event=enter_dropped_control_changed");
         return false;
     };
-    if !unsafe { automation.CompareElements(focused, &current) }.is_ok_and(BOOL::as_bool) {
+    if !unsafe { automation.CompareElements(focused, &current) }.is_ok_and(BOOL::as_bool)
+        || !focused_belongs_to_surface(&current, surface)
+    {
         log_diagnostic("event=enter_dropped_control_changed");
         return false;
     }
-    // GetFocusedElement and CompareElements are cross-process operations too;
-    // check the owning window once more immediately before touching the field.
-    request_window_is_current(foreground)
+    // The same UIA element can change its role or writable state while a
+    // path is being resolved. Browser navigation must re-prove the complete
+    // address-bar predicate at each sink, not merely its PID/HWND ancestry.
+    if surface.kind == SurfaceKind::Browser
+        && trusted_editable_value_pattern(&current, surface).is_none()
+    {
+        log_diagnostic("event=enter_dropped_browser_control_rejected");
+        return false;
+    }
+    surface_is_current(surface)
+}
+
+/// The hook swallowed the key-down before the worker ever saw it, so a worker
+/// path that declines to translate must hand the Enter back rather than let it
+/// vanish (issue #122). Replaying into a window the user has since left would
+/// be worse than the drop, so both the foreground window and the key
+/// generation must still be the ones the hook observed.
+fn replay_enter_for_window(foreground: HWND, generation: u64) {
+    if generation == KEYDOWN_GENERATION.load(Ordering::Acquire)
+        && request_target_is_current(foreground, unsafe { GetForegroundWindow() })
+    {
+        replay_enter();
+    }
 }
 
 fn replay_enter_if_current(
     automation: &IUIAutomation,
     focused: &IUIAutomationElement,
-    foreground: HWND,
+    surface: &TrustedSurface,
 ) {
-    if request_control_is_current(automation, focused, foreground) {
+    // Returning the user's Enter does not grant permission to rewrite text.
+    // Webpage controls may belong to a renderer process and must retain their
+    // ordinary Enter behavior even though they fail the address-bar gate.
+    if !surface_is_current(surface) {
+        return;
+    }
+    let Ok(current) = (unsafe { automation.GetFocusedElement() }) else {
+        return;
+    };
+    if unsafe { automation.CompareElements(focused, &current) }.is_ok_and(BOOL::as_bool)
+        && surface_is_current(surface)
+    {
         replay_enter();
     }
 }
 
-fn process_enter_request(surface: SurfaceKind, foreground: HWND) {
-    // This check deliberately precedes the paused branch: a request queued
-    // while active must not replay Enter into a window the user selected while
-    // the worker was busy.
-    if !request_window_is_current(foreground) {
-        return;
-    }
+const BROWSER_CAPTURE_BUDGET_MS: u64 = 250;
+const BROWSER_CAPTURE_STABLE_MS: u64 = 60;
+const BROWSER_CAPTURE_MIN_SAMPLES: u32 = 3;
+const BROWSER_CAPTURE_INTERVAL_MS: u64 = 10;
 
-    if PAUSED.load(Ordering::Relaxed) {
-        // There is no captured UIA control in this branch, but foreground must
-        // still be current immediately before injecting Enter.
-        if request_window_is_current(foreground) {
-            replay_enter();
+#[derive(Debug, Default)]
+struct StableInputCapture {
+    value: Option<String>,
+    stable_since_ms: u64,
+    samples: u32,
+}
+
+impl StableInputCapture {
+    fn observe(&mut self, value: String, now_ms: u64) -> bool {
+        if self.value.as_deref() != Some(&value) {
+            self.value = Some(value);
+            self.stable_since_ms = now_ms;
+            self.samples = 1;
+            return false;
         }
-        return;
+        self.samples = self.samples.saturating_add(1);
+        self.samples >= BROWSER_CAPTURE_MIN_SAMPLES
+            && now_ms.saturating_sub(self.stable_since_ms) >= BROWSER_CAPTURE_STABLE_MS
     }
+}
 
-    if surface == SurfaceKind::Unknown {
-        if request_window_is_current(foreground) {
-            replay_enter();
+fn browser_capture_sample(
+    automation: &IUIAutomation,
+    surface: &TrustedSurface,
+    expected_profile: &str,
+    generation: u64,
+) -> Option<String> {
+    if generation != KEYDOWN_GENERATION.load(Ordering::Acquire) || !surface_is_current(surface) {
+        return None;
+    }
+    let current = unsafe { automation.GetFocusedElement() }.ok()?;
+    let process_id = u32::try_from(unsafe { current.CurrentProcessId() }.ok()?).ok()?;
+    if process_id != surface.pid || editable_value_pattern(&current).is_none() {
+        return None;
+    }
+    let browser::FocusEligibility::Eligible { profile, .. } =
+        browser::focused_field_eligibility(automation, &current, surface.foreground)
+    else {
+        return None;
+    };
+    if profile != expected_profile || !browser::plain_browser_enter_is_safe(surface.foreground) {
+        return None;
+    }
+    let value = read_focused_value(&current)?;
+    (generation == KEYDOWN_GENERATION.load(Ordering::Acquire) && surface_is_current(surface))
+        .then_some(value)
+}
+
+/// Wait without starving the worker STA (issue #126). A plain `Sleep` blocks
+/// inbound cross-apartment COM calls — which is precisely the traffic the
+/// browser's UIA provider makes back into this thread while the capture is
+/// sampling it — because those arrive as *sent* messages. A `MsgWaitFor*` wait
+/// keeps sent messages dispatched for the whole interval. It deliberately does
+/// not pump *posted* messages: a nested `PROCESS_ENTER` dispatched from inside
+/// a capture would re-enter this transaction.
+fn wait_pumping_sent_messages(ms: u64) {
+    let ms = u32::try_from(ms).unwrap_or(u32::MAX);
+    unsafe {
+        MsgWaitForMultipleObjectsEx(0, std::ptr::null(), ms, QS_SENDMESSAGE, 0);
+    }
+}
+
+fn capture_stable_browser_input(
+    automation: &IUIAutomation,
+    surface: &TrustedSurface,
+    profile: &str,
+    generation: u64,
+) -> Option<String> {
+    let started = unsafe { GetTickCount64() };
+    let mut capture = StableInputCapture::default();
+    loop {
+        let now = unsafe { GetTickCount64() };
+        let value = browser_capture_sample(automation, surface, profile, generation)?;
+        if capture.observe(value.clone(), now) {
+            let final_value = browser_capture_sample(automation, surface, profile, generation)?;
+            return (final_value == value).then_some(value);
         }
+        if now.saturating_sub(started) >= BROWSER_CAPTURE_BUDGET_MS {
+            return None;
+        }
+        // The loop's own `BROWSER_CAPTURE_BUDGET_MS` check above bounds the
+        // total time spent here regardless of how the wait returns.
+        wait_pumping_sent_messages(BROWSER_CAPTURE_INTERVAL_MS);
+    }
+}
+
+fn replay_browser_enter_if_current(
+    automation: &IUIAutomation,
+    surface: &TrustedSurface,
+    expected_profile: &str,
+    expected_value: Option<&str>,
+    generation: u64,
+) {
+    // `SetValue` is allowed to replace Chromium's virtual omnibox element.
+    // Do not reuse the capture helper here: its pre-write modifier/IME gate
+    // can observe transient post-Enter state and reject a legitimate
+    // replacement. The tested transaction binding is the replacement's
+    // profile, foreground HWND, PID, written value and key generation.
+    if !surface_is_current(surface) {
+        log_diagnostic("event=browser_enter_dropped_foreground_changed");
         return;
     }
+    let Ok(current) = (unsafe { automation.GetFocusedElement() }) else {
+        log_diagnostic("event=browser_enter_dropped_focus_unavailable");
+        return;
+    };
+    let Ok(process_id) = (unsafe { current.CurrentProcessId() }) else {
+        log_diagnostic("event=browser_enter_dropped_replacement_pid_unavailable");
+        return;
+    };
+    if u32::try_from(process_id).ok() != Some(surface.pid)
+        || editable_value_pattern(&current).is_none()
+    {
+        log_diagnostic("event=browser_enter_dropped_replacement_not_editable");
+        return;
+    }
+    let browser::FocusEligibility::Eligible { profile, .. } =
+        browser::focused_field_eligibility(automation, &current, surface.foreground)
+    else {
+        log_diagnostic("event=browser_enter_dropped_replacement_unverified");
+        return;
+    };
+    let Some(value) = read_focused_value(&current) else {
+        log_diagnostic("event=browser_enter_dropped_replacement_value_unavailable");
+        return;
+    };
+    if profile != expected_profile
+        || unsafe { GetForegroundWindow() } != surface.foreground
+        || expected_value.is_some_and(|expected| expected != value)
+        || generation != KEYDOWN_GENERATION.load(Ordering::Acquire)
+        || !surface_is_current(surface)
+    {
+        log_diagnostic("event=browser_enter_dropped_transaction_changed");
+        return;
+    }
+    replay_enter();
+}
 
+/// Browser address bars replace their UIA element after `SetValue`. This path
+/// is separate from normal shell fields: it samples the replacement, requires
+/// the same observed browser profile/PID/window, then replays the user's
+/// original Enter only if the value still matches the transaction.
+fn process_browser_enter_request(surface: &TrustedSurface, generation: u64) {
+    if generation != KEYDOWN_GENERATION.load(Ordering::Acquire) || !surface_is_current(surface) {
+        return;
+    }
     let Some(automation) = AUTOMATION.with_borrow(Option::clone) else {
-        if request_window_is_current(foreground) {
-            replay_enter();
-        }
+        replay_enter_for_window(surface.foreground, generation);
         return;
     };
-
     let Ok(focused) = (unsafe { automation.GetFocusedElement() }) else {
-        if request_window_is_current(foreground) {
-            replay_enter();
-        }
+        log_diagnostic("event=browser_enter_replayed_focus_unavailable");
+        replay_enter_for_window(surface.foreground, generation);
         return;
     };
-
-    if !request_control_is_current(&automation, &focused, foreground) {
-        return;
-    }
-
-    let Some(value_pattern) = editable_value_pattern(&focused) else {
-        log_diagnostic("event=surface_rejected");
-        replay_enter_if_current(&automation, &focused, foreground);
+    let Some(pattern) = editable_value_pattern(&focused) else {
+        // A browser window can contain ordinary webpage controls (including
+        // password fields). They are not navigation targets, but the broker
+        // already swallowed the physical Enter, so return it to the unchanged
+        // focused control rather than turning Enter into a dead key.
+        replay_enter_if_current(&automation, &focused, surface);
         return;
     };
-
-    // The value read is private input. Revalidate before reading and again
-    // after the potentially blocking UIA property calls complete.
-    if !request_control_is_current(&automation, &focused, foreground) {
-        return;
-    }
-    let Some(input) = read_focused_value(&focused) else {
-        replay_enter_if_current(&automation, &focused, foreground);
+    let browser::FocusEligibility::Eligible { family, profile } =
+        browser::focused_field_eligibility(&automation, &focused, surface.foreground)
+    else {
+        replay_enter_if_current(&automation, &focused, surface);
         return;
     };
-
-    if !request_control_is_current(&automation, &focused, foreground) {
+    if !browser::plain_browser_enter_is_safe(surface.foreground) {
+        replay_enter_if_current(&automation, &focused, surface);
         return;
     }
-
+    let Some(input) = capture_stable_browser_input(&automation, surface, profile, generation)
+    else {
+        replay_browser_enter_if_current(&automation, surface, profile, None, generation);
+        return;
+    };
     if !input.starts_with('/') {
-        replay_enter_if_current(&automation, &focused, foreground);
+        replay_browser_enter_if_current(&automation, surface, profile, Some(&input), generation);
         return;
     }
-
-    let snap = Snapshot::current();
-    let mut buf = RenderBuf::new();
-    let resolved = match resolve_user_slash_path(&input, &snap, &mut buf) {
-        Ok(r) => r,
-        Err(err) => {
-            log_diagnostic(&format!("event=path_rejected reason={}", err.name()));
-            let err_msg = format_resolve_error(err, &snap.distributions);
-            show_notification(&err_msg, NIIF_WARNING);
+    let snapshot = Snapshot::current();
+    let target = match resolve_user_target(&input, &snapshot, None) {
+        Ok(target) => target,
+        Err(_error) => {
+            // TargetError deliberately has no stable user-path diagnostic
+            // spelling. Keep the broker log categorical. The Enter is not
+            // replayed (replaying would make the browser search for the
+            // untranslated text), but the user gets an explanation instead
+            // of a dead key.
+            log_diagnostic("event=path_rejected reason=target");
+            show_notification(
+                "That path could not be resolved to a location on this machine.",
+                NIIF_WARNING,
+            );
             return;
         }
     };
-
-    log_diagnostic(if resolved.is_provider_root() {
-        "event=route_wsl_root"
-    } else if resolved.distribution().is_none() {
-        "event=route_folder"
-    } else {
-        "event=route_distribution"
-    });
-
-    // Win32 strips a trailing `.` or space from the last component — but only
-    // when it is the end of the string. ext4 allows both, so a separator is
-    // appended to keep `\\wsl.localhost\Ubuntu\tmp\dir.` addressable.
-    let resolved_display = resolved.unc_display();
-    let owned_with_separator;
-    let unc_path: &str =
-        if resolved.has_win32_normalization_hazard() && !resolved_display.ends_with('\\') {
-            log_diagnostic("event=win32_normalization_hazard");
-            owned_with_separator = format!("{resolved_display}\\");
-            &owned_with_separator
+    let Ok(file_uri) = target.file_uri() else {
+        log_diagnostic("event=browser_file_uri_rejected");
+        show_notification(
+            "That path resolves to a destination the browser cannot be given.",
+            NIIF_WARNING,
+        );
+        return;
+    };
+    // Gecko's Windows file handler uses a complete UNC path after an empty
+    // authority (RFC 8089 E.3.2). Preserve the server instead of letting it
+    // interpret an authority-form URI as a local path. Chromium and drive
+    // paths retain the resolver's existing representation and escaping.
+    let file_uri =
+        if family == browser::BrowserFamily::Gecko && target.native_path().starts_with(r"\\") {
+            file_uri.replacen("file://", "file://///", 1)
         } else {
-            resolved_display
+            file_uri
         };
+    if browser_capture_sample(&automation, surface, profile, generation).as_deref() != Some(&input)
+    {
+        log_diagnostic("event=browser_enter_dropped_prewrite_value_changed");
+        return;
+    }
+    if set_pattern_value(&pattern, &file_uri) {
+        replay_browser_enter_if_current(&automation, surface, profile, Some(&file_uri), generation);
+    } else {
+        log_diagnostic("event=browser_value_set_failed");
+        replay_browser_enter_if_current(&automation, surface, profile, Some(&input), generation);
+    }
+}
 
-    if surface == SurfaceKind::Search {
-        if !request_control_is_current(&automation, &focused, foreground) {
+/// The worker's entry point for a hook-classified Enter. Attestation lives here
+/// and not in the hook (issue #121): `OpenProcess`, `QueryFullProcessImageNameW`,
+/// `fs::canonicalize`, `GetPackageFamilyName` and two token reads are all
+/// capable of a disk stall, and a `WH_KEYBOARD_LL` callback that outruns
+/// `LowLevelHooksTimeout` is removed by Windows without notice. The hook has
+/// already swallowed the key-down, so a window that fails to attest gets its
+/// Enter back untouched.
+fn process_enter_hwnd(foreground: HWND, generation: u64) {
+    let Some(surface) = attest_foreground_surface(foreground) else {
+        log_diagnostic("event=enter_replayed_unattested");
+        replay_enter_for_window(foreground, generation);
+        return;
+    };
+    process_enter_request(&surface, generation);
+}
+
+/// Runs on the worker, keeping cross-process UIA and WSL I/O off the hook.
+fn process_enter_request(surface: &TrustedSurface, generation: u64) {
+    if surface.kind == SurfaceKind::Browser {
+        process_browser_enter_request(surface, generation);
+        return;
+    }
+    if !surface_is_current(surface) {
+        log_diagnostic("event=enter_dropped_foreground_changed");
+        return;
+    }
+    if PAUSED.load(Ordering::Relaxed) {
+        // A pause that lands between the hook's check and this one must still
+        // return the keystroke: the hook has already swallowed it (issue #122).
+        log_diagnostic("event=enter_replayed_paused");
+        replay_enter_for_window(surface.foreground, generation);
+        return;
+    }
+    let Some(automation) = AUTOMATION.with_borrow(Option::clone) else {
+        replay_enter_for_window(surface.foreground, generation);
+        return;
+    };
+    let Ok(focused) = (unsafe { automation.GetFocusedElement() }) else {
+        log_diagnostic("event=enter_replayed_focus_unavailable");
+        replay_enter_for_window(surface.foreground, generation);
+        return;
+    };
+    if !request_control_is_current(&automation, &focused, surface) {
+        replay_enter_if_current(&automation, &focused, surface);
+        return;
+    }
+    let Some(pattern) = trusted_editable_value_pattern(&focused, surface) else {
+        log_diagnostic("event=surface_rejected");
+        replay_enter_if_current(&automation, &focused, surface);
+        return;
+    };
+    let Some(input) = read_focused_value(&focused) else {
+        replay_enter_if_current(&automation, &focused, surface);
+        return;
+    };
+    if !input.starts_with('/') {
+        replay_enter_if_current(&automation, &focused, surface);
+        return;
+    }
+    let snapshot = Snapshot::current();
+    let mut buffer = RenderBuf::new();
+    let resolved = match resolve_user_slash_path(&input, &snapshot, &mut buffer) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            log_diagnostic(&format!("event=path_rejected reason={}", error.name()));
+            show_notification(
+                &format_resolve_error(error, &snapshot.distributions),
+                NIIF_WARNING,
+            );
             return;
         }
-        if !open_resolved_path(unc_path) {
+    };
+    let path = resolved.unc_display();
+    // Win32 normalization strips a trailing `.`/space on the final component
+    // outside the `\\?\` namespace, silently opening a different file (ext4
+    // allows `notes` and `notes.` side by side). A trailing separator is
+    // preserved, so appending one keeps the component the user named: the
+    // directory opens correctly and a file fails visibly instead of opening
+    // its dotless twin. Browser sinks are unaffected — file URIs carry the
+    // component percent-encoded to the provider.
+    let mut translated = path.to_string();
+    if resolved.has_win32_normalization_hazard() {
+        translated.push('\\');
+        log_diagnostic("event=win32_normalization_hazard");
+    }
+    // Windows Search and Start own their Enter: writing the UNC into the query
+    // box and replaying Enter runs a *search* for the text. The sink is a shell
+    // open plus an Escape to dismiss the flyout the user is done with.
+    if surface.kind == SurfaceKind::Search {
+        if !request_control_is_current(&automation, &focused, surface) {
+            return;
+        }
+        if !open_resolved_path(&translated) {
             show_notification("Windows could not open the location.", NIIF_ERROR);
         }
-        if request_control_is_current(&automation, &focused, foreground) {
+        if request_control_is_current(&automation, &focused, surface) {
             send_virtual_key(VK_ESCAPE);
         }
         return;
     }
-
-    if surface == SurfaceKind::Explorer
+    // The WSL provider root is a virtual Explorer location. Navigating the
+    // attested current window keeps its breadcrumb/address state synchronized
+    // with the folder view; generic PIDL opening can reuse the view while
+    // leaving the old filesystem address visible.
+    if surface.kind == SurfaceKind::Explorer
         && resolved.is_provider_root()
-        && request_control_is_current(&automation, &focused, foreground)
-        && navigate_explorer_window(&automation, &focused, foreground, unc_path)
+        && navigate_explorer_window(&automation, &focused, surface, path)
     {
         return;
     }
-
-    if request_control_is_current(&automation, &focused, foreground)
-        && set_pattern_value(&value_pattern, unc_path)
-    {
-        replay_enter_if_current(&automation, &focused, foreground);
+    // Preserve the original surface's semantics. The broker translates the
+    // physical user's text but does not decide whether the result is a file,
+    // directory, link, executable, or provider object. Windows/the browser
+    // receives the translated value and handles Enter exactly as it normally
+    // would. Security comes from authenticating and revalidating the surface,
+    // not from replacing native path traversal with a second policy engine.
+    if !request_control_is_current(&automation, &focused, surface) {
         return;
     }
+    if !set_pattern_value(&pattern, &translated) {
+        log_diagnostic("event=value_write_failed");
+    }
+    // A failed write passes the original Enter through; there is no broker-side
+    // ShellExecute fallback.
+    replay_enter_if_current(&automation, &focused, surface);
+}
 
-    if !request_control_is_current(&automation, &focused, foreground) {
-        return;
-    }
-    if !open_resolved_path(unc_path) {
-        show_notification("Windows could not open the location.", NIIF_ERROR);
-    }
+#[must_use]
+fn input_can_drive_broker(flags: u32) -> bool {
+    flags & LLKHF_LOWER_IL_INJECTED == 0
+}
+
+/// Cheap gate inside the hook: only these window classes can ever attest to a
+/// trusted surface, and reading a class is a fixed-size read of the calling
+/// process's own memory. Everything else — Notepad, terminals, games — skips
+/// the per-process identity work (an `OpenProcess`, `fs::canonicalize`, token
+/// reads) that must not run per-Enter: a low-level hook past
+/// `LowLevelHooksTimeout` is removed by Windows without notice.
+fn is_candidate_foreground_class(foreground: HWND) -> bool {
+    let class = window_class(foreground);
+    eq_ignore_case(&class, "CabinetWClass")
+        || eq_ignore_case(&class, "ExploreWClass")
+        || eq_ignore_case(&class, "#32770")
+        || eq_ignore_case(&class, "Windows.UI.Core.CoreWindow")
+        || browser_window_class(&class)
 }
 
 unsafe extern "system" fn low_level_keyboard_proc(
@@ -854,13 +1838,26 @@ unsafe extern "system" fn low_level_keyboard_proc(
     }
 
     let key = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+    let key_up = wparam == WM_KEYUP as usize
+        || wparam == WM_SYSKEYUP as usize
+        || (key.flags & LLKHF_UP) != 0;
+    // The browser worker waits briefly for an omnibox value to settle. Any
+    // later ordinary/same-integrity injected key cancels that stale request;
+    // our marked replay is excluded so it cannot cancel itself.
+    if !key_up && key.dwExtraInfo != REPLAY_MARKER {
+        KEYDOWN_GENERATION.fetch_add(1, Ordering::Release);
+    }
     if key.vkCode != u32::from(VK_RETURN) || key.dwExtraInfo == REPLAY_MARKER {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
-    let key_up = wparam == WM_KEYUP as usize
-        || wparam == WM_SYSKEYUP as usize
-        || (key.flags & LLKHF_UP) != 0;
+    // Do not let a lower-integrity process drive this medium-integrity broker.
+    // Equal-integrity accessibility tools, touch keyboards, macros, and test
+    // automation retain normal Windows input semantics; the attested HWND,
+    // PID, session, integrity and focused UIA control still gate every write.
+    if !input_can_drive_broker(key.flags) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
 
     if key_up {
         ENTER_DOWN.store(false, Ordering::Relaxed);
@@ -879,23 +1876,62 @@ unsafe extern "system" fn low_level_keyboard_proc(
     }
 
     let foreground = unsafe { GetForegroundWindow() };
+    // The E2E instance may run beside the Store-installed broker. It must
+    // never suppress or translate input outside the exact browser HWND/PID
+    // that its harness supplied before startup.
+    if !integration_target_matches(foreground) {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
     if PAUSED.load(Ordering::Relaxed) {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
-    let surface = classify_surface(foreground);
-    if surface == SurfaceKind::Unknown {
+
+    // Discovery owns the expensive process and UIA checks. The hook only
+    // consumes its atomic exact-HWND publication; the worker rechecks the
+    // complete cached TrustedSurface before it can reach a navigation sink.
+    if CACHED_BROWSER_FOREGROUND.load(Ordering::Acquire) == foreground as isize {
+        let worker = WORKER_WINDOW.load(Ordering::Relaxed) as HWND;
+        let generation = KEYDOWN_GENERATION.load(Ordering::Acquire);
+        let Ok(generation_lparam) = LPARAM::try_from(generation) else {
+            return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+        };
+        let posted = !worker.is_null()
+            && unsafe {
+                PostMessageW(
+                    worker,
+                    PROCESS_CACHED_BROWSER_ENTER,
+                    foreground as WPARAM,
+                    generation_lparam,
+                )
+            } != 0;
+        if posted {
+            SUPPRESS_ENTER_UP.store(true, Ordering::Relaxed);
+            return 1;
+        }
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    }
+    if !is_candidate_foreground_class(foreground) {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
 
-    // Everything past the classification happens on the worker: a low-level
-    // hook that takes longer than LowLevelHooksTimeout is removed by Windows
-    // without notice, and the removal is invisible to us.
+    // Everything past the class check happens on the worker — attestation
+    // included (issue #121): a low-level hook that takes longer than
+    // LowLevelHooksTimeout is removed by Windows without notice, and the
+    // removal is invisible to us. Nothing here allocates or blocks.
     let worker = WORKER_WINDOW.load(Ordering::Relaxed) as HWND;
-    // PostMessageW(NULL, ...) targets this thread's message queue and succeeds,
-    // so it is not evidence that a worker will process the request. Pass both
-    // edges through natively until a real worker window exists.
+    let generation = KEYDOWN_GENERATION.load(Ordering::Acquire);
+    let Ok(generation_lparam) = LPARAM::try_from(generation) else {
+        return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
+    };
     let posted = !worker.is_null()
-        && unsafe { PostMessageW(worker, PROCESS_ENTER, surface as usize, foreground as LPARAM) } != 0;
+        && unsafe {
+            PostMessageW(
+                worker,
+                PROCESS_ENTER,
+                foreground as WPARAM,
+                generation_lparam,
+            )
+        } != 0;
     if !should_swallow_enter(!worker.is_null(), posted) {
         return unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) };
     }
@@ -997,6 +2033,11 @@ fn disconnect_filter() {
 /// The distribution list most recently accepted by the driver.
 ///
 /// Mirrors `g_published_distributions` (`src/broker/main.cpp:54`).
+/// Whether the driver-namespace preflight rejection has already been logged.
+/// The health timer re-runs the check every tick and the verdict cannot change
+/// without user action, so it is worth exactly one line per process.
+static DRIVER_PREFLIGHT_REJECTED: AtomicBool = AtomicBool::new(false);
+
 static PUBLISHED_DISTRIBUTIONS: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
 /// The list most recently enumerated for publication, accepted or not.
@@ -1024,14 +2065,63 @@ fn ensure_filter_port() -> bool {
             std::ptr::null(),
             0,
             std::ptr::null_mut(),
-            &mut connected_port,
+            &raw mut connected_port,
         )
     };
     if hr < 0 || connected_port == INVALID_HANDLE_VALUE {
         return false;
     }
+    if !verify_filter_protocol(connected_port) {
+        unsafe {
+            CloseHandle(connected_port);
+        }
+        return false;
+    }
     FILTER_PORT.store(connected_port as isize, Ordering::Relaxed);
     true
+}
+
+/// The loaded driver reports the protocol version it speaks when a Ping
+/// carries a `ULONG` output buffer (`include/fsw_filter_protocol.h`). A
+/// mismatch means the message layout this broker compiled against is not the
+/// one the driver interprets — a publish would still "succeed" while the
+/// driver parsed different bytes, so the disagreement is logged and the
+/// connection refused instead of silently misbehaving.
+fn verify_filter_protocol(port: HANDLE) -> bool {
+    /// `size_of::<u32>()` as the `u32` the filter API takes.
+    const REPORTED_SIZE: u32 = 4;
+    const FSW_OPERATION_PING: u32 = 3;
+    let mut msg: FswMappingMessage = unsafe { std::mem::zeroed() };
+    let Some(message_size) = fixed_size_u32::<FswMappingMessage>() else {
+        log_diagnostic("event=filter_message_size_unrepresentable");
+        return false;
+    };
+    msg.version = FSW_FILTER_PROTOCOL_VERSION;
+    msg.size = message_size;
+    msg.operation = FSW_OPERATION_PING;
+    let mut reported = 0u32;
+    let mut returned = 0u32;
+    let sent = unsafe {
+        FilterSendMessage(
+            port,
+            (&raw const msg).cast(),
+            message_size,
+            (&raw mut reported).cast(),
+            REPORTED_SIZE,
+            &raw mut returned,
+        )
+    };
+    if sent >= 0 && returned == REPORTED_SIZE && reported == FSW_FILTER_PROTOCOL_VERSION {
+        return true;
+    }
+    if sent < 0 {
+        log_diagnostic("event=filter_protocol_ping_failed");
+    } else {
+        log_diagnostic(&format!(
+            "event=filter_protocol_mismatch driver_reported={reported} returned_bytes={returned}"
+        ));
+    }
+    false
 }
 
 /// Re-times the health timer. `SetTimer` with an existing id replaces the
@@ -1053,7 +2143,53 @@ fn set_health_interval(connected: bool) {
     }
 }
 
+/// Refuse to create a virtual namespace over a real filesystem object. The
+/// exact-root `symlink_metadata` call does not follow its final component, so a
+/// junction or symbolic link cannot redirect this inspection elsewhere.
+fn validate_driver_namespace_root() -> Result<(), String> {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+    match std::fs::symlink_metadata(r"C:\fwdslash") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(metadata) => {
+            let attributes = std::os::windows::fs::MetadataExt::file_attributes(&metadata);
+            if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                Err(
+                    "C:\\fwdslash is a reparse point; refusing to activate driver mappings."
+                        .to_owned(),
+                )
+            } else {
+                Err(
+                    "C:\\fwdslash already exists; refusing to shadow it with driver mappings."
+                        .to_owned(),
+                )
+            }
+        }
+        Err(error) => Err(format!(
+            "cannot inspect C:\\fwdslash without traversal ({error}); refusing to activate driver mappings."
+        )),
+    }
+}
+
 fn publish_filter_mappings(force: bool) {
+    if let Err(_reason) = validate_driver_namespace_root() {
+        // GUI subsystem: `eprintln!` went nowhere, and the health timer
+        // repeated it every tick. One category-only line per process, and
+        // never the path (issue #126).
+        if !DRIVER_PREFLIGHT_REJECTED.swap(true, Ordering::Relaxed) {
+            log_diagnostic("event=driver_namespace_rejected");
+        }
+        // A pre-existing port may still own prior mappings. Closing it invokes
+        // the driver's disconnect cleanup, so the unsafe namespace cannot
+        // remain active after a later health-timer check.
+        disconnect_filter();
+        set_health_interval(false);
+        if let Ok(mut published) = PUBLISHED_DISTRIBUTIONS.lock() {
+            *published = None;
+        }
+        return;
+    }
+
     // The connect attempt comes first: whether anything is listening decides
     // both the tick interval and whether enumerating Lxss buys anything.
     let connected = ensure_filter_port();
@@ -1112,29 +2248,46 @@ fn publish_filter_mappings(force: bool) {
     unsafe {
         let mut msg: FswMappingMessage = std::mem::zeroed();
         msg.version = FSW_FILTER_PROTOCOL_VERSION;
-        msg.size = std::mem::size_of::<FswMappingMessage>() as u32;
+        let Some(message_size) = fixed_size_u32::<FswMappingMessage>() else {
+            log_diagnostic("event=filter_message_size_unrepresentable");
+            return;
+        };
+        msg.size = message_size;
         msg.operation = FSW_OPERATION_REPLACE_MAPPINGS;
         msg.reserved = 0; // the driver requires zero; explicit, not padding luck
         msg.generation = GetTickCount64();
         let count = distributions.len().min(FSW_FILTER_MAX_DISTRIBUTIONS);
-        msg.distribution_count = count as u32;
+        let Ok(distribution_count) = u32::try_from(count) else {
+            log_diagnostic("event=distribution_count_unrepresentable");
+            return;
+        };
+        msg.distribution_count = distribution_count;
 
-        for (i, d) in distributions[..count].iter().enumerate() {
+        for (i, d) in distributions.iter().take(count).enumerate() {
             let wide = to_u16_vec(d);
-            let copy_len = wide.len().min(FSW_MAX_DISTRIBUTION_NAME - 1);
-            msg.distributions[i][..copy_len].copy_from_slice(&wide[..copy_len]);
+            if let Some(destination) = msg.distributions.get_mut(i) {
+                // A name the 128-unit slot cannot hold is published truncated,
+                // which no longer equals the registry name and can never match.
+                // Say so instead of failing silently.
+                let truncated = wide.len() >= destination.len();
+                copy_wide_truncated(destination, &wide);
+                if truncated {
+                    log_diagnostic("event=filter_distribution_name_truncated");
+                }
+            }
         }
 
         let mut returned = 0u32;
         let sent = FilterSendMessage(
             port,
             (&raw const msg).cast(),
-            std::mem::size_of::<FswMappingMessage>() as u32,
+            message_size,
             std::ptr::null_mut(),
             0,
-            &mut returned,
+            &raw mut returned,
         );
         if sent < 0 {
+            log_diagnostic("event=filter_publish_failed");
             disconnect_filter();
             return;
         }
@@ -1159,13 +2312,13 @@ fn tray_tip() -> &'static str {
     }
 }
 
-fn tray_icon_data(window: HWND) -> NOTIFYICONDATAW {
+fn tray_icon_data(window: HWND) -> Option<NOTIFYICONDATAW> {
     unsafe {
         let mut icon: NOTIFYICONDATAW = std::mem::zeroed();
-        icon.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        icon.cbSize = fixed_size_u32::<NOTIFYICONDATAW>()?;
         icon.hWnd = window;
-        icon.uID = TRAY_ID as u32;
-        icon
+        icon.uID = tray_id()?;
+        Some(icon)
     }
 }
 
@@ -1176,17 +2329,25 @@ fn tray_icon_data(window: HWND) -> NOTIFYICONDATAW {
 /// unchecked add costs the user the icon, the menu and every balloon for the
 /// whole session, so the result drives `ICON_ADDED` and the health-timer retry.
 fn add_tray_icon(window: HWND) -> bool {
+    if integration_test_mode() {
+        return false;
+    }
     unsafe {
-        let mut icon = tray_icon_data(window);
+        let Some(mut icon) = tray_icon_data(window) else {
+            log_diagnostic("event=tray_icon_data_unrepresentable");
+            return false;
+        };
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = TRAY_MESSAGE;
-        icon.hIcon = LoadIconW(GetModuleHandleW(std::ptr::null()), IDI_FSW_APP as *const u16);
+        icon.hIcon = LoadIconW(
+            GetModuleHandleW(std::ptr::null()),
+            IDI_FSW_APP as *const u16,
+        );
 
         let tip = to_u16_vec(tray_tip());
-        let tip_len = tip.len().min(icon.szTip.len() - 1);
-        icon.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);
+        copy_wide_truncated(&mut icon.szTip, &tip);
 
-        if Shell_NotifyIconW(NIM_ADD, &icon) == 0 {
+        if Shell_NotifyIconW(NIM_ADD, &raw const icon) == 0 {
             ICON_ADDED.store(false, Ordering::Relaxed);
             log_diagnostic("event=tray_icon_add_failed");
             return false;
@@ -1196,15 +2357,21 @@ fn add_tray_icon(window: HWND) -> bool {
         // Version 4 only after the icon exists: it is a property of an icon
         // the shell already knows about.
         icon.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &icon);
+        Shell_NotifyIconW(NIM_SETVERSION, &raw const icon);
         true
     }
 }
 
 fn remove_tray_icon(window: HWND) {
+    if integration_test_mode() {
+        return;
+    }
     unsafe {
-        let icon = tray_icon_data(window);
-        Shell_NotifyIconW(NIM_DELETE, &icon);
+        let Some(icon) = tray_icon_data(window) else {
+            log_diagnostic("event=tray_icon_data_unrepresentable");
+            return;
+        };
+        Shell_NotifyIconW(NIM_DELETE, &raw const icon);
     }
     ICON_ADDED.store(false, Ordering::Relaxed);
 }
@@ -1216,18 +2383,23 @@ fn ensure_tray_icon(window: HWND) {
     }
 }
 
-/// Re-announces the tooltip (NIM_MODIFY) without touching the icon itself.
+/// Re-announces the tooltip (`NIM_MODIFY`) without touching the icon itself.
 fn update_tray_tooltip(window: HWND) {
+    if integration_test_mode() {
+        return;
+    }
     if !ICON_ADDED.load(Ordering::Relaxed) {
         return;
     }
     unsafe {
-        let mut icon = tray_icon_data(window);
+        let Some(mut icon) = tray_icon_data(window) else {
+            log_diagnostic("event=tray_icon_data_unrepresentable");
+            return;
+        };
         icon.uFlags = NIF_TIP;
         let tip = to_u16_vec(tray_tip());
-        let tip_len = tip.len().min(icon.szTip.len() - 1);
-        icon.szTip[..tip_len].copy_from_slice(&tip[..tip_len]);
-        Shell_NotifyIconW(NIM_MODIFY, &icon);
+        copy_wide_truncated(&mut icon.szTip, &tip);
+        Shell_NotifyIconW(NIM_MODIFY, &raw const icon);
     }
 }
 
@@ -1237,9 +2409,8 @@ fn update_tray_tooltip(window: HWND) {
 /// restart would leave the resident broker with no tray icon at all.
 fn taskbar_created_message() -> u32 {
     static TASKBAR_CREATED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *TASKBAR_CREATED.get_or_init(|| unsafe {
-        RegisterWindowMessageW(to_u16_vec("TaskbarCreated").as_ptr())
-    })
+    *TASKBAR_CREATED
+        .get_or_init(|| unsafe { RegisterWindowMessageW(to_u16_vec("TaskbarCreated").as_ptr()) })
 }
 
 /// Drains pause writes in submission order on one background thread.
@@ -1262,7 +2433,7 @@ fn report_persist_failure() {
     }
 }
 
-fn drain_persist_queue<F>(receiver: mpsc::Receiver<bool>, mut persist: F)
+fn drain_persist_queue<F>(receiver: &mpsc::Receiver<bool>, mut persist: F)
 where
     F: FnMut(bool),
 {
@@ -1271,7 +2442,7 @@ where
     }
 }
 
-fn persist_worker_main(receiver: mpsc::Receiver<bool>) {
+fn persist_worker_main(receiver: &mpsc::Receiver<bool>) {
     drain_persist_queue(receiver, |disabled| {
         let failed = persist_disabled(disabled).is_err();
         PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
@@ -1291,17 +2462,17 @@ fn request_persist_disabled(disabled: bool) {
     };
     if queue.is_none() {
         let (sender, receiver) = mpsc::channel();
-        match std::thread::Builder::new()
+        if let Ok(handle) = std::thread::Builder::new()
             .name("fsw-persist".to_owned())
-            .spawn(move || persist_worker_main(receiver))
+            .spawn(move || persist_worker_main(&receiver))
         {
-            Ok(_) => *queue = Some(sender),
-            Err(_) => {
-                PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
-                log_diagnostic("event=persist_queue_start_failed");
-                report_persist_failure();
-                return;
-            }
+            drop(handle);
+            *queue = Some(sender);
+        } else {
+            PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+            log_diagnostic("event=persist_queue_start_failed");
+            report_persist_failure();
+            return;
         }
     }
     let Some(sender) = queue.as_ref() else { return };
@@ -1384,8 +2555,21 @@ fn run_cli_bounded(cli: &Path, args: &[&str], timeout: std::time::Duration) -> O
 /// once the recorded version already matches, so racing a manual enable from
 /// the settings app costs at worst a redundant reinstall.
 fn run_adapter_upgrade(cli: &Path, id: &str) -> Option<i32> {
-    run_cli_bounded(cli, &["integration", id, "enable"], ADAPTER_UPGRADE_TIMEOUT)
+    // `--background`: this sweep may swap the %LOCALAPPDATA% payload, which is
+    // the whole upgrade now, but must never write the user's PowerShell profile
+    // under Documents — Controlled Folder Access guards it, and a blocked write
+    // used to fail silently (#127).
+    run_cli_bounded(
+        cli,
+        &["integration", id, "enable", "--background"],
+        ADAPTER_UPGRADE_TIMEOUT,
+    )
 }
+
+/// `fwdslash integration <id> enable` exit codes the sweep treats specially,
+/// mirrored from `crates/fsw-cli/src/adapters/mod.rs` (#127).
+const ADAPTER_EXIT_NEEDS_CONFIRMATION: i32 = 4;
+const ADAPTER_EXIT_BLOCKED: i32 = 5;
 
 /// Runs one `fwdslash repair-adapters` to completion, bounded by
 /// [`ADAPTER_UPGRADE_TIMEOUT`]. Fire-and-forget: a repair that fails or times
@@ -1422,9 +2606,15 @@ enum AdapterOutcome {
     /// again. Silent by design: nothing the user does changes this.
     Deferred,
     /// The CLI ran and refused. A third-party-modified profile, a missing
-    /// `pwsh.exe`, a Controlled Folder Access block — the failures that stay
-    /// failed until somebody acts.
+    /// `pwsh.exe` — the failures that stay failed until somebody acts.
     NeedsUser,
+    /// The payload is current, but the profile carries a block only the user
+    /// may authorise rewriting (#127). Nothing is broken: the deployed block
+    /// keeps working until they confirm.
+    NeedsConfirmation,
+    /// A profile write was refused — Controlled Folder Access is the usual
+    /// cause, and naming it is the whole point (#127).
+    Blocked,
 }
 
 /// Classifies one adapter from its two attempts' exit codes (issue #56).
@@ -1439,11 +2629,21 @@ fn adapter_outcome(first: Option<i32>, retry: Option<i32>) -> AdapterOutcome {
     if first == Some(0) {
         return AdapterOutcome::Upgraded;
     }
+    // A refusal a person has to act on is the same on both attempts; retrying
+    // it changes nothing, so the first answer stands.
+    if let Some(ADAPTER_EXIT_NEEDS_CONFIRMATION) = first {
+        return AdapterOutcome::NeedsConfirmation;
+    }
+    if let Some(ADAPTER_EXIT_BLOCKED) = first {
+        return AdapterOutcome::Blocked;
+    }
     match retry {
         Some(0) => AdapterOutcome::Upgraded,
         // Two attempts, neither of which the CLI answered: transient by every
         // available signal. Balloon nothing.
         None => AdapterOutcome::Deferred,
+        Some(ADAPTER_EXIT_NEEDS_CONFIRMATION) => AdapterOutcome::NeedsConfirmation,
+        Some(ADAPTER_EXIT_BLOCKED) => AdapterOutcome::Blocked,
         Some(_) => AdapterOutcome::NeedsUser,
     }
 }
@@ -1537,6 +2737,8 @@ fn adapter_upgrade_sweep() {
     if !outdated.is_empty() {
         let mut upgraded: Vec<&'static str> = Vec::new();
         let mut needs_user = false;
+        let mut needs_confirmation = false;
+        let mut blocked = false;
         for (id, label) in outdated {
             let first = run_adapter_upgrade(&cli, id);
             // One retry, after a pause (issue #56). Right after an MSIX update
@@ -1544,7 +2746,10 @@ fn adapter_upgrade_sweep() {
             // a console still holding the old payload's `fwdslash.exe`, a copy
             // out of `WindowsApps` competing with the package still being
             // staged.
-            let retry = if first == Some(0) {
+            let retry = if first == Some(0)
+                || first == Some(ADAPTER_EXIT_NEEDS_CONFIRMATION)
+                || first == Some(ADAPTER_EXIT_BLOCKED)
+            {
                 None
             } else {
                 log_diagnostic("event=adapter_upgrade_retry");
@@ -1561,17 +2766,40 @@ fn adapter_upgrade_sweep() {
                     log_diagnostic("event=adapter_upgrade_failed");
                     needs_user = true;
                 }
+                AdapterOutcome::NeedsConfirmation => {
+                    log_diagnostic("event=adapter_upgrade_needs_confirmation");
+                    needs_confirmation = true;
+                }
+                AdapterOutcome::Blocked => {
+                    log_diagnostic("event=adapter_upgrade_blocked");
+                    blocked = true;
+                }
             }
         }
 
         // Exactly one balloon, whatever the mix: a per-adapter notification
         // would stack three toasts on top of a logon the user did not ask
         // about. A deferral alone is silent — it retries itself.
-        if needs_user {
+        if blocked {
+            notify_when_icon_ready(
+                "Windows Controlled Folder Access blocked an update to your PowerShell profile. \
+                 Allow Forward Slash Windows through it under Windows Security, or turn the \
+                 PowerShell integration off.",
+                NIIF_WARNING,
+            );
+        } else if needs_user {
             notify_when_icon_ready(
                 "Some terminal integrations could not be updated automatically. \
                  Open Settings and choose Repair integrations.",
                 NIIF_WARNING,
+            );
+        } else if needs_confirmation {
+            // Not a failure: the deployed block still works. It is a change to
+            // a file under Documents, which only the user may authorise (#127).
+            notify_when_icon_ready(
+                "The PowerShell integration needs a change you must confirm. Open Settings and \
+                 turn the PowerShell integration off and on again to apply it.",
+                NIIF_INFO,
             );
         } else if !upgraded.is_empty() {
             notify_when_icon_ready(
@@ -1676,7 +2904,7 @@ fn update_cycle_due(running: bool, age_ms: u64, worker_busy: bool, allowed: bool
 fn should_balloon_update(tag: Option<&str>, notified: Option<&str>) -> bool {
     match (tag, notified) {
         (Some(current), Some(last)) => current != last,
-        (Some(_), None) | (None, None) => true,
+        (Some(_) | None, None) => true,
         (None, Some(_)) => false,
     }
 }
@@ -1768,7 +2996,10 @@ fn update_cycle() {
             let failures = UPDATE_INSTALL_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
             log_diagnostic("event=update_cycle_failed");
             if should_balloon_install_failure(failures, is_store_flavor()) {
-                notify_update_once("fwdslash could not update itself automatically.", NIIF_WARNING);
+                notify_update_once(
+                    "fwdslash could not update itself automatically.",
+                    NIIF_WARNING,
+                );
             }
         }
         // 0 (install started), 10 (deferred — a settings window is open, or
@@ -1789,10 +3020,8 @@ fn maybe_start_update_cycle() {
         BROKER_START_MS.load(Ordering::Relaxed),
         LAST_UPDATE_TICK_MS.load(Ordering::Relaxed),
     );
-    let allowed = update::update_check_allowed(
-        has_package_identity(),
-        update::read_auto_update_enabled(),
-    );
+    let allowed =
+        update::update_check_allowed(has_package_identity(), update::read_auto_update_enabled());
     if !update_cycle_due(
         UPDATE_RUNNING.load(Ordering::Acquire),
         age,
@@ -1828,6 +3057,10 @@ fn maybe_start_update_cycle() {
 /// somebody else and writing it again would be a loop.
 fn apply_paused(paused: bool) -> bool {
     PAUSED.store(paused, Ordering::Relaxed);
+    // A paused broker must be inert: leaving discovery armed kept two
+    // desktop-wide WinEvent hooks running and kept calling GetFocusedElement
+    // on the user's browser (issue #122).
+    request_browser_discovery(!paused);
     if paused {
         remove_hook();
         true
@@ -1926,14 +3159,21 @@ fn open_settings_section(section: &str) {
         let wide_arg = to_u16_vec(&arg);
 
         let mut exec: SHELLEXECUTEINFOW = std::mem::zeroed();
-        exec.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        let Some(exec_size) = fixed_size_u32::<SHELLEXECUTEINFOW>() else {
+            show_notification(
+                "The WinUI settings application could not be opened.",
+                NIIF_ERROR,
+            );
+            return;
+        };
+        exec.cbSize = exec_size;
         exec.fMask = SEE_MASK_FLAG_NO_UI;
         exec.lpVerb = wide_verb.as_ptr();
         exec.lpFile = wide_file.as_ptr();
         exec.lpParameters = wide_arg.as_ptr();
         exec.nShow = SW_SHOWNORMAL;
 
-        if ShellExecuteExW(&mut exec) == 0 {
+        if ShellExecuteExW(&raw mut exec) == 0 {
             show_notification(
                 "The WinUI settings application could not be opened.",
                 NIIF_ERROR,
@@ -1954,7 +3194,7 @@ fn build_distributions_menu() -> windows_sys::Win32::UI::WindowsAndMessaging::HM
             AppendMenuW(submenu, MF_STRING | MF_GRAYED, 0, s_none.as_ptr());
         }
     } else {
-        for (index, name) in distributions[..listed].iter().enumerate() {
+        for (index, name) in distributions.iter().take(listed).enumerate() {
             let label = to_u16_vec(name);
             let id = MENU_DISTRO_BASE as usize + index;
             unsafe {
@@ -2089,10 +3329,11 @@ fn handle_menu_command(window: HWND, id: u32) {
             DestroyWindow(window);
         },
         _ => {
-            if let Some(index) = id.checked_sub(MENU_DISTRO_BASE) {
-                if (index as usize) < MENU_DISTRO_MAX {
-                    open_menu_distribution(index as usize);
-                }
+            if let Some(index) = id.checked_sub(MENU_DISTRO_BASE)
+                && let Ok(index) = usize::try_from(index)
+                && index < MENU_DISTRO_MAX
+            {
+                open_menu_distribution(index);
             }
         }
     }
@@ -2124,6 +3365,7 @@ fn health_tick(window: HWND) {
 /// An unbounded join would keep a ghost icon on screen for as long as the bind
 /// takes, so a worker that misses the deadline is detached on purpose.
 fn stop_worker() {
+    // The worker unhooks its own WinEvent hooks as it leaves `pump_messages`.
     let thread_id = WORKER_THREAD.swap(0, Ordering::Relaxed);
     if thread_id == 0 {
         return;
@@ -2192,7 +3434,28 @@ unsafe extern "system" fn worker_proc(
             // force-closes the package while this handler is mid-rewrite would
             // take the user's keystroke down with it.
             let _busy = WorkerBusy::mark();
-            process_enter_request(SurfaceKind::from_wparam(wparam), lparam as HWND);
+            if let Ok(generation) = u64::try_from(lparam) {
+                process_enter_hwnd(wparam as HWND, generation);
+            }
+            0
+        }
+        PROCESS_CACHED_BROWSER_ENTER => {
+            let _busy = WorkerBusy::mark();
+            if let Ok(generation) = u64::try_from(lparam) {
+                process_cached_browser_enter(wparam as HWND, generation);
+            }
+            0
+        }
+        BROWSER_DISCOVERY_PROBE => {
+            probe_browser_surface(wparam as HWND);
+            0
+        }
+        WORKER_SET_DISCOVERY => {
+            if wparam == 0 {
+                remove_browser_discovery();
+            } else {
+                install_browser_discovery();
+            }
             0
         }
         WORKER_OPEN_PATH => {
@@ -2203,7 +3466,7 @@ unsafe extern "system" fn worker_proc(
             if lparam != 0 {
                 // Ownership was handed over by `request_open_path`.
                 let path = unsafe { Box::from_raw(lparam as *mut String) };
-                if !open_resolved_path(&path) {
+                if !perform_navigation(&NavigationAction::OpenDirectory((*path).clone())) {
                     show_notification("Windows could not open the location.", NIIF_ERROR);
                 }
             }
@@ -2213,6 +3476,7 @@ unsafe extern "system" fn worker_proc(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 unsafe extern "system" fn window_proc(
     window: HWND,
     message: u32,
@@ -2234,27 +3498,36 @@ unsafe extern "system" fn window_proc(
         // Replies with the resulting `BrokerState` (Active=1 / Paused=2), or 0
         // when the request could not be honoured. The old unconditional 1 made
         // a failed resume indistinguishable from a successful one.
+        FSW_WM_SET_PAUSED if integration_test_mode() => BrokerState::Active as isize,
         FSW_WM_SET_PAUSED => match set_paused(wparam != 0) {
             Ok(state) => state as isize,
             Err(()) => 0,
         },
         FSW_WM_SHOW_SETTINGS => {
-            open_settings_section("general");
-            1
+            if integration_test_mode() {
+                0
+            } else {
+                open_settings_section("general");
+                1
+            }
         }
         PERSIST_FAILED => {
-            show_notification("The pause setting could not be saved.", NIIF_ERROR);
+            if !integration_test_mode() {
+                show_notification("The pause setting could not be saved.", NIIF_ERROR);
+            }
             0
         }
         WM_TIMER => {
-            if wparam == HEALTH_TIMER {
+            if !integration_test_mode() && wparam == HEALTH_TIMER {
                 health_tick(window);
             }
             0
         }
         message if message == taskbar_created_message() => {
-            ICON_ADDED.store(false, Ordering::Relaxed);
-            add_tray_icon(window);
+            if !integration_test_mode() {
+                ICON_ADDED.store(false, Ordering::Relaxed);
+                add_tray_icon(window);
+            }
             0
         }
         // Somebody changed shared state (issue #55). It is a broadcast, so it
@@ -2264,7 +3537,9 @@ unsafe extern "system" fn window_proc(
         // `message != 0` because a failed registration answers 0, and 0 is
         // WM_NULL — which arrives whenever anything probes this window.
         message if message != 0 && message == state_changed_message() => {
-            reload_settings(window);
+            if !integration_test_mode() {
+                reload_settings(window);
+            }
             0
         }
         // Session end: Windows destroys the window without WM_DESTROY running
@@ -2275,10 +3550,15 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_COMMAND => {
-            handle_menu_command(window, u32::try_from(wparam & 0xFFFF).unwrap_or(0));
+            if !integration_test_mode() {
+                handle_menu_command(window, u32::try_from(wparam & 0xFFFF).unwrap_or(0));
+            }
             0
         }
         TRAY_MESSAGE => {
+            if integration_test_mode() {
+                return 0;
+            }
             // NOTIFYICON_VERSION_4: the notification is the low word of
             // lParam and the anchor point rides in wParam.
             let event = u32::try_from(lparam & 0xFFFF).unwrap_or(0);
@@ -2295,7 +3575,7 @@ unsafe extern "system" fn window_proc(
                     // where wParam is the icon id and not a point.
                     let mut cursor: POINT = unsafe { std::mem::zeroed() };
                     unsafe {
-                        GetCursorPos(&mut cursor);
+                        GetCursorPos(&raw mut cursor);
                     }
                     show_tray_menu(window, cursor);
                 }
@@ -2331,7 +3611,7 @@ fn format_resolve_error(err: fsw_path::ResolveError, distributions: &[String]) -
     if err.hint_lists_distributions() && !distributions.is_empty() {
         message.push_str(" Try ");
         let count = distributions.len().min(3);
-        for (idx, d) in distributions[..count].iter().enumerate() {
+        for (idx, d) in distributions.iter().take(count).enumerate() {
             if idx != 0 {
                 message.push_str(", ");
             }
@@ -2349,14 +3629,18 @@ fn register_window_class(name: &[u16], proc: WNDPROC, icon: HICON) -> bool {
     unsafe {
         let instance = GetModuleHandleW(std::ptr::null());
         let mut wc: WNDCLASSEXW = std::mem::zeroed();
-        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
+        let Some(class_size) = fixed_size_u32::<WNDCLASSEXW>() else {
+            log_diagnostic("event=window_class_size_unrepresentable");
+            return false;
+        };
+        wc.cbSize = class_size;
         wc.lpfnWndProc = proc;
         wc.hInstance = instance;
         wc.hIcon = icon;
         wc.hIconSm = icon;
         wc.hCursor = LoadCursorW(std::ptr::null_mut(), IDC_ARROW);
         wc.lpszClassName = name.as_ptr();
-        RegisterClassExW(&wc) != 0
+        RegisterClassExW(&raw const wc) != 0
     }
 }
 
@@ -2382,7 +3666,7 @@ fn worker_thread_main(ready: &std::sync::mpsc::SyncSender<()>) {
             return;
         }
 
-        let class_name = to_u16_vec(WORKER_WINDOW_CLASS);
+        let class_name = to_u16_vec(worker_window_class());
         if !register_window_class(&class_name, Some(worker_proc), std::ptr::null_mut()) {
             CoUninitialize();
             let _ = ready.send(());
@@ -2419,10 +3703,18 @@ fn worker_thread_main(ready: &std::sync::mpsc::SyncSender<()>) {
 
         WORKER_THREAD.store(GetCurrentThreadId(), Ordering::Relaxed);
         WORKER_WINDOW.store(worker_wnd as isize, Ordering::Release);
+        // Installed here, not from the UI thread: `SetWinEventHook` delivers
+        // its out-of-context callbacks on the installing thread's pump, and
+        // that must not be the thread that owns the keyboard hook (issue #121).
+        if !PAUSED.load(Ordering::Relaxed) {
+            install_browser_discovery();
+        }
         let _ = ready.send(());
 
         pump_messages();
 
+        // `UnhookWinEvent` is only valid from the installing thread.
+        remove_browser_discovery();
         WORKER_WINDOW.store(0, Ordering::Release);
         AUTOMATION.with_borrow_mut(|slot| *slot = None);
         DestroyWindow(worker_wnd);
@@ -2450,7 +3742,14 @@ fn start_worker() {
 
 fn main() {
     unsafe {
-        let wide_mutex = to_u16_vec(MUTEX_NAME);
+        let integration_test = integration_test_mode();
+        // A malformed test invocation must be inert rather than installing a
+        // second desktop-wide hook.
+        if integration_test && integration_test_target().is_none() {
+            log_diagnostic("event=integration_test_target_missing");
+            return;
+        }
+        let wide_mutex = to_u16_vec(broker_mutex_name());
         let mutex = CreateMutexW(std::ptr::null_mut(), 0, wide_mutex.as_ptr());
         if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
             if !mutex.is_null() {
@@ -2464,8 +3763,13 @@ fn main() {
             return;
         }
 
+        // No EcoQoS here (issue #121). This process owns a WH_KEYBOARD_LL
+        // hook, and a hook callback that outruns `LowLevelHooksTimeout` is
+        // removed by Windows silently: asking the scheduler to prefer
+        // efficiency cores for the thread that runs it trades a latency budget
+        // we do not control for power we do not measure.
         let instance = GetModuleHandleW(std::ptr::null());
-        let class_name = to_u16_vec(FSW_BROKER_WINDOW_CLASS);
+        let class_name = to_u16_vec(broker_window_class());
         let icon = LoadIconW(instance, IDI_FSW_APP as *const u16);
         if !register_window_class(&class_name, Some(window_proc), icon) {
             CoUninitialize();
@@ -2504,22 +3808,34 @@ fn main() {
 
         BROKER_WINDOW.store(broker_wnd as isize, Ordering::Relaxed);
         // Paused state first: the tray tooltip reflects it at NIM_ADD time.
-        PAUSED.store(is_disabled(), Ordering::Relaxed);
-        add_tray_icon(broker_wnd);
+        PAUSED.store(
+            if integration_test {
+                false
+            } else {
+                is_disabled()
+            },
+            Ordering::Relaxed,
+        );
+        if !integration_test {
+            add_tray_icon(broker_wnd);
+        }
         // The worker has to exist before the hook does, or the first Enter is
         // classified with nowhere to post it.
+        // The worker installs browser discovery itself, on its own pump.
         start_worker();
         let hook_installed = PAUSED.load(Ordering::Relaxed) || install_hook();
-        update_tray_tooltip(broker_wnd);
-        let start_tick = GetTickCount64();
-        LAST_MAINTENANCE_MS.store(start_tick, Ordering::Relaxed);
-        // The update cycle measures its first delay from here, not from boot.
-        BROKER_START_MS.store(start_tick, Ordering::Relaxed);
-        SetTimer(broker_wnd, HEALTH_TIMER, HEALTH_INTERVAL_IDLE_MS, None);
-        // Switches the timer to 5 s if a driver actually answers.
-        publish_filter_mappings(true);
+        if !integration_test {
+            update_tray_tooltip(broker_wnd);
+            let start_tick = GetTickCount64();
+            LAST_MAINTENANCE_MS.store(start_tick, Ordering::Relaxed);
+            // The update cycle measures its first delay from here, not from boot.
+            BROKER_START_MS.store(start_tick, Ordering::Relaxed);
+            SetTimer(broker_wnd, HEALTH_TIMER, HEALTH_INTERVAL_IDLE_MS, None);
+            // Switches the timer to 5 s if a driver actually answers.
+            publish_filter_mappings(true);
+        }
 
-        if !hook_installed {
+        if !hook_installed && !integration_test {
             show_notification(
                 "The shell keyboard hook could not be installed.",
                 NIIF_ERROR,
@@ -2528,7 +3844,9 @@ fn main() {
 
         // Last, and off this thread: the icon and the hook are what the user
         // notices missing, and the sweep may take minutes.
-        start_adapter_upgrade();
+        if !integration_test {
+            start_adapter_upgrade();
+        }
 
         pump_messages();
 
@@ -2548,6 +3866,311 @@ fn main() {
 // the user is typing in an address bar.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_identity_is_independent_of_localized_labels() {
+        assert_eq!(super::address_identity("", "", "Ctrl+L"), (true, false));
+        assert_eq!(
+            super::address_identity("", "urlbar-input", ""),
+            (true, false)
+        );
+        assert_eq!(
+            super::address_identity("Search this page", "", ""),
+            (false, false)
+        );
+        assert!(super::browser_window_class("Chrome_WidgetWin_1"));
+        assert!(super::browser_window_class("MozillaWindowClass"));
+        assert!(!super::browser_window_class("WindowsForms10.Window"));
+    }
+
+    #[test]
+    fn only_exact_system_search_or_start_identities_may_cross_integrity() {
+        let search_image =
+            r"\\?\C:\Windows\SystemApps\Microsoft.Windows.Search_cw5n1h2txyewy\SearchHost.exe";
+        let current_search_image =
+            r"C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe";
+        let start_image = r"C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe";
+
+        assert!(super::trusted_windows_search_identity(
+            search_image,
+            Some("Microsoft.Windows.Search_cw5n1h2txyewy")
+        ));
+        assert!(super::trusted_windows_search_identity(
+            start_image,
+            Some("MICROSOFT.WINDOWS.STARTMENUEXPERIENCEHOST_CW5N1H2TXYEWY")
+        ));
+        assert!(super::trusted_windows_search_identity(
+            current_search_image,
+            Some("MicrosoftWindows.Client.CBS_cw5n1h2txyewy")
+        ));
+        assert!(!super::trusted_windows_search_identity(
+            r"C:\Users\attacker\SearchHost.exe",
+            Some("Microsoft.Windows.Search_cw5n1h2txyewy")
+        ));
+        assert!(!super::trusted_windows_search_identity(
+            search_image,
+            Some("Contoso.Windows.Search_cw5n1h2txyewy")
+        ));
+        assert!(!super::trusted_windows_search_identity(search_image, None));
+        assert!(super::trusted_windows_search_integrity(0x1000));
+        assert!(super::trusted_windows_search_integrity(0x2000));
+        assert!(!super::trusted_windows_search_integrity(0x3000));
+    }
+
+    #[test]
+    #[ignore = "requires FSW_SEARCH_TEST_HWND for a real Windows Search or Start surface"]
+    fn real_search_surface_is_attested() -> Result<(), Box<dyn std::error::Error>> {
+        let hwnd = std::env::var("FSW_SEARCH_TEST_HWND")?.parse::<isize>()? as super::HWND;
+        let surface = super::attest_foreground_surface(hwnd)
+            .ok_or("Search/Start surface was not attested")?;
+        if surface.kind != super::SurfaceKind::Search {
+            return Err("foreground surface was not classified as Windows Search or Start".into());
+        }
+        if !super::trusted_windows_search_identity(
+            &surface.canonical_image,
+            surface.package_identity.as_deref(),
+        ) || !super::trusted_windows_search_integrity(surface.integrity_level)
+        {
+            return Err("Search/Start surface lost its package/image/integrity binding".into());
+        }
+        println!(
+            "PASS: trusted Search/Start PID={} package={:?} image={} IL={}",
+            surface.pid, surface.package_identity, surface.canonical_image, surface.integrity_level
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equal_integrity_automation_is_allowed_but_lower_integrity_input_is_not() {
+        const INJECTED: u32 = 0x10;
+        assert!(super::input_can_drive_broker(0));
+        assert!(super::input_can_drive_broker(INJECTED));
+        assert!(!super::input_can_drive_broker(
+            super::LLKHF_LOWER_IL_INJECTED
+        ));
+        assert!(!super::input_can_drive_broker(
+            INJECTED | super::LLKHF_LOWER_IL_INJECTED
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires a real foreground browser window"]
+    #[allow(clippy::too_many_lines)]
+    fn browser_worker_translates_into_real_address_bar() -> Result<(), Box<dyn std::error::Error>> {
+        use windows::Win32::UI::Accessibility::TreeScope_Descendants;
+
+        unsafe { super::CoInitializeEx(None, super::COINIT_APARTMENTTHREADED).ok()? };
+        let automation: super::IUIAutomation = unsafe {
+            super::CoCreateInstance(&super::CUIAutomation, None, super::CLSCTX_INPROC_SERVER)?
+        };
+        super::AUTOMATION.with_borrow_mut(|slot| *slot = Some(automation.clone()));
+        if let Ok(delay) = std::env::var("FSW_BROWSER_TEST_FOCUS_DELAY_MS") {
+            std::thread::sleep(std::time::Duration::from_millis(delay.parse()?));
+        }
+        let foreground = unsafe { super::GetForegroundWindow() };
+        let surface = super::attest_browser_surface(foreground)
+            .ok_or("foreground browser identity was not attested")?;
+        if let Ok(suffix) = std::env::var("FSW_BROWSER_TEST_IMAGE_SUFFIX")
+            && !super::canonical_image_ends_with(&surface.canonical_image, &suffix)
+        {
+            return Err(format!(
+                "wrong foreground browser: expected image suffix {suffix:?}, got {:?}",
+                surface.canonical_image
+            )
+            .into());
+        }
+        let root =
+            unsafe { automation.ElementFromHandle(windows::Win32::Foundation::HWND(foreground))? };
+        let condition = unsafe { automation.CreateTrueCondition()? };
+        let descendants = unsafe { root.FindAll(TreeScope_Descendants, &condition)? };
+        let mut address_bar = None;
+        let mut candidates = Vec::new();
+        for index in 0..unsafe { descendants.Length()? } {
+            let element = unsafe { descendants.GetElement(index)? };
+            if super::trusted_editable_value_pattern(&element, &surface).is_some() {
+                address_bar = Some(element);
+                break;
+            }
+            let control_type = unsafe { element.CurrentControlType()? };
+            if (control_type == super::UIA_EditControlTypeId
+                || control_type == super::UIA_ComboBoxControlTypeId)
+                && candidates.len() < 24
+            {
+                candidates.push(format!(
+                    "name={:?} id={:?} accelerator={:?} pid={} belongs={} address={} editable={}",
+                    unsafe { element.CurrentName()? }.to_string(),
+                    unsafe { element.CurrentAutomationId()? }.to_string(),
+                    unsafe { element.CurrentAcceleratorKey()? }.to_string(),
+                    unsafe { element.CurrentProcessId()? },
+                    super::focused_belongs_to_surface(&element, &surface),
+                    super::is_browser_address_bar(&element),
+                    super::editable_value_pattern(&element).is_some(),
+                ));
+            }
+        }
+        let focused = address_bar.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "no trusted browser address bar was found; edit candidates: {}",
+                candidates.join(" | ")
+            ))
+        })?;
+        unsafe { focused.SetFocus()? };
+        let pattern = super::trusted_editable_value_pattern(&focused, &surface)
+            .ok_or("discovered address bar lost its trust binding")?;
+        let original = unsafe { pattern.CurrentValue()? }.to_string();
+        let snapshot = fsw_core::Snapshot::current();
+        let distribution = snapshot
+            .distributions
+            .first()
+            .ok_or("browser test requires one registered WSL distribution")?;
+        let input = format!("/{distribution}/");
+        let expected = fsw_core::resolve_user_target(&input, &snapshot, None)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?
+            .file_uri()
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        if !super::set_pattern_value(&pattern, &input) {
+            return Err("could not seed the slash path into the address bar".into());
+        }
+        super::REPLAY_ENTER_CAPTURED.store(false, std::sync::atomic::Ordering::Release);
+        super::CAPTURE_REPLAY_ENTER.store(true, std::sync::atomic::Ordering::Release);
+        super::process_enter_request(
+            &surface,
+            super::KEYDOWN_GENERATION.load(std::sync::atomic::Ordering::Acquire),
+        );
+        super::CAPTURE_REPLAY_ENTER.store(false, std::sync::atomic::Ordering::Release);
+        let written = unsafe { pattern.CurrentValue()? }.to_string();
+        let restored = super::set_pattern_value(&pattern, &original);
+        if written != expected {
+            return Err(format!(
+                "production worker wrote the wrong value: expected {expected:?}, got {written:?}"
+            )
+            .into());
+        }
+        if !super::REPLAY_ENTER_CAPTURED.load(std::sync::atomic::Ordering::Acquire) {
+            return Err("production worker did not request the original Enter replay".into());
+        }
+        if !restored {
+            return Err("browser address-bar value could not be restored".into());
+        }
+        println!(
+            "PASS: production worker translated {input:?} to {expected:?} in PID {} ({})",
+            surface.pid, surface.canonical_image
+        );
+        super::AUTOMATION.with_borrow_mut(|slot| *slot = None);
+        unsafe { super::CoUninitialize() };
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the foreground low-integrity Search-class/UIA fake from the security harness"]
+    #[allow(clippy::too_many_lines)]
+    fn reject_low_integrity_foreground() -> Result<(), Box<dyn std::error::Error>> {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let hwnd: usize = std::env::var("FSW_ATTESTATION_TEST_HWND")?.parse()?;
+        let pid: u32 = std::env::var("FSW_ATTESTATION_TEST_PID")?.parse()?;
+        let edit: isize = std::env::var("FSW_ATTESTATION_TEST_EDIT_HWND")?.parse()?;
+        let marker = std::path::PathBuf::from(std::env::var("FSW_ATTESTATION_MARKER")?);
+        let input = std::env::var("FSW_ATTESTATION_INPUT")?;
+        assert_eq!(
+            std::env::var("FSW_ATTESTATION_EXPECTED_VERSION")?,
+            env!("CARGO_PKG_VERSION"),
+            "attestation binary must match the running broker version"
+        );
+        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        assert_eq!(
+            unsafe { super::GetForegroundWindow() },
+            hwnd,
+            "fake must actually be foreground"
+        );
+        let mut actual_pid = 0;
+        unsafe { super::GetWindowThreadProcessId(hwnd, &raw mut actual_pid) };
+        assert_eq!(actual_pid, pid);
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(!process.is_null());
+        let integrity = super::process_integrity_level(process);
+        unsafe { super::CloseHandle(process) };
+        assert_eq!(integrity, Some(4096));
+        assert_eq!(
+            super::process_integrity_level(unsafe { super::GetCurrentProcess() }),
+            Some(8192)
+        );
+        assert_eq!(
+            super::window_class(hwnd),
+            "Windows.UI.Core.CoreWindow",
+            "the fake must exercise Search's top-level window class"
+        );
+        let identity = super::attest_foreground_identity(hwnd)
+            .ok_or("the Search-class fake did not yield foreground process facts")?;
+        assert_eq!(identity.0, pid, "foreground identity was not PID-bound");
+        assert_eq!(identity.4, 4096, "foreground identity lost Low IL");
+        assert!(
+            !super::trusted_windows_search_identity(&identity.1, identity.2.as_deref()),
+            "a private executable must not satisfy Windows Search package/image identity"
+        );
+
+        unsafe { super::CoInitializeEx(None, super::COINIT_APARTMENTTHREADED).ok()? };
+        let automation: super::IUIAutomation = unsafe {
+            super::CoCreateInstance(&super::CUIAutomation, None, super::CLSCTX_INPROC_SERVER)?
+        };
+        let edit = unsafe {
+            automation.ElementFromHandle(windows::Win32::Foundation::HWND(edit as *mut _))?
+        };
+        assert_eq!(
+            unsafe { edit.CurrentProcessId()? },
+            pid.cast_signed(),
+            "the focused writable UIA element must belong to the low-IL fake PID"
+        );
+        let pattern = unsafe {
+            edit.GetCurrentPatternAs::<super::IUIAutomationValuePattern>(super::UIA_ValuePatternId)?
+        };
+        assert!(
+            !unsafe { pattern.CurrentIsReadOnly()? }.as_bool(),
+            "the fake must expose a writable native UIA ValuePattern"
+        );
+        assert_eq!(unsafe { pattern.CurrentValue()? }.to_string(), input);
+        assert!(
+            super::attest_foreground_surface(hwnd).is_none(),
+            "production attestation must reject the Low-IL Search-class impersonator"
+        );
+        assert!(
+            !marker.exists(),
+            "the canary was already launched before the attestation boundary"
+        );
+
+        // This is the same physical-Enter path the low-level hook takes. It
+        // must stop at the production foreground attestation boundary: no
+        // worker message, UIA value mutation, or canary launch is permitted.
+        let previous_down = super::ENTER_DOWN.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let previous_suppress =
+            super::SUPPRESS_ENTER_UP.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let mut key: super::KBDLLHOOKSTRUCT = unsafe { std::mem::zeroed() };
+        key.vkCode = u32::from(super::VK_RETURN);
+        let _ = unsafe {
+            super::low_level_keyboard_proc(
+                0,
+                0x0100,
+                (&raw mut key).cast::<std::ffi::c_void>() as super::LPARAM,
+            )
+        };
+        super::ENTER_DOWN.store(previous_down, std::sync::atomic::Ordering::Release);
+        super::SUPPRESS_ENTER_UP.store(previous_suppress, std::sync::atomic::Ordering::Release);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert_eq!(
+            unsafe { pattern.CurrentValue()? }.to_string(),
+            input,
+            "the rejected UIA edit was mutated by the keyboard handling boundary"
+        );
+        assert!(
+            !marker.exists(),
+            "the rejected UIA edit was mutated and launched its marker"
+        );
+        unsafe { super::CoUninitialize() };
+        println!(
+            "PASS: production physical-Enter attestation rejected low-integrity Search-class PID {pid} without UIA mutation or marker launch"
+        );
+        Ok(())
+    }
     use super::{
         AdapterOutcome, UPDATE_CONSIDER_INTERVAL_MS, UPDATE_FIRST_DELAY_MS, adapter_outcome,
         drain_persist_queue, request_target_is_current, should_balloon_install_failure,
@@ -2680,18 +4303,39 @@ mod tests {
         assert_eq!(adapter_outcome(None, Some(2)), AdapterOutcome::NeedsUser);
     }
 
+    /// The two refusals that are about the user's own Documents folder, not
+    /// about a broken install, get their own outcomes on the first answer —
+    /// retrying them changes nothing (#127).
+    #[test]
+    fn confirmation_and_cfa_refusals_are_reported_separately() {
+        assert_eq!(
+            adapter_outcome(Some(4), None),
+            AdapterOutcome::NeedsConfirmation
+        );
+        assert_eq!(
+            adapter_outcome(Some(4), Some(4)),
+            AdapterOutcome::NeedsConfirmation
+        );
+        assert_eq!(adapter_outcome(Some(5), None), AdapterOutcome::Blocked);
+        assert_eq!(adapter_outcome(None, Some(5)), AdapterOutcome::Blocked);
+        assert_eq!(
+            adapter_outcome(None, Some(4)),
+            AdapterOutcome::NeedsConfirmation
+        );
+    }
+
     // -- #65: pause persistence ordering ----------------------------------
 
     #[test]
     fn persistence_queue_keeps_rapid_toggles_in_order() {
         let (sender, receiver) = std::sync::mpsc::channel();
-        sender.send(true).unwrap();
-        sender.send(false).unwrap();
-        sender.send(true).unwrap();
+        assert!(sender.send(true).is_ok());
+        assert!(sender.send(false).is_ok());
+        assert!(sender.send(true).is_ok());
         drop(sender);
 
         let mut persisted = Vec::new();
-        drain_persist_queue(receiver, |disabled| persisted.push(disabled));
+        drain_persist_queue(&receiver, |disabled| persisted.push(disabled));
         assert_eq!(persisted, [true, false, true]);
     }
 

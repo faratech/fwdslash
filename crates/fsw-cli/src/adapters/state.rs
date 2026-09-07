@@ -56,6 +56,13 @@ pub fn decide_ps_install(marker_present: bool, state: MarkerState) -> InstallDec
     }
 }
 
+/// Whether the pre-install `AutoRun` value represents a real user value.
+/// An existing empty value is meaningful and must be restored, while a value
+/// consisting only of a stale fwdslash hook is debris rather than an original.
+pub fn original_autorun_present(raw_present: bool, raw_value: &str, original_value: &str) -> bool {
+    raw_present && (raw_value.is_empty() || !original_value.is_empty())
+}
+
 /// What `disable` should do given the current marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UninstallDecision {
@@ -95,7 +102,7 @@ pub fn decide_ps_uninstall(marker_present: bool, state: MarkerState) -> Uninstal
     }
 }
 
-/// The AutoRun value the installer writes: the marker alone, or the user's
+/// The `AutoRun` value the installer writes: the marker alone, or the user's
 /// existing value appended verbatim with ` & `.
 pub fn installed_autorun(original: &str, marker: &str) -> String {
     if original.trim().is_empty() {
@@ -105,7 +112,7 @@ pub fn installed_autorun(original: &str, marker: &str) -> String {
     }
 }
 
-/// Whether one ` & `-joined AutoRun segment is a fwdslash hook — a
+/// Whether one ` & `-joined `AutoRun` segment is a fwdslash hook — a
 /// `call "…ForwardSlashWindows…fsw-autorun.cmd"`. Recognised case-insensitively
 /// by the two path markers rather than an exact path, so a hook a *different*
 /// install left behind is still ours (#37).
@@ -117,7 +124,7 @@ pub fn is_fwdslash_autorun_segment(segment: &str) -> bool {
         && lower.contains("fsw-autorun.cmd")
 }
 
-/// The observed AutoRun with every fwdslash hook segment removed, so the true
+/// The observed `AutoRun` with every fwdslash hook segment removed, so the true
 /// third-party value is recovered even when a prior install's marker was lost
 /// but its `call "…fsw-autorun.cmd"` hook persisted (exactly the MSIX-uninstall
 /// leftover). Empty when fwdslash's hook was the only content. Segments are the
@@ -135,12 +142,7 @@ pub fn strip_fwdslash_autorun(current: &str) -> String {
     kept.join(" & ")
 }
 
-/// Existence and registry kind survive even when the original value is empty.
-pub fn original_autorun_present(present: bool, raw: &str, cleaned: &str) -> bool {
-    present && (raw.is_empty() || !cleaned.is_empty())
-}
-
-/// Whether an AutoRun value routes through a fwdslash hook at all — the cheap
+/// Whether an `AutoRun` value routes through a fwdslash hook at all — the cheap
 /// classifier `fwdslash doctor` and the self-clean probe use.
 #[must_use]
 pub fn autorun_references_fwdslash(current: &str) -> bool {
@@ -344,7 +346,9 @@ pub struct PolicyBlock {
 pub enum PolicyVerdict {
     /// Scripts load. `note` is `Some` only for a policy string this build does
     /// not know, which is reported but never refused.
-    Allowed { note: Option<String> },
+    Allowed {
+        note: Option<String>,
+    },
     Blocked(PolicyBlock),
 }
 

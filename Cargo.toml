@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.6"
+version = "0.0.8"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -41,7 +41,11 @@ windows-collections = "0.3.2"
 embed-resource = "3.0.11"
 
 [profile.release]
-opt-level = "s"      # rustc docs: "z" often produces LARGER binaries than "s". Measure per binary.
+# Measured 2026-09-06 (aarch64-pc-windows-msvc): "z" vs "s" — fwdslash 478 KiB
+# vs 522 KiB, fswbroker 377 KiB vs 411 KiB, fswsettings 1536 KiB vs 1881 KiB.
+# The only measurable cost is resolver codegen (45 -> 69 ns/resolve), which is
+# noise next to the registry/COM I/O that dominates every real transaction.
+opt-level = "z"
 lto = "fat"          # Maximum cross-crate optimization and dead code elimination.
 codegen-units = 1    # Enables full LTO optimization across all compilation units.
 panic = "abort"      # Drops unwinding tables and landing pads entirely.
@@ -49,10 +53,21 @@ strip = "symbols"    # Strips symbol tables; keep .pdb files if debugging is nee
 incremental = false
 overflow-checks = false
 
-# Identical to release except opt-level, so `s` vs `z` is a profile switch, not an edit.
-[profile.release-z]
-inherits = "release"
-opt-level = "z"
+# The resolver is the product's hot pure-logic path (every Enter transaction
+# and every `fwdslash resolve`), so it is compiled at opt-level 3 rather than
+# the workspace's "z".
+#
+# Be careful what you conclude from this: `lto = "fat"` above merges every
+# crate into one LLVM module and re-optimizes it at the *binary's* opt-level,
+# so this override does NOT guarantee speed-optimized resolver codegen inside
+# fwdslash.exe / fswbroker.exe. What it does buy is the pre-LTO pass over
+# fsw-path's own CGUs -- inlining and shape decisions made at O3 there largely
+# survive the merge -- and, with no LTO in the way, fully speed-optimized code
+# in `cargo test -p fsw-path --release`, which is where tests/perf.rs measures.
+# Treat the ~45 ns/resolve figure as the resolver's own number, not a promise
+# about the shipped binaries; docs/size-baseline.md is the measured record.
+[profile.release.package.fsw-path]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

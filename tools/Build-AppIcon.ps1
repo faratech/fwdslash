@@ -17,6 +17,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Drawing
 
 # $PSScriptRoot is empty while an advanced function's parameter defaults are
@@ -72,10 +73,10 @@ try {
         try {
             $writer.Write([uint16]0)
             $writer.Write([uint16]1)
-            $writer.Write([uint16]$sizes.Count)
-            [uint32]$offset = 6 + (16 * $sizes.Count)
-            for ($index = 0; $index -lt $sizes.Count; $index++) {
-                $size = $sizes[$index]
+            $writer.Write([uint16]$iconSizes.Count)
+            [uint32]$offset = 6 + (16 * $iconSizes.Count)
+            for ($index = 0; $index -lt $iconSizes.Count; $index++) {
+                $size = $iconSizes[$index]
                 $writer.Write([byte]$(if ($size -eq 256) { 0 } else { $size }))
                 $writer.Write([byte]$(if ($size -eq 256) { 0 } else { $size }))
                 $writer.Write([byte]0)
@@ -102,6 +103,13 @@ try {
     if (Test-Path -LiteralPath $temporary) {
         Remove-Item -LiteralPath $temporary -Force
     }
+}
+
+# The .ico has shipped silently corrupt before (a header count of 0 with the
+# PNGs appended raw). Verify the file we just wrote actually parses.
+$written = [IO.File]::ReadAllBytes([IO.Path]::GetFullPath($destinationPath))
+if ($written.Length -lt 6 -or [BitConverter]::ToUInt16($written, 4) -ne $iconSizes.Count) {
+    throw "Generated .ico failed validation: entry count does not match $($iconSizes.Count)."
 }
 
 Write-Host "Generated $destinationPath with $($iconSizes.Count) PNG-backed icon sizes."

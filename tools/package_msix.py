@@ -83,6 +83,14 @@ def read_version():
         fields.append("0")
     if len(fields) != 4:
         sys.exit(f"Unsupported workspace version {version!r}; expected 3 or 4 fields")
+    # Same rules as tools/Package-Msix.ps1: the Store reserves the revision
+    # field (must be 0) and identity components cap at 65535. Duplicated
+    # validation already drifted once — keep the two packagers in step.
+    numbers = [int(field) for field in fields]
+    if fields[3] != "0":
+        sys.exit(f"MSIX version must be Major.Minor.Build.0 (Store reserves the revision): {version}")
+    if any(number > 65535 for number in numbers):
+        sys.exit(f"MSIX version components must not exceed 65535: {version}")
     return ".".join(fields)
 
 
@@ -192,8 +200,8 @@ def main():
         print(f"  Packed {pkg_path} ({os.path.getsize(pkg_path)} bytes)")
         produced.append(pkg_path)
 
-        # Copy to /mnt/c/code/
-        shutil.copy2(pkg_path, f"/mnt/c/code/fwdslash-{arch}.msix")
+        # Copy to /mnt/c/code/ — versioned names only: unversioned copies went
+        # stale here and were indistinguishable from current builds.
         shutil.copy2(pkg_path, f"/mnt/c/code/fwdslash-{VERSION}-{arch}.msix")
 
     # MakeAppx bundle
@@ -212,8 +220,7 @@ def main():
     shutil.rmtree(bundle_input)
     print(f"  Bundled {bundle_path} ({os.path.getsize(bundle_path)} bytes)")
 
-    # Copy to /mnt/c/code/
-    shutil.copy2(bundle_path, "/mnt/c/code/fwdslash.msixbundle")
+    # Copy to /mnt/c/code/ — versioned names only.
     shutil.copy2(bundle_path, f"/mnt/c/code/fwdslash-{VERSION}.msixbundle")
     print("\nSuccessfully produced unsigned MSIX and MSIXBUNDLE for Microsoft Store!")
 

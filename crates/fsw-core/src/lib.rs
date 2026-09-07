@@ -7,6 +7,7 @@ use fsw_path::{
     BareSlashMode, Context, RenderBuf, ResolveError, Resolved, eq_ignore_case,
     is_valid_distribution_name, is_valid_windows_root, resolve, resolve_under_root,
 };
+pub mod navigation;
 pub mod powershell_policy;
 pub mod settings_write;
 pub mod update;
@@ -21,6 +22,89 @@ pub use settings_write::{
 
 use std::fmt;
 use std::path::PathBuf;
+
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+/// The only in-box executables security-sensitive code may start.  Keeping
+/// this closed prevents an ambient `PATH` or current-directory executable from
+/// becoming part of a privileged update or scheduled-task flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemBinary {
+    Cmd,
+    PowerShell,
+    Ping,
+    Reg,
+    Schtasks,
+    Winget,
+}
+
+impl SystemBinary {
+    #[must_use]
+    pub const fn file_name(self) -> &'static str {
+        match self {
+            Self::Cmd => "cmd.exe",
+            Self::PowerShell => "WindowsPowerShell\\v1.0\\powershell.exe",
+            Self::Ping => "ping.exe",
+            Self::Reg => "reg.exe",
+            Self::Schtasks => "schtasks.exe",
+            Self::Winget => "winget.exe",
+        }
+    }
+
+    /// Resolves from the OS-reported system directory, never from `PATH`,
+    /// `SystemRoot`, or the current directory.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn path(self) -> Option<PathBuf> {
+        if self == Self::Winget {
+            return winget_alias_path();
+        }
+        let mut buffer = vec![0_u16; 32_768];
+        // SAFETY: `buffer` is writable for the count supplied, and Windows
+        // writes a NUL-terminated UTF-16 system-directory path on success.
+        let Ok(buffer_length) = u32::try_from(buffer.len()) else {
+            return None;
+        };
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer_length) };
+        if length == 0 || length as usize >= buffer.len() {
+            return None;
+        }
+        buffer.truncate(length as usize);
+        Some(PathBuf::from(String::from_utf16_lossy(&buffer)).join(self.file_name()))
+    }
+
+    #[cfg(not(windows))]
+    #[must_use]
+    pub fn path(self) -> Option<PathBuf> {
+        let _ = self;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn winget_alias_path() -> Option<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
+
+    let mut raw = std::ptr::null_mut();
+    let folder = FOLDERID_LocalAppData;
+    let result =
+        unsafe { SHGetKnownFolderPath(&raw const folder, 0, std::ptr::null_mut(), &raw mut raw) };
+    if result < 0 || raw.is_null() {
+        return None;
+    }
+    let mut length = 0;
+    while unsafe { *raw.add(length) } != 0 {
+        length += 1;
+    }
+    let path = PathBuf::from(String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(raw, length)
+    }))
+    .join("Microsoft\\WindowsApps\\winget.exe");
+    unsafe { CoTaskMemFree(raw.cast()) };
+    path.is_file().then_some(path)
+}
 
 pub const FSW_BROKER_WINDOW_CLASS: &str = "ForwardSlashWindows.Broker";
 
@@ -74,7 +158,7 @@ pub const FSW_BARE_SLASH_DISTRIBUTION_VALUE: &str = "BareSlashDistribution";
 /// Custom bare-slash root: an absolute Windows path (`C:\code`, a UNC) that
 /// `/` opens and everything non-distro resolves under. Deliberately a separate
 /// value, not a third `BareSlashMode`: both resolvers read any nonzero
-/// BareSlashMode DWORD as "default distribution" (docs/divergences.md,
+/// `BareSlashMode` DWORD as "default distribution" (docs/divergences.md,
 /// resolver 6), so a stale C++ build ignores this value and falls back to
 /// today's behavior instead of disagreeing about what `/` means.
 pub const FSW_BARE_SLASH_ROOT_VALUE: &str = "BareSlashRoot";
@@ -85,7 +169,7 @@ pub const FSW_BARE_SLASH_ROOT_VALUE: &str = "BareSlashRoot";
 /// dispatch): a wrong port, version, size or a non-zero Reserved silently
 /// fails the publish, so if you touch the header, touch these.
 pub const FSW_FILTER_PORT_NAME: &str = "\\FswFilterPort";
-pub const FSW_FILTER_PROTOCOL_VERSION: u32 = 2;
+pub const FSW_FILTER_PROTOCOL_VERSION: u32 = 3;
 pub const FSW_FILTER_MAX_DISTRIBUTIONS: usize = 32;
 
 pub const LXSS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
@@ -103,6 +187,8 @@ pub const FSW_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// GUID publisher at runtime — see `is_store_flavor`.
 pub const STORE_IDENTITY_NAME: &str = "32827MikeFara.fwdslash";
 pub const STORE_PUBLISHER: &str = "CN=ABDB6B3F-DF9E-447D-BC0E-4DA7BAFD14C4";
+/// Expected publisher of the independently distributed GitHub package.
+pub const GITHUB_PUBLISHER: &str = "CN=Mike Fara, O=Mike Fara, L=White Plains, S=ny, C=US";
 pub const STORE_PACKAGE_FAMILY: &str = "32827MikeFara.fwdslash_t6j5qexy2jpp2";
 
 /// The Store **product id** (the `9P…` Store ID assigned in Partner Center),
@@ -234,6 +320,7 @@ impl Snapshot {
         }
     }
 
+    #[must_use]
     pub fn context<'a>(&'a self, registry_refs: &'a [&'a str]) -> Context<'a, [&'a str]> {
         Context {
             registry: registry_refs,
@@ -257,17 +344,18 @@ pub fn package_full_name() -> Option<String> {
         FULL_NAME
             .get_or_init(|| unsafe {
                 let mut length = 0u32;
-                let first = GetCurrentPackageFullName(&mut length, std::ptr::null_mut());
+                let first = GetCurrentPackageFullName(&raw mut length, std::ptr::null_mut());
                 if first != ERROR_INSUFFICIENT_BUFFER || length == 0 {
                     return None;
                 }
                 let mut buffer = vec![0u16; length as usize];
-                let second = GetCurrentPackageFullName(&mut length, buffer.as_mut_ptr());
+                let second = GetCurrentPackageFullName(&raw mut length, buffer.as_mut_ptr());
                 if second != 0 {
                     return None;
                 }
                 // length includes the terminating NUL.
-                Some(String::from_utf16_lossy(&buffer[..length as usize - 1]))
+                let end = usize::try_from(length).ok()?.checked_sub(1)?;
+                Some(String::from_utf16_lossy(buffer.get(..end)?))
             })
             .clone()
     }
@@ -285,22 +373,25 @@ fn is_four_part_version(text: &str) -> bool {
 
 /// The package family from a full name. Full names are
 /// `Name_Version_Arch[_ResourceId]__PublisherHash`; our manifest declares no
-/// ResourceId, so the shipped form contains an empty group (a double
+/// `ResourceId`, so the shipped form contains an empty group (a double
 /// underscore): `32827MikeFara.fwdslash_0.0.2.0_x64__hash`. Parse from the
 /// right, skipping empty groups — the identity name itself may contain
 /// underscores.
+#[must_use]
 pub fn package_family_from_full_name(full: &str) -> Option<String> {
     let (name, hash) = split_full_name_tail(full)?;
     Some(format!("{name}_{hash}"))
 }
 
 /// The four-part package version from a full name.
+#[must_use]
 pub fn package_version_from_full_name(full: &str) -> Option<String> {
     let fields: Vec<&str> = full.split('_').filter(|field| !field.is_empty()).collect();
     if fields.len() < 4 {
         return None;
     }
-    let version = fields[fields.len() - 3];
+    let version_index = fields.len().checked_sub(3)?;
+    let version = fields.get(version_index)?;
     is_four_part_version(version).then(|| version.to_string())
 }
 
@@ -311,12 +402,13 @@ fn split_full_name_tail(full: &str) -> Option<(String, String)> {
     if fields.len() < 4 {
         return None;
     }
-    let version = fields[fields.len() - 3];
+    let version_index = fields.len().checked_sub(3)?;
+    let version = fields.get(version_index)?;
     if !is_four_part_version(version) {
         return None;
     }
-    let hash = fields[fields.len() - 1];
-    let name = fields[..fields.len() - 3].join("_");
+    let hash = fields.last()?;
+    let name = fields.get(..version_index)?.join("_");
     Some((name, hash.to_string()))
 }
 
@@ -353,6 +445,7 @@ pub fn package_version() -> Option<String> {
 /// True when this packaged build came from the Microsoft Store track: the
 /// package family matches the Partner Center identity. The GitHub-distributed
 /// build carries the Trusted Signing publisher, whose hash differs.
+#[must_use]
 pub fn is_store_flavor() -> bool {
     package_family().as_deref() == Some(STORE_PACKAGE_FAMILY)
 }
@@ -368,8 +461,8 @@ pub fn has_package_identity() -> bool {
         *PACKAGED.get_or_init(|| {
             let mut length: u32 = 0;
             unsafe {
-                GetCurrentPackageFullName(&mut length, std::ptr::null_mut())
-                    != APPMODEL_ERROR_NO_PACKAGE as u32
+                GetCurrentPackageFullName(&raw mut length, std::ptr::null_mut())
+                    != APPMODEL_ERROR_NO_PACKAGE
             }
         })
     }
@@ -380,6 +473,7 @@ pub fn has_package_identity() -> bool {
 }
 
 /// Enumerate registered WSL distribution names under HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss.
+#[must_use]
 pub fn list_registered_distributions() -> Vec<String> {
     #[cfg(windows)]
     {
@@ -423,12 +517,11 @@ fn distributions_from_lxss(lxss: &windows_registry::Key) -> Vec<String> {
         return distros;
     };
     for subkey_name in keys {
-        if let Ok(subkey) = lxss.open(&subkey_name) {
-            if let Ok(name) = subkey.get_string("DistributionName") {
-                if is_valid_distribution_name(&name) {
-                    distros.push(name);
-                }
-            }
+        if let Ok(subkey) = lxss.open(&subkey_name)
+            && let Ok(name) = subkey.get_string("DistributionName")
+            && is_valid_distribution_name(&name)
+        {
+            distros.push(name);
         }
     }
     distros
@@ -462,6 +555,7 @@ fn single_registered_distribution(registered: &[String]) -> Option<String> {
 }
 
 /// Checks if a distribution name is registered (case-insensitive ordinal).
+#[must_use]
 pub fn is_registered_distribution(candidate: &str) -> bool {
     list_registered_distributions()
         .iter()
@@ -473,10 +567,10 @@ pub fn is_registered_distribution(candidate: &str) -> bool {
 pub fn get_default_distribution(registered: &[String]) -> Option<String> {
     #[cfg(windows)]
     {
-        if let Ok(lxss) = windows_registry::CURRENT_USER.open(LXSS_KEY) {
-            if let Some(name) = default_distribution_from_lxss(&lxss, registered) {
-                return Some(name);
-            }
+        if let Ok(lxss) = windows_registry::CURRENT_USER.open(LXSS_KEY)
+            && let Some(name) = default_distribution_from_lxss(&lxss, registered)
+        {
+            return Some(name);
         }
     }
 
@@ -519,7 +613,7 @@ pub fn is_disabled() -> bool {
 /// reaches the real hive with `reg.exe` when this process is packaged: the
 /// PowerShell module reads this flag from an unpackaged shell, where a
 /// virtualized write is invisible (verified 2026-09-04; see
-/// docs/compatibility.md). Issue #52 is the same fault for the BareSlash*
+/// docs/compatibility.md). Issue #52 is the same fault for the `BareSlash`*
 /// values, which used to be written in-process only.
 pub fn persist_disabled(disabled: bool) -> Result<(), u32> {
     set_setting_u32(FSW_DISABLED_VALUE, u32::from(disabled))
@@ -552,21 +646,66 @@ pub fn write_bare_slash_settings(
     mode.and(pinned).and(configured_root)
 }
 
+/// Resolves a navigation target without filesystem or existence checks.
+/// Preserves local mount aliases, native paths and file URIs from the browser
+/// implementation used by the earlier compatibility runs.
+pub fn resolve_user_target(
+    input: &str,
+    snapshot: &Snapshot,
+    base: Option<fsw_path::TargetBase<'_>>,
+) -> Result<fsw_path::UserTarget, fsw_path::TargetError> {
+    let refs: Vec<&str> = snapshot.distributions.iter().map(String::as_str).collect();
+    let context = snapshot.context(&refs);
+    fsw_path::resolve_user_target(
+        input,
+        Some(&context),
+        snapshot
+            .bare_slash_root
+            .as_deref()
+            .filter(|root| is_valid_windows_root(root)),
+        base,
+    )
+}
+
 /// Resolves a forward-slash path against the live user registry configuration.
 ///
-/// When a custom bare-slash root is configured (`BareSlashRoot`) and the
-/// input's first segment is not a registered distribution, the root owns the
-/// input entirely: a bare `/` opens the root and `/foo` resolves to
-/// root\foo — in either bare-slash mode. Only registered-distribution inputs
-/// keep WSL semantics, which is the escape hatch to `\\wsl.localhost` the
-/// README advertises. A root that is absent or malformed changes nothing, so
-/// a stale C++ install (which never reads the value) behaves identically to
-/// a corrupt one (docs/divergences.md, resolver 6).
+/// Distribution claims on the first segment exist only in list mode with no
+/// chosen root: there `/` opens `\\wsl.localhost` and the first segment is
+/// the only way to name a distribution. When a default distribution or a
+/// chosen folder root (`BareSlashRoot`) owns `/`, the root owns the input
+/// entirely — a bare `/` opens the root and every segment, including ones
+/// that share a name with an installed distribution, resolves under it. A
+/// root that is absent or malformed changes nothing, so a stale C++ install
+/// (which never reads the value and still resolves registered first segments
+/// against the list) behaves differently by design on shadowed names
+/// (docs/divergences.md, resolver 6).
+///
+/// The `/mnt/<letter>` drive alias wins over all of it, identically to the
+/// browser funnel (`fsw_path::resolve_user_target` → `resolve_mnt_drive`).
 pub fn resolve_user_slash_path<'b>(
     input: &str,
     snapshot: &'b Snapshot,
     render_buf: &'b mut RenderBuf,
 ) -> Result<Resolved<'b>, ResolveError> {
+    // Shape check before any slicing: `input[1..]` panics on an empty input
+    // and on a multi-byte first character, and `panic = "abort"` would take
+    // the CLI (or the resident broker) down instead of reporting R1.
+    let bytes = input.as_bytes();
+    let mnt_claims = input.starts_with("/mnt/")
+        && bytes.get(5).is_some_and(u8::is_ascii_alphabetic)
+        && bytes.get(6).is_none_or(|byte| *byte == b'/');
+
+    // The drive alias is resolved as the only buffer use on its path, so the
+    // borrowed render output can flow out of the function.
+    if mnt_claims {
+        return match fsw_path::resolve_mnt_drive_resolved(input, render_buf)? {
+            Some(resolved) => Ok(resolved),
+            // The claims gate above mirrors the resolver's own rules, so
+            // `None` cannot happen for a claimed input.
+            None => Err(ResolveError::NotASlashPath),
+        };
+    }
+
     // Validation happens here, not only at set time: the funnel runs on every
     // platform and a hand-built snapshot must not bypass it.
     let configured_root = snapshot
@@ -574,15 +713,15 @@ pub fn resolve_user_slash_path<'b>(
         .as_deref()
         .filter(|root| is_valid_windows_root(root));
 
-    // Shape check before any slicing: `input[1..]` panics on an empty input
-    // and on a multi-byte first character, and `panic = "abort"` would take
-    // the CLI (or the resident broker) down instead of reporting R1.
     let Some(after_root) = input.strip_prefix('/') else {
         return Err(ResolveError::NotASlashPath);
     };
 
     let first_segment = after_root.split('/').next().unwrap_or_default();
-    let explicit_distro = !first_segment.is_empty()
+    let in_list_mode =
+        snapshot.bare_slash_mode == BareSlashMode::DistributionList && configured_root.is_none();
+    let explicit_distro = in_list_mode
+        && !first_segment.is_empty()
         && snapshot
             .distributions
             .iter()
@@ -594,7 +733,7 @@ pub fn resolve_user_slash_path<'b>(
         return resolve_under_root(input, root, render_buf);
     }
 
-    let refs: Vec<&str> = snapshot.distributions.iter().map(|s| s.as_str()).collect();
+    let refs: Vec<&str> = snapshot.distributions.iter().map(String::as_str).collect();
     let ctx = snapshot.context(&refs);
     resolve(input, &ctx, render_buf)
 }
@@ -643,18 +782,18 @@ impl fmt::Display for DiagEvent {
     }
 }
 
-/// Logs a diagnostic category event if FSW_DIAGNOSTIC_LOG is configured.
+/// Logs a diagnostic category event if `FSW_DIAGNOSTIC_LOG` is configured.
 pub fn diagnostic(event: DiagEvent) {
-    if let Ok(log_path) = std::env::var("FSW_DIAGNOSTIC_LOG") {
-        if !log_path.is_empty() {
-            use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
-                let _ = writeln!(file, "{event}");
-            }
+    if let Ok(log_path) = std::env::var("FSW_DIAGNOSTIC_LOG")
+        && !log_path.is_empty()
+    {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(file, "{event}");
         }
     }
 }
@@ -683,14 +822,15 @@ fn to_wide(value: &str) -> Vec<u16> {
 }
 
 /// Reads a `REG_SZ`/`REG_EXPAND_SZ` value and compares it for exact equality.
+#[must_use]
 pub fn registry_string_equals(path: &str, name: &str, expected: &str) -> bool {
     #[cfg(windows)]
     {
         use windows_registry::CURRENT_USER;
-        if let Ok(key) = CURRENT_USER.open(path) {
-            if let Ok(value) = key.get_string(name) {
-                return value == expected;
-            }
+        if let Ok(key) = CURRENT_USER.open(path)
+            && let Ok(value) = key.get_string(name)
+        {
+            return value == expected;
         }
     }
     let _ = (path, name, expected);
@@ -711,10 +851,10 @@ pub fn adapter_version(marker_key_path: &str) -> Option<String> {
     #[cfg(windows)]
     {
         use windows_registry::CURRENT_USER;
-        if let Ok(key) = CURRENT_USER.open(marker_key_path) {
-            if let Ok(version) = key.get_string("Version") {
-                return Some(version);
-            }
+        if let Ok(key) = CURRENT_USER.open(marker_key_path)
+            && let Ok(version) = key.get_string("Version")
+        {
+            return Some(version);
         }
     }
     let _ = marker_key_path;
@@ -733,6 +873,7 @@ pub fn adapter_outdated(marker_key_path: &str, current_version: &str) -> bool {
 ///
 /// A packaged build declares its startup task in the manifest, so identity alone
 /// is the answer; unpackaged installs write the per-user Run value.
+#[must_use]
 pub fn windows_integration_installed() -> bool {
     if has_package_identity() {
         return true;
@@ -748,17 +889,21 @@ pub fn windows_integration_installed() -> bool {
 }
 
 /// Whether `name` resolves on the current search path.
+#[must_use]
 pub fn executable_available(name: &str) -> bool {
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::Storage::FileSystem::SearchPathW;
         let wide_name = to_wide(name);
-        let mut buffer = [0u16; 32768];
+        let mut buffer = vec![0u16; 32768].into_boxed_slice();
+        let Ok(buffer_length) = u32::try_from(buffer.len()) else {
+            return false;
+        };
         let length = SearchPathW(
             std::ptr::null(),
             wide_name.as_ptr(),
             std::ptr::null(),
-            buffer.len() as u32,
+            buffer_length,
             buffer.as_mut_ptr(),
             std::ptr::null_mut(),
         );
@@ -772,6 +917,7 @@ pub fn executable_available(name: &str) -> bool {
 }
 
 /// Whether the broker's never-shown top-level window is present on this desktop.
+#[must_use]
 pub fn broker_window_exists() -> bool {
     #[cfg(windows)]
     unsafe {
@@ -817,10 +963,19 @@ pub fn settings_window_exists() -> bool {
                 if length <= 0 {
                     return 1;
                 }
-                let mut text = vec![0u16; (length as usize) + 1];
-                GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32);
+                let Ok(length) = usize::try_from(length) else {
+                    return 1;
+                };
+                let Some(text_length) = length.checked_add(1) else {
+                    return 1;
+                };
+                let mut text = vec![0u16; text_length];
+                let Ok(text_length) = i32::try_from(text.len()) else {
+                    return 1;
+                };
+                GetWindowTextW(window, text.as_mut_ptr(), text_length);
                 // `title` carries its NUL; compare the caption against the rest.
-                if text.get(..length as usize) != state.title.get(..state.title.len() - 1) {
+                if text.get(..length) != state.title.get(..state.title.len() - 1) {
                     return 1;
                 }
                 let mut owner = 0u32;
@@ -866,9 +1021,15 @@ fn process_image_is(pid: u32, image_name: &str) -> bool {
             return false;
         }
         let mut image = [0u16; 1024];
-        let mut length = image.len() as u32;
-        let queried =
-            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, image.as_mut_ptr(), &mut length);
+        let Ok(mut length) = u32::try_from(image.len()) else {
+            return false;
+        };
+        let queried = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            image.as_mut_ptr(),
+            &raw mut length,
+        );
         CloseHandle(handle);
         if queried == 0 {
             return false;
@@ -889,6 +1050,7 @@ fn process_image_is(pid: u32, image_name: &str) -> bool {
 /// send is skipped when the window is absent). The settings window uses
 /// 750 ms (`src/settings/main.cpp:827`) so a wedged broker cannot stall a
 /// refresh; the CLI uses 200 ms for the same reason.
+#[must_use]
 pub fn broker_state(timeout_ms: u32) -> BrokerState {
     #[cfg(windows)]
     unsafe {
@@ -908,12 +1070,12 @@ pub fn broker_state(timeout_ms: u32) -> BrokerState {
             0,
             SMTO_ABORTIFHUNG | SMTO_BLOCK,
             timeout_ms,
-            &mut result,
+            &raw mut result,
         );
         if delivered == 0 {
             BrokerState::Unavailable
         } else {
-            BrokerState::from(result as isize)
+            BrokerState::from(result.cast_signed())
         }
     }
     #[cfg(not(windows))]
@@ -1126,7 +1288,10 @@ pub fn ensure_broker_running() {
         let working_directory = to_wide(&directory.to_string_lossy());
 
         let mut startup: STARTUPINFOW = std::mem::zeroed();
-        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let Ok(startup_size) = u32::try_from(std::mem::size_of::<STARTUPINFOW>()) else {
+            return;
+        };
+        startup.cb = startup_size;
         let mut process: PROCESS_INFORMATION = std::mem::zeroed();
 
         let started = CreateProcessW(
@@ -1138,8 +1303,8 @@ pub fn ensure_broker_running() {
             CREATE_NEW_PROCESS_GROUP,
             std::ptr::null(),
             working_directory.as_ptr(),
-            &startup,
-            &mut process,
+            &raw const startup,
+            &raw mut process,
         );
         if started == 0 {
             return;

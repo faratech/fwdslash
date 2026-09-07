@@ -7,9 +7,12 @@
 //! packaged file writes to `%LOCALAPPDATA%` and `Documents` are not
 //! virtualized (verified 2026-09-04).
 //!
-//! This module also owns the adapter payload version: `PAYLOAD_VERSION` names
-//! the shared `PowerShell\<version>` module directory and is embedded in the
-//! profile marker blocks.
+//! This module also owns the adapter payload version: `PAYLOAD_VERSION` is the
+//! `Version` each adapter records in its marker key. Since #127 it names **no**
+//! directory and appears in **no** profile block — both shell payloads live in
+//! version-free directories (`…\ForwardSlashWindows\cmd` and
+//! `…\ForwardSlashWindows\PowerShell\payload`) that are swapped by
+//! rename-aside, so an upgrade never has to rewrite a file under `Documents`.
 
 #[cfg(windows)]
 pub mod cmd;
@@ -30,29 +33,61 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
 
-/// CREATE_NO_WINDOW for the real-process children.
+/// `CREATE_NO_WINDOW` for the real-process children.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// The adapter payload directory version. Derived from the crate version, so
-/// a product bump moves the payload directory and marks every deployed
+/// The adapter payload version of record. Derived from the crate version and
+/// stored in each adapter's marker key, so a product bump marks every deployed
 /// adapter as outdated — which is what drives the upgrade in
-/// [`set_integration`].
+/// [`set_integration`]. It is the **only** place staleness is read from
+/// (#127): never the profile block's fence text, which no longer carries it.
 pub const PAYLOAD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A user-facing adapter failure. The message is shown verbatim.
+///
+/// `blocked` marks the one failure the caller has to distinguish rather than
+/// merely print (#127): a `Documents` write Controlled Folder Access refused.
+/// It carries all the way out to the CLI's exit code
+/// ([`EXIT_BLOCKED`]), which the broker turns into its own balloon and the
+/// settings window into an `InfoBar`.
 #[derive(Debug, Clone)]
 pub struct AdapterError {
     message: String,
+    blocked: bool,
 }
 
 impl AdapterError {
     pub fn new(message: &str) -> Self {
         Self {
             message: message.to_string(),
+            blocked: false,
         }
     }
+
+    /// A failure whose cause is a refused write to a guarded folder.
+    pub fn blocked(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            blocked: true,
+        }
+    }
+
+    #[must_use]
+    pub fn is_blocked(&self) -> bool {
+        self.blocked
+    }
 }
+
+/// `fwdslash integration <id> enable|disable` exit codes beyond the original
+/// 0/1/2 (#127). Both are refusals a person has to act on, and both are
+/// deliberately distinct from the generic failure so the broker and the
+/// settings window can say something specific.
+///
+/// A profile change the background sweep is not allowed to make.
+pub const EXIT_NEEDS_CONFIRMATION: i32 = 4;
+/// A profile write Controlled Folder Access (or a like restriction) refused.
+pub const EXIT_BLOCKED: i32 = 5;
 
 impl core::fmt::Display for AdapterError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -64,6 +99,14 @@ impl std::error::Error for AdapterError {}
 
 impl From<std::io::Error> for AdapterError {
     fn from(error: std::io::Error) -> Self {
+        // Permission-denied is never just "a file operation failed": on the
+        // profile path it is almost always Controlled Folder Access, and it
+        // used to reach the user as nothing at all (#127).
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return Self::blocked(&format!(
+                "The file write {BLOCKED_WRITE_GUIDANCE} ({error})"
+            ));
+        }
         Self::new(&format!("file operation failed ({error})."))
     }
 }
@@ -76,8 +119,17 @@ pub fn registry_error(error: impl core::fmt::Display) -> AdapterError {
 
 /// Handles `fwdslash integration <id> <enable|disable>` for the shell
 /// adapters (the `windows` integration is registry-only and stays in
-/// `main.rs`). Exit codes: 0 success/no-op, 1 failure, 2 unknown id.
-pub fn set_integration(id: &str, enabled: bool) -> i32 {
+/// `main.rs`).
+///
+/// `user_initiated` is `false` for the broker's startup sweep and the settings
+/// window's launch sweep, and `true` only when a person asked. A background run
+/// may swap the `%LOCALAPPDATA%` payload — that is the whole upgrade now — but
+/// must never write the user's `profile.ps1` (#127).
+///
+/// Exit codes: 0 success/no-op, 1 failure, 2 unknown id,
+/// [`EXIT_NEEDS_CONFIRMATION`] a profile change only the user may authorise,
+/// [`EXIT_BLOCKED`] a profile write Controlled Folder Access refused.
+pub fn set_integration(id: &str, enabled: bool, user_initiated: bool) -> i32 {
     #[cfg(windows)]
     {
         let edition = match id {
@@ -109,25 +161,24 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
             Some(edition) => edition.display_name(),
         };
 
-        // Idempotence: an enable/disable that matches the stored marker is a
-        // silent no-op, exactly like the script flow — except for an
+        // Idempotence applies to enabled, installed adapters only. Disable
+        // must reach uninstall for prepared/removing markers so an interrupted
+        // transaction can recover. Uninstall handles an absent marker itself.
+        // An exception to the enable no-op is an
         // `installed` marker naming an older payload than this build ships.
-        // That is the upgrade path: the same transactional uninstall, then
-        // the same transactional install, so a failure still rolls back.
+        // The existing upgrade path uninstalls and then installs separately.
         let mut upgrading = false;
-        if fsw_core::adapter_installed(&marker_key) == enabled {
-            if !enabled {
-                return 0;
-            }
+        if enabled && fsw_core::adapter_installed(&marker_key) {
             let installed_version = fsw_core::adapter_version(&marker_key);
             if installed_version.as_deref() == Some(PAYLOAD_VERSION) {
                 // Already current, so nothing else runs today — but a machine
                 // upgraded before the prune existed still has stranded
                 // `PowerShell\<version>` directories and this no-op is the
                 // only path the broker ever reaches for it.
-                if edition.is_some() {
-                    powershell::prune_orphaned_module_dirs();
+                if let Some(edition) = edition {
+                    return current_version_noop(edition, user_initiated);
                 }
+                prune_leftover_dirs();
                 return 0;
             }
             println!(
@@ -135,16 +186,6 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
                 installed_version.as_deref().unwrap_or("an earlier version")
             );
             upgrading = true;
-        }
-
-        // An upgrade removes the prior adapter before installing the new one.
-        // Refuse a Windows PowerShell upgrade before that destructive half if
-        // a fresh ordinary shell cannot run the profile.
-        if upgrading && edition == Some(state::Edition::WindowsPowerShell) {
-            if let Some(error) = powershell::execution_policy_refusal(edition.unwrap()) {
-                eprintln!("{error}");
-                return 1;
-            }
         }
 
         // Before staging anything: if no marker references the payload tree at
@@ -155,25 +196,33 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
         }
 
         let controller = std::env::current_exe().unwrap_or_default();
+
+        // A PowerShell upgrade no longer goes through uninstall+install: when
+        // the deployed block is already the stable one, swapping the payload
+        // directory is the whole job and `Documents` is never touched (#127).
+        if upgrading && let Some(edition) = edition {
+            let result = powershell::upgrade(edition, &controller, user_initiated);
+            return match result {
+                Ok(powershell::UpgradeOutcome::Upgraded) => {
+                    powershell::prune_orphaned_module_dirs();
+                    prune_leftover_dirs();
+                    0
+                }
+                Ok(powershell::UpgradeOutcome::NeedsConfirmation) => {
+                    eprintln!("{MIGRATION_PENDING_MESSAGE}");
+                    EXIT_NEEDS_CONFIRMATION
+                }
+                Err(error) => report_adapter_error(&error),
+            };
+        }
+
         // An upgrade is the old payload's uninstall followed by this one's
-        // install; `upgrading` is only ever set on the enable path.
-        let removal = if upgrading {
-            match edition {
-                None => cmd::uninstall(),
-                Some(edition) => powershell::uninstall(edition),
-            }
-        } else {
-            Ok(())
-        };
+        // install; `upgrading` is only ever set on the enable path, and for
+        // PowerShell it already returned above.
+        let removal = if upgrading { cmd::uninstall() } else { Ok(()) };
         let result = removal.and_then(|()| match (edition, enabled) {
             (None, true) => cmd::install(&controller),
             (None, false) => cmd::uninstall(),
-            (Some(state::Edition::WindowsPowerShell), true) if upgrading => {
-                powershell::install_after_policy_preflight(
-                    state::Edition::WindowsPowerShell,
-                    &controller,
-                )
-            }
             (Some(edition), true) => powershell::install(edition, &controller),
             (Some(edition), false) => powershell::uninstall(edition),
         });
@@ -185,19 +234,58 @@ pub fn set_integration(id: &str, enabled: bool) -> i32 {
                 if enabled && edition.is_some() {
                     powershell::prune_orphaned_module_dirs();
                 }
+                prune_leftover_dirs();
                 0
             }
-            Err(error) => {
-                eprintln!("{error}");
-                1
-            }
+            Err(error) => report_adapter_error(&error),
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = (id, enabled);
+        let _ = (id, enabled, user_initiated);
         1
     }
+}
+
+/// What the CLI says when a background sweep found a profile change it is not
+/// allowed to make. Written to stderr so it reaches the settings window's
+/// `InfoBar`, and paired with [`EXIT_NEEDS_CONFIRMATION`] so the broker can
+/// balloon it (#127).
+pub const MIGRATION_PENDING_MESSAGE: &str = "The PowerShell integration needs a change to your PowerShell profile that only you can \
+     approve. Open Settings and turn the PowerShell integration off and on again (or run \
+     \"fwdslash integration powershell enable\") to apply it.";
+
+/// The `enable` no-op for a PowerShell adapter whose marker already records
+/// this build's payload version.
+///
+/// It is not always a no-op: a legacy versioned block may still be sitting in
+/// the profile (an install migrated its marker but not its `Documents` file, or
+/// a hand edit). Rewriting it is a `Documents` write, so only an explicit user
+/// action pays for it (#127).
+#[cfg(windows)]
+fn current_version_noop(edition: state::Edition, user_initiated: bool) -> i32 {
+    if let profile::ProfileHealth::MigrationPending(_) = powershell::profile_health(edition) {
+        if !user_initiated {
+            eprintln!("{MIGRATION_PENDING_MESSAGE}");
+            return EXIT_NEEDS_CONFIRMATION;
+        }
+        let controller = std::env::current_exe().unwrap_or_default();
+        if let Err(error) = powershell::migrate(edition, &controller) {
+            return report_adapter_error(&error);
+        }
+    }
+    powershell::prune_orphaned_module_dirs();
+    prune_leftover_dirs();
+    0
+}
+
+/// Prints an adapter failure and maps it onto the exit code: a
+/// Controlled Folder Access refusal gets its own, so the broker and the
+/// settings window can name it (#127).
+#[cfg(windows)]
+fn report_adapter_error(error: &AdapterError) -> i32 {
+    eprintln!("{error}");
+    if error.is_blocked() { EXIT_BLOCKED } else { 1 }
 }
 
 /// Best-effort removal of every shell adapter during `fwdslash uninstall`.
@@ -224,7 +312,7 @@ pub fn sweep_uninstall() -> i32 {
         if !installed {
             continue;
         }
-        let code = set_integration(id, false);
+        let code = set_integration(id, false, true);
         if code != 0 {
             println!("The {label} adapter could not be removed automatically.");
             worst = 1;
@@ -235,7 +323,12 @@ pub fn sweep_uninstall() -> i32 {
     // Unconditional, so an install that never had a marker to remove still
     // clears directories a previous release stranded.
     #[cfg(windows)]
-    powershell::prune_orphaned_module_dirs();
+    {
+        powershell::prune_orphaned_module_dirs();
+        // Rename-aside leftovers from an interrupted swap are nobody's any more
+        // once the adapters are gone (#127).
+        prune_leftover_dirs();
+    }
     worst
 }
 
@@ -348,9 +441,16 @@ fn ps_health_status(edition: state::Edition) -> String {
         }
         profile::ProfileHealth::Healthy => "healthy".to_string(),
         profile::ProfileHealth::Orphaned(version) => {
-            format!("orphaned profile block for {version}")
+            format!(
+                "orphaned profile block for {}",
+                profile::version_label(&version)
+            )
         }
-        profile::ProfileHealth::Stale(version) => format!("stale profile block for {version}"),
+        profile::ProfileHealth::MigrationPending(version) => format!(
+            "legacy profile block for {} — run \"fwdslash integration {} enable\" to migrate it",
+            profile::version_label(&version),
+            edition.cli_id()
+        ),
         profile::ProfileHealth::Duplicated => "duplicate profile blocks".to_string(),
     }
 }
@@ -370,11 +470,14 @@ fn cmd_health_status() -> String {
 pub fn repair_integration(id: &str) -> i32 {
     #[cfg(windows)]
     {
+        // `fwdslash integration <id> repair` is typed by a person, so the
+        // profile write it may need is authorised (#127).
         let controller = std::env::current_exe().unwrap_or_default();
         match id {
             "cmd" => {
                 let before = cmd::repair();
                 report_cmd_repair(before);
+                prune_leftover_dirs();
             }
             "windows-powershell" => report_ps_repair(
                 "Windows PowerShell",
@@ -382,7 +485,7 @@ pub fn repair_integration(id: &str) -> i32 {
                 &controller,
             ),
             "powershell" => {
-                report_ps_repair("PowerShell 7", state::Edition::PowerShell, &controller)
+                report_ps_repair("PowerShell 7", state::Edition::PowerShell, &controller);
             }
             _ => return 2,
         }
@@ -413,15 +516,21 @@ fn report_cmd_repair(result: Result<cmd::CmdHealth, AdapterError>) {
 
 #[cfg(windows)]
 fn report_ps_repair(label: &str, edition: state::Edition, controller: &Path) {
-    match powershell::repair(edition, controller) {
+    match powershell::repair(edition, controller, true) {
         Ok(profile::ProfileHealth::Healthy | profile::ProfileHealth::Clean) => {
             println!("{label}: healthy");
         }
         Ok(profile::ProfileHealth::Orphaned(version)) => {
-            println!("{label}: orphaned profile block for {version} — repaired");
+            println!(
+                "{label}: orphaned profile block for {} — repaired",
+                profile::version_label(&version)
+            );
         }
-        Ok(profile::ProfileHealth::Stale(version)) => {
-            println!("{label}: stale profile block for {version} — repaired");
+        Ok(profile::ProfileHealth::MigrationPending(version)) => {
+            println!(
+                "{label}: legacy profile block for {} — migrated",
+                profile::version_label(&version)
+            );
         }
         Ok(profile::ProfileHealth::Duplicated) => {
             println!("{label}: duplicate profile blocks — repaired");
@@ -439,16 +548,33 @@ pub fn repair_all() -> i32 {
     {
         let controller = std::env::current_exe().unwrap_or_default();
         let _ = cmd::repair();
+        // `user_initiated = false`: this is the background sweep, and it may
+        // not write a `Documents` file. A repair that needs one is reported by
+        // `integrations`, not performed here (#127).
+        let mut needs_confirmation = false;
         for edition in [
             state::Edition::WindowsPowerShell,
             state::Edition::PowerShell,
         ] {
-            let _ = powershell::repair(edition, &controller);
+            if matches!(
+                powershell::repair(edition, &controller, false),
+                Ok(profile::ProfileHealth::MigrationPending(_)
+                    | profile::ProfileHealth::Orphaned(_)
+                    | profile::ProfileHealth::Duplicated)
+            ) {
+                needs_confirmation = true;
+            }
         }
         powershell::prune_orphaned_module_dirs();
         // A payload tree no marker names is debris from a deferred delete that
-        // never completed (#37).
+        // never completed (#37), and a rename-aside leftover is debris from an
+        // interrupted swap (#127).
         prune_orphaned_payload_tree();
+        prune_leftover_dirs();
+        if needs_confirmation {
+            eprintln!("{MIGRATION_PENDING_MESSAGE}");
+            return EXIT_NEEDS_CONFIRMATION;
+        }
         0
     }
     #[cfg(not(windows))]
@@ -583,22 +709,44 @@ pub use crate::scheduled_task::task_args as cleanup_task_args;
 pub use crate::scheduled_task::task_start_time;
 
 /// The batch file the cleanup task runs: wait for this process to exit, remove
-/// the payload tree, then delete the task and itself. Every path is quoted, so
-/// a space in the profile-independent `%LOCALAPPDATA%` path is safe.
+/// only adapter-owned payload directories, then delete the task and itself.
+/// Every path is quoted, so a space in the profile-independent
+/// `%LOCALAPPDATA%` path is safe.
 #[must_use]
-pub fn cleanup_script_body(payload_dir: &str, task_name: &str) -> String {
-    format!(
+pub fn cleanup_script_body(
+    payload_dir: &Path,
+    task_name: &str,
+    ping: &Path,
+    schtasks: &Path,
+) -> Option<String> {
+    let payload_dir = cleanup_batch_path(payload_dir)?;
+    let ping = cleanup_batch_path(ping)?;
+    let schtasks = cleanup_batch_path(schtasks)?;
+    if !crate::scheduled_task::is_safe_task_literal(task_name) {
+        return None;
+    }
+    Some(format!(
         "@echo off\r\n\
-         ping -n 3 127.0.0.1 >nul\r\n\
-         reg query HKCU\\Software\\ForwardSlashWindows\\CmdAdapter >nul 2>&1 && goto done\r\n\
-         reg query HKCU\\Software\\ForwardSlashWindows\\PowerShellAdapter\\WindowsPowerShell >nul 2>&1 && goto done\r\n\
-         reg query HKCU\\Software\\ForwardSlashWindows\\PowerShellAdapter\\PowerShell >nul 2>&1 && goto done\r\n\
+         \"{ping}\" -n 3 127.0.0.1 >nul\r\n\
          rd /s /q \"{payload_dir}\\cmd\"\r\n\
          rd /s /q \"{payload_dir}\\PowerShell\"\r\n\
-         :done\r\n\
-         schtasks /delete /tn \"{task_name}\" /f >nul 2>&1\r\n\
+         for /d %%D in (\"{payload_dir}\\.cmd-staging-*\") do rd /s /q \"%%~fD\"\r\n\
+         for /d %%D in (\"{payload_dir}\\.powershell-staging-*\") do rd /s /q \"%%~fD\"\r\n\
+         \"{schtasks}\" /delete /tn \"{task_name}\" /f >nul 2>&1\r\n\
          del /q \"%~f0\"\r\n"
-    )
+    ))
+}
+
+fn cleanup_batch_path(path: &Path) -> Option<&str> {
+    let path = path.to_str()?;
+    (!path.is_empty()
+        && !path.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'\"' | b'%' | b'&' | b'|' | b'^' | b'<' | b'>' | b'\r' | b'\n'
+            )
+        }))
+    .then_some(path)
 }
 
 /// Whether `payload` is exactly the tree the self-clean is allowed to remove.
@@ -634,10 +782,16 @@ fn schedule_payload_delete() {
     if !is_payload_tree(&payload, &local_app_data) {
         return;
     }
-    let task = crate::scheduled_task::OneShotTask::new(
-        CLEANUP_TASK_NAME,
-        cleanup_script_body(&payload.display().to_string(), CLEANUP_TASK_NAME),
-    );
+    let Some(ping) = fsw_core::SystemBinary::Ping.path() else {
+        return;
+    };
+    let Some(schtasks) = fsw_core::SystemBinary::Schtasks.path() else {
+        return;
+    };
+    let Some(script) = cleanup_script_body(&payload, CLEANUP_TASK_NAME, &ping, &schtasks) else {
+        return;
+    };
+    let task = crate::scheduled_task::OneShotTask::new(CLEANUP_TASK_NAME, script);
     if crate::scheduled_task::register_and_run(&task).is_some() {
         return;
     }
@@ -653,20 +807,32 @@ fn schedule_payload_delete() {
 fn spawn_detached_delete(payload: &Path) {
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let system32 = Path::new(&system_root).join("System32");
+    let Some(cmd) = fsw_core::SystemBinary::Cmd.path() else {
+        return;
+    };
+    let Some(ping) = fsw_core::SystemBinary::Ping.path() else {
+        return;
+    };
+    let Some(payload) = cleanup_batch_path(payload) else {
+        return;
+    };
+    let system32 = cmd
+        .parent()
+        .unwrap_or_else(|| Path::new(r"C:\Windows\System32"));
     let command = format!(
-        "ping -n 3 127.0.0.1 >nul & rd /s /q \"{}\\cmd\" & rd /s /q \"{}\\PowerShell\"",
-        payload.display(),
-        payload.display()
+        "\"{}\" -n 3 127.0.0.1 >nul & rd /s /q \"{payload}\\cmd\" & \
+         rd /s /q \"{payload}\\PowerShell\" & \
+         for /d %D in (\"{payload}\\.cmd-staging-*\") do rd /s /q \"%~fD\" & \
+         for /d %D in (\"{payload}\\.powershell-staging-*\") do rd /s /q \"%~fD\"",
+        ping.display()
     );
     for flags in [
         CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB,
         CREATE_NO_WINDOW | DETACHED_PROCESS,
     ] {
-        let spawned = Command::new("cmd.exe")
+        let spawned = Command::new(&cmd)
             .args(["/c", &command])
-            .current_dir(&system32)
+            .current_dir(system32)
             .creation_flags(flags)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -686,46 +852,22 @@ fn any_adapter_marker_present() -> bool {
 
     CURRENT_USER.open(fsw_core::CMD_ADAPTER_KEY).is_ok()
         || CURRENT_USER
-            .open(&format!(
+            .open(format!(
                 "{}WindowsPowerShell",
                 fsw_core::POWERSHELL_ADAPTER_ROOT
             ))
             .is_ok()
         || CURRENT_USER
-            .open(&format!("{}PowerShell", fsw_core::POWERSHELL_ADAPTER_ROOT))
+            .open(format!("{}PowerShell", fsw_core::POWERSHELL_ADAPTER_ROOT))
             .is_ok()
 }
 
-/// The parent is shared with the updater. Delete only adapter-owned children.
-#[cfg(windows)]
-fn prune_adapter_directories(payload: &Path) {
-    let Ok(entries) = std::fs::read_dir(payload) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.eq_ignore_ascii_case("cmd")
-            || name.eq_ignore_ascii_case("PowerShell")
-            || name.starts_with(".cmd-staging-")
-            || name.starts_with(".cmd-rollback-")
-        {
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-}
-
-/// Stop old parent-wide deletion tasks before a new adapter is staged.
+/// Belt and braces for a deferred delete that never completed: when no adapter
+/// marker references it at all, the whole `%LOCALAPPDATA%\ForwardSlashWindows`
+/// tree is stale and goes before anything new is staged into it. Best effort
+/// and silent; never touches a tree any marker still names.
 #[cfg(windows)]
 pub fn prune_orphaned_payload_tree() {
-    let _ = Command::new("schtasks.exe")
-        .args(["/end", "/tn", CLEANUP_TASK_NAME])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let _ = crate::scheduled_task::delete_task(CLEANUP_TASK_NAME);
     if any_adapter_marker_present() {
         return;
     }
@@ -741,6 +883,105 @@ pub fn prune_orphaned_payload_tree() {
     // fresh payload into, and its backstop trigger can still be an hour away.
     // The script deletes its own task, but only once it has run.
     let _ = crate::scheduled_task::delete_task(CLEANUP_TASK_NAME);
+}
+
+/// Removes only adapter-owned payload directories. Update staging and unknown
+/// sibling data are separate owners and must survive an adapter repair sweep.
+#[cfg(windows)]
+fn prune_adapter_directories(payload: &Path) {
+    let Ok(children) = std::fs::read_dir(payload) else {
+        return;
+    };
+    for child in children.flatten() {
+        let name = child.file_name();
+        let name = name.to_string_lossy();
+        if name.eq_ignore_ascii_case("cmd")
+            || name.eq_ignore_ascii_case("PowerShell")
+            || name.starts_with(".cmd-staging-")
+            || name.starts_with(".powershell-staging-")
+        {
+            let _ = std::fs::remove_dir_all(child.path());
+        }
+    }
+}
+
+/// Whether a directory name inside `%LOCALAPPDATA%\ForwardSlashWindows` (or,
+/// with `in_powershell_dir`, inside its `PowerShell` subdirectory) is a
+/// rename-aside leftover of an interrupted or completed swap (#127).
+///
+/// Two stranded `cmd.removing-*` directories were found on a live host: the
+/// mechanism creates them deliberately and deletes them best-effort, so
+/// something has to come back for the ones a crash or a locked file left.
+/// Deliberately narrow — only names the adapters themselves generate.
+#[must_use]
+pub fn is_prunable_leftover(name: &str, in_powershell_dir: bool) -> bool {
+    const ROOT_PREFIXES: [&str; 4] = [
+        "cmd.removing-",
+        "cmd.rollback-",
+        ".cmd-staging-",
+        ".cmd-rollback-",
+    ];
+    const POWERSHELL_INFIXES: [&str; 3] = [".removing-", ".staging-", ".rollback-"];
+
+    if in_powershell_dir {
+        // `payload.removing-<id>`, `payload.staging-<id>` and the pre-#127
+        // `<version>.staging-<id>` all match; `payload`, `state` and a version
+        // directory do not.
+        return POWERSHELL_INFIXES.iter().any(|infix| {
+            name.split_once(infix)
+                .is_some_and(|(head, tail)| !head.is_empty() && !tail.is_empty())
+        });
+    }
+    ROOT_PREFIXES
+        .iter()
+        .any(|prefix| name.len() > prefix.len() && name.starts_with(prefix))
+        || name.starts_with(".powershell-staging-")
+}
+
+/// Deletes every rename-aside leftover both adapters can strand (#127), in the
+/// payload root and in the PowerShell payload directory.
+///
+/// Skips the one directory a cmd uninstall may still be using: while the marker
+/// says `removing`, its recorded `RemovalPath` is live recovery state, not
+/// debris. Best effort and silent throughout; no path is ever logged.
+#[cfg(windows)]
+pub fn prune_leftover_dirs() {
+    let Ok(local_app_data) = local_app_data() else {
+        return;
+    };
+    let root = local_app_data.join("ForwardSlashWindows");
+    if !root.is_dir() {
+        return;
+    }
+    let in_flight = cmd::active_removal_path();
+    let sweep = |directory: &Path, in_powershell_dir: bool| {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if !entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+            {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !is_prunable_leftover(name, in_powershell_dir) {
+                continue;
+            }
+            let path = entry.path();
+            if in_flight
+                .as_deref()
+                .is_some_and(|active| Path::new(active) == path)
+            {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    };
+    sweep(&root, false);
+    sweep(&root.join("PowerShell"), true);
 }
 
 /// The payload directory for an adapter kind, relative to the executable:
@@ -844,13 +1085,14 @@ pub fn product_present(recorded_probes: &[String]) -> bool {
 /// the query cannot be run at all.
 #[cfg(windows)]
 fn appx_registered(identity_name: &str) -> bool {
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let shell = Path::new(&system_root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    let Some(shell) = fsw_core::SystemBinary::PowerShell.path() else {
+        return true;
+    };
     let script = format!(
         "if (Get-AppxPackage -Name '{}') {{ exit 0 }} else {{ exit 1 }}",
         identity_name.replace('\'', "''")
     );
-    Command::new(shell)
+    Command::new(&shell)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
@@ -860,7 +1102,7 @@ fn appx_registered(identity_name: &str) -> bool {
         .map_or(true, |status| status.success())
 }
 
-/// The real Documents folder, following OneDrive redirection
+/// The real Documents folder, following `OneDrive` redirection
 /// (`SHGetKnownFolderPath`, not `%USERPROFILE%\Documents`).
 #[cfg(windows)]
 pub fn documents_dir() -> Result<PathBuf, AdapterError> {
@@ -868,7 +1110,8 @@ pub fn documents_dir() -> Result<PathBuf, AdapterError> {
 
     unsafe {
         let mut path = std::ptr::null_mut();
-        let status = SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut path);
+        let status =
+            SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &raw mut path);
         if status != 0 || path.is_null() {
             return Err(AdapterError::new("could not locate the Documents folder"));
         }
@@ -893,12 +1136,15 @@ pub fn new_transaction_id() -> String {
 
 /// Creates a directory through `cmd.exe` — a real process, so the directory
 /// lands in the real file system even when this process is packaged (MSIX
-/// virtualization would otherwise redirect it into LocalCache, where
+/// virtualization would otherwise redirect it into `LocalCache`, where
 /// unpackaged shells can never see the adapter payload). Already-existing
 /// directories are fine.
 #[cfg(windows)]
 pub fn real_make_dir(path: &Path) -> Result<(), AdapterError> {
-    let output = Command::new("cmd.exe")
+    let cmd = fsw_core::SystemBinary::Cmd
+        .path()
+        .ok_or_else(|| AdapterError::new("cmd.exe was not found."))?;
+    let output = Command::new(cmd)
         .args(["/c", "mkdir"])
         .arg(path)
         .creation_flags(CREATE_NO_WINDOW)
@@ -914,7 +1160,7 @@ pub fn real_make_dir(path: &Path) -> Result<(), AdapterError> {
 }
 
 /// Copies one file through `cmd.exe` (real process — see `real_make_dir`).
-/// Sources may live in the package's WindowsApps directory (readable by path);
+/// Sources may live in the package's `WindowsApps` directory (readable by path);
 /// destinations land in the real file system.
 ///
 /// The size is compared afterwards: `copy` is binary for a file-to-file copy,
@@ -928,7 +1174,10 @@ pub fn real_copy_file(source: &Path, destination_dir: &Path) -> Result<(), Adapt
     let file_name = source
         .file_name()
         .ok_or_else(|| AdapterError::new("invalid payload source name"))?;
-    let output = Command::new("cmd.exe")
+    let cmd = fsw_core::SystemBinary::Cmd
+        .path()
+        .ok_or_else(|| AdapterError::new("cmd.exe was not found."))?;
+    let output = Command::new(cmd)
         .args(["/c", "copy", "/y"])
         .arg(source)
         .arg(destination_dir.join(file_name))
@@ -938,13 +1187,13 @@ pub fn real_copy_file(source: &Path, destination_dir: &Path) -> Result<(), Adapt
     if output.status.success() && destination_dir.join(file_name).is_file() {
         let copied = std::fs::metadata(destination_dir.join(file_name)).map(|data| data.len());
         let original = std::fs::metadata(source).map(|data| data.len());
-        if let (Ok(copied), Ok(original)) = (copied, original) {
-            if copied != original {
-                return Err(AdapterError::new(&format!(
-                    "{} was deployed incompletely ({copied} of {original} bytes)",
-                    file_name.to_string_lossy()
-                )));
-            }
+        if let (Ok(copied), Ok(original)) = (copied, original)
+            && copied != original
+        {
+            return Err(AdapterError::new(&format!(
+                "{} was deployed incompletely ({copied} of {original} bytes)",
+                file_name.to_string_lossy()
+            )));
         }
         return Ok(());
     }
@@ -991,7 +1240,10 @@ pub fn explain_file_error(error: &AdapterError, what: &str, target: &Path) -> Ad
     let text = error.to_string();
     let parent_exists = target.parent().is_some_and(Path::is_dir);
     if looks_like_blocked_write(&text, parent_exists) {
-        return AdapterError::new(&format!("{what} {BLOCKED_WRITE_GUIDANCE}"));
+        return AdapterError::blocked(&format!("{what} {BLOCKED_WRITE_GUIDANCE}"));
+    }
+    if error.is_blocked() {
+        return AdapterError::blocked(&text);
     }
     AdapterError::new(&text)
 }

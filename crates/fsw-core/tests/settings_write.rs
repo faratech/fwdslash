@@ -8,7 +8,7 @@ use fsw_core::settings_write::{
     RawSetting, SettingValue, WritePlan, parse_reg_number, parse_reg_query, sync_plan, write_plan,
 };
 use fsw_core::{
-    FSW_BARE_SLASH_DISTRIBUTION_VALUE, FSW_BARE_SLASH_MODE_VALUE, FSW_DISABLED_VALUE,
+    FSW_BARE_SLASH_DISTRIBUTION_VALUE, FSW_BARE_SLASH_MODE_VALUE, FSW_DISABLED_VALUE, SystemBinary,
     sync_settings_to_real_hive,
 };
 
@@ -28,6 +28,26 @@ fn unpackaged_writes_the_real_hive_only() {
     // Without package identity the in-process API *is* the real hive; a
     // reg.exe child would only write the same value twice.
     assert_eq!(write_plan(false), WritePlan::RealOnly);
+}
+
+#[test]
+fn registry_writer_uses_the_closed_system_binary_set() {
+    assert_eq!(SystemBinary::Reg.file_name(), "reg.exe");
+}
+
+#[cfg(windows)]
+#[test]
+#[allow(clippy::expect_used)]
+fn registry_writer_resolves_from_the_windows_system_directory() {
+    let path = SystemBinary::Reg
+        .path()
+        .expect("Windows must report a system-directory reg.exe path");
+    assert!(path.is_absolute());
+    assert!(path.is_file());
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("reg.exe")
+    );
 }
 
 #[test]
@@ -54,8 +74,14 @@ const REAL_HIVE_SAMPLE: &str = "\r\nHKEY_CURRENT_USER\\Software\\ForwardSlashWin
 fn parses_the_measured_real_hive_output() {
     let values = parse_reg_query(REAL_HIVE_SAMPLE);
     assert_eq!(values.len(), 1);
-    assert_eq!(values[0].0, FSW_DISABLED_VALUE);
-    assert_eq!(values[0].1, raw("REG_DWORD", "0x0"));
+    assert_eq!(
+        values.first().map(|entry| entry.0.as_str()),
+        Some(FSW_DISABLED_VALUE)
+    );
+    assert_eq!(
+        values.first().map(|entry| &entry.1),
+        Some(&raw("REG_DWORD", "0x0"))
+    );
 }
 
 #[test]
@@ -67,9 +93,18 @@ fn parses_every_type_this_key_uses() {
         \x20   LastUpdateCheck    REG_QWORD    0x68b8c0f1\r\n";
     let values = parse_reg_query(output);
     assert_eq!(values.len(), 4);
-    assert_eq!(values[2].0, FSW_BARE_SLASH_DISTRIBUTION_VALUE);
-    assert_eq!(values[2].1, raw("REG_SZ", "Ubuntu"));
-    assert_eq!(values[3].1, raw("REG_QWORD", "0x68b8c0f1"));
+    assert_eq!(
+        values.get(2).map(|entry| entry.0.as_str()),
+        Some(FSW_BARE_SLASH_DISTRIBUTION_VALUE)
+    );
+    assert_eq!(
+        values.get(2).map(|entry| &entry.1),
+        Some(&raw("REG_SZ", "Ubuntu"))
+    );
+    assert_eq!(
+        values.get(3).map(|entry| &entry.1),
+        Some(&raw("REG_QWORD", "0x68b8c0f1"))
+    );
 }
 
 #[test]
@@ -77,7 +112,10 @@ fn a_string_value_keeps_its_spaces_and_quotes() {
     let output = "    BareSlashRoot    REG_SZ    C:\\Program Files\\My \"Code\"\r\n";
     let values = parse_reg_query(output);
     assert_eq!(values.len(), 1);
-    assert_eq!(values[0].1.data, "C:\\Program Files\\My \"Code\"");
+    assert_eq!(
+        values.first().map(|entry| entry.1.data.as_str()),
+        Some("C:\\Program Files\\My \"Code\"")
+    );
 }
 
 #[test]
@@ -85,15 +123,24 @@ fn a_value_name_with_spaces_still_splits_on_the_type() {
     let output = "    Bare Slash Root    REG_SZ    C:\\code\r\n";
     let values = parse_reg_query(output);
     assert_eq!(values.len(), 1);
-    assert_eq!(values[0].0, "Bare Slash Root");
-    assert_eq!(values[0].1.data, "C:\\code");
+    assert_eq!(
+        values.first().map(|entry| entry.0.as_str()),
+        Some("Bare Slash Root")
+    );
+    assert_eq!(
+        values.first().map(|entry| entry.1.data.as_str()),
+        Some("C:\\code")
+    );
 }
 
 #[test]
 fn empty_data_parses_as_an_empty_string() {
     let values = parse_reg_query("    AvailableUpdate    REG_SZ    \r\n");
     assert_eq!(values.len(), 1);
-    assert_eq!(values[0].1, raw("REG_SZ", ""));
+    assert_eq!(
+        values.first().map(|entry| &entry.1),
+        Some(&raw("REG_SZ", ""))
+    );
 }
 
 #[test]
@@ -118,7 +165,10 @@ fn foreign_types_on_the_key_are_parsed_not_skipped() {
     // disappear and read as "the real hive has nothing".
     let values = parse_reg_query("    BareSlashRoot    REG_EXPAND_SZ    %USERPROFILE%\\code\r\n");
     assert_eq!(values.len(), 1);
-    assert_eq!(values[0].1.kind, "REG_EXPAND_SZ");
+    assert_eq!(
+        values.first().map(|entry| entry.1.kind.as_str()),
+        Some("REG_EXPAND_SZ")
+    );
 }
 
 #[test]
@@ -188,10 +238,7 @@ fn the_reported_split_mirrors_both_bare_slash_values() {
     let real = parse_reg_query(REAL_HIVE_SAMPLE);
     assert_eq!(
         sync_plan(&merged, &real),
-        vec![
-            FSW_BARE_SLASH_MODE_VALUE,
-            FSW_BARE_SLASH_DISTRIBUTION_VALUE
-        ]
+        vec![FSW_BARE_SLASH_MODE_VALUE, FSW_BARE_SLASH_DISTRIBUTION_VALUE]
     );
 }
 

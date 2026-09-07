@@ -3,6 +3,8 @@
 //! manual verification matrix; everything decided here is what that I/O
 //! feeds on.
 
+#![allow(clippy::panic)]
+
 use super::profile;
 use super::state;
 
@@ -16,25 +18,41 @@ fn empty_originals_remain_present_but_orphan_hooks_do_not() {
     assert!(state::original_autorun_present(true, "", ""));
     assert!(!state::original_autorun_present(false, "", ""));
     assert!(!state::original_autorun_present(true, "call old-hook", ""));
-    assert!(state::original_autorun_present(true, "%SystemRoot%", "%SystemRoot%"));
+    assert!(state::original_autorun_present(
+        true,
+        "%SystemRoot%",
+        "%SystemRoot%"
+    ));
 }
 
 #[cfg(windows)]
 #[test]
 fn orphan_cleanup_preserves_updater_and_unrelated_data() {
     let root = std::env::temp_dir().join(format!("fsw-prune-{}", super::new_transaction_id()));
-    for child in ["cmd", "PowerShell", ".cmd-staging-test", "update", "unrelated"] {
-        std::fs::create_dir_all(root.join(child)).unwrap();
-        std::fs::write(root.join(child).join("sentinel"), b"keep").unwrap();
+    for child in [
+        "cmd",
+        "PowerShell",
+        ".cmd-staging-test",
+        "update",
+        "unrelated",
+    ] {
+        std::fs::create_dir_all(root.join(child))
+            .unwrap_or_else(|error| panic!("create test child: {error}"));
+        std::fs::write(root.join(child).join("sentinel"), b"keep")
+            .unwrap_or_else(|error| panic!("write test sentinel: {error}"));
     }
     super::prune_adapter_directories(&root);
     for child in ["cmd", "PowerShell", ".cmd-staging-test"] {
         assert!(!root.join(child).exists());
     }
     for child in ["update", "unrelated"] {
-        assert_eq!(std::fs::read(root.join(child).join("sentinel")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read(root.join(child).join("sentinel"))
+                .unwrap_or_else(|error| panic!("read test sentinel: {error}")),
+            b"keep"
+        );
     }
-    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(root).unwrap_or_else(|error| panic!("remove test root: {error}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +69,11 @@ fn classify_knows_the_three_transaction_states() {
 #[test]
 fn classify_rejects_everything_else() {
     for text in ["", "Installed", "INSTALL", "garbage"] {
-        assert_eq!(state::classify(text), state::MarkerState::Unknown, "{text:?}");
+        assert_eq!(
+            state::classify(text),
+            state::MarkerState::Unknown,
+            "{text:?}"
+        );
     }
 }
 
@@ -220,7 +242,12 @@ fn judge_autorun_tolerates_the_0_0_2_one_character_truncation() {
     );
     // A one-character difference that is not a prefix is still Changed.
     assert_eq!(
-        state::judge_autorun(true, "call \"C:\\fsw\\fsw-autorun.cmdX", installed, original),
+        state::judge_autorun(
+            true,
+            "call \"C:\\fsw\\fsw-autorun.cmdX",
+            installed,
+            original
+        ),
         state::AutorunVerdict::Changed
     );
     // An empty current value never counts as a truncation of anything.
@@ -314,9 +341,15 @@ fn decode_reg_string_decodes_an_empty_value() {
 #[test]
 fn decode_reg_string_preserves_a_non_ascii_last_character() {
     // U+00E9 is E9 00 in UTF-16LE — the same zero high byte, same 0.0.2 loss.
-    assert_eq!(super::reg::decode_reg_string(&reg_bytes("caf\u{e9}", 1)), "caf\u{e9}");
+    assert_eq!(
+        super::reg::decode_reg_string(&reg_bytes("caf\u{e9}", 1)),
+        "caf\u{e9}"
+    );
     // A code unit with a non-zero high byte was never affected; still exact.
-    assert_eq!(super::reg::decode_reg_string(&reg_bytes("\u{65e5}", 1)), "\u{65e5}");
+    assert_eq!(
+        super::reg::decode_reg_string(&reg_bytes("\u{65e5}", 1)),
+        "\u{65e5}"
+    );
 }
 
 #[cfg(windows)]
@@ -342,12 +375,30 @@ fn decode_reg_string_ignores_a_trailing_odd_byte() {
 
 #[test]
 fn detect_encoding_reads_every_bom() {
-    assert_eq!(profile::detect_encoding(&[0x00, 0x00, 0xFE, 0xFF]), profile::ProfileEncoding::Utf32Be);
-    assert_eq!(profile::detect_encoding(&[0xFF, 0xFE, 0x00, 0x00]), profile::ProfileEncoding::Utf32Le);
-    assert_eq!(profile::detect_encoding(&[0xFE, 0xFF]), profile::ProfileEncoding::Utf16Be);
-    assert_eq!(profile::detect_encoding(&[0xFF, 0xFE]), profile::ProfileEncoding::Utf16Le);
-    assert_eq!(profile::detect_encoding(b"plain"), profile::ProfileEncoding::Utf8);
-    assert_eq!(profile::detect_encoding(&[]), profile::ProfileEncoding::Utf8);
+    assert_eq!(
+        profile::detect_encoding(&[0x00, 0x00, 0xFE, 0xFF]),
+        profile::ProfileEncoding::Utf32Be
+    );
+    assert_eq!(
+        profile::detect_encoding(&[0xFF, 0xFE, 0x00, 0x00]),
+        profile::ProfileEncoding::Utf32Le
+    );
+    assert_eq!(
+        profile::detect_encoding(&[0xFE, 0xFF]),
+        profile::ProfileEncoding::Utf16Be
+    );
+    assert_eq!(
+        profile::detect_encoding(&[0xFF, 0xFE]),
+        profile::ProfileEncoding::Utf16Le
+    );
+    assert_eq!(
+        profile::detect_encoding(b"plain"),
+        profile::ProfileEncoding::Utf8
+    );
+    assert_eq!(
+        profile::detect_encoding(&[]),
+        profile::ProfileEncoding::Utf8
+    );
     // Preserved quirk: a UTF-16LE payload whose next unit starts with 0x00
     // matches the UTF-32LE probe first.
     assert_eq!(
@@ -359,8 +410,14 @@ fn detect_encoding_reads_every_bom() {
 #[test]
 fn encode_never_prepends_a_bom() {
     // UTF-16LE of "abc" must start with 'a' (0x61 0x00), not a BOM.
-    assert_eq!(profile::encode("abc", profile::ProfileEncoding::Utf16Le), vec![0x61, 0x00, 0x62, 0x00, 0x63, 0x00]);
-    assert_eq!(profile::encode("abc", profile::ProfileEncoding::Utf8), b"abc".to_vec());
+    assert_eq!(
+        profile::encode("abc", profile::ProfileEncoding::Utf16Le),
+        vec![0x61, 0x00, 0x62, 0x00, 0x63, 0x00]
+    );
+    assert_eq!(
+        profile::encode("abc", profile::ProfileEncoding::Utf8),
+        b"abc".to_vec()
+    );
     assert_eq!(
         profile::encode("a", profile::ProfileEncoding::Utf16Be),
         vec![0x00, 0x61]
@@ -376,7 +433,9 @@ fn encode_round_trips_through_utf16() {
     let text = "dir /etc ← 日本語";
     let bytes = profile::encode(text, profile::ProfileEncoding::Utf16Le);
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     assert_eq!(String::from_utf16(&units).ok().as_deref(), Some(text));
@@ -384,10 +443,8 @@ fn encode_round_trips_through_utf16() {
 
 /// A guarded block for the tests: the fixed probe/controller keep the layout
 /// assertions focused on the parts #37 changed.
-fn ps_block(version: &str, id: &str, module: &str, original_non_empty: bool) -> String {
+fn ps_block(module: &str, original_non_empty: bool) -> String {
     profile::block_text(&profile::BlockParams {
-        version,
-        transaction_id: id,
         module_path: module,
         probe_path: "C:\\Local\\Packages\\Fam_abc",
         alias_path: "C:\\Local\\Microsoft\\WindowsApps\\fwdslash.exe",
@@ -398,17 +455,11 @@ fn ps_block(version: &str, id: &str, module: &str, original_non_empty: bool) -> 
 
 #[test]
 fn block_text_renders_the_guarded_form() {
-    // The payload version follows the crate version, so the layout assertions
-    // are built from PAYLOAD_VERSION rather than a literal that goes stale
-    // at every release.
-    let version = super::PAYLOAD_VERSION;
-    let module = format!(
-        r"C:\Users\me\AppData\Local\ForwardSlashWindows\PowerShell\{version}\ForwardSlashWindows.psm1"
-    );
-    let block = ps_block(version, "cafe", &module, false);
-    assert!(block.starts_with(&format!(
-        "# >>> Forward Slash Windows {version} cafe >>>\r\n"
-    )));
+    // The payload directory is version-free since #127, so the module path in
+    // the block is a literal that never moves.
+    let module = r"C:\Users\me\AppData\Local\ForwardSlashWindows\PowerShell\payload\ForwardSlashWindows.psm1";
+    let block = ps_block(module, false);
+    assert!(block.starts_with("# >>> Forward Slash Windows >>>\r\n"));
     assert!(block.contains(&format!("$m = '{module}'\r\n")));
     // The import is guarded by Test-Path, never a bare Import-Module (#37); the
     // product counts as present when EITHER the probe folder or the
@@ -426,16 +477,18 @@ fn block_text_renders_the_guarded_form() {
         !block.contains("Import-Module -Name 'C:"),
         "no unguarded literal-path import"
     );
-    assert!(block.ends_with(&format!(
-        "# <<< Forward Slash Windows {version} cafe <<<\r\n"
-    )));
+    assert!(block.ends_with("# <<< Forward Slash Windows <<<\r\n"));
+    // The whole point of #127: no version and no transaction id anywhere, so
+    // the bytes are identical release to release and the Documents write that
+    // Controlled Folder Access blocked simply never happens.
+    assert!(!block.contains(super::PAYLOAD_VERSION));
     // No blank-line prefix when the original was empty.
     assert!(!block.starts_with("\r\n"));
 }
 
 #[test]
 fn block_text_escapes_quotes_and_prefixes_nonempty_originals() {
-    let block = ps_block(super::PAYLOAD_VERSION, "t", "C:\\it's", true);
+    let block = ps_block("C:\\it's", true);
     assert!(block.starts_with("\r\n"));
     assert!(block.contains("$m = 'C:\\it''s'\r\n"));
 }
@@ -443,7 +496,7 @@ fn block_text_escapes_quotes_and_prefixes_nonempty_originals() {
 #[test]
 fn strip_restores_the_true_original_utf8() {
     let original = b"Write-Host hi\r\n".to_vec();
-    let block = ps_block(super::PAYLOAD_VERSION, "id1", "C:\\m.psm1", true);
+    let block = ps_block("C:\\m.psm1", true);
     let mut installed = original.clone();
     installed.extend_from_slice(block.as_bytes());
     assert_eq!(profile::strip_fwdslash_blocks(&installed), original);
@@ -451,7 +504,7 @@ fn strip_restores_the_true_original_utf8() {
 
 #[test]
 fn strip_restores_empty_when_the_original_was_absent() {
-    let block = ps_block(super::PAYLOAD_VERSION, "id1", "C:\\m.psm1", false);
+    let block = ps_block("C:\\m.psm1", false);
     assert!(profile::strip_fwdslash_blocks(block.as_bytes()).is_empty());
 }
 
@@ -460,8 +513,8 @@ fn strip_removes_every_block_on_a_multi_version_upgrade() {
     // The append-not-replace bug (#37): a profile carrying an old block and a
     // new one must strip back to the genuine original, and both are detected.
     let original = b"# my profile\r\n".to_vec();
-    let old = ps_block("0.0.1", "old", "C:\\old\\m.psm1", true);
-    let new = ps_block("0.0.3", "new", "C:\\new\\m.psm1", true);
+    let old = legacy_block("0.0.1", "old", "C:\\old\\m.psm1", true);
+    let new = ps_block("C:\\new\\m.psm1", true);
     let mut polluted = original.clone();
     polluted.extend_from_slice(old.as_bytes());
     polluted.extend_from_slice(new.as_bytes());
@@ -478,7 +531,7 @@ fn strip_leaves_a_fenceless_profile_byte_exact() {
 #[test]
 fn strip_restores_the_true_original_utf16le_with_bom() {
     let text = "Write-Host hi\r\n";
-    let block = ps_block(super::PAYLOAD_VERSION, "id", "C:\\m.psm1", true);
+    let block = ps_block("C:\\m.psm1", true);
     let mut installed = vec![0xFF, 0xFE];
     installed.extend_from_slice(&profile::encode(text, profile::ProfileEncoding::Utf16Le));
     installed.extend_from_slice(&profile::encode(&block, profile::ProfileEncoding::Utf16Le));
@@ -489,15 +542,79 @@ fn strip_restores_the_true_original_utf16le_with_bom() {
 
 #[test]
 fn parse_blocks_extracts_version_and_module() {
-    let block = ps_block("0.0.1", "abc123", "C:\\FSW\\PowerShell\\0.0.1\\ForwardSlashWindows.psm1", true);
+    let block = legacy_block(
+        "0.0.1",
+        "abc123",
+        "C:\\FSW\\PowerShell\\0.0.1\\ForwardSlashWindows.psm1",
+        true,
+    );
     let blocks = profile::parse_blocks(block.as_bytes());
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].version, "0.0.1");
-    assert_eq!(blocks[0].transaction_id, "abc123");
     assert_eq!(
-        blocks[0].module_path.as_deref(),
+        blocks.first().map(|parsed| parsed.version.as_str()),
+        Some("0.0.1")
+    );
+    assert_eq!(
+        blocks.first().map(|parsed| parsed.transaction_id.as_str()),
+        Some("abc123")
+    );
+    assert_eq!(
+        blocks
+            .first()
+            .and_then(|parsed| parsed.module_path.as_deref()),
         Some("C:\\FSW\\PowerShell\\0.0.1\\ForwardSlashWindows.psm1")
     );
+    assert!(blocks.first().is_some_and(profile::ParsedBlock::is_legacy));
+}
+
+/// A block written by a release before #127: the version and transaction id
+/// still live in both fence lines. Every parser path has to keep finding these
+/// so an existing install can be migrated and removed.
+fn legacy_block(version: &str, id: &str, module: &str, original_non_empty: bool) -> String {
+    let stable = ps_block(module, original_non_empty);
+    stable
+        .replace(
+            profile::FENCE_OPEN,
+            &format!("# >>> Forward Slash Windows {version} {id} >>>"),
+        )
+        .replace(
+            profile::FENCE_CLOSE,
+            &format!("# <<< Forward Slash Windows {version} {id} <<<"),
+        )
+}
+
+/// The stable fence carries no version, so a block this build wrote parses with
+/// an empty version and is never legacy (#127).
+#[test]
+fn the_stable_fence_parses_without_a_version() {
+    let block = ps_block(
+        "C:\\FSW\\PowerShell\\payload\\ForwardSlashWindows.psm1",
+        true,
+    );
+    let blocks = profile::parse_blocks(block.as_bytes());
+    assert_eq!(blocks.len(), 1);
+    let parsed = blocks.first();
+    assert_eq!(parsed.map(|block| block.version.as_str()), Some(""));
+    assert_eq!(parsed.map(|block| block.transaction_id.as_str()), Some(""));
+    assert_eq!(parsed.map(profile::ParsedBlock::is_legacy), Some(false));
+}
+
+/// Two releases produce the same bytes, which is what stops an upgrade from
+/// touching the profile at all (#127).
+#[test]
+fn block_text_is_byte_identical_across_runs() {
+    let module = r"C:\FSW\PowerShell\payload\ForwardSlashWindows.psm1";
+    assert_eq!(ps_block(module, true), ps_block(module, true));
+}
+
+/// A legacy block still strips cleanly, so the migration restores the genuine
+/// pre-fwdslash profile before writing the stable block (#127).
+#[test]
+fn a_legacy_block_still_strips_back_to_the_true_original() {
+    let original = b"Write-Host hi\r\n".to_vec();
+    let mut installed = original.clone();
+    installed.extend_from_slice(legacy_block("0.0.7", "abc", "C:\\old\\m.psm1", true).as_bytes());
+    assert_eq!(profile::strip_fwdslash_blocks(&installed), original);
 }
 
 #[test]
@@ -508,46 +625,53 @@ fn parse_and_strip_understand_the_old_one_line_import_format() {
     let blocks = profile::parse_blocks(legacy.as_bytes());
     assert_eq!(blocks.len(), 1);
     assert_eq!(
-        blocks[0].module_path.as_deref(),
+        blocks
+            .first()
+            .and_then(|parsed| parsed.module_path.as_deref()),
         Some("C:\\old\\ForwardSlashWindows.psm1")
     );
     assert!(profile::strip_fwdslash_blocks(legacy.as_bytes()).is_empty());
 }
 
+/// Staleness is the registry marker's job now (#127): a stable block carries no
+/// version, so the only thing the classifier can say about the fence text is
+/// whether it is still the legacy form.
 #[test]
-fn classify_profile_ranks_orphan_over_duplicate_and_stale() {
+fn classify_profile_ranks_orphan_over_duplicate_and_migration() {
     use profile::{BlockPresence, ProfileHealth};
     let present = BlockPresence {
-        version: super::PAYLOAD_VERSION.to_string(),
+        version: String::new(),
         module_present: true,
     };
     let missing = BlockPresence {
         version: "0.0.1".to_string(),
         module_present: false,
     };
-    let stale = BlockPresence {
-        version: "0.0.1".to_string(),
+    let legacy = BlockPresence {
+        version: "0.0.7".to_string(),
         module_present: true,
     };
+    assert_eq!(profile::classify_profile(&[]), ProfileHealth::Clean);
     assert_eq!(
-        profile::classify_profile(&[], super::PAYLOAD_VERSION),
-        ProfileHealth::Clean
-    );
-    assert_eq!(
-        profile::classify_profile(std::slice::from_ref(&present), super::PAYLOAD_VERSION),
+        profile::classify_profile(std::slice::from_ref(&present)),
         ProfileHealth::Healthy
     );
     assert_eq!(
-        profile::classify_profile(&[present.clone(), missing], super::PAYLOAD_VERSION),
+        profile::classify_profile(&[present.clone(), missing]),
         ProfileHealth::Orphaned("0.0.1".to_string())
     );
     assert_eq!(
-        profile::classify_profile(&[present.clone(), present.clone()], super::PAYLOAD_VERSION),
+        profile::classify_profile(&[present.clone(), present.clone()]),
         ProfileHealth::Duplicated
     );
     assert_eq!(
-        profile::classify_profile(std::slice::from_ref(&stale), super::PAYLOAD_VERSION),
-        ProfileHealth::Stale("0.0.1".to_string())
+        profile::classify_profile(std::slice::from_ref(&legacy)),
+        ProfileHealth::MigrationPending("0.0.7".to_string())
+    );
+    // A stable block never goes stale, whatever this build's version is.
+    assert_eq!(
+        profile::classify_profile(std::slice::from_ref(&present)),
+        ProfileHealth::Healthy
     );
 }
 
@@ -556,32 +680,117 @@ fn decide_profile_repair_covers_the_matrix() {
     use profile::{ProfileAction, ProfileHealth};
     // Healthy: nothing when installed; a dangling leftover to remove otherwise.
     assert_eq!(
-        profile::decide_profile_repair(&ProfileHealth::Healthy, true, true),
+        profile::decide_profile_repair(&ProfileHealth::Healthy, true, true, true),
         ProfileAction::Nothing
     );
     assert_eq!(
-        profile::decide_profile_repair(&ProfileHealth::Healthy, false, true),
+        profile::decide_profile_repair(&ProfileHealth::Healthy, false, true, true),
         ProfileAction::RemoveBlocks
     );
     // Orphan: write one current block when the module is there, reinstall when
     // it is missing, strip entirely when the marker is gone.
     let orphan = ProfileHealth::Orphaned("x".to_string());
     assert_eq!(
-        profile::decide_profile_repair(&orphan, true, true),
+        profile::decide_profile_repair(&orphan, true, true, true),
         ProfileAction::WriteCurrentBlock
     );
     assert_eq!(
-        profile::decide_profile_repair(&orphan, true, false),
+        profile::decide_profile_repair(&orphan, true, false, true),
         ProfileAction::Reinstall
     );
     assert_eq!(
-        profile::decide_profile_repair(&orphan, false, true),
+        profile::decide_profile_repair(&orphan, false, true, true),
         ProfileAction::RemoveBlocks
     );
     assert_eq!(
-        profile::decide_profile_repair(&ProfileHealth::Clean, false, false),
+        profile::decide_profile_repair(&ProfileHealth::Clean, false, false, true),
         ProfileAction::Nothing
     );
+    // A legacy block is migrated on an explicit action.
+    let legacy = ProfileHealth::MigrationPending("0.0.7".to_string());
+    assert_eq!(
+        profile::decide_profile_repair(&legacy, true, true, true),
+        ProfileAction::WriteCurrentBlock
+    );
+}
+
+/// The rule the silent-failure bug turned on (#127): a background sweep never
+/// writes a file under `Documents`. Every verdict that would becomes
+/// `NeedsConfirmation`; the ones that would not are unaffected.
+#[test]
+fn a_background_sweep_never_writes_a_profile() {
+    use profile::{ProfileAction, ProfileHealth};
+    for health in [
+        ProfileHealth::MigrationPending("0.0.7".to_string()),
+        ProfileHealth::Orphaned("0.0.7".to_string()),
+        ProfileHealth::Duplicated,
+        ProfileHealth::Clean,
+    ] {
+        assert_eq!(
+            profile::decide_profile_repair(&health, true, true, false),
+            ProfileAction::NeedsConfirmation,
+            "{health:?}"
+        );
+    }
+    // Removing a dangling block is a profile write too.
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::Healthy, false, true, false),
+        ProfileAction::NeedsConfirmation
+    );
+    // And the states that change nothing stay silent.
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::Healthy, true, true, false),
+        ProfileAction::Nothing
+    );
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::Clean, false, false, false),
+        ProfileAction::Nothing
+    );
+    assert!(!ProfileAction::NeedsConfirmation.writes_profile());
+    assert!(!ProfileAction::Nothing.writes_profile());
+}
+
+/// A permission-denied file error must arrive as the Controlled Folder Access
+/// explanation and carry the flag the CLI turns into its own exit code (#127).
+#[test]
+fn permission_denied_becomes_a_named_controlled_folder_access_failure() {
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let error = super::AdapterError::from(denied);
+    assert!(error.is_blocked());
+    assert!(error.to_string().contains("Controlled Folder Access"));
+    // An ordinary failure keeps the old shape and does not claim a block.
+    let missing = super::AdapterError::from(std::io::Error::from(std::io::ErrorKind::NotFound));
+    assert!(!missing.is_blocked());
+}
+
+/// The rename-aside leftovers both adapters strand, and the live directories
+/// that must survive the prune (#127).
+#[test]
+fn removing_and_staging_leftovers_are_prunable_but_live_payloads_are_not() {
+    use super::is_prunable_leftover;
+    for name in [
+        "cmd.removing-1a2b-3c",
+        "cmd.rollback-99-1",
+        ".cmd-staging-1a2b-3c",
+        ".cmd-rollback-1a2b-3c",
+        ".powershell-staging-1a2b-3c",
+    ] {
+        assert!(is_prunable_leftover(name, false), "{name}");
+    }
+    for name in [
+        "payload.removing-1a2b-3c",
+        "payload.staging-7",
+        "0.0.7.staging-3",
+    ] {
+        assert!(is_prunable_leftover(name, true), "{name}");
+    }
+    // The live payloads, the state tree, and a legacy version directory stay.
+    for name in ["cmd", "PowerShell", "update", "cmd.removing-"] {
+        assert!(!is_prunable_leftover(name, false), "{name}");
+    }
+    for name in ["payload", "state", "0.0.7", ".removing-x"] {
+        assert!(!is_prunable_leftover(name, true), "{name}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,14 +799,22 @@ fn decide_profile_repair_covers_the_matrix() {
 
 #[test]
 fn strip_fwdslash_autorun_recovers_the_true_third_party_value() {
-    let hook =
-        "call \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
+    let hook = "call \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
     // The MSIX-leftover case: an AutoRun that is purely our own hook.
     assert_eq!(state::strip_fwdslash_autorun(hook), "");
-    assert_eq!(state::strip_fwdslash_autorun(&format!("echo hi & {hook}")), "echo hi");
-    assert_eq!(state::strip_fwdslash_autorun(&format!("{hook} & echo hi")), "echo hi");
+    assert_eq!(
+        state::strip_fwdslash_autorun(&format!("echo hi & {hook}")),
+        "echo hi"
+    );
+    assert_eq!(
+        state::strip_fwdslash_autorun(&format!("{hook} & echo hi")),
+        "echo hi"
+    );
     // A doubled install (`call fsw & call fsw`) strips to nothing.
-    assert_eq!(state::strip_fwdslash_autorun(&format!("{hook} & {hook}")), "");
+    assert_eq!(
+        state::strip_fwdslash_autorun(&format!("{hook} & {hook}")),
+        ""
+    );
     // A third-party value that itself contains ` & ` survives intact.
     assert_eq!(
         state::strip_fwdslash_autorun(&format!("echo a & echo b & {hook}")),
@@ -612,8 +829,7 @@ fn a_refused_uninstall_still_strips_only_our_own_autorun_segment() {
     // third party edited AutoRun after we installed, which used to leave our
     // `call "…fsw-autorun.cmd"` pointing at a script the self-clean then
     // deleted — a "system cannot find the path specified" on every cmd start.
-    let hook =
-        "call \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
+    let hook = "call \"C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
     let original = "echo hi";
     let installed = state::installed_autorun(original, hook);
     let tampered = format!("{installed} & echo later");
@@ -635,7 +851,9 @@ fn a_refused_uninstall_still_strips_only_our_own_autorun_segment() {
 #[test]
 fn autorun_reference_and_path_helpers() {
     let hook = "call \"C:\\x\\ForwardSlashWindows\\cmd\\fsw-autorun.cmd\"";
-    assert!(state::autorun_references_fwdslash(&format!("echo hi & {hook}")));
+    assert!(state::autorun_references_fwdslash(&format!(
+        "echo hi & {hook}"
+    )));
     assert!(!state::autorun_references_fwdslash("echo hi"));
     assert_eq!(
         state::fwdslash_autorun_path(hook).as_deref(),
@@ -670,17 +888,31 @@ fn task_start_time_formats_and_wraps_at_midnight() {
 
 #[test]
 fn cleanup_script_quotes_every_path_and_self_destructs() {
-    let dir = r"C:\Users\a b\AppData\Local\ForwardSlashWindows";
-    let body = super::cleanup_script_body(dir, super::CLEANUP_TASK_NAME);
+    use std::path::Path;
+
+    let dir = Path::new(r"C:\Users\a b\AppData\Local\ForwardSlashWindows");
+    let ping = Path::new(r"C:\Windows\System32\ping.exe");
+    let schtasks = Path::new(r"C:\Windows\System32\schtasks.exe");
+    let body = super::cleanup_script_body(dir, super::CLEANUP_TASK_NAME, ping, schtasks)
+        .unwrap_or_else(|| panic!("safe cleanup paths"));
     // The payload path is quoted, so a space in the profile name is safe.
-    assert!(!body.contains(&format!("rd /s /q \"{dir}\"\r\n")));
-    assert!(body.contains(&format!("rd /s /q \"{dir}\\cmd\"\r\n")));
-    assert!(body.contains(&format!("rd /s /q \"{dir}\\PowerShell\"\r\n")));
+    assert!(!body.contains(&format!("rd /s /q \"{}\"\r\n", dir.display())));
+    assert!(body.contains(&format!("rd /s /q \"{}\\cmd\"\r\n", dir.display())));
+    assert!(body.contains(&format!("rd /s /q \"{}\\PowerShell\"\r\n", dir.display())));
+    assert!(body.contains(&format!(
+        "for /d %%D in (\"{}\\.cmd-staging-*\")",
+        dir.display()
+    )));
+    assert!(body.contains(&format!(
+        "for /d %%D in (\"{}\\.powershell-staging-*\")",
+        dir.display()
+    )));
+    assert!(!body.contains(&format!("rd /s /q \"{}\\update\"", dir.display())));
     // It waits for the launching process to exit before deleting.
-    assert!(body.contains("ping -n 3 127.0.0.1 >nul\r\n"));
+    assert!(body.contains("\"C:\\Windows\\System32\\ping.exe\" -n 3 127.0.0.1 >nul\r\n"));
     // ...then removes the task and itself, so nothing accumulates.
     assert!(body.contains(&format!(
-        "schtasks /delete /tn \"{}\" /f",
+        "\"C:\\Windows\\System32\\schtasks.exe\" /delete /tn \"{}\" /f",
         super::CLEANUP_TASK_NAME
     )));
     assert!(body.contains("del /q \"%~f0\""));
@@ -790,7 +1022,10 @@ fn execution_policy_parses_every_documented_name_case_insensitively() {
 
 #[test]
 fn only_restricted_undefined_and_allsigned_block() {
-    for edition in [state::Edition::WindowsPowerShell, state::Edition::PowerShell] {
+    for edition in [
+        state::Edition::WindowsPowerShell,
+        state::Edition::PowerShell,
+    ] {
         for blocking in ["Restricted", "Undefined", "AllSigned"] {
             assert!(
                 state::classify_execution_policy(edition, blocking).is_blocked(),
@@ -809,23 +1044,39 @@ fn only_restricted_undefined_and_allsigned_block() {
 
 #[test]
 fn an_unknown_policy_never_blocks_but_is_noted() {
-    let verdict = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Whatever\r\n");
+    let verdict =
+        state::classify_execution_policy(state::Edition::WindowsPowerShell, "Whatever\r\n");
     assert!(!verdict.is_blocked());
     let note = match &verdict {
         state::PolicyVerdict::Allowed { note } => note.clone().unwrap_or_default(),
         state::PolicyVerdict::Blocked(_) => String::new(),
     };
-    assert!(note.contains("unrecognized execution policy 'Whatever'"), "{note}");
+    assert!(
+        note.contains("unrecognized execution policy 'Whatever'"),
+        "{note}"
+    );
 }
 
 #[test]
 fn the_remedy_names_the_edition_that_owns_the_policy() {
     let windows = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Restricted");
     let seven = state::classify_execution_policy(state::Edition::PowerShell, "Restricted");
-    let windows = windows.blocked().map(|block| block.remedy.clone()).unwrap_or_default();
-    let seven = seven.blocked().map(|block| block.remedy.clone()).unwrap_or_default();
-    assert!(windows.contains("Run this in Windows PowerShell,"), "{windows}");
-    assert!(seven.contains("Run this in PowerShell 7 (pwsh),"), "{seven}");
+    let windows = windows
+        .blocked()
+        .map(|block| block.remedy.clone())
+        .unwrap_or_default();
+    let seven = seven
+        .blocked()
+        .map(|block| block.remedy.clone())
+        .unwrap_or_default();
+    assert!(
+        windows.contains("Run this in Windows PowerShell,"),
+        "{windows}"
+    );
+    assert!(
+        seven.contains("Run this in PowerShell 7 (pwsh),"),
+        "{seven}"
+    );
     // Both point at the same one-line fix, ending in a copyable command.
     for remedy in [&windows, &seven] {
         assert!(remedy.ends_with(state::REMOTE_SIGNED_COMMAND), "{remedy}");
@@ -854,7 +1105,10 @@ fn undefined_explains_that_it_means_restricted() {
         .blocked()
         .map(state::policy_install_error)
         .unwrap_or_default();
-    assert!(text.contains("is Undefined, which is treated as Restricted"), "{text}");
+    assert!(
+        text.contains("is Undefined, which is treated as Restricted"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -878,7 +1132,10 @@ fn the_exit_42_rewrite_keeps_the_rollback_clause() {
         remedy: String::new(),
     });
     let text = state::policy_verify_error(&block);
-    assert!(text.starts_with("Windows PowerShell's execution policy is Restricted,"), "{text}");
+    assert!(
+        text.starts_with("Windows PowerShell's execution policy is Restricted,"),
+        "{text}"
+    );
     assert!(text.contains("The installation was rolled back."), "{text}");
     assert!(text.ends_with(state::REMOTE_SIGNED_COMMAND), "{text}");
     // The generic "did not load the ... adapter" wording is replaced, not
@@ -890,9 +1147,15 @@ fn the_exit_42_rewrite_keeps_the_rollback_clause() {
 fn the_health_line_says_blocked_by_execution_policy() {
     let verdict = state::classify_execution_policy(state::Edition::WindowsPowerShell, "Restricted");
     let line = state::policy_health_status("Restricted\r\n", &verdict);
-    assert!(line.starts_with("Restricted — blocked by execution policy: "), "{line}");
+    assert!(
+        line.starts_with("Restricted — blocked by execution policy: "),
+        "{line}"
+    );
     let ok = state::classify_execution_policy(state::Edition::WindowsPowerShell, "RemoteSigned");
-    assert_eq!(state::policy_health_status("RemoteSigned\r\n", &ok), "RemoteSigned");
+    assert_eq!(
+        state::policy_health_status("RemoteSigned\r\n", &ok),
+        "RemoteSigned"
+    );
 }
 
 #[test]
@@ -935,7 +1198,10 @@ fn remove_block_excises_exactly_one_occurrence() {
         profile::remove_block(b"head BLOCK tail", b"BLOCK").as_deref(),
         Some(b"head  tail".as_slice())
     );
-    assert_eq!(profile::remove_block(b"BLOCK", b"BLOCK").as_deref(), Some(&[][..]));
+    assert_eq!(
+        profile::remove_block(b"BLOCK", b"BLOCK").as_deref(),
+        Some(&[][..])
+    );
     assert_eq!(profile::remove_block(b"no match", b"BLOCK"), None);
 }
 
@@ -978,19 +1244,19 @@ fn base64_utf16le_matches_known_vectors() {
             if byte == b'=' {
                 break;
             }
-            let Some(value) = value_of(byte) else { continue };
+            let Some(value) = value_of(byte) else {
+                continue;
+            };
             buffer = (buffer << 6) | value;
             bits += 6;
             if bits >= 8 {
                 bits -= 8;
-                bytes.push((buffer >> bits) as u8);
+                let value = (buffer >> bits) & u32::from(u8::MAX);
+                bytes.push(u8::try_from(value).unwrap_or_default());
             }
         }
         bytes
     };
-    let expected: Vec<u8> = text
-        .encode_utf16()
-        .flat_map(|unit| unit.to_le_bytes())
-        .collect();
+    let expected: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
     assert_eq!(decoded, expected);
 }

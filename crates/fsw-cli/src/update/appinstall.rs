@@ -17,7 +17,7 @@
 //! The spike (PR 1) established that `AppInstallManager` activates *both*
 //! identity-less and from inside the installed Store package, so this file is
 //! used from both — phase 1a in-process, phase 1b from the staged helper. What
-//! it must never do is assume: every WinRT call is `let Ok(..) = .. else`,
+//! it must never do is assume: every `WinRT` call is `let Ok(..) = .. else`,
 //! because a refusal here is a route change, not a crash.
 
 use super::install_control::{
@@ -31,14 +31,14 @@ use windows_future::{AsyncStatus, IAsyncOperation};
 /// How long to wait for the Store to finish before giving up. The Store's own
 /// queue can be slow enough that anything shorter turns a working install into
 /// a reported failure.
-pub const INSTALL_CEILING: Duration = Duration::from_secs(45 * 60);
+pub const INSTALL_CEILING: Duration = Duration::from_mins(45);
 /// How often the item statuses are re-read. One second is what winget uses.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// The entitlement and the start call are the only two awaits that must not
 /// hang; neither has any business taking minutes.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// `E_ABORT` — the only HRESULT this file invents, for its own timeouts.
-const E_ABORT: i32 = 0x8000_4004_u32 as i32;
+const E_ABORT: i32 = 0x8000_4004_u32.cast_signed();
 
 /// What one attempt at route 1 did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +140,23 @@ pub fn result_for(code: i32, error: Option<&str>) -> HelperResult {
 /// `update apply-store --product 9P51CM0MTMK2` against a current 0.0.4 install
 /// returned zero queued items, wrote `completed`, left the package at 0.0.4 and
 /// left the broker running. The zero-item arm below is that case.
+fn install_options() -> Result<AppInstallOptions, Outcome> {
+    let Ok(options) = AppInstallOptions::new() else {
+        return Err(Outcome::NotStarted("0x80040154".to_string()));
+    };
+    // Silent and restartable: no toast at either end, and the Store is allowed
+    // to close the running package to complete the install — which is exactly
+    // why the watchdog task is registered before this function is called.
+    let _ = options.SetAllowForcedAppRestart(true);
+    let _ = options
+        .SetInstallInProgressToastNotificationMode(AppInstallationToastNotificationMode::NoToast);
+    let _ = options
+        .SetCompletedInstallToastNotificationMode(AppInstallationToastNotificationMode::NoToast);
+    // An update, never a repair: a repair would reinstall the current version.
+    let _ = options.SetRepair(false);
+    Ok(options)
+}
+
 pub fn apply_store_update(product_id: &str) -> Outcome {
     let product = HSTRING::from(product_id);
     let empty = HSTRING::new();
@@ -154,33 +171,39 @@ pub fn apply_store_update(product_id: &str) -> Outcome {
         let _ = block_on(&operation, CALL_TIMEOUT);
     }
 
-    let Ok(options) = AppInstallOptions::new() else {
-        return Outcome::NotStarted("0x80040154".to_string());
+    let options = match install_options() {
+        Ok(options) => options,
+        Err(outcome) => return outcome,
     };
-    // Silent and restartable: no toast at either end, and the Store is allowed
-    // to close the running package to complete the install — which is exactly
-    // why the watchdog task is registered before this function is called.
-    let _ = options.SetAllowForcedAppRestart(true);
-    let _ = options
-        .SetInstallInProgressToastNotificationMode(AppInstallationToastNotificationMode::NoToast);
-    let _ = options
-        .SetCompletedInstallToastNotificationMode(AppInstallationToastNotificationMode::NoToast);
-    // An update, never a repair: a repair would reinstall the current version.
-    let _ = options.SetRepair(false);
 
     let clientid = HSTRING::from("fwdslash");
-    let items = match manager
+    let operation = match manager
         .StartProductInstallWithOptionsAsync(&product, &empty, &clientid, &empty, &options)
     {
-        Ok(operation) => match block_on(&operation, CALL_TIMEOUT) {
-            Ok(items) => items,
-            Err(error) => return Outcome::NotStarted(hex(&error)),
-        },
+        Ok(operation) => operation,
         Err(error) => return Outcome::NotStarted(hex(&error)),
     };
+    // An operation exists from here on. A timeout or status failure does not
+    // prove Windows declined the install, so it is terminal rather than a
+    // license to start a lower rung in parallel.
+    let items = match block_on(&operation, CALL_TIMEOUT) {
+        Ok(items) => items,
+        Err(error) => {
+            return Outcome::Finished {
+                code: EXIT_ERROR,
+                result: HelperResult::Error(hex(&error)),
+            };
+        }
+    };
 
-    let Ok(count) = items.Size() else {
-        return Outcome::NotStarted("0x80004005".to_string());
+    let count = match items.Size() {
+        Ok(count) => count,
+        Err(error) => {
+            return Outcome::Finished {
+                code: EXIT_ERROR,
+                result: HelperResult::Error(hex(&error)),
+            };
+        }
     };
     if count == 0 {
         // The Store queued nothing: there was nothing newer to install. Not a
@@ -214,10 +237,11 @@ pub fn apply_store_update(product_id: &str) -> Outcome {
             match code_for(state) {
                 Poll::Continue => still_working = true,
                 Poll::Finished(code) => {
-                    if code == EXIT_ERROR && error_code.is_none() {
-                        if let Ok(hresult) = status.ErrorCode() {
-                            error_code = Some(format!("0x{:08X}", hresult.0.cast_unsigned()));
-                        }
+                    if code == EXIT_ERROR
+                        && error_code.is_none()
+                        && let Ok(hresult) = status.ErrorCode()
+                    {
+                        error_code = Some(format!("0x{:08X}", hresult.0.cast_unsigned()));
                     }
                     // An error outranks a pause outranks a completion, so the
                     // reported outcome is the worst thing that happened to any

@@ -19,13 +19,26 @@ use windows::Services::Store::{StoreContext, StorePackageUpdate, StorePackageUpd
 use windows_collections::IVectorView;
 use windows_future::{AsyncStatus, IAsyncOperation, IAsyncOperationWithProgress};
 
+/// Where the silent Store route stopped.  Once the async install operation was
+/// created, Windows may have accepted deployment even if a later status read
+/// fails, so callers must never start another installer from that outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// The Store refused before an install operation existed.  It is safe to
+    /// fall through to the next route.
+    NotStarted(String),
+    /// An operation was created (or an up-to-date answer was returned).  This
+    /// route is terminal because deployment may already be in progress.
+    Finished { code: i32, detail: Option<String> },
+}
+
 /// The query is a network round trip to the Store service; a minute is
 /// generous and still bounded.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// A silent download plus deployment. The same 45-minute ceiling route 1 uses.
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+const INSTALL_TIMEOUT: Duration = Duration::from_mins(45);
 /// `E_ABORT` — the only HRESULT invented here, for this file's own timeouts.
-const E_ABORT: i32 = 0x8000_4004_u32 as i32;
+const E_ABORT: i32 = 0x8000_4004_u32.cast_signed();
 
 fn timed_out<T>() -> windows_core::Result<T> {
     Err(windows_core::Error::from_hresult(windows_core::HRESULT(
@@ -84,6 +97,8 @@ fn pending_updates() -> windows_core::Result<IVectorView<StorePackageUpdate>> {
 /// means up to date. Packaged callers only.
 pub fn check_store_updates() -> Result<Vec<String>, String> {
     let updates = pending_updates().map_err(|error| hex(&error))?;
+    let current =
+        fsw_core::package_version().ok_or_else(|| "package-version-unavailable".to_string())?;
     let count = updates.Size().map_err(|error| hex(&error))?;
     let mut versions = Vec::new();
     for index in 0..count {
@@ -93,13 +108,21 @@ pub fn check_store_updates() -> Result<Vec<String>, String> {
         // The version is the useful part: the broker balloons once per version
         // and the settings card prints it. A package whose version cannot be
         // read still counts as an update, under a name that says so.
-        versions.push(update_version(&update).unwrap_or_else(|| "unknown".to_string()));
+        if let Some(version) = update_version(&update)
+            && fsw_core::update::is_newer_package_version(&current, &version)
+        {
+            versions.push(version);
+        }
     }
     Ok(versions)
 }
 
 fn update_version(update: &StorePackageUpdate) -> Option<String> {
-    let version = update.Package().ok()?.Id().ok()?.Version().ok()?;
+    let id = update.Package().ok()?.Id().ok()?;
+    if id.Name().ok()? != fsw_core::STORE_IDENTITY_NAME {
+        return None;
+    }
+    let version = id.Version().ok()?;
     Some(format!(
         "{}.{}.{}.{}",
         version.Major, version.Minor, version.Build, version.Revision
@@ -116,29 +139,79 @@ pub fn can_silently_download() -> bool {
         .unwrap_or(false)
 }
 
-/// Route 2: download and deploy silently. Returns the verb's exit code.
+/// Route 2: download and deploy silently.
 ///
 /// Deployment terminates this process when it lands, so in the successful case
 /// this function does not return at all — the watchdog task registered before
 /// the call is what brings the product back.
-pub fn silent_download_and_install() -> Result<i32, String> {
-    let context = StoreContext::GetDefault().map_err(|error| hex(&error))?;
-    let updates = pending_updates().map_err(|error| hex(&error))?;
-    if updates.Size().map_err(|error| hex(&error))? == 0 {
-        return Ok(EXIT_NOTHING);
+pub fn silent_download_and_install() -> Outcome {
+    let context = match StoreContext::GetDefault() {
+        Ok(context) => context,
+        Err(error) => return Outcome::NotStarted(hex(&error)),
+    };
+    let updates = match pending_updates() {
+        Ok(updates) => updates,
+        Err(error) => return Outcome::NotStarted(hex(&error)),
+    };
+    let count = match updates.Size() {
+        Ok(count) => count,
+        Err(error) => return Outcome::NotStarted(hex(&error)),
+    };
+    if count == 0 {
+        return Outcome::Finished {
+            code: EXIT_NOTHING,
+            detail: None,
+        };
     }
-    if !context
-        .CanSilentlyDownloadStorePackageUpdates()
-        .unwrap_or(false)
-    {
-        return Err("0x80070005".to_string());
+    let Some(current) = fsw_core::package_version() else {
+        return Outcome::NotStarted("package-version-unavailable".to_string());
+    };
+    let has_newer_app = (0..count).any(|index| {
+        updates
+            .GetAt(index)
+            .ok()
+            .and_then(|update| update_version(&update))
+            .is_some_and(|version| fsw_core::update::is_newer_package_version(&current, &version))
+    });
+    if !has_newer_app {
+        return Outcome::Finished {
+            code: EXIT_NOTHING,
+            detail: None,
+        };
     }
-    let operation = context
-        .TrySilentDownloadAndInstallStorePackageUpdatesAsync(&updates)
-        .map_err(|error| hex(&error))?;
-    let result = block_on_progress(&operation, INSTALL_TIMEOUT).map_err(|error| hex(&error))?;
-    let state = result.OverallState().map_err(|error| hex(&error))?;
-    Ok(code_for_state(state))
+    let can_silently_download = match context.CanSilentlyDownloadStorePackageUpdates() {
+        Ok(value) => value,
+        Err(error) => return Outcome::NotStarted(hex(&error)),
+    };
+    if !can_silently_download {
+        return Outcome::NotStarted("0x80070005".to_string());
+    }
+    let operation = match context.TrySilentDownloadAndInstallStorePackageUpdatesAsync(&updates) {
+        Ok(operation) => operation,
+        Err(error) => return Outcome::NotStarted(hex(&error)),
+    };
+    let result = match block_on_progress(&operation, INSTALL_TIMEOUT) {
+        Ok(result) => result,
+        Err(error) => {
+            return Outcome::Finished {
+                code: EXIT_ERROR,
+                detail: Some(hex(&error)),
+            };
+        }
+    };
+    let state = match result.OverallState() {
+        Ok(state) => state,
+        Err(error) => {
+            return Outcome::Finished {
+                code: EXIT_ERROR,
+                detail: Some(hex(&error)),
+            };
+        }
+    };
+    Outcome::Finished {
+        code: code_for_state(state),
+        detail: None,
+    }
 }
 
 /// `StorePackageUpdateState` to exit code. The three `Error*` states that name
@@ -147,10 +220,10 @@ pub fn silent_download_and_install() -> Result<i32, String> {
 #[must_use]
 pub fn code_for_state(state: StorePackageUpdateState) -> i32 {
     match state {
-        StorePackageUpdateState::Completed => EXIT_OK,
+        StorePackageUpdateState::Completed
         // Still in flight when the wait returned: the deployment is queued and
         // will land, which is the same "started" the caller wanted.
-        StorePackageUpdateState::Pending
+        | StorePackageUpdateState::Pending
         | StorePackageUpdateState::Downloading
         | StorePackageUpdateState::Deploying => EXIT_OK,
         StorePackageUpdateState::ErrorLowBattery

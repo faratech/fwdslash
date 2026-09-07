@@ -101,3 +101,8 @@ __pycache__/
 Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+
+# Local agent scratch and a stale artifact directory created by running a
+# Windows-style "out\msix-store" path under bash, which collapses the backslash.
+.zcode/
+outmsix-store/

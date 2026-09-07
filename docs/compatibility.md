@@ -9,7 +9,9 @@ Blank or pending entries are unverified and must not be advertised as working.
 | Explorer current tab | UIA rewrite/replay | Automated on ARM64 host |
 | Explorer bare `/` | COM provider-root navigation | Automated on ARM64 host |
 | Win+R | UIA rewrite/replay | Manual gate required |
-| Windows Search navigation | Direct shell open | Manual gate required |
+| Windows Search navigation | UIA rewrite/replay in the authenticated Windows Search process | Candidate validation required |
+| Edge, Chrome, Brave address bars | File-URI rewrite with stable input capture and replacement-control replay | Restored from the working audit checkout; historical nine-case runs pass for each browser. Revalidate the 0.0.7 candidate. |
+| Firefox address bar | Observed native UIA profile | Unverified; native pass-through required when no profile matches |
 | Classic Open/Save dialog | UIA rewrite/replay | Re-verify: detection narrowed in 0.0.3 |
 | Modern app-specific picker | Adapter or minifilter | Per-application gate |
 | Win32 `CreateFileW` | Minifilter | VM integration gate pending |
@@ -24,7 +26,7 @@ Blank or pending entries are unverified and must not be advertised as working.
 | Settings app | Windows App Runtime **2.x** (`Microsoft.WindowsAppRuntime.2`) | ARM64 host launch and responsiveness verified |
 | Bare `/` in generic APIs | Windows drive-root semantics | Intentionally unsupported |
 | Elevated desktop app | Per-user driver mapping | VM gate pending |
-| Service/AppContainer/SYSTEM | Excluded by policy | Intentionally unsupported |
+| Generic service/AppContainer/SYSTEM filesystem access | No general user-mode interception | Unsupported without application-specific integration; authenticated Windows Search is handled separately |
 
 ## User-mode release gate
 
@@ -120,6 +122,15 @@ that carries it. A full end-to-end run therefore cannot be observed until a
 one are marked pending, and the first observable Store update is a 0.0.5
 install being offered 0.0.6. Blank or pending means unverified and must not be
 advertised as working.
+
+**Update (2026-09-06):** the 0.0.6.0 rows below stay pending for a structural
+reason: the *shipped* 0.0.6 updater accepts non-newer Store candidates (it
+reports the Store's signature-repair offer of equal version as `available`),
+so an in-app version-advance from 0.0.6 cannot be observed at all. Real 0.0.6
+installs migrate to 0.0.7 through the Store's own delivery — verified working
+onto this host via the Internal flight — and the in-app matrix becomes
+testable from 0.0.7.0 forward. Evidence and recipes:
+`docs/update-test-0.0.7.md` (findings §1–§3).
 
 Store-identity rows are produced with
 

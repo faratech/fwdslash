@@ -24,12 +24,13 @@ enum Expect {
     Fail(ResolveError),
 }
 
+#[allow(clippy::panic)]
 fn check(input: &str, got: &Result<Resolved<'_>, ResolveError>, want: &Expect) {
     match (got, want) {
         (Ok(Resolved::WslRoot), Expect::Root) => {
-            assert_eq!(got.as_ref().unwrap().unc_display(), r"\\wsl.localhost");
-            assert_eq!(got.as_ref().unwrap().linux_path(), "/");
-            assert!(got.as_ref().unwrap().distribution().is_none());
+            assert_eq!(Resolved::WslRoot.unc_display(), r"\\wsl.localhost");
+            assert_eq!(Resolved::WslRoot.linux_path(), "/");
+            assert!(Resolved::WslRoot.distribution().is_none());
         }
         (Ok(Resolved::Distribution(path)), Expect::Path(distro, unc, linux)) => {
             assert_eq!(path.distribution(), *distro, "distribution for {input:?}");
@@ -141,9 +142,17 @@ cases! {
         "/", DefaultDistribution, None, None
         => Expect::Fail(ResolveError::NoDefaultDistribution);
 
-    default_mode_leaves_explicit_distribution_paths_alone:
+    default_mode_treats_a_registered_name_as_a_folder:
         "/Ubuntu/home", DefaultDistribution, Some("Ubuntu"), None
-        => Expect::Path("Ubuntu", r"\\wsl.localhost\Ubuntu\home", "/home");
+        => Expect::Path("Ubuntu", r"\\wsl.localhost\Ubuntu\Ubuntu\home", "/Ubuntu/home");
+
+    default_mode_resolves_the_distro_name_folder_bare:
+        "/Ubuntu", DefaultDistribution, Some("Ubuntu"), Some("Ubuntu")
+        => Expect::Path("Ubuntu", r"\\wsl.localhost\Ubuntu\Ubuntu", "/Ubuntu");
+
+    default_mode_still_rejects_unregistered_first_segments:
+        "/Nope/home", DefaultDistribution, Some("Ubuntu"), None
+        => Expect::Path("Ubuntu", r"\\wsl.localhost\Ubuntu\Nope\home", "/Nope/home");
 
     non_distro_path_lands_in_the_default_distribution:
         "/tmp/build/log.txt", DefaultDistribution, None, Some("Ubuntu")
@@ -181,9 +190,30 @@ cases! {
         "/tmp", DefaultDistribution, Some("Debian"), None
         => Expect::Fail(ResolveError::NoDefaultDistribution);
 
-    a_registered_distribution_wins_over_the_default:
+    a_registered_name_is_a_folder_under_the_default:
         "/Dev Distro/home", DefaultDistribution, Some("Ubuntu"), Some("Ubuntu")
-        => Expect::Path("Dev Distro", r"\\wsl.localhost\Dev Distro\home", "/home");
+        => Expect::Path("Ubuntu", r"\\wsl.localhost\Ubuntu\Dev Distro\home", "/Dev Distro/home");
+
+    // R8 against the traversal rules: a registered first segment in default
+    // mode is an ordinary folder, so `..` cancels *it*, not a distribution
+    // selection. Under the pre-2026-09-06 rule `/Ubuntu/..` selected Ubuntu
+    // and then escaped above its root; now it is `<default>/Ubuntu/..`, which
+    // normalizes back to the default distribution's own root.
+    default_mode_registered_segment_is_cancelled_by_traversal:
+        "/Ubuntu/..", DefaultDistribution, Some("Dev Distro"), Some("Ubuntu")
+        => Expect::Path("Dev Distro", r"\\wsl.localhost\Dev Distro", "/");
+
+    default_mode_registered_segment_traversal_can_still_escape:
+        "/Ubuntu/../..", DefaultDistribution, Some("Ubuntu"), Some("Ubuntu")
+        => Expect::Fail(ResolveError::TraversalAboveRoot);
+
+    default_mode_registered_segment_survives_a_dot_component:
+        "/Ubuntu/./tmp", DefaultDistribution, None, Some("Dev Distro")
+        => Expect::Path(
+            "Dev Distro",
+            r"\\wsl.localhost\Dev Distro\Ubuntu\tmp",
+            "/Ubuntu/tmp",
+        );
 }
 
 // ---------------------------------------------------------------------------
@@ -250,20 +280,28 @@ fn bare_slash_in_default_mode_reports_a_trailing_separator() {
         preferred: None,
         wsl_default: Some("Ubuntu"),
     };
-    let Ok(Resolved::Distribution(path)) = resolve("/", &ctx, &mut buf) else {
-        panic!("bare slash should resolve in default mode");
-    };
-    assert!(path.had_trailing_separator());
-    assert_eq!(path.unc_display(), r"\\wsl.localhost\Ubuntu");
+    match resolve("/", &ctx, &mut buf) {
+        Ok(Resolved::Distribution(path)) => {
+            assert!(path.had_trailing_separator());
+            assert_eq!(path.unc_display(), r"\\wsl.localhost\Ubuntu");
+        }
+        other => assert!(
+            matches!(other, Ok(Resolved::Distribution(_))),
+            "bare slash should resolve in default mode"
+        ),
+    }
 }
 
 #[test]
 fn explicit_distribution_root_without_slash_reports_no_trailing_separator() {
     let mut buf = RenderBuf::new();
-    let Ok(Resolved::Distribution(path)) = resolve_strict("/Ubuntu", &REGISTERED, &mut buf) else {
-        panic!("should resolve");
-    };
-    assert!(!path.had_trailing_separator());
+    match resolve_strict("/Ubuntu", &REGISTERED, &mut buf) {
+        Ok(Resolved::Distribution(path)) => assert!(!path.had_trailing_separator()),
+        other => assert!(
+            matches!(other, Ok(Resolved::Distribution(_))),
+            "should resolve"
+        ),
+    }
 }
 
 #[test]
@@ -287,21 +325,26 @@ fn win32_normalization_hazard_is_detected() {
         ("/Ubuntu", false),
         ("/Ubuntu/", false),
     ] {
-        let Ok(Resolved::Distribution(path)) = resolve_strict(input, &REGISTERED, &mut buf) else {
-            panic!("{input} should resolve");
-        };
-        assert_eq!(
-            path.has_win32_normalization_hazard(),
-            hazard,
-            "hazard for {input:?} (linux {:?})",
-            path.linux_path()
-        );
-        let resolved = resolve_strict(input, &REGISTERED, &mut buf);
-        assert_eq!(
-            resolved.map(|r| r.has_win32_normalization_hazard()),
-            Ok(hazard),
-            "Resolved-level hazard for {input:?}"
-        );
+        match resolve_strict(input, &REGISTERED, &mut buf) {
+            Ok(Resolved::Distribution(path)) => {
+                assert_eq!(
+                    path.has_win32_normalization_hazard(),
+                    hazard,
+                    "hazard for {input:?} (linux {:?})",
+                    path.linux_path()
+                );
+                let resolved = resolve_strict(input, &REGISTERED, &mut buf);
+                assert_eq!(
+                    resolved.map(|r| r.has_win32_normalization_hazard()),
+                    Ok(hazard),
+                    "Resolved-level hazard for {input:?}"
+                );
+            }
+            other => assert!(
+                matches!(other, Ok(Resolved::Distribution(_))),
+                "{input} should resolve"
+            ),
+        }
     }
 }
 
@@ -315,16 +358,18 @@ fn win32_normalization_hazard_covers_folder_roots_and_never_the_provider_root() 
         ("/a./", false),
         ("/", false),
     ] {
-        let Ok(Resolved::Folder(path)) = fsw_path::resolve_under_root(input, r"C:\code", &mut buf)
-        else {
-            panic!("{input} should resolve under a folder root");
-        };
-        assert_eq!(
-            path.has_win32_normalization_hazard(),
-            hazard,
-            "hazard for {input:?} (under-root {:?})",
-            path.under_root()
-        );
+        match fsw_path::resolve_under_root(input, r"C:\code", &mut buf) {
+            Ok(Resolved::Folder(path)) => assert_eq!(
+                path.has_win32_normalization_hazard(),
+                hazard,
+                "hazard for {input:?} (under-root {:?})",
+                path.under_root()
+            ),
+            other => assert!(
+                matches!(other, Ok(Resolved::Folder(_))),
+                "{input} should resolve under a folder root"
+            ),
+        }
     }
     assert!(!Resolved::WslRoot.has_win32_normalization_hazard());
 }
@@ -344,7 +389,10 @@ fn render_buffer_is_reusable_and_results_are_independent() {
     let mut buf = RenderBuf::new();
     for _ in 0..3 {
         let got = resolve_strict("/Ubuntu/home", &REGISTERED, &mut buf);
-        assert_eq!(got.unwrap().unc_display(), r"\\wsl.localhost\Ubuntu\home");
+        assert!(got.is_ok(), "should resolve");
+        if let Ok(resolved) = got {
+            assert_eq!(resolved.unc_display(), r"\\wsl.localhost\Ubuntu\home");
+        }
     }
 }
 
@@ -478,23 +526,44 @@ fn folder(input: &str, root: &str, want_display: &str, want_under: &str) {
     let mut buf = RenderBuf::new();
     match fsw_path::resolve_under_root(input, root, &mut buf) {
         Ok(Resolved::Folder(path)) => {
-            assert_eq!(path.display(), want_display, "display for {input:?} under {root:?}");
-            assert_eq!(path.under_root(), want_under, "under-root for {input:?} under {root:?}");
+            assert_eq!(
+                path.display(),
+                want_display,
+                "display for {input:?} under {root:?}"
+            );
+            assert_eq!(
+                path.under_root(),
+                want_under,
+                "under-root for {input:?} under {root:?}"
+            );
         }
-        other => panic!("for {input:?} under {root:?}: got {other:?}"),
+        other => assert!(
+            matches!(other, Ok(Resolved::Folder(_))),
+            "for {input:?} under {root:?}: expected a folder result"
+        ),
     }
 }
 
 #[test]
 fn folder_root_bare_slash_returns_the_root() {
     folder("/", r"C:\code", r"C:\code", "/");
-    folder("/", r"\\wsl.localhost\Ubuntu\home\mike", r"\\wsl.localhost\Ubuntu\home\mike", "/");
+    folder(
+        "/",
+        r"\\wsl.localhost\Ubuntu\home\mike",
+        r"\\wsl.localhost\Ubuntu\home\mike",
+        "/",
+    );
 }
 
 #[test]
 fn folder_root_joins_components() {
     folder("/tmp/x", r"C:\code", r"C:\code\tmp\x", "/tmp/x");
-    folder("/proj/build", r"\\wsl.localhost\Ubuntu\home\mike", r"\\wsl.localhost\Ubuntu\home\mike\proj\build", "/proj/build");
+    folder(
+        "/proj/build",
+        r"\\wsl.localhost\Ubuntu\home\mike",
+        r"\\wsl.localhost\Ubuntu\home\mike\proj\build",
+        "/proj/build",
+    );
 }
 
 #[test]
@@ -566,30 +635,64 @@ fn windows_root_validation_table() {
         r"\\wsl.localhost\Ubuntu",
         r"\\wsl.localhost\Ubuntu\home\mike",
     ] {
-        assert!(fsw_path::is_valid_windows_root(root), "{root:?} should be valid");
+        assert!(
+            fsw_path::is_valid_windows_root(root),
+            "{root:?} should be valid"
+        );
     }
     // Rejected: relative, empty, separators of the other kind, device
     // namespaces, streams, junk.
-    for root in ["", "code", r"relative\path", r"\\.\pipe\x", r"\\?\C:\x", r"\??\x", r"C:\a:b", r"\\server", "C:/code", "/tmp"] {
-        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+    for root in [
+        "",
+        "code",
+        r"relative\path",
+        r"\\.\pipe\x",
+        r"\\?\C:\x",
+        r"\??\x",
+        r"C:\a:b",
+        r"\\server",
+        "C:/code",
+        "/tmp",
+    ] {
+        assert!(
+            !fsw_path::is_valid_windows_root(root),
+            "{root:?} should be invalid"
+        );
     }
     // Rejected: drive-*relative*. Win32 resolves these against a hidden
     // per-drive current directory, so they name no fixed folder.
     for root in [r"C:code", r"C:Users\me", r"c:x"] {
-        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+        assert!(
+            !fsw_path::is_valid_windows_root(root),
+            "{root:?} should be invalid"
+        );
     }
     // Rejected: UNC with no share component.
     for root in [r"\\server\", r"\\server\\share", r"\\\share"] {
-        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+        assert!(
+            !fsw_path::is_valid_windows_root(root),
+            "{root:?} should be invalid"
+        );
     }
     // Rejected: the provider root itself, however spelled. `unc_display`
     // promises that literal belongs to `Resolved::WslRoot` alone.
-    for root in [r"\\wsl.localhost", r"\\wsl.localhost\", r"\\WSL.LOCALHOST\\", r"\\Wsl.LocalHost"] {
-        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+    for root in [
+        r"\\wsl.localhost",
+        r"\\wsl.localhost\",
+        r"\\WSL.LOCALHOST\\",
+        r"\\Wsl.LocalHost",
+    ] {
+        assert!(
+            !fsw_path::is_valid_windows_root(root),
+            "{root:?} should be invalid"
+        );
     }
     // Rejected: wildcards name a pattern, not a folder.
     for root in [r"C:\co*de", r"C:\wh?t", r"\\server\sh*re"] {
-        assert!(!fsw_path::is_valid_windows_root(root), "{root:?} should be invalid");
+        assert!(
+            !fsw_path::is_valid_windows_root(root),
+            "{root:?} should be invalid"
+        );
     }
 }
 

@@ -15,6 +15,13 @@ extern crate alloc;
 
 use alloc::string::String;
 
+mod target;
+
+pub use target::{
+    TargetBase, TargetError, TargetKind, TargetRejection, UserTarget, resolve_mnt_drive_resolved,
+    resolve_user_target,
+};
+
 /// The UNC prefix every resolved path is built on.
 pub const WSL_ROOT_UNC: &str = r"\\wsl.localhost";
 
@@ -422,7 +429,9 @@ pub fn resolve_under_root<'r>(
         // Mirror the UNC tail below the root, with `/` separators. When the
         // base is a drive root the tail does not start with a separator (it
         // is already part of the base), so the leading `/` is explicit.
-        let tail = unc[base_end..].strip_prefix('\\').unwrap_or(&unc[base_end..]);
+        let tail = unc[base_end..]
+            .strip_prefix('\\')
+            .unwrap_or(&unc[base_end..]);
         linux.push('/');
         for (index, part) in tail.split('\\').enumerate() {
             if index > 0 {
@@ -474,6 +483,23 @@ pub fn is_valid_windows_root(root: &str) -> bool {
     }
     let forbidden = |byte: u8| matches!(byte, b'"' | b'<' | b'>' | b'|' | b'*' | b'?' | 0..=0x1F);
 
+    // A root whose components end in `.` or a space (or are `.`/`..`) is
+    // normalized away by Win32 outside the `\\?\` namespace: joins would
+    // claim `C:\code.\tmp` while Windows opens `C:\code\tmp`. The rendered
+    // tail is hazard-checked elsewhere; the root itself must be clean too.
+    for component in root.trim_end_matches('\\').split(['\\', '/']) {
+        if component.is_empty() {
+            continue;
+        }
+        if component == "."
+            || component == ".."
+            || component.ends_with('.')
+            || component.ends_with(' ')
+        {
+            return false;
+        }
+    }
+
     let bytes = root.as_bytes();
     let drive_letter = matches!(
         (bytes.first(), bytes.get(1)),
@@ -485,7 +511,9 @@ pub fn is_valid_windows_root(root: &str) -> bool {
             return false;
         }
         // A second `:` (`C:\a:b`) would be a stream, not a folder.
-        return root[2..].bytes().all(|byte| byte != b':' && !forbidden(byte));
+        return root[2..]
+            .bytes()
+            .all(|byte| byte != b':' && !forbidden(byte));
     }
     if let Some(rest) = root.strip_prefix(r"\\") {
         // UNC form: `\\server\share[\dir …]`. Both the server and the share
@@ -497,7 +525,12 @@ pub fn is_valid_windows_root(root: &str) -> bool {
             return false;
         }
         let after_server = rest.get(share_start + 1..).unwrap_or_default();
-        if after_server.split('\\').next().unwrap_or_default().is_empty() {
+        if after_server
+            .split('\\')
+            .next()
+            .unwrap_or_default()
+            .is_empty()
+        {
             return false;
         }
         return rest.bytes().all(|byte| byte != b':' && !forbidden(byte));
@@ -547,7 +580,16 @@ pub fn resolve<'r, R: Registry + ?Sized>(
         None => (after_root, input.len()),
     };
 
-    let explicit = !segment.is_empty() && ctx.registry.is_registered(segment);
+    // A registered name is a distribution selector only in list mode, where
+    // `/` opens the provider root and the first segment must name a distro.
+    // In default-distribution mode `/` is already inside one distribution:
+    // every segment is filesystem content of that root, so a folder that
+    // happens to share its name with any installed distribution resolves
+    // inside the distribution instead of being shadowed by it. The rule must
+    // not depend on what the user's distributions happen to be named.
+    let explicit = ctx.mode == BareSlashMode::DistributionList
+        && !segment.is_empty()
+        && ctx.registry.is_registered(segment);
 
     if explicit {
         // R6 on the input itself.

@@ -3,10 +3,10 @@
 //!
 //! `windows-sys` ships the GUIDs and the raw COM allocator but no interface
 //! vtables, so the two vtables we touch are hand-declared. The slot order is
-//! the SDK's own `ShObjIdl_core.h` declaration order (IFileDialog methods
+//! the SDK's own `ShObjIdl_core.h` declaration order (`IFileDialog` methods
 //! verified slot-by-slot against it); unused slots are typed `*mut c_void`
 //! and never called. Everything runs on the UI thread, which reactor has
-//! already CoInitializeEx'd as STA.
+//! already `CoInitializeEx`'d as STA.
 
 use windows_sys::core::{GUID, PCWSTR, PWSTR};
 
@@ -30,10 +30,14 @@ const S_OK: i32 = 0;
 #[allow(non_snake_case)]
 #[repr(C)]
 struct IFileDialogVtbl {
-    QueryInterface: unsafe extern "system" fn(*mut core::ffi::c_void, *const GUID, *mut *mut core::ffi::c_void) -> i32,
+    QueryInterface: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> i32,
     AddRef: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
     Release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
-    Show: unsafe extern "system" fn(*mut core::ffi::c_void, HWND) -> i32,
+    Show: unsafe extern "system" fn(*mut core::ffi::c_void, Hwnd) -> i32,
     SetFileTypes: *mut core::ffi::c_void,
     SetFileTypeIndex: *mut core::ffi::c_void,
     GetFileTypeIndex: *mut core::ffi::c_void,
@@ -50,7 +54,8 @@ struct IFileDialogVtbl {
     SetTitle: unsafe extern "system" fn(*mut core::ffi::c_void, PCWSTR) -> i32,
     SetOkButtonLabel: *mut core::ffi::c_void,
     SetFileNameLabel: *mut core::ffi::c_void,
-    GetResult: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void) -> i32,
+    GetResult:
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut core::ffi::c_void) -> i32,
     AddPlace: *mut core::ffi::c_void,
     SetDefaultExtension: *mut core::ffi::c_void,
     Close: *mut core::ffi::c_void,
@@ -62,7 +67,11 @@ struct IFileDialogVtbl {
 #[allow(non_snake_case)]
 #[repr(C)]
 struct IShellItemVtbl {
-    QueryInterface: unsafe extern "system" fn(*mut core::ffi::c_void, *const GUID, *mut *mut core::ffi::c_void) -> i32,
+    QueryInterface: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> i32,
     AddRef: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
     Release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
     BindToHandler: *mut core::ffi::c_void,
@@ -72,7 +81,7 @@ struct IShellItemVtbl {
     Compare: *mut core::ffi::c_void,
 }
 
-type HWND = *mut core::ffi::c_void;
+type Hwnd = *mut core::ffi::c_void;
 
 /// Discovers this process's own top-level window by title.
 ///
@@ -106,13 +115,19 @@ pub(crate) fn current_process_window() -> isize {
                     return 1;
                 }
                 let length = GetWindowTextLengthW(window);
-                if length <= 0 {
+                let Ok(length) = usize::try_from(length) else {
                     return 1;
-                }
-                let mut text = vec![0u16; (length as usize) + 1];
-                GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32);
+                };
+                let Some(capacity) = length
+                    .checked_add(1)
+                    .and_then(|value| i32::try_from(value).ok())
+                else {
+                    return 1;
+                };
+                let mut text = vec![0u16; length + 1];
+                GetWindowTextW(window, text.as_mut_ptr(), capacity);
                 // `title` is NUL-terminated; compare the text without it.
-                if text.get(..length as usize) == state.title.get(..state.title.len() - 1) {
+                if text.get(..length) == state.title.get(..state.title.len() - 1) {
                     state.found = window as isize;
                     return 0;
                 }
@@ -140,23 +155,23 @@ pub(crate) fn current_process_window() -> isize {
 pub fn pick_folder() -> Option<String> {
     #[cfg(windows)]
     unsafe {
-        use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows_sys::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 
-        let parent: HWND = current_process_window() as HWND;
+        let parent: Hwnd = current_process_window() as Hwnd;
         let mut dialog: *mut core::ffi::c_void = std::ptr::null_mut();
         let hr = CoCreateInstance(
             &CLSID_FILE_OPEN_DIALOG,
             std::ptr::null_mut(),
             CLSCTX_INPROC_SERVER,
             &IID_IFILE_OPEN_DIALOG,
-            &mut dialog,
+            &raw mut dialog,
         );
         if hr != S_OK || dialog.is_null() {
             return None;
         }
         let result = run_dialog(dialog, parent);
         // The vtable lives behind the same pointer; Release is slot 2.
-        let vtbl = (*(dialog as *mut *mut IFileDialogVtbl)).cast::<IFileDialogVtbl>();
+        let vtbl = (*dialog.cast::<*mut IFileDialogVtbl>()).cast::<IFileDialogVtbl>();
         ((*vtbl).Release)(dialog);
         result
     }
@@ -167,10 +182,10 @@ pub fn pick_folder() -> Option<String> {
 }
 
 #[cfg(windows)]
-unsafe fn run_dialog(dialog: *mut core::ffi::c_void, parent: HWND) -> Option<String> {
+unsafe fn run_dialog(dialog: *mut core::ffi::c_void, parent: Hwnd) -> Option<String> {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
 
-    let vtbl = unsafe { (*(dialog as *mut *mut IFileDialogVtbl)).as_ref() }?;
+    let vtbl = unsafe { (*dialog.cast::<*mut IFileDialogVtbl>()).as_ref() }?;
     if unsafe { (vtbl.SetOptions)(dialog, FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM) } != S_OK {
         return None;
     }
@@ -183,12 +198,12 @@ unsafe fn run_dialog(dialog: *mut core::ffi::c_void, parent: HWND) -> Option<Str
     }
 
     let mut item: *mut core::ffi::c_void = std::ptr::null_mut();
-    if unsafe { (vtbl.GetResult)(dialog, &mut item) } != S_OK || item.is_null() {
+    if unsafe { (vtbl.GetResult)(dialog, &raw mut item) } != S_OK || item.is_null() {
         return None;
     }
     let path = unsafe { display_path(item) };
     unsafe {
-        let item_vtbl = (*(item as *mut *mut IShellItemVtbl)).cast::<IShellItemVtbl>();
+        let item_vtbl = (*item.cast::<*mut IShellItemVtbl>()).cast::<IShellItemVtbl>();
         ((*item_vtbl).Release)(item);
         if !path.0.is_null() {
             CoTaskMemFree(path.0.cast());
@@ -200,11 +215,11 @@ unsafe fn run_dialog(dialog: *mut core::ffi::c_void, parent: HWND) -> Option<Str
 /// `(raw PWSTR, string)` so the caller can free after conversion.
 #[cfg(windows)]
 unsafe fn display_path(item: *mut core::ffi::c_void) -> (PWSTR, Option<String>) {
-    let Some(vtbl) = (unsafe { (*(item as *mut *mut IShellItemVtbl)).as_ref() }) else {
+    let Some(vtbl) = (unsafe { (*item.cast::<*mut IShellItemVtbl>()).as_ref() }) else {
         return (std::ptr::null_mut(), None);
     };
     let mut wide: PWSTR = std::ptr::null_mut();
-    if unsafe { (vtbl.GetDisplayName)(item, SIGDN_FILESYSPATH, &mut wide) } != S_OK
+    if unsafe { (vtbl.GetDisplayName)(item, SIGDN_FILESYSPATH, &raw mut wide) } != S_OK
         || wide.is_null()
     {
         return (wide, None);

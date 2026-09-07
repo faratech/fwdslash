@@ -4,13 +4,13 @@
 //! verification matrix.
 
 use fsw_core::update::{
-    auto_update_from_value, check_is_due, default_auto_update, extract_bundle_url, extract_tag_name,
-    format_last_check, is_newer_version, normalize_running_version, parse_version,
-    update_check_allowed, UpdateOutcome,
+    UpdateOutcome, auto_update_from_value, check_is_due, default_auto_update, expected_bundle_url,
+    expected_bundle_version, extract_bundle_digest, extract_bundle_url, extract_tag_name,
+    format_last_check, is_newer_available_version, is_newer_github_release,
+    is_newer_package_version, is_newer_version, normalize_running_version, parse_release_tag,
+    parse_version, update_check_allowed,
 };
-use fsw_core::{
-    package_family_from_full_name, package_version_from_full_name,
-};
+use fsw_core::{package_family_from_full_name, package_version_from_full_name};
 
 #[test]
 fn family_from_full_name_handles_the_empty_resource_id() {
@@ -23,6 +23,25 @@ fn family_from_full_name_handles_the_empty_resource_id() {
 }
 
 #[test]
+fn expected_bundle_version_is_exactly_the_msix_release_version() {
+    assert_eq!(
+        expected_bundle_version("v0.0.4").as_deref(),
+        Some("0.0.4.0")
+    );
+    for invalid in ["1.2.3", "V1.2.3", "v1.2", "v1.2.3.4", "v1.2.3-rc1", ""] {
+        assert_eq!(expected_bundle_version(invalid), None, "{invalid:?}");
+    }
+}
+
+#[test]
+fn release_tags_have_one_canonical_shape() {
+    assert!(parse_release_tag("v1.2.3").is_some());
+    for invalid in ["1.2.3", "V1.2.3", "vv1.2.3", "v1.2.3.0", "v1.2.3-rc1"] {
+        assert!(parse_release_tag(invalid).is_none(), "{invalid:?}");
+    }
+}
+
+#[test]
 fn family_ignores_an_underscore_in_the_identity_name() {
     assert_eq!(
         package_family_from_full_name("a.b_c_1.2.3.0_x64__h").as_deref(),
@@ -32,7 +51,12 @@ fn family_ignores_an_underscore_in_the_identity_name() {
 
 #[test]
 fn family_rejects_short_or_malformed_names() {
-    for full in ["", "x", "a_b_c", "32827MikeFara.fwdslash_notaversion_x64__h"] {
+    for full in [
+        "",
+        "x",
+        "a_b_c",
+        "32827MikeFara.fwdslash_notaversion_x64__h",
+    ] {
         assert_eq!(package_family_from_full_name(full), None, "{full:?}");
     }
 }
@@ -71,6 +95,27 @@ fn is_newer_version_compares_numerically() {
 }
 
 #[test]
+fn package_versions_must_be_strictly_newer() {
+    assert!(!is_newer_package_version("0.0.5.0", "0.0.5.0"));
+    assert!(!is_newer_package_version("0.0.5.0", "0.0.4.0"));
+    assert!(is_newer_package_version("0.0.5.0", "0.0.6.0"));
+    assert!(!is_newer_package_version("0.0.5", "0.0.6.0"));
+    assert!(!is_newer_available_version("0.0.5.0", "v0.0.5"));
+    assert!(is_newer_available_version("0.0.5.0", "v0.0.6"));
+}
+
+#[test]
+fn cached_github_bundles_are_eligible_only_when_strictly_newer() {
+    // This is the scheduling gate used by `pending_bundle_path`: a pre-existing
+    // same/older file must never reach the detached update helper.
+    assert!(!is_newer_github_release("0.0.6.0", "v0.0.6"));
+    assert!(!is_newer_github_release("0.0.6.0", "v0.0.5"));
+    assert!(is_newer_github_release("0.0.6.0", "v0.0.7"));
+    assert!(!is_newer_github_release("0.0.6.0", "0.0.7.0"));
+    assert!(!is_newer_github_release("0.0.6.0", "v0.0.7-rc1"));
+}
+
+#[test]
 fn normalize_running_version_drops_the_msix_fourth_group() {
     assert_eq!(normalize_running_version("0.0.2.0"), "0.0.2");
     assert_eq!(normalize_running_version("1.2.3.4"), "1.2.3");
@@ -88,12 +133,27 @@ fn the_packaged_four_part_version_can_see_a_release() {
     // The shipped bug: `package_version()` reports the four-part MSIX version,
     // `parse_version` rejects four groups, so every packaged GitHub install
     // answered `false` here and never updated.
-    assert!(!is_newer_version("0.0.2.0", "v0.0.3"), "the raw shape never compares");
+    assert!(
+        !is_newer_version("0.0.2.0", "v0.0.3"),
+        "the raw shape never compares"
+    );
 
-    assert!(is_newer_version(&normalize_running_version("0.0.2.0"), "v0.0.3"));
-    assert!(!is_newer_version(&normalize_running_version("0.0.3.0"), "v0.0.3"));
-    assert!(!is_newer_version(&normalize_running_version("0.0.3.0"), "v0.0.2"));
-    assert!(is_newer_version(&normalize_running_version("0.0.9.0"), "v0.0.10"));
+    assert!(is_newer_version(
+        &normalize_running_version("0.0.2.0"),
+        "v0.0.3"
+    ));
+    assert!(!is_newer_version(
+        &normalize_running_version("0.0.3.0"),
+        "v0.0.3"
+    ));
+    assert!(!is_newer_version(
+        &normalize_running_version("0.0.3.0"),
+        "v0.0.2"
+    ));
+    assert!(is_newer_version(
+        &normalize_running_version("0.0.9.0"),
+        "v0.0.10"
+    ));
 }
 
 #[test]
@@ -111,7 +171,7 @@ const RELEASE_JSON: &str = r#"{
   "assets": [
     { "name": "fwdslash-0.0.3.0-arm64.msix", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0-arm64.msix" },
     { "name": "fwdslash-0.0.3.0-store-unsigned.msixbundle", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0-store-unsigned.msixbundle" },
-    { "name": "fwdslash-0.0.3.0.msixbundle", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0.msixbundle" },
+    { "name": "fwdslash-0.0.3.0.msixbundle", "digest": "sha256:6eeee075b066dec837f8946909e368942dabc1aa7d80699145c739b50fd51345", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0.msixbundle" },
     { "name": "forward-slash-windows-0.0.3-arm64.zip", "browser_download_url": "https://github.com/faratech/fwdslash/releases/download/v0.0.3/forward-slash-windows-0.0.3-arm64.zip" }
   ]
 }"#;
@@ -138,7 +198,9 @@ fn extract_bundle_url_picks_the_msixbundle() {
     let url = extract_bundle_url(RELEASE_JSON);
     assert_eq!(
         url,
-        Some("https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0.msixbundle")
+        Some(
+            "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0.msixbundle"
+        )
     );
 }
 
@@ -159,10 +221,70 @@ fn extract_bundle_url_skips_the_unsigned_store_bundle() {
 }
 
 #[test]
+fn expected_bundle_url_uses_the_pipeline_asset_name() {
+    // The release pipeline attaches `fwdslash-<X.Y.Z.0>.msixbundle`
+    // (tools/Package-Msix.ps1); the updater must demand that name, not a
+    // three-part tag spelling no release has ever carried.
+    assert_eq!(
+        expected_bundle_url("v0.0.7"),
+        Some(
+            "https://github.com/faratech/fwdslash/releases/download/v0.0.7/fwdslash-0.0.7.0.msixbundle"
+                .to_string()
+        )
+    );
+    assert_eq!(expected_bundle_url("0.0.7"), None);
+}
+
+#[test]
+fn extract_bundle_digest_finds_githubs_field_order() {
+    // Regression: GitHub places `digest` BEFORE `browser_download_url` in the
+    // asset object, so the search window must extend backward to the `{`.
+    let digest = extract_bundle_digest(
+        RELEASE_JSON,
+        "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0.msixbundle",
+    );
+    assert_eq!(
+        digest,
+        Some("6eeee075b066dec837f8946909e368942dabc1aa7d80699145c739b50fd51345")
+    );
+}
+
+#[test]
+fn extract_bundle_digest_ignores_other_assets_digests() {
+    // The store-unsigned bundle lists a different digest; the exact-URL
+    // selection must not pick it up.
+    let json = r#"{"assets":[
+        {"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","browser_download_url":"https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0-store-unsigned.msixbundle"},
+        {"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","browser_download_url":"https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0.msixbundle"}
+    ]}"#;
+    let digest = extract_bundle_digest(
+        json,
+        "https://github.com/faratech/fwdslash/releases/download/v0.0.3/fwdslash-0.0.3.0.msixbundle",
+    );
+    assert_eq!(
+        digest,
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
+}
+
+#[test]
 fn check_is_due_respects_the_daily_cadence() {
     assert!(check_is_due(None, 1_000));
-    assert!(check_is_due(Some(1_000), 1_000 + fsw_core::update::CHECK_CADENCE_SECS));
-    assert!(!check_is_due(Some(1_000), 1_000 + fsw_core::update::CHECK_CADENCE_SECS - 1));
+    assert!(check_is_due(
+        Some(1_000),
+        1_000 + fsw_core::update::CHECK_CADENCE_SECS
+    ));
+    assert!(!check_is_due(
+        Some(1_000),
+        1_000 + fsw_core::update::CHECK_CADENCE_SECS - 1
+    ));
+}
+
+#[test]
+fn check_is_due_recovers_from_a_future_stamp() {
+    // A clock written ahead must not suppress checks until real time catches
+    // up: a future stamp is due immediately.
+    assert!(check_is_due(Some(1_000_000), 1_000));
 }
 
 #[test]
@@ -211,9 +333,15 @@ fn format_last_check_reads_as_an_age() {
     assert_eq!(format_last_check(now, Some(now)), "just now");
     assert_eq!(format_last_check(now, Some(now - 59)), "just now");
     assert_eq!(format_last_check(now, Some(now - MINUTE)), "1 minute ago");
-    assert_eq!(format_last_check(now, Some(now - 2 * MINUTE)), "2 minutes ago");
+    assert_eq!(
+        format_last_check(now, Some(now - 2 * MINUTE)),
+        "2 minutes ago"
+    );
     assert_eq!(format_last_check(now, Some(now - HOUR)), "1 hour ago");
-    assert_eq!(format_last_check(now, Some(now - 23 * HOUR)), "23 hours ago");
+    assert_eq!(
+        format_last_check(now, Some(now - 23 * HOUR)),
+        "23 hours ago"
+    );
     assert_eq!(format_last_check(now, Some(now - DAY)), "1 day ago");
     assert_eq!(format_last_check(now, Some(now - 9 * DAY)), "9 days ago");
     // A clock that moved backwards reads as "just now", never as a negative
