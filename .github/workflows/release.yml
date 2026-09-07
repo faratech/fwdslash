@@ -128,7 +128,7 @@ jobs:
 
       - name: Package the MSIX bundle (unsigned through makeappx)
         run: |
-          .\tools\Package-Msix.ps1 -BinarySource Rust `
+          .\tools\Package-Msix.ps1 `
               -Version '${{ steps.version.outputs.version }}' `
               -Publisher "$env:TS_PUBLISHER" `
               -PublisherDisplayName 'Mike Fara'
@@ -166,7 +166,7 @@ jobs:
       - name: Package the Store-flavor MSIX bundle (unsigned)
         id: store
         run: |
-          .\tools\Package-Msix.ps1 -BinarySource Rust `
+          .\tools\Package-Msix.ps1 `
               -Version '${{ steps.version.outputs.version }}' `
               -OutputRoot 'out\msix-store'
           $packed = Join-Path 'out\msix-store' ('fwdslash-{0}.msixbundle' -f '${{ steps.version.outputs.version }}')
@@ -223,16 +223,19 @@ jobs:
           $assets += @(Get-ChildItem 'out\package' -Filter '*.zip' -Recurse |
               ForEach-Object { $_.FullName })
           $assets += (Resolve-Path -LiteralPath '${{ steps.store.outputs.bundle }}').Path
-          gh release create "$env:GITHUB_REF_NAME" @assets `
-              --title "Forward Slash Windows ${{ steps.version.outputs.short }}" `
-              --generate-notes
-          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
+          # The curated, user-facing notes for this version. They are the ONLY
+          # thing Store customers read: publish-to-store.yml truncates the body
+          # at the '## Downloads' marker, so everything above it becomes the
+          # Store's "What's new". Keep that file in plain language — no file
+          # names, issue numbers or internals.
+          $notesPath = Join-Path 'docs\release-notes' ('{0}.md' -f '${{ steps.version.outputs.short }}')
+          if (-not (Test-Path -LiteralPath $notesPath)) {
+              throw ("No release notes at $notesPath. Add one before tagging: it is " +
+                     "the text Store customers see as What's new.")
+          }
+          $friendly = (Get-Content -LiteralPath $notesPath -Raw).TrimEnd()
+          if (-not $friendly) { throw "$notesPath is empty." }
 
-          # Append the asset guide *after* GitHub's generated "What's Changed"
-          # list. It cannot be passed to --notes, because gh puts that text
-          # before the generated section, and publish-to-store.yml derives the
-          # Store "What's new" by truncating the body at the '## Downloads'
-          # marker — a marker at the top would truncate the changelog away.
           $downloads = @(
             '## Downloads',
             '',
@@ -242,10 +245,16 @@ jobs:
             '| `forward-slash-windows-<version>-<arch>.zip` | The same signed executables loose, for an unpackaged install (`fwdslash install`). Needs the Windows App Runtime 2.x installed separately. |',
             '| `fwdslash-<version>-store-unsigned.msixbundle` | **Not installable — do not download this to install fwdslash.** It is the Microsoft Store submission artifact: identical binaries, but carrying the Partner Center package identity and deliberately left unsigned, because the Store re-signs what it accepts. Windows refuses to install it. It is attached here so the Store submission is reproducible from the release, and `publish-to-store.yml` uploads it to Partner Center; Store users get this build from [the Store listing](https://apps.microsoft.com/detail/9P51CM0MTMK2). |'
           ) -join "`n"
-          $body = (gh release view "$env:GITHUB_REF_NAME" --json body -q .body) -join "`n"
-          ($body.TrimEnd() + "`n`n" + $downloads) | Out-File -Encoding utf8 release-body.md
-          gh release edit "$env:GITHUB_REF_NAME" --notes-file release-body.md
-          if ($LASTEXITCODE -ne 0) { throw 'gh release edit failed.' }
+          # gh places --notes-file content ABOVE the generated "What's Changed"
+          # section, so the finished body reads: friendly notes, the asset
+          # guide, then the generated changelog for developers. The Store keeps
+          # only the first part, which is exactly what the marker cuts at.
+          ($friendly + "`n`n" + $downloads) | Out-File -Encoding utf8 release-body.md
+          gh release create "$env:GITHUB_REF_NAME" @assets `
+              --title "Forward Slash Windows ${{ steps.version.outputs.short }}" `
+              --notes-file release-body.md `
+              --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed.' }
 
           "released=true" >> $env:GITHUB_OUTPUT
 

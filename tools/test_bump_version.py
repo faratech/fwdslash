@@ -214,22 +214,26 @@ class BumpTests(TreeCase):
     def test_check_fails_when_one_location_is_stale(self):
         self.assertEqual(self.bump()[0], 0)
         # Put one file back the way it was; Cargo.toml still carries the new one.
-        (self.tmp / "CMakeLists.txt").write_bytes(self.before["CMakeLists.txt"])
+        (self.tmp / "SECURITY.md").write_bytes(self.before["SECURITY.md"])
         code, _out, err = self.check()
         self.assertEqual(code, 1)
         self.assertIn("FAILED", err)
-        self.assertIn("CMakeLists.txt", err)
+        self.assertIn("SECURITY.md", err)
         self.assertIn(OLD, err)
         self.assertIn(NEW, err)
 
     def test_check_lists_every_stale_location(self):
         self.assertEqual(self.bump()[0], 0)
-        for rel in ("CMakeLists.txt", "SECURITY.md", "assets/fwdslash.rc"):
+        for rel in (
+            "SECURITY.md",
+            "crates/fsw-settings/app.manifest",
+            "crates/fsw-broker/app.rc",
+        ):
             (self.tmp / rel).write_bytes(self.before[rel])
         code, _out, err = self.check()
         self.assertEqual(code, 1)
-        # fwdslash.rc carries four of them (two numeric, two string).
-        self.assertIn("6 literal(s) disagree", err)
+        # app.rc carries two of them (the numeric and the string fallback).
+        self.assertIn("4 literal(s) disagree", err)
 
     def test_check_against_an_explicit_version(self):
         code, _out, err = self.check(NEW)
@@ -301,15 +305,16 @@ class RefusalTests(TreeCase):
 
 class MatchCountTests(TreeCase):
     def test_a_missing_literal_fails_the_count(self):
-        rc = self.tmp / "assets/fwdslash.rc"
-        text = rc.read_text(encoding="utf-8")
-        line = f' PRODUCTVERSION {bv.render("commas4", OLD_V)}\n'
-        rc.write_text(text.replace(line, ""), encoding="utf-8")
+        lock = self.tmp / "Cargo.lock"
+        text = lock.read_text(encoding="utf-8")
+        lock.write_text(
+            text.replace('name = "fswbroker"', 'name = "fswbroker-renamed"'),
+            encoding="utf-8",
+        )
 
         code, _out, err = self.bump()
         self.assertEqual(code, 1)
-        self.assertIn("expected 2 match(es)", err)
-        self.assertIn("found 1", err)
+        self.assertIn("Cargo.lock", err)
         self.assertIn("tools/bump_version.py", err)
 
     def test_nothing_is_written_when_one_site_fails(self):
@@ -328,16 +333,10 @@ class MatchCountTests(TreeCase):
         self.assert_tree_unchanged()
 
     def test_an_extra_literal_fails_the_count(self):
-        cmake = self.tmp / "CMakeLists.txt"
-        text = cmake.read_text(encoding="utf-8")
-        cmake.write_text(
-            text.replace(
-                f"project(ForwardSlashWindows VERSION {OLD} LANGUAGES CXX)",
-                f"project(ForwardSlashWindows VERSION {OLD} LANGUAGES CXX)\n"
-                f"project(ForwardSlashWindows VERSION {OLD} LANGUAGES CXX)",
-            ),
-            encoding="utf-8",
-        )
+        rc = self.tmp / "crates/fsw-broker/app.rc"
+        text = rc.read_text(encoding="utf-8")
+        line = f'#define FSW_VER_STR "{OLD}"'
+        rc.write_text(text.replace(line, line + "\n" + line), encoding="utf-8")
         code, _out, err = self.bump()
         self.assertEqual(code, 1)
         self.assertIn("expected 1 match(es)", err)
@@ -363,17 +362,22 @@ class MatchCountTests(TreeCase):
 
 class EncodingTests(TreeCase):
     def test_crlf_is_preserved(self):
-        raw_before = self.before["tools/Package.ps1"]
+        # No site file in the tree is CRLF today, so make one: the guarantee
+        # under test is that the bump re-encodes with the line endings it found.
+        rel = "crates/fsw-broker/app.rc"
+        target = self.tmp / rel
+        target.write_bytes(target.read_bytes().replace(b"\n", b"\r\n"))
+        raw_before = target.read_bytes()
         self.assertIn(b"\r\n", raw_before)  # guards the fixture itself
         self.assertEqual(self.bump()[0], 0)
-        raw_after = (self.tmp / "tools/Package.ps1").read_bytes()
+        raw_after = target.read_bytes()
         self.assertEqual(raw_before.count(b"\r\n"), raw_after.count(b"\r\n"))
         self.assertEqual(
             raw_before.count(b"\n") - raw_before.count(b"\r\n"),
             raw_after.count(b"\n") - raw_after.count(b"\r\n"),
             "a lone LF appeared or vanished",
         )
-        self.assertIn(f'"forward-slash-windows-{NEW}-{{0}}"'.encode(), raw_after)
+        self.assertIn(f'#define FSW_VER_STR "{NEW}"'.encode(), raw_after)
 
     def test_line_endings_survive_in_every_file(self):
         self.assertEqual(self.bump()[0], 0)

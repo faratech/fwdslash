@@ -26,12 +26,10 @@
       <qualifier name="Custom" value="" />
     </default>
     <!--
-      Folder indexing only, with no "resfiles"/"priinfo" indexer. The Rust
-      payload has nothing else to index; the C++ payload
-      (Package-Msix.ps1 -BinarySource Cpp) additionally stages an MSBuild-built
-      fswsettings.pri, and parsing that here as well would make both indexers
-      claim Files/App.xbf, which makepri rejects with PRI277 "conflicting
-      values".
+      Folder indexing only, with no "resfiles"/"priinfo" indexer: the staged
+      payload has nothing else to index, and a second indexer over a
+      precompiled .pri would make both claim the same files, which makepri
+      rejects with PRI277 "conflicting values".
     -->
     <indexer-config type="folder" foldernameAsQualifier="true" filenameAsQualifier="true" qualifierDelimiter="." />
   </index>

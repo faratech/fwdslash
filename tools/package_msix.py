@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Stages and packs the Rust product as an MSIX bundle, from WSL.
 
-The WSL-runnable equivalent of `tools/Package-Msix.ps1 -BinarySource Rust`:
-it shells out to the SDK's makeappx.exe/makepri.exe through `wslpath`, so
+The WSL-runnable equivalent of `tools/Package-Msix.ps1`: it shells out to the SDK's makeappx.exe/makepri.exe through `wslpath`, so
 packaging never requires leaving WSL for native PowerShell. Build first with
 `cargo build --release --target <triple> --workspace` on the Windows side.
 """
@@ -28,8 +27,7 @@ PUBLISHER_DISPLAY_NAME = "WindowsForum.com"
 
 # The shell payload the CLI's adapters copy out of the package at
 # `fwdslash integration <name> enable`. Keep in step with the payload lists in
-# crates/fsw-cli/src/adapters/cmd.rs, tools/Package.ps1 and
-# tools/Package-Msix.ps1.
+# crates/fsw-cli/src/adapters/cmd.rs and tools/Package-Msix.ps1.
 REQUIRED_PAYLOAD = [
     ("cmd", "fsw-autorun.cmd"),
     ("cmd", "fsw-cd.cmd"),
@@ -138,11 +136,9 @@ def main():
         # License
         shutil.copy2(os.path.join(REPO, "LICENSE"), os.path.join(stage, "LICENSE"))
 
-        # Shell adapter payload, from the repo tree.
-        #
-        # NOT from out/user/<arch>/Release/shell: that is whatever
-        # Build-UserMode.ps1 last staged for the C++ build, and 0.0.2 shipped a
-        # ForwardSlashWindows.psm1 two days older than the repo's because of it.
+        # Shell adapter payload, from the repo tree — the only source. Staging
+        # it out of a build tree instead is how 0.0.2 shipped a
+        # ForwardSlashWindows.psm1 two days older than the repo's.
         for sh_dir in ["cmd", "powershell"]:
             src_sh = os.path.join(REPO, "shell", sh_dir)
             dst_sh = os.path.join(stage, "shell", sh_dir)

@@ -7,8 +7,9 @@ function Test-ForwardSlashWindowsDisabled {
     # milliseconds on every call. Callers must reach this only after a slash
     # argument has been found, so an ordinary "dir" or "cd .." pays nothing.
     # This key path is the one literal the module cannot share with
-    # include/fsw_user_protocol.h -- renaming the value there means editing
-    # this line too (CLAUDE.md).
+    # crates/fsw-core/src/lib.rs, which defines it for the rest of the product
+    # -- renaming the key or value there means editing this line too
+    # (CLAUDE.md).
     $key = $null
     try {
         $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\ForwardSlashWindows\Settings')

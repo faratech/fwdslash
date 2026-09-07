@@ -14,11 +14,6 @@ function Invoke-FswTest {
     }
 }
 
-Invoke-FswTest 'resolver-unit-tests' {
-    & (Join-Path $artifacts 'fswcore_tests.exe')
-    if ($LASTEXITCODE -ne 0) { throw "Resolver tests exited with $LASTEXITCODE" }
-}
-
 Invoke-FswTest 'controller-status' {
     & (Join-Path $artifacts 'fwdslash.exe') status
     if ($LASTEXITCODE -ne 0) { throw "Controller status exited with $LASTEXITCODE" }

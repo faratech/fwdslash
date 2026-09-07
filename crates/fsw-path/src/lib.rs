@@ -37,7 +37,7 @@ pub enum ResolveError {
     DoubleLeadingSlash,
     /// Unreachable in practice — see [`ResolveError::MissingDistribution`] notes
     /// on [`resolve_strict`]. Retained because the name is a diagnostics wire
-    /// value that the C++ build can still emit.
+    /// value that an older installed version can still emit.
     MissingDistribution,
     UnregisteredDistribution,
     BackslashNotAllowed,
@@ -47,8 +47,8 @@ pub enum ResolveError {
 }
 
 impl ResolveError {
-    /// Stable category name. Mirrors the C++ `ResolveErrorName` exactly, because
-    /// it is emitted as `reason=<name>` into the diagnostic log.
+    /// Stable category name. It is emitted as `reason=<name>` into the
+    /// diagnostic log, so it must not drift.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -88,7 +88,7 @@ impl ResolveError {
         }
     }
 
-    /// Whether the C++ appends the " Try /Ubuntu, ..." suffix for this error.
+    /// Whether the hint appends the " Try /Ubuntu, ..." suffix for this error.
     #[must_use]
     pub const fn hint_lists_distributions(self) -> bool {
         matches!(self, Self::UnregisteredDistribution)
@@ -186,8 +186,7 @@ pub enum Resolved<'r> {
     WslRoot,
     /// A path inside one distribution.
     Distribution(DistributionPath<'r>),
-    /// A path under the user's custom bare-slash root (Rust-layer feature; the
-    /// C++ resolver has no counterpart — see docs/divergences.md).
+    /// A path under the user's custom bare-slash root — see docs/divergences.md.
     Folder(FolderPath<'r>),
 }
 
@@ -538,7 +537,7 @@ pub fn is_valid_windows_root(root: &str) -> bool {
     false
 }
 
-/// Resolve an explicit `/Distro/path` input. Mirrors the C++ `ResolveSlashPath`.
+/// Resolve an explicit `/Distro/path` input.
 ///
 /// Note that `ResolveError::MissingDistribution` is unreachable here, and always
 /// was: an empty distribution segment requires either `input == "/"` (returned
@@ -558,7 +557,7 @@ pub fn resolve<'r, R: Registry + ?Sized>(
     ctx: &Context<'_, R>,
     buf: &'r mut RenderBuf,
 ) -> Result<Resolved<'r>, ResolveError> {
-    // Rules R1-R5, in the C++'s order. R2 deliberately precedes R3, so `//\0`
+    // Rules R1-R5, in order. R2 deliberately precedes R3, so `//\0`
     // reports DoubleLeadingSlash rather than EmbeddedNul.
     if input.is_empty() || !input.starts_with('/') {
         return Err(ResolveError::NotASlashPath);
@@ -618,10 +617,11 @@ pub fn resolve<'r, R: Registry + ?Sized>(
         })
         .ok_or(ResolveError::NoDefaultDistribution)?;
 
-    // The C++ builds `"/" + target + input` and re-parses. Because `input`
-    // always begins with `/` and a validated distribution name contains no `/`,
-    // the component scan starts at exactly the same offset either way — so we
-    // pass the distribution out-of-band and scan `input` from index 1 instead.
+    // The textual form of this rewrite would build `"/" + target + input` and
+    // re-parse. Because `input` always begins with `/` and a validated
+    // distribution name contains no `/`, the component scan starts at exactly
+    // the same offset either way — so we pass the distribution out-of-band and
+    // scan `input` from index 1 instead.
     // `rewrite_equivalence` in the tests proves the two agree.
     //
     // R6 applies to the *rewritten* string, whose length is always > 1, so the
@@ -737,7 +737,7 @@ pub fn eq_ignore_case(left: &str, right: &str) -> bool {
         return left.eq_ignore_ascii_case(right);
     }
     // The simple mapping is 1:1, so a lockstep character compare is equivalent
-    // to the C++'s length-check-then-compare and needs no separate short circuit.
+    // to a length-check-then-compare and needs no separate short circuit.
     let mut left_folded = left.chars().map(simple_upper);
     let mut right_folded = right.chars().map(simple_upper);
     loop {

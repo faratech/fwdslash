@@ -9,7 +9,7 @@ use fsw_path::{
     BareSlashMode, Context, RenderBuf, ResolveError, Resolved, eq_ignore_case, resolve_strict,
 };
 
-/// Mirrors the C++ `Registered` predicate, including the non-ASCII entry.
+/// The registered-distribution fixture, including the non-ASCII entry.
 pub const REGISTERED: &[&str] = &["Ubuntu", "Dev Distro", "\u{65e5}\u{672c}\u{8a9e}"];
 
 /// Inputs probed by `rewrite_equivalence` and by the perf/allocation tests.
@@ -65,11 +65,11 @@ impl TestRegistry for &[&str] {
     }
 }
 
-/// A transcription of the C++ `ResolveSlashPathWithBareSlashMode` build-`"/"+target+input`
-/// and re-parse oracle, updated for the folder-shadowing rule: in
+/// The reference oracle: the textual build-`"/"+target+input`-and-re-parse form
+/// of the rewrite, with the folder-shadowing rule applied — in
 /// default-distribution mode the input is *always* relative to the pinned or
 /// default distribution, even when its first segment names a registered
-/// distribution (the C++ still passes those through — see docs/divergences.md).
+/// distribution (see docs/divergences.md).
 /// Strict-resolution errors other than `UnregisteredDistribution` keep their
 /// original spelling for both rules.
 #[allow(dead_code)]

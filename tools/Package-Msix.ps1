@@ -3,9 +3,6 @@ param(
     [ValidateSet('x64', 'ARM64')]
     [string[]]$Architecture = @('x64', 'ARM64'),
 
-    [ValidateSet('Debug', 'Release')]
-    [string]$Configuration = 'Release',
-
     # Four-part MSIX version. Defaults to the product version compiled into the
     # binaries so the package can never disagree with what it contains. The Store
     # requires the revision (fourth) field to be 0.
@@ -23,16 +20,6 @@ param(
     [string]$CertificatePath,
     [string]$CertificatePassword,
 
-    # Where the staged binaries come from. Cpp (default) = the MSVC build in
-    # out\user\<arch>\<Configuration>, built here unless -SkipBuild. Rust =
-    # the cargo release build in target\<rust-triple>\release, built by the
-    # caller (e.g. the release workflow). The Rust payload omits App.xbf and
-    # fswsettings.pri — the Rust settings app needs neither — and takes the
-    # adapter scripts and shell payload straight from the repo instead of the
-    # C++ build output.
-    [ValidateSet('Cpp', 'Rust')]
-    [string]$BinarySource = 'Cpp',
-
     # Where the packed .msix / .msixbundle (and the staging directories and PRI
     # dumps that produce them) land. Defaults to out\msix. The release workflow
     # packages the tree twice — the GitHub flavor it signs, and the unsigned
@@ -40,8 +27,6 @@ param(
     # run is given a root of its own instead of overwriting the first. A
     # relative path is resolved against the repository root.
     [string]$OutputRoot,
-
-    [switch]$SkipBuild,
 
     # Explicit opt-in for locally signed beta revisions, never Store uploads.
     [switch]$LocalBeta
@@ -74,33 +59,25 @@ if (-not (Test-Path -LiteralPath $assetSource -PathType Container)) {
 }
 
 if (-not $Version) {
-    if ($BinarySource -eq 'Rust') {
-        # The Rust product's version lives in the workspace Cargo.toml, not in
-        # the C++ resource script: reading assets\fwdslash.rc here stamped the
-        # package with a version the staged binaries did not carry.
-        $metadataJson = & cargo metadata --format-version 1 --no-deps
-        if ($LASTEXITCODE -ne 0) {
-            throw 'cargo metadata failed; pass -Version explicitly.'
-        }
-        $metadata = ($metadataJson | Out-String) | ConvertFrom-Json
-        $core = @($metadata.packages | Where-Object { $_.name -eq 'fsw-core' })
-        if ($core.Count -ne 1) {
-            throw 'cargo metadata did not report exactly one fsw-core package; pass -Version explicitly.'
-        }
-        if ($core[0].version -notmatch '^([0-9]+)\.([0-9]+)\.([0-9]+)$') {
-            throw "Unexpected workspace version '$($core[0].version)'; pass -Version explicitly."
-        }
-        # MSIX identities are four-part and the Store reserves the last field.
-        $Version = '{0}.0' -f $core[0].version
-    } else {
-        # assets\fwdslash.rc is where the C++ product's version is authored.
-        $resourceScript = Get-Content -LiteralPath (Join-Path $repo 'assets\fwdslash.rc') -Raw
-        if ($resourceScript -notmatch 'VALUE\s+"FileVersion",\s*"([0-9]+)\.([0-9]+)\.([0-9]+)') {
-            throw 'Could not read FileVersion from assets\fwdslash.rc; pass -Version explicitly.'
-        }
-        $Version = '{0}.{1}.{2}.0' -f $Matches[1], $Matches[2], $Matches[3]
+    # The product's version lives in the workspace Cargo.toml, and nowhere else:
+    # reading a resource script here stamped the package with a version the
+    # staged binaries did not carry.
+    $metadataJson = & cargo metadata --format-version 1 --no-deps
+    if ($LASTEXITCODE -ne 0) {
+        throw 'cargo metadata failed; pass -Version explicitly.'
     }
+    $metadata = ($metadataJson | Out-String) | ConvertFrom-Json
+    $core = @($metadata.packages | Where-Object { $_.name -eq 'fsw-core' })
+    if ($core.Count -ne 1) {
+        throw 'cargo metadata did not report exactly one fsw-core package; pass -Version explicitly.'
+    }
+    if ($core[0].version -notmatch '^([0-9]+)\.([0-9]+)\.([0-9]+)$') {
+        throw "Unexpected workspace version '$($core[0].version)'; pass -Version explicitly."
+    }
+    # MSIX identities are four-part and the Store reserves the last field.
+    $Version = '{0}.0' -f $core[0].version
 }
+
 if ($LocalBeta) {
     if ($Version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
         throw "Local beta MSIX version must have four numeric components: $Version"
@@ -149,60 +126,25 @@ function Invoke-Tool {
     }
 }
 
-# Everything the product needs at runtime. Deliberately excludes the test
-# executables, every build artifact (*.pdb, *.winmd, *.lib, *.exp) and anything
-# from driver\, which is production-gated and must never reach the Store.
-$payloadFiles = @(
-    'fwdslash.exe',
-    'fswbroker.exe',
-    'fswsettings.exe'
-)
-# Inside a package the Windows App SDK is reached through the manifest
-# PackageDependency, and -Packaged stops the bootstrap initializer being
-# compiled in, so the bootstrap DLL would be dead weight.
-$optionalPayloadFiles = @(
-    'App.xbf',
-    'fswsettings.pri'
-)
-
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 $produced = @()
 
 foreach ($target in $Architecture) {
     Write-Host "== $target =="
-    if ($BinarySource -eq 'Cpp') {
-        if (-not $SkipBuild) {
-            & (Join-Path $PSScriptRoot 'Build-UserMode.ps1') -Architecture $target -Configuration $Configuration `
-                -Packaged -PackageIdentityName $IdentityName
-            if ($LASTEXITCODE -ne 0) { throw "Build-UserMode.ps1 failed for $target." }
-        }
-
-        $binaries = Join-Path $repo ('out\user\{0}\{1}' -f $target.ToLowerInvariant(), $Configuration)
-        if (-not (Test-Path -LiteralPath $binaries -PathType Container)) {
-            throw "Build output does not exist: $binaries"
-        }
-    } else {
-        $rustTriple = if ($target -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
-        $binaries = Join-Path $repo ("target\$rustTriple\release")
-        if (-not (Test-Path -LiteralPath $binaries -PathType Container)) {
-            throw "Rust build output does not exist: $binaries. Run cargo build --release --target $rustTriple --workspace first."
-        }
+    $rustTriple = if ($target -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
+    $binaries = Join-Path $repo ("target\$rustTriple\release")
+    if (-not (Test-Path -LiteralPath $binaries -PathType Container)) {
+        throw "Rust build output does not exist: $binaries. Run cargo build --release --target $rustTriple --workspace first."
     }
 
     $stage = Join-Path $outputRoot ('stage-{0}' -f $target.ToLowerInvariant())
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-    # The three executables always come from the binary source; the adapter
-    # scripts and shell payload come from the C++ build output for Cpp (which
-    # stages them) and straight from the repo for Rust.
+    # The three executables come from the cargo release build; the adapter
+    # scripts and shell payload come straight from the repo.
     $exes = @('fwdslash.exe', 'fswbroker.exe', 'fswsettings.exe')
-    $sideFiles = if ($BinarySource -eq 'Cpp') {
-        $payloadFiles + $optionalPayloadFiles
-    } else {
-        @()
-    }
-    $shellBase = if ($BinarySource -eq 'Cpp') { $binaries } else { $repo }
+    $shellBase = $repo
 
     foreach ($file in $exes) {
         $source = Join-Path $binaries $file
@@ -210,8 +152,8 @@ foreach ($target in $Architecture) {
             throw "Required payload file is missing from the build: $source"
         }
         # The manifest's identity must describe the binaries it wraps: a
-        # -SkipBuild after a version bump, or a stale binary source, otherwise
-        # ships old code under a new version and every current check passes.
+        # A stale binary source otherwise ships old code under a new version
+        # and every current check passes.
         # Rust exes stamp a three-part FileVersion ("0.0.8") while the package
         # is four-part ("0.0.8.0"), so the prefix is what must match.
         $parsedVersion = [version]$Version
@@ -219,13 +161,6 @@ foreach ($target in $Architecture) {
         $stagedVersion = (Get-Item -LiteralPath $source).VersionInfo.FileVersion
         if ($stagedVersion -ne $Version -and $stagedVersion -ne $shortVersion) {
             throw "Staged $file reports FileVersion '$stagedVersion', expected '$Version'. Rebuild or fix the binary source."
-        }
-        Copy-Item -LiteralPath $source -Destination $stage
-    }
-    foreach ($file in $sideFiles) {
-        $source = Join-Path $binaries $file
-        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-            throw "Required payload file is missing: $source"
         }
         Copy-Item -LiteralPath $source -Destination $stage
     }
@@ -239,19 +174,12 @@ foreach ($target in $Architecture) {
     }
     Copy-Item -LiteralPath (Join-Path $repo 'LICENSE') -Destination $stage
 
-    # The MSIX logo set. The C++ settings app additionally loads a title-bar
-    # image through ms-appx:///Assets/; the Rust app embeds that PNG with
-    # include_bytes! and never resolves an ms-appx URI, so staging it into a
-    # Rust package would ship a resource nothing reads.
+    # The MSIX logo set. The settings app embeds its title-bar PNG with
+    # include_bytes! and never resolves an ms-appx URI, so staging that image
+    # would ship a resource nothing reads.
     $stageAssets = Join-Path $stage 'Assets'
     New-Item -ItemType Directory -Force -Path $stageAssets | Out-Null
     Copy-Item -Path (Join-Path $assetSource '*') -Destination $stageAssets -Recurse -Force
-    if ($BinarySource -eq 'Cpp') {
-        $titleBar = Join-Path $binaries 'Assets\fwdslash-titlebar.png'
-        if (Test-Path -LiteralPath $titleBar -PathType Leaf) {
-            Copy-Item -LiteralPath $titleBar -Destination $stageAssets -Force
-        }
-    }
 
     $stagedAssets = @(Get-ChildItem -LiteralPath $stageAssets -File).Count
     if ($stagedAssets -lt 40) {
@@ -287,21 +215,15 @@ foreach ($target in $Architecture) {
         '/o'
     )
 
-    # The index has to be named after Identity/Name either way: that is what
-    # makes the manifest's own logo qualifiers resolve. The C++ app also
-    # resolves ms-appx:///App.xaml and its title-bar image through this map, so
-    # only that payload asserts the title-bar resource is present.
+    # The index has to be named after Identity/Name: that is what makes the
+    # manifest's own logo qualifiers resolve.
     $priDump = Join-Path $outputRoot ('resources-{0}.xml' -f $target.ToLowerInvariant())
     Invoke-Tool $makepri @('dump', '/if', (Join-Path $stage 'resources.pri'), '/of', $priDump, '/o')
     $dump = Get-Content -LiteralPath $priDump -Raw
     if ($dump -notmatch [regex]::Escape('name=' + [char]34 + $IdentityName + [char]34)) {
         throw "resources.pri primary map is not named '$IdentityName'; ms-appx lookups would fail."
     }
-    $expectedResources = if ($BinarySource -eq 'Cpp') {
-        @('Square44x44Logo.png', 'fwdslash-titlebar.png')
-    } else {
-        @('Square44x44Logo.png')
-    }
+    $expectedResources = @('Square44x44Logo.png')
     foreach ($resource in $expectedResources) {
         if ($dump -notmatch [regex]::Escape($resource)) {
             throw "resources.pri is missing an expected resource: $resource"

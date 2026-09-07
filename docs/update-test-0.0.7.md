@@ -38,16 +38,16 @@ Baseline facts:
    `flavor: store`, forced checks round-trip, `upToDate`/`available` states
    correct. The in-app update path is testable from 0.0.7.0 forward — first
    real matrix: 0.0.7.0 → next flight (0.0.7.1+).
-4. **Packaging trap:** `tools/Package-Msix.ps1` defaults to
-   `-BinarySource Cpp` and will silently stage stale committed binaries from
-   `out\user\arm64\Release\` (help text with no `update`/`version` lines, exit
-   2 on unknown commands). Always pass `-BinarySource Rust` and verify the
-   staged exe hash matches the cargo build before signing. Consider making
-   Rust the default or failing when the C++ tree is stale.
+4. **Packaging trap (since fixed):** at the time of this run
+   `tools/Package-Msix.ps1` had a `-BinarySource` switch that defaulted to a
+   second, non-shipping binary tree, and would silently stage stale binaries
+   from it (help text with no `update`/`version` lines, exit 2 on unknown
+   commands). The switch is gone — the packager stages
+   `target\<triple>\release` and nothing else — but verifying the staged exe
+   hash matches the cargo build before signing is still worth doing.
 5. **Baseline recipes that work** (see Phase 1): Store-signed 0.0.6.0 via
    `winget` (only while the public listing serves it); locally-signed
-   Store-identity builds via the v0.0.6 worktree + `-BinarySource Rust` +
-   signtool with the `CN=ABDB6B3F…` cert (`6D0BD446…`, trusted). GitHub-release
+   Store-identity builds via the v0.0.6 worktree + signtool with the `CN=ABDB6B3F…` cert (`6D0BD446…`, trusted). GitHub-release
    bundles are personal-cert signed (GitHub flavor) and unusable for Store
    flavor tests.
 

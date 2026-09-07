@@ -1,6 +1,7 @@
 #include <winver.h>
 
-// Kept in step with include/fsw_resources.h and the IDI_FSW_APP const in main.rs.
+// IDI_FSW_APP = 101 also appears in crates/fsw-settings/app.rc and as a const in
+// main.rs; keep the three in step.
 #define IDI_FSW_APP 101
 
 // A reduced icon: the tray and the window class never request above 48px, and the

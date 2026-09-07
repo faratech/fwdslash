@@ -80,9 +80,8 @@ paths are not logged.
 ## Settings and optional shell adapters
 
 The settings process is a Rust desktop app built on the vendored
-`windows-reactor` crate over the Windows App SDK (`crates/fsw-settings`; the
-WinUI 3 C++ app in `src/settings/` is the reference implementation it was ported
-from). It delegates every state change to `fwdslash`; it never edits profiles or
+`windows-reactor` crate over the Windows App SDK (`crates/fsw-settings`). It
+delegates every state change to `fwdslash`; it never edits profiles or
 registry integration state itself, and it runs those invocations on the thread
 pool so the window stays responsive. The app uses a Mica system backdrop and the
 Windows App SDK `TitleBar` control, with the caption icon in the `LeftHeader`

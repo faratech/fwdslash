@@ -227,7 +227,7 @@ const MENU_DISTRO_MAX: usize = 64;
 const DIALOG_PATH_COMBO: i32 = 0x47C;
 const DIALOG_FILE_NAME_EDIT: i32 = 0x480;
 
-/// Icon resource id, kept in step with `include/fsw_resources.h`.
+/// Icon resource id, kept in step with `app.rc` here and in `fsw-settings`.
 const IDI_FSW_APP: u16 = 101;
 
 // Port, protocol version and distribution capacity come from `fsw_core`
@@ -2031,8 +2031,6 @@ fn disconnect_filter() {
 }
 
 /// The distribution list most recently accepted by the driver.
-///
-/// Mirrors `g_published_distributions` (`src/broker/main.cpp:54`).
 /// Whether the driver-namespace preflight rejection has already been logged.
 /// The health timer re-runs the check every tick and the verdict cannot change
 /// without user action, so it is worth exactly one line per process.
@@ -2205,9 +2203,8 @@ fn publish_filter_mappings(force: bool) {
         Vec::new()
     } else {
         let mut distros = list_registered_distributions();
-        // Ordinal case-insensitive, matching the C++ `CompareStringOrdinal`
-        // sort. The driver receives this array in order, so the comparison has
-        // to agree.
+        // Ordinal case-insensitive sort. The driver receives this array in
+        // order, so the comparison has to agree.
         distros.sort_by(|a, b| {
             let a_folded: Vec<char> = a.chars().flat_map(char::to_uppercase).collect();
             let b_folded: Vec<char> = b.chars().flat_map(char::to_uppercase).collect();
@@ -3783,8 +3780,8 @@ fn main() {
         // A top-level never-shown tool window, not a message-only one:
         // message-only windows are skipped by HWND_BROADCAST, so
         // TaskbarCreated and WM_ENDSESSION would never reach the icon
-        // lifecycle below. Divergence from the C++ broker (HWND_MESSAGE);
-        // discovery via FindWindowW on the class is unaffected.
+        // lifecycle below. Discovery via FindWindowW on the class is
+        // unaffected by the window not being message-only.
         let broker_wnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             class_name.as_ptr(),

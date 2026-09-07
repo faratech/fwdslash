@@ -2,7 +2,8 @@
 
 1 24 "app.manifest"
 
-// Kept in step with include/fsw_resources.h. The settings window is the one binary
+// IDI_FSW_APP = 101 also appears in crates/fsw-broker/app.rc and as a const in that
+// crate's main.rs; keep the three in step. The settings window is the one binary
 // the shell shows at large sizes, so it links the full icon.
 #define IDI_FSW_APP 101
 IDI_FSW_APP ICON "../../assets/fwdslash.ico"
