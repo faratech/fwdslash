@@ -2,34 +2,6 @@
 
 $script:FswController = Join-Path $PSScriptRoot 'fwdslash.exe'
 
-function Test-ForwardSlashWindowsDisabled {
-    # Direct RegistryKey read rather than the HKCU: provider, which costs
-    # milliseconds on every call. Callers must reach this only after a slash
-    # argument has been found, so an ordinary "dir" or "cd .." pays nothing.
-    # This key path is the one literal the module cannot share with
-    # crates/fsw-core/src/lib.rs, which defines it for the rest of the product
-    # -- renaming the key or value there means editing this line too
-    # (CLAUDE.md).
-    $key = $null
-    try {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\ForwardSlashWindows\Settings')
-        if ($null -eq $key) {
-            return $false
-        }
-        $value = $key.GetValue('Disabled', 0)
-        if ($null -eq $value) {
-            return $false
-        }
-        return ([int]$value -ne 0)
-    } catch {
-        return $false
-    } finally {
-        if ($null -ne $key) {
-            $key.Dispose()
-        }
-    }
-}
-
 function Resolve-ForwardSlashWindowsTarget {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -41,7 +13,9 @@ function Resolve-ForwardSlashWindowsTarget {
     }
     # One spawn per slash argument. shell-resolve answers from the settings
     # snapshot alone -- no broker round trip, no filter-port probe -- and
-    # returns the kind, the target and the distribution list together.
+    # returns the kind, the target and the distribution list together. That
+    # snapshot includes the global pause, so a paused product comes back as
+    # kind:'native' and the module never opens the settings key itself (#135).
     $output = & $script:FswController shell-resolve $Path 2>$null
     if (-not $output) {
         return $null
@@ -138,7 +112,12 @@ function Invoke-ForwardSlashWindowsChildItem {
     $forward = @($args)
     $pathIndexes = Get-ForwardSlashWindowsPathIndex -Arguments $forward
 
-    if ($pathIndexes.Count -eq 0 -or (Test-ForwardSlashWindowsDisabled)) {
+    # No slash argument: never spawn the controller, never read a setting.
+    # The global pause is decided by shell-resolve itself -- it answers
+    # kind:'native' when Disabled is set (#135), so the module no longer
+    # duplicates the settings key literal that crates/fsw-core/src/lib.rs
+    # owns for the rest of the product.
+    if ($pathIndexes.Count -eq 0) {
         Microsoft.PowerShell.Management\Get-ChildItem @forward
         return
     }
@@ -226,9 +205,6 @@ function Resolve-ForwardSlashWindowsLocationTarget {
             }
         }
     }
-    if (Test-ForwardSlashWindowsDisabled) {
-        return $null
-    }
     $parentOfDistribution = $false
     if ($null -eq $slashPath) {
         # 'cd ..' at a distribution share root. Above \\wsl.localhost\Ubuntu
@@ -239,7 +215,8 @@ function Resolve-ForwardSlashWindowsLocationTarget {
         # resolve that instead (#132). Both checks are string work on values
         # already in hand, and the location lookup is only reached once the
         # arguments already look like '..', so an ordinary 'cd ..' anywhere
-        # else still pays nothing. Paused, the native error stands.
+        # else still pays nothing. Paused, shell-resolve answers 'native' and
+        # the native error stands (#135).
         if (-not (Test-ForwardSlashWindowsParentReference -Arguments @($BoundParameters.Values))) {
             return $null
         }

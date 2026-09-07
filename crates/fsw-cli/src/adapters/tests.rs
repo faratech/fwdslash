@@ -471,12 +471,55 @@ fn block_text_renders_the_guarded_form() {
     // `$a -and` guards the alias: an unresolvable %LOCALAPPDATA% renders it
     // empty, and a bare `Test-Path -LiteralPath ''` throws on every shell start.
     assert!(block.contains(
-        "if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) { if (Test-Path -LiteralPath $m) { Import-Module -Name $m -Global -Force } } elseif (Test-Path -LiteralPath $c) { Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }\r\n"
+        "if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) { if (Test-Path -LiteralPath $m) {\r\n"
+    ));
+    assert!(block.contains(
+        "} } elseif (Test-Path -LiteralPath $c) { Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }\r\n"
     ));
     assert!(
         !block.contains("Import-Module -Name 'C:"),
         "no unguarded literal-path import"
     );
+    // #134: the block installs stubs and imports nothing at profile time. The
+    // only Import-Module in it is inside the lazy helper, reached on the first
+    // slash argument.
+    assert!(
+        !block.contains("Import-Module -Name $m "),
+        "no eager import of the module at profile time"
+    );
+    assert!(block.contains("Import-Module -Name $global:FswStubModule -Global -Force\r\n"));
+    for stub in [
+        "function global:Invoke-FswStubChildItem {",
+        "function global:Invoke-FswStubSetLocation {",
+        "function global:Invoke-FswStubPushLocation {",
+    ] {
+        assert!(block.contains(stub), "missing stub: {stub}");
+    }
+    // The location stubs keep the proxy parameter metadata, so binding before
+    // the flip is identical to binding after it.
+    assert!(block.contains(
+        "        [Parameter(Position = 0, ParameterSetName = 'Path', ValueFromPipeline = $true)]\r\n"
+    ));
+    assert!(block.contains("        [switch]$UseTransaction\r\n"));
+    // Every alias the module owns is claimed by a stub first.
+    for alias in ["dir", "ls", "cd", "chdir", "sl", "pushd"] {
+        assert!(
+            block.contains(&format!(
+                "Set-Item -Path alias:{alias} -Value Invoke-FswStub"
+            )),
+            "alias not stubbed: {alias}"
+        );
+    }
+    // Never a Utility cmdlet at profile time: `Set-Alias` alone would cost
+    // ~70 ms of Microsoft.PowerShell.Utility load in a session that has not
+    // already paid it. The alias: provider is Management, which the native
+    // passthrough needs anyway.
+    assert!(
+        !block.contains("Set-Alias"),
+        "no Utility cmdlet at profile time"
+    );
+    // No slash argument means no import and no registry read at all.
+    assert!(block.contains("    Microsoft.PowerShell.Management\\Get-ChildItem @args\r\n"));
     assert!(block.ends_with("# <<< Forward Slash Windows <<<\r\n"));
     // The whole point of #127: no version and no transaction id anywhere, so
     // the bytes are identical release to release and the Documents write that
@@ -633,23 +676,25 @@ fn parse_and_strip_understand_the_old_one_line_import_format() {
     assert!(profile::strip_fwdslash_blocks(legacy.as_bytes()).is_empty());
 }
 
-/// Staleness is the registry marker's job now (#127): a stable block carries no
-/// version, so the only thing the classifier can say about the fence text is
-/// whether it is still the legacy form.
+/// Version staleness is the registry marker's job (#127); *content* staleness
+/// is `matches_current` (#134). A stable fence can say neither on its own.
 #[test]
 fn classify_profile_ranks_orphan_over_duplicate_and_migration() {
     use profile::{BlockPresence, ProfileHealth};
     let present = BlockPresence {
         version: String::new(),
         module_present: true,
+        matches_current: true,
     };
     let missing = BlockPresence {
         version: "0.0.1".to_string(),
         module_present: false,
+        matches_current: true,
     };
     let legacy = BlockPresence {
         version: "0.0.7".to_string(),
         module_present: true,
+        matches_current: false,
     };
     assert_eq!(profile::classify_profile(&[]), ProfileHealth::Clean);
     assert_eq!(
@@ -668,11 +713,156 @@ fn classify_profile_ranks_orphan_over_duplicate_and_migration() {
         profile::classify_profile(std::slice::from_ref(&legacy)),
         ProfileHealth::MigrationPending("0.0.7".to_string())
     );
-    // A stable block never goes stale, whatever this build's version is.
+    // A stable block never goes stale by *version*, whatever this build's is.
     assert_eq!(
         profile::classify_profile(std::slice::from_ref(&present)),
         ProfileHealth::Healthy
     );
+}
+
+/// #134: the block's content changed but the fence, by #127 design, cannot say
+/// so. Without this the whole lazy-stub change would ship and never reach a
+/// machine that already has the adapter installed on the same version — it
+/// would be classified `Healthy` and never rewritten.
+#[test]
+fn a_stable_block_whose_content_drifted_is_update_pending() {
+    use profile::{BlockPresence, ProfileHealth};
+    let drifted = BlockPresence {
+        version: String::new(),
+        module_present: true,
+        matches_current: false,
+    };
+    assert_eq!(
+        profile::classify_profile(std::slice::from_ref(&drifted)),
+        ProfileHealth::UpdatePending
+    );
+    // A missing module still outranks drift: it is the only state that throws.
+    let orphan = BlockPresence {
+        version: String::new(),
+        module_present: false,
+        matches_current: false,
+    };
+    assert_eq!(
+        profile::classify_profile(std::slice::from_ref(&orphan)),
+        ProfileHealth::Orphaned(String::new())
+    );
+    // So does a legacy fence, which names the more specific repair.
+    let legacy_drifted = BlockPresence {
+        version: "0.0.7".to_string(),
+        module_present: true,
+        matches_current: false,
+    };
+    assert_eq!(
+        profile::classify_profile(std::slice::from_ref(&legacy_drifted)),
+        ProfileHealth::MigrationPending("0.0.7".to_string())
+    );
+}
+
+/// The #127 property, pinned: an upgrade that does not change the block text
+/// leaves the deployed block matching, so there is nothing to do and no
+/// `Documents` write happens. This is the case that must stay free.
+#[test]
+fn an_unchanged_block_text_writes_nothing() {
+    use profile::{BlockPresence, ProfileAction, ProfileHealth};
+    let module = r"C:\FSW\PowerShell\payload\ForwardSlashWindows.psm1";
+    // What "unchanged" means concretely: the same params render the same
+    // region, so the comparison `inspect` makes comes out equal.
+    let deployed = ps_block(module, true);
+    let current = ps_block(module, false);
+    assert!(
+        deployed.ends_with(&current),
+        "the fence-to-fence region is prefix-independent"
+    );
+    let matching = BlockPresence {
+        version: String::new(),
+        module_present: true,
+        matches_current: true,
+    };
+    let health = profile::classify_profile(std::slice::from_ref(&matching));
+    assert_eq!(health, ProfileHealth::Healthy);
+    // Installed and healthy: nothing, for a user action and a sweep alike.
+    for user_initiated in [true, false] {
+        assert_eq!(
+            profile::decide_profile_repair(&health, true, true, user_initiated),
+            ProfileAction::Nothing
+        );
+    }
+}
+
+/// Drift needs a `Documents` write, and a background sweep may not make one
+/// (#127). It must surface as `NeedsConfirmation`, exactly like a pending
+/// migration, and be applied only on an explicit user action.
+#[test]
+fn a_background_sweep_never_rewrites_a_drifted_block() {
+    use profile::{ProfileAction, ProfileHealth};
+    // Background sweep: reported, not written.
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::UpdatePending, true, true, false),
+        ProfileAction::NeedsConfirmation
+    );
+    // Explicit user action: rewrite the block.
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::UpdatePending, true, true, true),
+        ProfileAction::WriteCurrentBlock
+    );
+    // Drifted, and the current module is gone too: a full redeploy.
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::UpdatePending, true, false, true),
+        ProfileAction::Reinstall
+    );
+    // Drifted but the marker is gone: it is a leftover, so strip it.
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::UpdatePending, false, true, true),
+        ProfileAction::RemoveBlocks
+    );
+    assert_eq!(
+        profile::decide_profile_repair(&ProfileHealth::UpdatePending, false, true, false),
+        ProfileAction::NeedsConfirmation
+    );
+}
+
+/// The comparison `inspect` performs, end to end through the parser: a profile
+/// carrying the previous eager-import block parses to a region that is not the
+/// current one, while a profile carrying this build's block parses to a region
+/// that is.
+#[test]
+fn parse_blocks_recovers_the_region_that_drift_detection_compares() {
+    let module = r"C:\FSW\PowerShell\payload\ForwardSlashWindows.psm1";
+    let current_region = ps_block(module, false);
+
+    // A profile holding exactly this build's block, after a real original.
+    let mut installed = b"Write-Host hi
+"
+    .to_vec();
+    installed.extend_from_slice(ps_block(module, true).as_bytes());
+    let blocks = profile::parse_blocks(&installed);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks.first().map(|b| b.text.as_str()),
+        Some(current_region.as_str()),
+        "a current block's region must compare equal"
+    );
+
+    // The pre-#134 eager-import block: same stable fence, different body.
+    let eager = format!(
+        "{}\r\n$m = '{module}'\r\n$p = 'C:\\p'\r\n$a = ''\r\n$c = 'C:\\c'\r\nif (Test-Path -LiteralPath $m) {{ Import-Module -Name $m -Global -Force }}\r\n{}\r\n",
+        profile::FENCE_OPEN,
+        profile::FENCE_CLOSE
+    );
+    let drifted = profile::parse_blocks(eager.as_bytes());
+    assert_eq!(drifted.len(), 1);
+    assert_eq!(
+        drifted.first().map(profile::ParsedBlock::is_legacy),
+        Some(false),
+        "the fence is the stable form"
+    );
+    assert_ne!(
+        drifted.first().map(|b| b.text.as_str()),
+        Some(current_region.as_str()),
+        "an eager-import block must not compare equal to the stub block"
+    );
+    // And it still strips cleanly, so the rewrite restores the true original.
+    assert!(profile::strip_fwdslash_blocks(eager.as_bytes()).is_empty());
 }
 
 #[test]

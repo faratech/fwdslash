@@ -691,6 +691,11 @@ fn inspect(edition: Edition) -> Result<Inspection, AdapterError> {
         (false, Vec::new())
     };
 
+    // What this build would write, with no blank-line prefix: `ParsedBlock::text`
+    // is the fence-to-fence region and carries no prefix either, so the two are
+    // directly comparable. A stable-fence block that differs is content drift
+    // (#134) — the fence cannot carry a version to say so (#127).
+    let desired_block = block_for(false).unwrap_or_default();
     let presence: Vec<profile::BlockPresence> = profile::parse_blocks(&bytes)
         .into_iter()
         .map(|block| profile::BlockPresence {
@@ -699,6 +704,7 @@ fn inspect(edition: Edition) -> Result<Inspection, AdapterError> {
                 .module_path
                 .as_deref()
                 .is_some_and(|path| Path::new(path).is_file()),
+            matches_current: !desired_block.is_empty() && block.text == desired_block,
         })
         .collect();
     let health = profile::classify_profile(&presence);

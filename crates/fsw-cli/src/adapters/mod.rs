@@ -264,7 +264,13 @@ pub const MIGRATION_PENDING_MESSAGE: &str = "The PowerShell integration needs a 
 /// action pays for it (#127).
 #[cfg(windows)]
 fn current_version_noop(edition: state::Edition, user_initiated: bool) -> i32 {
-    if let profile::ProfileHealth::MigrationPending(_) = powershell::profile_health(edition) {
+    // `UpdatePending` is the same situation as a legacy block for this purpose:
+    // the deployed block's *content* is not what this build writes (#134), and
+    // replacing it is the same `Documents` write.
+    if matches!(
+        powershell::profile_health(edition),
+        profile::ProfileHealth::MigrationPending(_) | profile::ProfileHealth::UpdatePending
+    ) {
         if !user_initiated {
             eprintln!("{MIGRATION_PENDING_MESSAGE}");
             return EXIT_NEEDS_CONFIRMATION;
@@ -451,6 +457,10 @@ fn ps_health_status(edition: state::Edition) -> String {
             profile::version_label(&version),
             edition.cli_id()
         ),
+        profile::ProfileHealth::UpdatePending => format!(
+            "installed, but the profile block needs an update — run \"fwdslash integration {} enable\" to apply it",
+            edition.cli_id()
+        ),
         profile::ProfileHealth::Duplicated => "duplicate profile blocks".to_string(),
     }
 }
@@ -532,6 +542,9 @@ fn report_ps_repair(label: &str, edition: state::Edition, controller: &Path) {
                 profile::version_label(&version)
             );
         }
+        Ok(profile::ProfileHealth::UpdatePending) => {
+            println!("{label}: profile block needed an update — applied");
+        }
         Ok(profile::ProfileHealth::Duplicated) => {
             println!("{label}: duplicate profile blocks — repaired");
         }
@@ -559,6 +572,7 @@ pub fn repair_all() -> i32 {
             if matches!(
                 powershell::repair(edition, &controller, false),
                 Ok(profile::ProfileHealth::MigrationPending(_)
+                    | profile::ProfileHealth::UpdatePending
                     | profile::ProfileHealth::Orphaned(_)
                     | profile::ProfileHealth::Duplicated)
             ) {
