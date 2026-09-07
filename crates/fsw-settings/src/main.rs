@@ -258,6 +258,11 @@ struct State {
     root: Option<String>,
     store_flavor: bool,
     auto_update: bool,
+    /// An install attempt owns the update right now, so this window must not
+    /// offer to start another one (issue #145). Route-independent: every route
+    /// takes the attempt token before it starts, and the token is on disk, so
+    /// this survives closing and reopening the window.
+    install_in_flight: bool,
     /// What the last check found, read through `update::cached_offer` rather
     /// than raw: a persisted label that is no longer newer than what runs is
     /// not an offer, and rendering one as a target was issue #97. A Store
@@ -323,6 +328,7 @@ impl State {
             root: settings.bare_slash_root,
             store_flavor: is_store_flavor(),
             auto_update: update::read_auto_update_enabled(),
+            install_in_flight: update::install_attempt_in_flight(),
             offer: update::cached_offer(),
             last_check: update::last_update_check(),
             distributions,
@@ -1970,13 +1976,24 @@ impl SettingsModel {
             state.update_bundle_ready,
             state.offer.is_some(),
         );
+        // An attempt already owns the update. Offering to start another would
+        // be a lie, even though it is now harmless: the queue reconciler adopts
+        // a live item rather than double-installing (issue #145).
         let install_button: View = match install_label {
+            Some(_) if state.install_in_flight => View::empty(),
             Some(label) => Button::new()
                 .is_enabled(self.controls_enabled())
                 .automation_name("Install the update")
                 .on_click(context.message(Msg::InstallUpdate))
                 .content(label),
             None => View::empty(),
+        };
+        let in_flight: View = if state.install_in_flight {
+            body(in_flight_line(state.store_flavor))
+                .foreground(ThemeBrush::TextSecondary)
+                .into()
+        } else {
+            View::empty()
         };
         // The Store hand-off link, when the last install said the user has to
         // finish it there. Reachable only through `install_notice`.
@@ -2041,6 +2058,7 @@ impl SettingsModel {
                         install_button,
                         store_button,
                     )),
+                in_flight,
                 progress,
             )),
         )
@@ -2259,6 +2277,17 @@ fn install_banner_label(
     } else {
         "Restart to update"
     })
+}
+
+/// What the Updates card says while an install attempt already owns the update.
+#[must_use]
+fn in_flight_line(store_flavor: bool) -> &'static str {
+    if store_flavor {
+        "An update is installing. The Microsoft Store is handling it, and Forward Slash \
+         Windows restarts on its own when it finishes."
+    } else {
+        "An update is installing. Forward Slash Windows restarts on its own when it finishes."
+    }
 }
 
 /// The About page's update line for an offer, or `None` when there is none.
@@ -3028,8 +3057,8 @@ mod tests {
         CHECK_ACTION, ExecutionPolicy, INSTALL_ACTION, InfoBarSeverity, NoticeAction,
         REPAIR_ACTION, SettingsModel, UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NEEDS_USER,
         UPDATE_EXIT_NOTHING, UPDATE_EXIT_OK, UPDATE_EXIT_TIMEOUT, UpdateOutcome, check_outcome,
-        install_banner_label, install_notice, install_was_queued, json_string_field,
-        pending_caption, store_product_uri, update_offer_line,
+        in_flight_line, install_banner_label, install_notice, install_was_queued,
+        json_string_field, pending_caption, store_product_uri, update_offer_line,
     };
     use std::cell::Cell;
 
@@ -3413,5 +3442,21 @@ mod tests {
             store_product_uri(),
             "ms-windows-store://pdp/?productid=9P51CM0MTMK2"
         );
+    }
+
+    #[test]
+    fn a_live_attempt_is_described_rather_than_re_offered() {
+        // Issue #145: reopening during a queued install used to show the offer
+        // and an enabled Install button, with no sign anything was happening.
+        let store = in_flight_line(true);
+        let github = in_flight_line(false);
+        assert!(store.contains("installing"), "{store}");
+        assert!(store.contains("Microsoft Store"), "{store}");
+        assert!(github.contains("installing"), "{github}");
+        // The GitHub track has no Store to name.
+        assert!(!github.contains("Microsoft Store"), "{github}");
+        // Both promise the restart, which is what the watchdog delivers.
+        assert!(store.contains("restarts on its own"), "{store}");
+        assert!(github.contains("restarts on its own"), "{github}");
     }
 }

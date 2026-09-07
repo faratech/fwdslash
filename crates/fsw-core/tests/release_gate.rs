@@ -4,12 +4,13 @@
 //! verification matrix.
 
 use fsw_core::update::{
-    Offer, UNNAMED_RETRY_BACKOFF_SECS, UpdateOutcome, auto_update_from_value, check_is_due,
-    default_auto_update, expected_bundle_url, expected_bundle_version, explain_entries,
-    extract_bundle_digest, extract_bundle_url, extract_tag_name, format_last_check,
-    is_newer_available_version, is_newer_github_release, is_newer_package_version,
-    is_newer_version, normalize_running_version, offer_from_state, parse_release_tag,
-    parse_version, store_offer_from_entries, unnamed_offer_actionable, update_check_allowed,
+    ATTEMPT_LIVE_WINDOW_SECS, Offer, UNNAMED_RETRY_BACKOFF_SECS, UpdateOutcome,
+    attempt_token_is_live, auto_update_from_value, check_is_due, default_auto_update,
+    expected_bundle_url, expected_bundle_version, explain_entries, extract_bundle_digest,
+    extract_bundle_url, extract_tag_name, format_last_check, is_newer_available_version,
+    is_newer_github_release, is_newer_package_version, is_newer_version, normalize_running_version,
+    offer_from_state, parse_release_tag, parse_version, store_offer_from_entries,
+    unnamed_offer_actionable, update_check_allowed,
 };
 use fsw_core::{package_family_from_full_name, package_version_from_full_name};
 
@@ -491,4 +492,22 @@ fn the_offer_diagnostic_carries_versions_and_counts_but_never_a_path() {
     let empty = explain_entries("0.0.8.0", &[]);
     assert!(empty.contains("ours=0"), "{empty}");
     assert!(empty.contains("first=none"), "{empty}");
+}
+
+/// A token that still suppresses the install button must never be one the
+/// stale-token sweep would already have reclaimed, or the window and the
+/// updater would disagree about whether an attempt exists. Compile-time,
+/// because it is a relationship between two constants rather than behaviour.
+const _: () = assert!(ATTEMPT_LIVE_WINDOW_SECS <= 65 * 60);
+
+#[test]
+fn an_attempt_token_is_live_only_inside_the_schedulers_own_limit() {
+    // Issue #145. Every task the updater registers carries a one-hour
+    // ExecutionTimeLimit, so a token older than that belongs to an attempt the
+    // scheduler has already stopped and must not suppress the install button.
+    assert!(!attempt_token_is_live(None));
+    assert!(attempt_token_is_live(Some(0)));
+    assert!(attempt_token_is_live(Some(ATTEMPT_LIVE_WINDOW_SECS - 1)));
+    assert!(!attempt_token_is_live(Some(ATTEMPT_LIVE_WINDOW_SECS)));
+    assert!(!attempt_token_is_live(Some(ATTEMPT_LIVE_WINDOW_SECS * 24)));
 }

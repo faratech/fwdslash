@@ -610,6 +610,18 @@ framework.
   `broker_state` uses a 250 ms timeout, `pwsh.exe` discovery is a process-wide
   `OnceLock`, and every page refreshes on navigation, About included — its
   Components and Updates cards are live state.
+- **A live install attempt is described, not re-offered (issue #145).** The
+  window reads `install_attempt_in_flight()` at launch and hides the install
+  button behind a sentence saying the update is already installing. The signal
+  is the attempt token on disk, so it is route-independent — every route takes
+  the token before it starts — and it survives closing and reopening the window,
+  which process-local state would not. A token is trusted only inside
+  `ATTEMPT_LIVE_WINDOW_SECS` (1 h), the `ExecutionTimeLimit` every updater task
+  carries, and that is deliberately shorter than the 65-minute stale-token
+  reclaim so the window and the updater can never disagree about whether an
+  attempt exists. Pressing Install anyway was already harmless — `reconcile_queue`
+  adopts a live item rather than double-installing — so this is honesty rather
+  than a race fix.
 - **All app-update UI lives on the About page.** The Automatic updates toggle,
   the last-check line, "Check now", the install button and the progress ring
   with its caption are one card there, beside the version and the offer the
