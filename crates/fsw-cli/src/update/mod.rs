@@ -673,38 +673,42 @@ impl Report {
 // COM
 // ---------------------------------------------------------------------------
 
-/// MTA for the duration of one update verb, so a blocking wait on a `WinRT`
-/// operation needs no message pump. Scoped, because `fwdslash` is a
-/// short-lived CLI whose other verbs must not pay for COM at all.
+/// MTA for the duration of one update verb, so a wait on a `WinRT` operation
+/// needs no message pump. Entered lazily, because `fwdslash` is a short-lived
+/// CLI whose other verbs — the ones the shell adapters run on every `cd` and
+/// `dir` — must not pay for COM at all.
 ///
 /// Nesting is safe and intended: a second `CoInitializeEx` on an
 /// already-multithreaded apartment returns `S_FALSE` and only bumps the
-/// reference count, which the matching `Drop` releases again.
-struct ComScope {
-    initialized: bool,
-}
+/// reference count.
+///
+/// **It deliberately never calls `CoUninitialize`.** An update verb registers
+/// completion delegates that `WinRT` holds a strong reference to, and it can
+/// return before one of them fires — on a timeout, that is the expected path.
+/// Uninitialising the apartment underneath a live delegate, or releasing a
+/// proxy afterwards, is a use-after-uninitialise, and it is reachable exactly
+/// when things are already going wrong. The process exits within moments of
+/// the verb finishing and Windows tears the apartment down then, so the only
+/// thing the missing call costs is tidiness in a process that is about to
+/// disappear. That trade is why this is a marker rather than a guard.
+struct ComScope;
 
 impl ComScope {
     fn new() -> Self {
         use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
-        // SAFETY: paired with the `CoUninitialize` in `Drop`, and only when
-        // this call actually took a reference on the apartment.
-        let result = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        Self {
-            initialized: result.is_ok(),
-        }
+        // SAFETY: no preconditions. A failure needs no handling here: every
+        // `WinRT` call below reports its own HRESULT, and the routes already
+        // treat an activation failure as a reason to try the next rung rather
+        // than as a crash.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        Self
     }
 }
 
-impl Drop for ComScope {
-    fn drop(&mut self) {
-        if self.initialized {
-            // SAFETY: balances exactly one successful CoInitializeEx above.
-            unsafe { windows::Win32::System::Com::CoUninitialize() };
-        }
-    }
-}
+// No `Drop`. See the type's documentation: uninitialising the apartment while
+// a completion delegate is still registered would be a use-after-uninitialise,
+// and the process is about to exit anyway.
 
 // ---------------------------------------------------------------------------
 // Entry point

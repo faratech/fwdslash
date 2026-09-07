@@ -56,20 +56,75 @@ fn hex(error: &windows_core::Error) -> String {
     format!("0x{:08X}", error.code().0.cast_unsigned())
 }
 
-fn block_on<T: windows_core::RuntimeType + 'static>(
-    operation: &IAsyncOperation<T>,
+/// How a bounded wait ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Waited<T> {
+    /// The work finished and produced this.
+    Ready(T),
+    /// The deadline passed with no answer.
+    TimedOut,
+    /// The work reported a failure, or could not be subscribed to at all.
+    Failed(String),
+}
+
+/// Waits for a callback, bounded by a deadline.
+///
+/// `subscribe` is handed the sender and is expected to arrange for exactly one
+/// send. Taking it as a closure is what makes the deadline testable: a fake
+/// that never sends proves the timeout without a Store, which is the gap in
+/// every callback-driven implementation of this that I looked at — they hand
+/// control to `WinRT` correctly and then have nothing to say if the callback
+/// never comes.
+///
+/// A send after the deadline lands on a dropped receiver and is discarded.
+/// That is the normal shape of a late answer, not an error.
+pub fn wait_bounded<T>(
+    subscribe: impl FnOnce(std::sync::mpsc::Sender<Result<T, String>>) -> Result<(), String>,
     timeout: Duration,
-) -> windows_core::Result<T> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if operation.Status()? != AsyncStatus::Started {
-            return operation.GetResults();
-        }
-        if Instant::now() >= deadline {
-            return timed_out();
-        }
-        std::thread::sleep(Duration::from_millis(50));
+) -> Waited<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    if let Err(detail) = subscribe(sender) {
+        return Waited::Failed(detail);
     }
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(value)) => Waited::Ready(value),
+        Ok(Err(detail)) => Waited::Failed(detail),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Waited::TimedOut,
+        // Every sender was dropped without sending: the callback was released
+        // without ever running. Not a timeout, and emphatically not "nothing
+        // to install" — that conflation is what issue #90 was about.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Waited::Failed("the update check was released without an answer".to_string())
+        }
+    }
+}
+
+/// Subscribes to one `WinRT` operation and reduces its result to plain Rust
+/// **inside the callback**.
+///
+/// That reduction is mandatory, not stylistic: the callback's `Send` bound is
+/// on the closure, and `IVectorView` is not `Send`, so the collection cannot
+/// cross the channel even though every element type can. `reduce` therefore
+/// runs on the delegate's own thread, which is safe here because the process
+/// is an MTA and `StoreContext`, `StorePackageUpdate` and
+/// `StorePackageUpdateResult` are all agile.
+fn subscribe_operation<T, R>(
+    operation: &IAsyncOperation<T>,
+    reduce: impl FnOnce(windows_core::Result<T>) -> Result<R, String> + Send + 'static,
+    sender: std::sync::mpsc::Sender<Result<R, String>>,
+) -> Result<(), String>
+where
+    T: windows_core::RuntimeType + 'static,
+    R: Send + 'static,
+{
+    // `when` fires synchronously if the operation has already completed, so
+    // there is no window between creating it and subscribing in which an
+    // answer could be lost.
+    operation
+        .when(move |result| {
+            let _ = sender.send(reduce(result));
+        })
+        .map_err(|error| hex(&error))
 }
 
 /// How watching one install operation ended.
@@ -123,6 +178,33 @@ where
     }
 }
 
+/// The install path's wait, which cannot be callback-driven.
+///
+/// `TrySilentDownloadAndInstallStorePackageUpdatesAsync` takes the live
+/// `IVectorView` back, and `IVectorView` is not `Send`, so the collection can
+/// neither cross a channel nor be produced on a delegate's thread and used
+/// here. Reducing it to plain Rust — the trick that makes the *query* path
+/// callback-driven — would destroy the thing the install needs.
+///
+/// Polling is therefore the honest choice here rather than a leftover. It is
+/// bounded, it runs in an MTA process with nothing else on the thread, and
+/// the caller bounds it again from outside.
+fn block_on<T: windows_core::RuntimeType + 'static>(
+    operation: &IAsyncOperation<T>,
+    timeout: Duration,
+) -> windows_core::Result<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if operation.Status()? != AsyncStatus::Started {
+            return operation.GetResults();
+        }
+        if Instant::now() >= deadline {
+            return timed_out();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn pending_updates() -> windows_core::Result<IVectorView<StorePackageUpdate>> {
     let operation = StoreContext::GetDefault()?.GetAppAndOptionalStorePackageUpdatesAsync()?;
     block_on(&operation, QUERY_TIMEOUT)
@@ -134,17 +216,60 @@ fn pending_updates() -> windows_core::Result<IVectorView<StorePackageUpdate>> {
 ///
 /// Packaged callers only: `StoreContext` needs package identity.
 pub fn check_store_offer() -> Result<Option<fsw_core::update::Offer>, String> {
-    let updates = pending_updates().map_err(|error| hex(&error))?;
     let current =
         fsw_core::package_version().ok_or_else(|| "package-version-unavailable".to_string())?;
-    let entries = offer_entries(&updates)?;
-    // The measurement hook for issue #97: versions and counts only, on stderr,
-    // and only when asked for. The broker discards stderr and the settings
-    // window surfaces it on its error branch alone, so this never reaches the
-    // UI on a normal check.
-    if std::env::var_os("FSW_UPDATE_EXPLAIN").is_some() {
-        eprintln!("{}", fsw_core::update::explain_entries(&current, &entries));
-    }
+    let context = StoreContext::GetDefault().map_err(|error| hex(&error))?;
+    let operation = context
+        .GetAppAndOptionalStorePackageUpdatesAsync()
+        .map_err(|error| hex(&error))?;
+
+    // The whole reduction happens in the callback, because `IVectorView` is
+    // not `Send` and cannot cross the channel. What comes back is one owned
+    // `Vec<Option<String>>`.
+    let explain = std::env::var_os("FSW_UPDATE_EXPLAIN").is_some();
+    let for_callback = current.clone();
+    let waited = wait_bounded(
+        |sender| {
+            subscribe_operation(
+                &operation,
+                move |result| {
+                    let updates = result.map_err(|error| hex(&error))?;
+                    let entries = offer_entries(&updates)?;
+                    // The measurement hook for issue #97: versions and counts
+                    // only, and only when asked for. The broker discards
+                    // stderr and the settings window surfaces it on its error
+                    // branch alone, so this never reaches the UI on a normal
+                    // check.
+                    if explain {
+                        eprintln!(
+                            "{}",
+                            fsw_core::update::explain_entries(&for_callback, &entries)
+                        );
+                    }
+                    Ok(entries)
+                },
+                sender,
+            )
+        },
+        QUERY_TIMEOUT,
+    );
+
+    let entries = match waited {
+        Waited::Ready(entries) => entries,
+        Waited::TimedOut => {
+            // The operation is still live and `WinRT` still holds the delegate.
+            // Leak the proxy rather than release it: this process is about to
+            // exit, and the apartment is deliberately never uninitialised (see
+            // `ComScope`), so a late completion has somewhere valid to land.
+            std::mem::forget(operation);
+            return Err(hex(&timed_out_error()));
+        }
+        Waited::Failed(detail) => {
+            std::mem::forget(operation);
+            return Err(detail);
+        }
+    };
+
     Ok(fsw_core::update::store_offer_from_entries(
         &current, &entries,
     ))
