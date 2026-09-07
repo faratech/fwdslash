@@ -241,13 +241,17 @@ pub fn sync_plan<'a>(
 /// `update.rs` owns the last three names; they are repeated here rather than
 /// imported to keep this list one readable inventory of the key.
 #[cfg(windows)]
-const SYNCED_DWORDS: [&str; 3] = [
+const SYNCED_DWORDS: [&str; 4] = [
     crate::FSW_DISABLED_VALUE,
     crate::FSW_BARE_SLASH_MODE_VALUE,
     crate::update::AUTO_UPDATE_VALUE,
+    crate::update::STORE_UPDATE_PENDING_VALUE,
 ];
 #[cfg(windows)]
-const SYNCED_QWORDS: [&str; 1] = [crate::update::LAST_UPDATE_CHECK_VALUE];
+const SYNCED_QWORDS: [&str; 2] = [
+    crate::update::LAST_UPDATE_CHECK_VALUE,
+    crate::update::STORE_UPDATE_ATTEMPT_VALUE,
+];
 #[cfg(windows)]
 const SYNCED_STRINGS: [&str; 3] = [
     crate::FSW_BARE_SLASH_DISTRIBUTION_VALUE,
@@ -595,5 +599,53 @@ pub fn sync_settings_to_real_hive() -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+#[cfg(all(test, windows))]
+mod inventory_tests {
+    use super::{SYNCED_DWORDS, SYNCED_QWORDS, SYNCED_STRINGS};
+
+    /// Issue #120 item 7: the sync inventory and the values the product owns
+    /// are two statements of one fact, and a new setting that misses the first
+    /// silently skips the self-heal, so a packaged write of it never reaches
+    /// the real hive that the unpackaged shell adapters read.
+    ///
+    /// This caught exactly that. `StoreUpdatePending` and `StoreUpdateAttempt`
+    /// were added for issue #97 and not listed, which is the drift #120 was
+    /// opened to predict.
+    #[test]
+    fn every_owned_setting_is_in_the_sync_inventory() {
+        let synced: Vec<&str> = SYNCED_DWORDS
+            .iter()
+            .chain(SYNCED_QWORDS.iter())
+            .chain(SYNCED_STRINGS.iter())
+            .copied()
+            .collect();
+        // Every value the product writes under the settings key. `UpdateRoute`
+        // is deliberately absent: it is read-only to the product and set by
+        // hand, so mirroring it would be writing a value nothing owns.
+        let owned = [
+            crate::FSW_DISABLED_VALUE,
+            crate::FSW_BARE_SLASH_MODE_VALUE,
+            crate::FSW_BARE_SLASH_DISTRIBUTION_VALUE,
+            crate::FSW_BARE_SLASH_ROOT_VALUE,
+            crate::update::AUTO_UPDATE_VALUE,
+            crate::update::LAST_UPDATE_CHECK_VALUE,
+            crate::update::AVAILABLE_UPDATE_VALUE,
+            crate::update::STORE_UPDATE_PENDING_VALUE,
+            crate::update::STORE_UPDATE_ATTEMPT_VALUE,
+        ];
+        for value in owned {
+            assert!(
+                synced.contains(&value),
+                "{value} is written by the product but missing from the sync \
+                 inventory, so a packaged write of it never reaches the real hive"
+            );
+        }
+        let mut seen = synced.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), synced.len(), "a value is listed twice");
     }
 }
