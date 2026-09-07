@@ -90,7 +90,7 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "fsw-core"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "fsw-path",
  "windows-registry",
@@ -99,11 +99,11 @@ dependencies = [
 
 [[package]]
 name = "fsw-path"
-version = "0.0.9"
+version = "0.1.0"
 
 [[package]]
 name = "fswbroker"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "embed-resource",
  "fsw-core",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "fswsettings"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "embed-resource",
  "fsw-core",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "fwdslash"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "embed-resource",
  "fsw-core",
