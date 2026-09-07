@@ -21,7 +21,7 @@ See the [GitHub release](https://example.invalid) for signed bundles.
 """
 
 GOOD = """- Updating from inside the app no longer gets stuck saying "Installing" forever.
-- Typing `cd ..` at a distribution root now resolves to `/` instead of failing.
+- Typing `cd ..` at the top of a distribution now takes you to `/` instead of failing.
 """
 
 
@@ -60,6 +60,41 @@ class LinterTests(unittest.TestCase):
 
     def test_empty_notes_are_rejected(self):
         self.assertTrue(problems("\n"))
+
+    def test_jargon_in_plain_prose_is_rejected(self):
+        # The gap the backtick rule alone left: a note can be written entirely
+        # in prose and still describe the machine rather than the person. Every
+        # one of these shipped or was drafted at some point.
+        for line in (
+            "- PowerShell loads faster by deferring initialization.",
+            "- Typing cd .. at a distribution root now resolves to / instead of failing.",
+            "- The watchdog restarts the app.",
+            "- The registry value is no longer wrong.",
+            "- The broker no longer drops Enter.",
+            "- A failed check now returns the right exit code.",
+            "- Cached results are reused.",
+        ):
+            self.assertTrue(problems(line + "\n"), line)
+
+    def test_the_words_a_user_of_this_product_actually_says_are_allowed(self):
+        # 0.0.8 is the model: it is entirely plain and must keep passing, so
+        # the jargon list can never grow into the product's own vocabulary.
+        for line in (
+            "- Automatic updates now download and install correctly.",
+            "- Open WSL root in the notification area menu works again.",
+            "- Terminal integrations update themselves quietly.",
+            "- Uninstalling cleans up the leftover files and scheduled tasks.",
+            "- Windows Search opens the folder you typed.",
+            "- Drive paths such as /mnt/c behave the same way everywhere.",
+            "- Typing a Linux path in File Explorer now works every time.",
+        ):
+            self.assertEqual(problems(line + "\n"), [], line)
+
+    def test_the_suggestion_says_what_to_write_instead(self):
+        # The error has to teach, or the next author just deletes the word and
+        # leaves the sentence as opaque as it was.
+        found = problems("- The watchdog restarts it.\n")
+        self.assertTrue(any("restarts itself" in problem for problem in found), found)
 
     def test_the_downloads_heading_is_rejected(self):
         # release.yml appends its own; one here produced the duplicate that

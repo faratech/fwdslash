@@ -13,10 +13,14 @@ release body gets two.
 submission before anyone noticed, which is why this is a gate rather than a
 convention.
 
+Two checks. The first bans code identifiers in backticks; the second bans words
+that describe the machine rather than the person, because a note can be written
+entirely in prose and still be unreadable to a customer.
+
 What is deliberately *not* banned: backticks around things a user types, like
-`cd ..` or `/etc/apt`. Those are the subject of the product. What is banned is
-backticks around code identifiers, which is the tell that a note was written
-for developers.
+`cd ..` or `/etc/apt`, and words a user of this product already uses — install,
+update, folder, path, scheduled tasks, notification area, terminal
+integrations. The product is about typing paths; saying so is not jargon.
 
     python3 tools/check_release_notes.py            # every notes file
     python3 tools/check_release_notes.py 0.1.0      # just one
@@ -33,6 +37,48 @@ NOTES_DIR = Path(__file__).resolve().parent.parent / "docs" / "release-notes"
 # The marker publish-to-store.yml truncates at. Everything above it is customer
 # copy; the line itself is the only heading a notes file may carry.
 DOWNLOADS_MARKER = "## Downloads"
+
+# Words that describe the machine rather than the person using it. These are
+# the ones that slipped past the backtick check, because a note can be written
+# entirely in prose and still be unreadable to a customer: "resolves", "the
+# check that follows it", "deferring initialization".
+#
+# The value is what to say instead, so the error is a suggestion rather than a
+# scolding. Deliberately absent: "install", "update", "download", "folder",
+# "path", "scheduled tasks", "notification area", "terminal integrations" —
+# all of those are things a user of this product sees and says.
+JARGON = {
+    "resolve": "say what the user sees — it opens, or it does not",
+    "resolves": "say what the user sees — it opens, or it does not",
+    "resolved": "say what the user sees — it opens, or it does not",
+    "resolution": "say what the user sees — it opens, or it does not",
+    "initialization": "say what they notice, such as starting faster",
+    "initialize": "say what they notice, such as starting faster",
+    "distribution root": "say the top of a distribution, or name one",
+    "registry": "describe the setting, not where it is stored",
+    "exit code": "describe the outcome, not how it is reported",
+    "watchdog": "say the app restarts itself",
+    "sidecar": "describe the file by what it does, or leave it out",
+    "broker": "say the app, or the part that watches for paths",
+    "subprocess": "leave it out; it is not a thing they installed",
+    "child process": "leave it out; it is not a thing they installed",
+    "apartment": "leave it out entirely",
+    "callback": "leave it out entirely",
+    "polling": "leave it out entirely",
+    "poll": "leave it out entirely",
+    "admission window": "say how long the app waits",
+    "adapter": "say terminal integrations, which is what the app calls them",
+    "payload": "name the thing, not its container",
+    "manifest": "leave it out entirely",
+    "telemetry": "say what is sent, or that nothing is",
+    "deferred": "say when it happens instead",
+    "deferring": "say when it happens instead",
+    "cached": "say remembered, or leave it out",
+    "api": "name the service, such as the Microsoft Store",
+    "hresult": "describe the failure in words",
+    "packaged": "say installed from the Microsoft Store",
+    "unpackaged": "say installed from GitHub",
+}
 
 # A backticked span that names code rather than something a user types.
 IDENTIFIER_TELLS = (
@@ -61,6 +107,13 @@ def problems(text: str) -> list[str]:
             )
         for issue in re.findall(r"(?<![\w/])#\d+", line):
             found.append(f"line {number}: an issue reference ({issue}). Customers cannot open it.")
+        lowered = line.lower()
+        for term, instead in JARGON.items():
+            if re.search(rf"(?<![\w-]){re.escape(term)}(?![\w-])", lowered):
+                found.append(
+                    f"line {number}: {term!r} describes the machine, not the person. "
+                    f"Instead, {instead}."
+                )
         for span in re.findall(r"`([^`]+)`", line):
             for tell in IDENTIFIER_TELLS:
                 if tell.search(span):
