@@ -216,7 +216,15 @@ global pause), `BareSlashMode` (DWORD, 0 = distribution list / 1 = default distr
 `BareSlashDistribution` (string, the pin), `BareSlashRoot` (string, the custom folder root),
 and — in **both** flavors — `AutoUpdate` / `LastUpdateCheck` / `AvailableUpdate`,
 plus the read-only `UpdateRoute` override (`auto|appinstall|store|winget|notify`, never written
-by the product). `AutoUpdate` is the one value whose *absent* meaning depends on the flavor:
+by the product), plus two Store-only values: `StoreUpdatePending` (DWORD) and
+`StoreUpdateAttempt` (QWORD). **`StoreUpdatePending` is the availability truth and
+`AvailableUpdate` is only its label** — the Store can offer an update whose version is not
+a trustworthy target, and the installed version must never be advertised as one (issue #97).
+Read the pair through `fsw_core::update::cached_offer()`, which returns an
+`Offer::Named(tag)` or `Offer::Unnamed`, and never read `AvailableUpdate` raw: a persisted
+label that is no longer newer than what runs is spent, not an offer. `StoreUpdateAttempt`
+stamps an install started from an unnamed offer, so a same-version repair offer gets one
+attempt a day rather than one per cycle. `AutoUpdate` is the one value whose *absent* meaning depends on the flavor:
 `fsw_core::update::default_auto_update(store_flavor) = !store_flavor`, so nothing stored means
 on for the GitHub build and off for the Store build, while the stored encoding stays the
 inverted DWORD it always was (`1` = off) so an explicit "off" never flips. The gate itself,

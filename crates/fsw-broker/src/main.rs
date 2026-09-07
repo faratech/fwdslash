@@ -370,7 +370,11 @@ static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
 static WORKER_BUSY: AtomicBool = AtomicBool::new(false);
 /// The version the last update balloon was about, so one available update
 /// produces one balloon however many cycles see it.
-static UPDATE_NOTIFIED_TAG: Mutex<Option<String>> = Mutex::new(None);
+/// The offer the last balloon announced. The **outer** `None` means nothing has
+/// been announced yet; the inner one means the offer announced had no version
+/// (issue #97). Collapsing the two was what made a nameless offer balloon on
+/// every cycle instead of once.
+static UPDATE_NOTIFIED_TAG: Mutex<Option<Option<String>>> = Mutex::new(None);
 /// Consecutive `update install` failures; any other outcome resets it.
 static UPDATE_INSTALL_FAILURES: AtomicU32 = AtomicU32::new(0);
 
@@ -2901,11 +2905,12 @@ fn update_cycle_due(running: bool, age_ms: u64, worker_busy: bool, allowed: bool
 /// registry had no tag) is announced once and then stays quiet, rather than
 /// once per cycle forever.
 #[must_use]
-fn should_balloon_update(tag: Option<&str>, notified: Option<&str>) -> bool {
-    match (tag, notified) {
-        (Some(current), Some(last)) => current != last,
-        (Some(_) | None, None) => true,
-        (None, Some(_)) => false,
+fn should_balloon_update(tag: Option<&str>, notified: Option<Option<&str>>) -> bool {
+    match notified {
+        // Nothing announced yet, named or not.
+        None => true,
+        // Announced already: only a *different* offer earns a second balloon.
+        Some(last) => tag != last,
     }
 }
 
@@ -2928,10 +2933,13 @@ fn notify_update_once(message: &str, flags: u32) {
     let Ok(mut notified) = UPDATE_NOTIFIED_TAG.lock() else {
         return;
     };
-    if !should_balloon_update(tag.as_deref(), notified.as_deref()) {
+    if !should_balloon_update(
+        tag.as_deref(),
+        notified.as_ref().map(|last| last.as_deref()),
+    ) {
         return;
     }
-    *notified = tag;
+    *notified = Some(tag);
     // The lock is held across a call that can park for ~10 s waiting for the
     // shell to accept the icon. Nothing else ever takes it except another
     // cycle, and `UPDATE_RUNNING` already makes those mutually exclusive.
@@ -4255,15 +4263,26 @@ mod tests {
     #[test]
     fn one_version_produces_one_balloon() {
         assert!(should_balloon_update(Some("0.0.5"), None));
-        assert!(!should_balloon_update(Some("0.0.5"), Some("0.0.5")));
+        assert!(!should_balloon_update(Some("0.0.5"), Some(Some("0.0.5"))));
         // A second update replacing the first is news again.
-        assert!(should_balloon_update(Some("0.0.6"), Some("0.0.5")));
+        assert!(should_balloon_update(Some("0.0.6"), Some(Some("0.0.5"))));
     }
 
     #[test]
     fn a_nameless_update_is_announced_once() {
+        // Nothing announced yet: balloon, named or not.
         assert!(should_balloon_update(None, None));
-        assert!(!should_balloon_update(None, Some("0.0.5")));
+        assert!(should_balloon_update(Some("0.0.5"), None));
+        // ...and then stay quiet, which is what the doc comment always
+        // promised and the old two-level match did not deliver: a nameless
+        // offer re-announced itself on every cycle forever.
+        assert!(!should_balloon_update(None, Some(None)));
+        assert!(!should_balloon_update(Some("0.0.5"), Some(Some("0.0.5"))));
+        // A different offer replacing the first is announced again, in both
+        // directions between named and nameless.
+        assert!(should_balloon_update(Some("0.0.6"), Some(Some("0.0.5"))));
+        assert!(should_balloon_update(Some("0.0.6"), Some(None)));
+        assert!(should_balloon_update(None, Some(Some("0.0.5"))));
     }
 
     #[test]

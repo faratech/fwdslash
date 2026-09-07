@@ -19,11 +19,13 @@ use super::relaunch::{
     winget_command_for,
 };
 use super::{
-    EXIT_AVAILABLE, EXIT_ERROR, EXIT_NEEDS_USER, EXIT_NOTHING, EXIT_OK, Fold, HelperResult,
-    Options, Precheck, Route, UpdateJson, Verb, fold_helper_result, install_moment_ok,
-    install_precheck, parse_args, parse_helper_result, render_json, route_for, state_for_code,
+    Availability, EXIT_AVAILABLE, EXIT_ERROR, EXIT_NEEDS_USER, EXIT_NOTHING, EXIT_OK, Fold,
+    HelperResult, InstallAnswer, Options, Precheck, Route, UpdateJson, Verb, fold_helper_result,
+    install_answer, install_moment_ok, install_precheck, parse_args, parse_helper_result,
+    render_json, route_for, state_for_code,
 };
 use crate::scheduled_task::is_safe_task_literal;
+use fsw_core::update::Offer;
 use std::path::Path;
 
 const FAMILY: &str = "32827MikeFara.fwdslash_t6j5qexy2jpp2";
@@ -969,4 +971,90 @@ fn the_winget_command_answers_every_prompt_in_advance() {
             "batch command contains {character}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The install gate (issues #90 and #97)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_unknown_availability_never_reaches_a_route() {
+    // The property issue #90 is about, and the one a refactor is most likely
+    // to break: a Store query that failed must not license an install, and
+    // must not claim there is nothing to install either.
+    for actionable in [false, true] {
+        for moment_ok in [false, true] {
+            assert_eq!(
+                install_answer(&Availability::Unknown, actionable, moment_ok),
+                InstallAnswer::Unknown,
+                "actionable {actionable}, moment {moment_ok}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nothing_to_install_still_outranks_the_moment() {
+    for moment_ok in [false, true] {
+        assert_eq!(
+            install_answer(&Availability::Nothing, true, moment_ok),
+            InstallAnswer::Nothing
+        );
+    }
+}
+
+#[test]
+fn a_named_offer_is_never_subject_to_the_unnamed_backoff() {
+    // Its version is the proof that something will change, so it is retried
+    // as often as the caller likes.
+    let named = Availability::Offer(Offer::Named("0.1.0.0".to_string()));
+    for actionable in [false, true] {
+        assert_eq!(
+            install_answer(&named, actionable, true),
+            InstallAnswer::Proceed
+        );
+        assert_eq!(
+            install_answer(&named, actionable, false),
+            InstallAnswer::Defer
+        );
+    }
+}
+
+#[test]
+fn an_unnamed_offer_backs_off_before_the_moment_is_even_asked() {
+    let unnamed = Availability::Offer(Offer::Unnamed);
+    for moment_ok in [false, true] {
+        assert_eq!(
+            install_answer(&unnamed, false, moment_ok),
+            InstallAnswer::BackedOff,
+            "a spent unnamed offer must not retry every cycle"
+        );
+    }
+    assert_eq!(install_answer(&unnamed, true, true), InstallAnswer::Proceed);
+    assert_eq!(install_answer(&unnamed, true, false), InstallAnswer::Defer);
+}
+
+#[test]
+fn the_availability_label_never_invents_a_version() {
+    assert_eq!(
+        Availability::Offer(Offer::Named("0.1.0.0".to_string())).label(),
+        Some("0.1.0.0".to_string())
+    );
+    assert_eq!(Availability::Offer(Offer::Unnamed).label(), None);
+    assert_eq!(Availability::Nothing.label(), None);
+    assert_eq!(Availability::Unknown.label(), None);
+}
+
+#[test]
+fn each_install_answer_carries_the_exit_code_its_state_names() {
+    // Pins the state/exit pairs `cmd_install` emits, so the two cannot drift.
+    // `Unknown` is 11 and not 12: twelve claims there is nothing to install,
+    // which is the whole of issue #90. It is not 0 either — the settings
+    // window reads exit 0 without `action: "queued"` as "about to be
+    // force-closed", shows nothing and leaves the broker down.
+    assert_eq!(state_for_code(EXIT_NOTHING), "upToDate");
+    assert_eq!(state_for_code(EXIT_NEEDS_USER), "needsUser");
+    assert_eq!(state_for_code(EXIT_AVAILABLE), "deferred");
+    assert_ne!(EXIT_NEEDS_USER, EXIT_NOTHING);
+    assert_ne!(EXIT_NEEDS_USER, EXIT_OK);
 }

@@ -258,9 +258,11 @@ struct State {
     root: Option<String>,
     store_flavor: bool,
     auto_update: bool,
-    /// The version the last check found, from `AvailableUpdate`. This is the
-    /// plan's `update_available`; it already existed under this name.
-    update_tag: Option<String>,
+    /// What the last check found, read through `update::cached_offer` rather
+    /// than raw: a persisted label that is no longer newer than what runs is
+    /// not an offer, and rendering one as a target was issue #97. A Store
+    /// offer with no trustworthy version is `Offer::Unnamed`.
+    offer: Option<update::Offer>,
     /// Unix time of the last check attempt, whatever it concluded. Rendered
     /// through `format_last_check` on the About page.
     last_check: Option<u64>,
@@ -321,7 +323,7 @@ impl State {
             root: settings.bare_slash_root,
             store_flavor: is_store_flavor(),
             auto_update: update::read_auto_update_enabled(),
-            update_tag: update::cached_update_tag(),
+            offer: update::cached_offer(),
             last_check: update::last_update_check(),
             distributions,
             wsl_default,
@@ -417,11 +419,7 @@ impl State {
 
     /// The About page's "there is a newer version" line, or `None`.
     fn update_available_line(&self) -> Option<String> {
-        let tag = self.update_tag.as_deref()?;
-        Some(format!(
-            "Update available: {}",
-            tag.strip_prefix('v').unwrap_or(tag)
-        ))
+        update_offer_line(self.offer.as_ref())
     }
 
     /// Which of the two package flavors is running, or neither.
@@ -1270,6 +1268,20 @@ impl Component for SettingsModel {
                         ));
                         self.notice_is_update = true;
                     }
+                    // The Store says there is an update but named no version
+                    // we trust. Announce the fact without inventing a number
+                    // (issue #97). Not gated on `explicit`: an offer is worth
+                    // surfacing from the launch check too, exactly like a
+                    // named one.
+                    UpdateOutcome::ReadyUnnamed => {
+                        self.notice = Some(Notice::new(
+                            InfoBarSeverity::Informational,
+                            "Update available",
+                            "An update is available in the Microsoft Store. Install it now, \
+                             or let the Store install it on its own schedule.",
+                        ));
+                        self.notice_is_update = true;
+                    }
                     // Everything else is silent unless the user asked: the
                     // launch check is background work they did not request.
                     UpdateOutcome::UpToDate | UpdateOutcome::NotDue if explicit => {
@@ -1680,7 +1692,7 @@ impl SettingsModel {
             self.state.packaged,
             self.state.store_flavor,
             self.state.update_bundle_ready,
-            self.state.update_tag.is_some(),
+            self.state.offer.is_some(),
         );
         let notice_action = self.notice.as_ref().and_then(|notice| notice.action);
         if self.upgrade.is_none()
@@ -2251,6 +2263,21 @@ fn install_banner_label(
     })
 }
 
+/// The About page's update line for an offer, or `None` when there is none.
+///
+/// An offer the Store would not name still gets a line: "an update exists" is
+/// the fact, and its version is only a label (issue #97).
+#[must_use]
+fn update_offer_line(offer: Option<&update::Offer>) -> Option<String> {
+    match offer? {
+        update::Offer::Named(tag) => Some(format!(
+            "Update available: {}",
+            tag.strip_prefix('v').unwrap_or(tag)
+        )),
+        update::Offer::Unnamed => Some("Update available".to_string()),
+    }
+}
+
 fn body(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text)
@@ -2540,7 +2567,11 @@ fn check_outcome(code: i32, stdout: &str) -> UpdateOutcome {
     if code == UPDATE_EXIT_AVAILABLE {
         return match json_string_field(line, "available") {
             Some(tag) if !tag.is_empty() => UpdateOutcome::Ready(tag),
-            _ => UpdateOutcome::Unavailable,
+            // Exit 10 without a version is a check that found something it
+            // could not name, not a check that failed. Reporting it as a
+            // failure hid every Store offer whose version we do not trust
+            // (issue #97).
+            _ => UpdateOutcome::ReadyUnnamed,
         };
     }
     match json_string_field(line, "state").as_deref() {
@@ -3000,7 +3031,7 @@ mod tests {
         REPAIR_ACTION, SettingsModel, UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NEEDS_USER,
         UPDATE_EXIT_NOTHING, UPDATE_EXIT_OK, UPDATE_EXIT_TIMEOUT, UpdateOutcome, check_outcome,
         install_banner_label, install_notice, install_was_queued, json_string_field,
-        pending_caption, store_product_uri,
+        pending_caption, store_product_uri, update_offer_line,
     };
     use std::cell::Cell;
 
@@ -3125,19 +3156,57 @@ mod tests {
     // -- check answers -----------------------------------------------------
 
     #[test]
-    fn exit_ten_with_a_version_is_the_only_ready() {
+    fn exit_ten_names_a_version_when_it_has_one_and_still_announces_when_it_does_not() {
         assert_eq!(
             check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "\"0.0.5\"")),
             UpdateOutcome::Ready("0.0.5".to_string())
         );
-        // Exit 10 that cannot name a version is nothing to announce.
+        // Exit 10 without a version is an offer we cannot name, not a check
+        // that failed. Treating it as a failure hid every Store offer whose
+        // version is not trustworthy (issue #97).
         assert_eq!(
             check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "null")),
-            UpdateOutcome::Unavailable
+            UpdateOutcome::ReadyUnnamed
         );
         assert_eq!(
             check_outcome(UPDATE_EXIT_AVAILABLE, &json_line("available", "\"\"")),
+            UpdateOutcome::ReadyUnnamed
+        );
+        // A genuine failure still has to look like one, and that comes from
+        // the state field on a different exit code.
+        assert_eq!(
+            check_outcome(UPDATE_EXIT_OK, &json_line("state", "\"unavailable\"")),
             UpdateOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn the_about_line_never_prints_a_version_the_store_did_not_name() {
+        assert_eq!(
+            update_offer_line(Some(&fsw_core::update::Offer::Named("0.1.0.0".to_string()))),
+            Some("Update available: 0.1.0.0".to_string())
+        );
+        // The GitHub shape keeps its `v` stripped.
+        assert_eq!(
+            update_offer_line(Some(&fsw_core::update::Offer::Named("v0.1.0".to_string()))),
+            Some("Update available: 0.1.0".to_string())
+        );
+        // An offer with no trustworthy version still gets a line, without one.
+        assert_eq!(
+            update_offer_line(Some(&fsw_core::update::Offer::Unnamed)),
+            Some("Update available".to_string())
+        );
+        assert_eq!(update_offer_line(None), None);
+    }
+
+    #[test]
+    fn an_unnamed_store_offer_still_offers_to_install() {
+        // `install_banner_label`'s fourth argument is now "is there an offer",
+        // not "is there a version", so a Store offer we cannot name is still
+        // installable from the window.
+        assert_eq!(
+            install_banner_label(true, true, false, true),
+            Some("Install now")
         );
     }
 

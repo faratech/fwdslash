@@ -213,6 +213,35 @@ one hand-rolled JSON line
 golden-tested; there is no serde in this workspace). COM is initialised in this
 module and nowhere else in the CLI, so the `cd /` hot path pays nothing for it.
 
+**What "an update is available" means (issues #90 and #97).** The presence of an
+offer and its version are separate facts, and only the first is authoritative.
+`StoreUpdatePending` records that the last successful Store query listed a
+pending update for this package; `AvailableUpdate` records a version *only* when
+one passed the strictly-newer filter. `fsw_core::update::offer_from_state` turns
+the pair into an `Offer::Named(tag)` or `Offer::Unnamed`, and everything reads
+through it — a label that is no longer newer than the running version is spent
+and yields no offer at all, which is how a notice left by an older build stops
+being shown without a migration. `store_offer_from_entries` does the same job for
+a live query, and is deliberately agnostic about whether
+`StorePackageUpdate.Package.Id.Version` names the catalog's version or echoes the
+installed one: under the first reading it yields `Named`, under the second
+`Unnamed`, and under neither does it advertise the installed version as a target.
+
+An unnamed offer is fully installable — every route installs by product id, not
+by version — but bounded. It may be a same-version repair offer that will never
+advance the version, and each attempt costs a force-close plus a watchdog
+timeout, so `unnamed_offer_actionable` gives it one attempt per
+`UNNAMED_RETRY_BACKOFF_SECS` (24 h) rather than one per cycle. A named offer is
+never subject to that: its version is the proof that something will change.
+
+`install`'s whole gate is the pure `install_answer`, whose third arm is issue
+#90: a Store query that **failed** is not a Store that answered "nothing". It
+reports `needsUser` / exit 11 and starts no installer. Not exit 12, which would
+claim there is nothing to install; and not exit 0, which the settings window
+reads as "about to be force-closed" — it would show no message and leave the
+broker down. On the wire an unnamed offer is the already-legal shape `state:
+"available"` with `available: null`, so no JSON field and no exit code changed.
+
 **The install ladder (Store flavor).** `route_for` is a pure function of five
 inputs and the single definition of precedence; the probes below it are lazy, so
 a rung is only asked about once the rung above is out.

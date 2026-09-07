@@ -93,40 +93,63 @@ fn pending_updates() -> windows_core::Result<IVectorView<StorePackageUpdate>> {
     block_on(&operation, QUERY_TIMEOUT)
 }
 
-/// The versions the Store is offering, newest first as it returns them. Empty
-/// means up to date. Packaged callers only.
-pub fn check_store_updates() -> Result<Vec<String>, String> {
+/// What the Store is offering for this package, or `None` when it answered and
+/// has nothing. `Err` means the query itself failed, which is a different fact
+/// and must stay distinguishable from an empty answer (issue #90).
+///
+/// Packaged callers only: `StoreContext` needs package identity.
+pub fn check_store_offer() -> Result<Option<fsw_core::update::Offer>, String> {
     let updates = pending_updates().map_err(|error| hex(&error))?;
     let current =
         fsw_core::package_version().ok_or_else(|| "package-version-unavailable".to_string())?;
+    let entries = offer_entries(&updates)?;
+    // The measurement hook for issue #97: versions and counts only, on stderr,
+    // and only when asked for. The broker discards stderr and the settings
+    // window surfaces it on its error branch alone, so this never reaches the
+    // UI on a normal check.
+    if std::env::var_os("FSW_UPDATE_EXPLAIN").is_some() {
+        eprintln!("{}", fsw_core::update::explain_entries(&current, &entries));
+    }
+    Ok(fsw_core::update::store_offer_from_entries(
+        &current, &entries,
+    ))
+}
+
+/// One entry per returned update that belongs to **this** package: `Some` with
+/// its version when that could be read, `None` when it could not.
+///
+/// The distinction matters. An entry we cannot name is still a pending update,
+/// whereas an entry for some other package is not ours at all — and collapsing
+/// the two, as an earlier `Option<String>` return did, silently dropped the
+/// first into the second.
+fn offer_entries(updates: &IVectorView<StorePackageUpdate>) -> Result<Vec<Option<String>>, String> {
     let count = updates.Size().map_err(|error| hex(&error))?;
-    let mut versions = Vec::new();
+    let mut entries = Vec::new();
     for index in 0..count {
         let Ok(update) = updates.GetAt(index) else {
             continue;
         };
-        // The version is the useful part: the broker balloons once per version
-        // and the settings card prints it. A package whose version cannot be
-        // read still counts as an update, under a name that says so.
-        if let Some(version) = update_version(&update)
-            && fsw_core::update::is_newer_package_version(&current, &version)
-        {
-            versions.push(version);
+        if let Some(entry) = entry_version(&update) {
+            entries.push(entry);
         }
     }
-    Ok(versions)
+    Ok(entries)
 }
 
-fn update_version(update: &StorePackageUpdate) -> Option<String> {
+/// `None` when the entry is not this package at all. `Some(None)` when it is
+/// ours but its version could not be read, which still counts as pending.
+fn entry_version(update: &StorePackageUpdate) -> Option<Option<String>> {
     let id = update.Package().ok()?.Id().ok()?;
     if id.Name().ok()? != fsw_core::STORE_IDENTITY_NAME {
         return None;
     }
-    let version = id.Version().ok()?;
-    Some(format!(
+    let Ok(version) = id.Version() else {
+        return Some(None);
+    };
+    Some(Some(format!(
         "{}.{}.{}.{}",
         version.Major, version.Minor, version.Build, version.Revision
-    ))
+    )))
 }
 
 /// Whether the Store would download an update without asking. False for every
@@ -166,14 +189,13 @@ pub fn silent_download_and_install() -> Outcome {
     let Some(current) = fsw_core::package_version() else {
         return Outcome::NotStarted("package-version-unavailable".to_string());
     };
-    let has_newer_app = (0..count).any(|index| {
-        updates
-            .GetAt(index)
-            .ok()
-            .and_then(|update| update_version(&update))
-            .is_some_and(|version| fsw_core::update::is_newer_package_version(&current, &version))
-    });
-    if !has_newer_app {
+    // The same classifier the availability query uses. A named offer and an
+    // unnamed one are both installable; only a list with no entry for this
+    // package is "nothing to do" (issue #97).
+    let Ok(entries) = offer_entries(&updates) else {
+        return Outcome::NotStarted("0x80004005".to_string());
+    };
+    if fsw_core::update::store_offer_from_entries(&current, &entries).is_none() {
         return Outcome::Finished {
             code: EXIT_NOTHING,
             detail: None,
