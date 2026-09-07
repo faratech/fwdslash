@@ -28,19 +28,19 @@ if "%fsw_target:~2,1%"=="" goto native
 if "%fsw_target:~2,1%"==":" goto native
 
 :resolve
-if not defined TEMP goto native
-
-rem See fsw-cd.cmd: FOR /F cannot report the child's exit code, so the
-rem controller's stdout line goes through a temp file.
-set "fsw_out=%TEMP%\fsw-pushd-%RANDOM%%RANDOM%.tmp"
-"%~dp0fwdslash.exe" cmd-cd "%fsw_target%" >"%fsw_out%"
-set "fsw_code=%errorlevel%"
+rem FOR /F cannot report the child's exit code, so the controller makes its
+rem single stdout line self-describing instead (issue #136): a resolved UNC
+rem path on success, and ":native" when the caller should run its own verb.
+rem A colon cannot begin a UNC path, so the two can never be confused. Nothing
+rem touches the filesystem here any more -- this used to write, read and delete
+rem a %TEMP% file on every "cd /x" purely to recover the exit code.
+rem Its stderr is left alone: that is where the user-facing message appears.
 set "fsw_path="
-for /f "usebackq delims=" %%T in ("%fsw_out%") do set "fsw_path=%%T"
-del "%fsw_out%" >nul 2>&1
-if "%fsw_code%"=="3" goto native
-if not "%fsw_code%"=="0" exit /b 1
-if "%fsw_path%"=="" exit /b 1
+for /f "usebackq delims=" %%T in (`^"^"%~dp0fwdslash.exe^" cmd-cd ^"%fsw_target%^"^"`) do set "fsw_path=%%T"
+if "%fsw_path%"==":native" goto native
+rem An empty capture is the rejected case, which has already explained itself
+rem on stderr. Running the native verb on "/etc" would be the worse guess.
+if not defined fsw_path exit /b 1
 endlocal & pushd "%fsw_path%"
 goto :eof
 

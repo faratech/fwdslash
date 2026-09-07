@@ -921,10 +921,20 @@ activate.` when the probed broker is merely paused, rather than the misleading
 ### 2. Shell verbs, exit 3, and a self-upgrading adapter payload
 
 - **`fwdslash cmd-cd <input>`** — the target for the cmd `CD`/`CHDIR`/`PUSHD`
-  macros. Stdout carries the Win32 path and nothing else, so the batch file can
-  capture it verbatim. A bare `/` in distribution-list mode is not one
-  directory, so it goes to stderr with the "`/` lists your WSL distributions…"
-  message and exit 1.
+  macros. Stdout carries the Win32 path and nothing else on success, so the
+  batch file captures it verbatim. A bare `/` in distribution-list mode is not
+  one directory, so it goes to stderr with the "`/` lists your WSL
+  distributions…" message and exit 1.
+
+  On exit 3 it also prints **`:native`** (issue #136). `cmd.exe`'s `for /f`
+  cannot see a child's exit code, and the exit code is what separates "run your
+  own verb" from "the resolver said no", so the adapters used to write, read
+  and delete a `%TEMP%` file on every `cd /x` purely to recover it. The verdict
+  is now legible in the output instead: a colon cannot begin a UNC path, so the
+  marker and a resolved target can never be confused, and the scripts touch the
+  filesystem nowhere. The exit codes are unchanged, and an adapter from an
+  older install checks the code before it reads stdout, so the two remain
+  compatible across an upgrade.
 - **`fwdslash shell-resolve <input>`** — one JSON line
   (`{"kind":"root|distribution|folder","target":…,"distributions":[…]}`) for the
   PowerShell module, so `ls /` costs a single spawn instead of a `resolve` plus

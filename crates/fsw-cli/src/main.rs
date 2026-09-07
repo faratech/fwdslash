@@ -638,6 +638,14 @@ fn root_distribution_hint(distributions: &[String]) -> String {
 /// `fwdslash cmd-cd <input>` — the target for the cmd adapter's CD/PUSHD
 /// macros. Stdout carries the Win32 path and nothing else, so the batch file
 /// can capture it verbatim; exit 3 means "run your own CD".
+/// The one stdout line `cmd-cd` prints when the caller should run its own verb
+/// unchanged. A `cmd.exe` `for /f` loop cannot see a child's exit code, so the
+/// verdict has to be legible in the output itself (issue #136).
+///
+/// Chosen so it can never collide with a resolved path: every success is a UNC
+/// path beginning with a backslash, and a leading colon is not legal in one.
+pub const SHELL_CD_NATIVE: &str = ":native";
+
 fn cmd_shell_cd(input: &str) -> i32 {
     match shell_target(input) {
         Ok(ShellTarget::Distribution { target } | ShellTarget::Folder { target }) => {
@@ -652,7 +660,15 @@ fn cmd_shell_cd(input: &str) -> i32 {
             eprintln!("{message}");
             1
         }
-        Err(ShellExit::Native) => 3,
+        Err(ShellExit::Native) => {
+            // Exit 3 is unchanged and remains the contract. This line is
+            // additional, and only a caller that cannot read the exit code
+            // looks at it — an adapter from an older install checks the code
+            // first and never reads stdout on 3, so the two stay compatible
+            // through an upgrade.
+            println!("{SHELL_CD_NATIVE}");
+            3
+        }
     }
 }
 
