@@ -132,6 +132,16 @@ onto this host via the Internal flight — and the in-app matrix becomes
 testable from 0.0.7.0 forward. Evidence and recipes:
 `docs/update-test-0.0.7.md` (findings §1–§3).
 
+**Update (2026-09-07):** the same structural limit applies to the 0.1.0
+self-update work. A route test exercises the updater *inside the installed
+package*, and this host carries 0.0.8.0, whose updater is the pre-fix code —
+driving `update install` from it reproduces the hang rather than testing the
+fix. The rows below that need a newer offer stay pending until 0.1.0 is
+installed and a 0.1.1 exists. Note also that **0.0.9 was never published**: it
+was still in certification when the 0.1.0 submission found the same pending
+submission and committed into it, so the next Store delivery here is 0.0.8.0
+to 0.1.0.0. Plan and today's results: `docs/update-test-0.1.0.md`.
+
 Store-identity rows are produced with
 
 ```powershell
@@ -148,7 +158,9 @@ without the identity (the same fact the adapters rely on for `reg.exe`).
 | `update install` with nothing to install answers "nothing", not "deferred" | `update install --json` on a current install | Same host, 2026-09-05: exit **12**, `state` `upToDate`; answered before any route probe or moment gate — **PASS** |
 | A helper-only verb refuses to run with package identity | `update apply-store` through `Invoke-CommandInDesktopPackage` | Same host, 2026-09-05: exit **20**, no task registered, no helper staged — **PASS** |
 | The Store accepts `StartProductInstallWithOptionsAsync` from an identity-less process (route 1b is real) | `update apply-store --product 9P51CM0MTMK2` from a plain console | Same host, 2026-09-05: the call was accepted and completed as a no-op on the current version; `last-result.txt` = `completed`; the running app was not terminated — **PASS** |
-| `update check` without package identity reports `disabled` and makes no network call | `update check --json` from an unpackaged build | Pending |
+| `update status` has no side effect on the updater's own files | Seed a stale owned sidecar, a fresh owned one and a foreign one in `%LOCALAPPDATA%\Temp`, then `update status --json` under package identity | Same host, 2026-09-07: all three survive — **PASS**. `Verb::collects_garbage` is the pure decision and `collect_for` its single call site |
+| `update check` collects only stale *owned* leftovers | The same three files, then `update check --json` | Same host, 2026-09-07: the stale owned sidecar is removed, the fresh owned one and the foreign one both survive — **PASS** |
+| `update check` without package identity reports `disabled` and makes no network call | `update check --json` from an unpackaged build | ARM64 host, 2026-09-07, 0.1.0 build: `flavor` `unpackaged`, `state` `disabled`, exit 0, for both `check` and `status` — **PASS** |
 | Route 1 end to end: Store installs, package force-closed, version advanced, broker back through the alias, task and script gone, `last-result.txt` = `completed` | `update install --route appinstall` with a newer version published | Pending — needs a published version above the installed one |
 | Route 2 (`StoreContext` silent), route 3 (`winget upgrade --source msstore`), route 4 (notify) | `update install --route store|winget|notify` | Pending — needs a published version above the installed one |
 | A metered connection suppresses route 3, and the Store's `Paused*` states map to exit 10 rather than an error | Metered Wi-Fi profile, `update install --route winget` | Pending |

@@ -544,6 +544,27 @@ fn the_helper_argv_round_trips() {
 }
 
 #[test]
+fn only_check_sweeps_the_updaters_leftovers() {
+    // `status` is the read-only verb by contract: asking what the updater
+    // thinks must never delete a scheduled task out from under a live
+    // install. `collect_for` is the single call site of `gc::collect`, so
+    // this table is the behaviour and not a description of it.
+    assert!(Verb::Check.collects_garbage());
+    for verb in [
+        Verb::Status,
+        Verb::Install,
+        Verb::ApplyStore,
+        Verb::ApplyBundle,
+    ] {
+        assert!(
+            !verb.collects_garbage(),
+            "{} must have no side effect on the updater's own files",
+            verb.name()
+        );
+    }
+}
+
+#[test]
 fn only_the_apply_verbs_are_helper_only() {
     assert!(Verb::ApplyStore.is_helper_only());
     assert!(Verb::ApplyBundle.is_helper_only());

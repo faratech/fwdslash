@@ -304,8 +304,8 @@ between registering and running left exactly that behind and used to fail
 every install for an hour with "the watchdog could not be registered".
 
 **Garbage collection** (`update::gc::collect`, issue #140) runs on every
-packaged `check` and `status` — so from the broker's update cycle and the
-settings window's launch — and removes what an attempt could not clean up
+packaged `check` — so from the broker's update cycle and the settings window's
+launch — and removes what an attempt could not clean up
 after itself: every owned task (the generated grammar and the legacy fixed
 name) whose `.cmd` sidecar is missing or older than `STALE_AFTER` (70 min),
 orphaned `.cmd`/`.xml` sidecars of the same age, and an attempt token that is
@@ -313,6 +313,13 @@ older than 65 minutes or names a task that is no longer registered. Age is
 the whole rule, deliberately: each task's XML limits it to an hour and its
 trigger is at most five minutes out, so nothing that old can be a live
 install, and the scheduler's status column is localized and not consulted.
+`status` deliberately does **not** collect: it reports what the registry
+already knows, and a person or script asking what the updater thinks must not
+thereby delete a scheduled task out from under a live install. Nothing is
+missed by that, because every caller that reaches `status` reaches `check`
+too. `Verb::collects_garbage` is the pure decision and `collect_for` its
+single call site, so the read-only contract is a test rather than a
+convention.
 GitHub downloads remain `*.part` files until atomic promotion, and
 `last-result.txt` contains only the compact completed/paused/error outcome.
 `fwdslash uninstall` cancels owned tasks before sweeping updater storage, so it

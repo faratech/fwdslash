@@ -105,6 +105,19 @@ impl Verb {
             Self::ApplyBundle => "apply-bundle",
         }
     }
+
+    /// Whether this verb sweeps the updater's leftovers.
+    ///
+    /// Only `check` does. `status` reports what the registry already knows and
+    /// has to stay free of side effects: a person or a script asking what the
+    /// updater thinks must not thereby delete a scheduled task. Nothing is
+    /// missed by that, because every caller that reaches `status` reaches
+    /// `check` too — the broker's cycle checks first, and the settings window
+    /// checks at launch.
+    #[must_use]
+    pub fn collects_garbage(self) -> bool {
+        matches!(self, Self::Check)
+    }
 }
 
 /// One rung of the install ladder. [`route_for`] picks one; `--route` and the
@@ -629,7 +642,7 @@ fn cmd_status(options: &Options) -> i32 {
         return Report::new("disabled", EXIT_OK).emit(options, None);
     }
     let folded = fold_result_file();
-    let _ = gc::collect();
+    collect_for(options.verb);
     let available = fsw_core::update::cached_update_tag();
     let state = if available.is_some() {
         "available"
@@ -649,9 +662,7 @@ fn cmd_check(options: &Options) -> i32 {
         return Report::new("disabled", EXIT_OK).emit(options, None);
     }
     let folded = fold_result_file();
-    // Every packaged check — the broker's cycle, the settings window's launch
-    // — is also the moment leftovers from earlier attempts are collected.
-    let _ = gc::collect();
+    collect_for(options.verb);
 
     if !options.force
         && !fsw_core::update::check_is_due(fsw_core::update::last_update_check(), now_unix())
@@ -795,6 +806,18 @@ pub const STORE_SCAN_COOLDOWN_SECS: u64 = 30 * 60;
 #[must_use]
 pub fn keep_cached_offer(last_check: Option<u64>, now: u64) -> bool {
     last_check.is_some_and(|last| now.saturating_sub(last) < STORE_SCAN_COOLDOWN_SECS)
+}
+
+/// The **only** call site of [`gc::collect`], so which verbs carry that side
+/// effect is decided once, by the pure [`Verb::collects_garbage`], rather than
+/// by which function someone happened to add a sweep to.
+///
+/// A packaged `check` is the moment leftovers from earlier attempts go: the
+/// broker's cycle and the settings window's launch both run one.
+fn collect_for(verb: Verb) {
+    if verb.collects_garbage() {
+        let _ = gc::collect();
+    }
 }
 
 /// The cached `AvailableUpdate`, only if it is still newer than what runs.
