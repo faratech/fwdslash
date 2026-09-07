@@ -114,10 +114,38 @@ fn xml_escape(value: &str) -> String {
 
 #[must_use]
 pub fn task_xml(script_path: &str, start_boundary: &str) -> String {
+    task_xml_with_arguments(script_path, None, start_boundary)
+}
+
+/// The same definition with an optional `<Arguments>` element.
+///
+/// Stage A of issue #137. The watchdog is a generated batch file today, which
+/// can never carry a signature and whose whole safety model is textual — the
+/// "no `%`, no quote" rule plus a literal allow-list. A task can just as well
+/// exec a signed binary with argv, which `CreateProcess` delivers and no shell
+/// parses. This is the XML half, with no caller changes: `task_xml` still
+/// produces byte-identical output, so the existing goldens hold.
+///
+/// Arguments are XML-escaped like every other spliced value. That is the only
+/// escaping they need, because the Task Scheduler hands the string to
+/// `CreateProcess` rather than to a command interpreter.
+#[must_use]
+pub fn task_xml_with_arguments(
+    command: &str,
+    arguments: Option<&str>,
+    start_boundary: &str,
+) -> String {
+    let action = match arguments {
+        Some(arguments) => format!(
+            "<Exec><Command>{}</Command><Arguments>{}</Arguments></Exec>",
+            xml_escape(command),
+            xml_escape(arguments)
+        ),
+        None => format!("<Exec><Command>{}</Command></Exec>", xml_escape(command)),
+    };
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n  <Triggers><TimeTrigger><StartBoundary>{}</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>\r\n  <Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings>\r\n  <Actions Context=\"Author\"><Exec><Command>{}</Command></Exec></Actions>\r\n</Task>\r\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n  <Triggers><TimeTrigger><StartBoundary>{}</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>\r\n  <Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings>\r\n  <Actions Context=\"Author\">{action}</Actions>\r\n</Task>\r\n",
         xml_escape(start_boundary),
-        xml_escape(script_path),
     )
 }
 
@@ -358,7 +386,7 @@ pub fn delete_task(name: &str) -> bool {
 mod tests {
     use super::{
         is_safe_task_literal, task_args, task_start_boundary, task_start_time, task_xml,
-        task_xml_args,
+        task_xml_args, task_xml_with_arguments,
     };
 
     #[test]
@@ -429,6 +457,9 @@ mod tests {
     fn task_xml_is_locale_independent_and_escapes_paths() {
         let xml = task_xml(r"C:\Users\a & b\Temp\x.cmd", "2027-01-01T00:00:00");
         assert!(xml.contains("<StartBoundary>2027-01-01T00:00:00</StartBoundary>"));
+        // No `<Arguments>` unless one was asked for, so the existing shape is
+        // byte-identical and stage A of #137 changes nothing at runtime.
+        assert!(!xml.contains("<Arguments>"));
         assert!(xml.contains("C:\\Users\\a &amp; b\\Temp\\x.cmd"));
         assert!(!xml.contains("/st"));
         assert_eq!(
@@ -523,5 +554,53 @@ mod tests {
             fixture.marker.is_file(),
             "Task Scheduler did not execute the XML task"
         );
+    }
+
+    #[test]
+    fn a_task_can_exec_a_binary_with_argv() {
+        // Stage A of issue #137: the XML half of pointing a task at the signed
+        // helper instead of a generated batch file. No caller uses it yet.
+        let xml = task_xml_with_arguments(
+            r"C:\Users\me\AppData\Local\ForwardSlashWindows\update\fwdslash-helper.exe",
+            Some("update watchdog --previous 0.1.0.0 --relaunch broker"),
+            "2027-01-01T00:00:00",
+        );
+        assert!(xml.contains(
+            "<Command>C:\\Users\\me\\AppData\\Local\\ForwardSlashWindows\\update\\fwdslash-helper.exe</Command>"
+        ));
+        assert!(xml.contains(
+            "<Arguments>update watchdog --previous 0.1.0.0 --relaunch broker</Arguments>"
+        ));
+        // `task_xml` is the no-arguments case and stays byte-identical.
+        assert_eq!(
+            task_xml("C:\\x.cmd", "2027-01-01T00:00:00"),
+            task_xml_with_arguments("C:\\x.cmd", None, "2027-01-01T00:00:00")
+        );
+    }
+
+    #[test]
+    fn argv_is_xml_escaped_and_needs_nothing_else() {
+        // Arguments reach CreateProcess, not a command interpreter, so XML
+        // escaping is the whole requirement — the batch file's "no percent, no
+        // quote" rule has no equivalent here. Prove the characters that would
+        // break the *document* are handled.
+        let xml = task_xml_with_arguments(
+            "C:\\a.exe",
+            Some("--x <&> \"q\" 100%"),
+            "2027-01-01T00:00:00",
+        );
+        assert!(
+            xml.contains("<Arguments>--x &lt;&amp;&gt; &quot;q&quot; 100%</Arguments>"),
+            "{xml}"
+        );
+        // The document stays well formed: no bare angle bracket survives
+        // inside the element.
+        let inner = xml
+            .split("<Arguments>")
+            .nth(1)
+            .and_then(|rest| rest.split("</Arguments>").next())
+            .unwrap_or_default();
+        assert!(!inner.contains('<'), "{inner}");
+        assert!(!inner.contains('>'), "{inner}");
     }
 }
