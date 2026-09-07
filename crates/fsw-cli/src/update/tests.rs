@@ -308,6 +308,39 @@ fn a_foreground_wait_hands_off_on_progress_or_at_the_admission_window() {
 }
 
 #[test]
+fn the_whole_attempt_shares_one_budget() {
+    // Issue #144. Every await and the poll loop measure from the same start,
+    // so a foreground caller promised a three-minute hand-off cannot be held
+    // for the sum of three independent ceilings.
+    use super::{Verdict, WaitPolicy, verdict};
+    use std::time::Duration;
+    let policy = WaitPolicy::Foreground {
+        admission: Duration::from_secs(180),
+    };
+    // Spent budget hands off immediately rather than opening a fresh window.
+    assert_eq!(
+        verdict(policy, Duration::from_secs(180), false),
+        Verdict::HandOff
+    );
+    assert_eq!(
+        verdict(policy, Duration::from_secs(600), false),
+        Verdict::HandOff
+    );
+    // And the background policy's much larger budget is still a single one.
+    let background = WaitPolicy::Background {
+        ceiling: Duration::from_mins(45),
+    };
+    assert_eq!(
+        verdict(background, Duration::from_mins(45), false),
+        Verdict::TimedOut
+    );
+    assert_eq!(
+        verdict(background, Duration::from_mins(44), false),
+        Verdict::Continue
+    );
+}
+
+#[test]
 fn a_background_wait_polls_to_the_ceiling_whatever_the_progress() {
     use super::{Verdict, WaitPolicy, verdict};
     use std::time::Duration;
