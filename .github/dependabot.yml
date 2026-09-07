@@ -1,0 +1,53 @@
+# Dependabot version updates.
+#
+# Dependabot *alerts* and *security updates* are repository settings and are
+# already enabled; this file only governs routine version bumps.
+#
+# `tools/update-deps.py` remains the primary way this workspace is updated,
+# because it understands the version-island rule in docs/dependencies.md. The
+# cargo entry below is deliberately narrow so Dependabot cannot break that rule:
+# every crate that pins an island is ignored outright. Bumping one of them in
+# isolation puts two incompatible windows-core generations — two COM/WinRT type
+# systems — into a single binary.
+version: 2
+
+updates:
+  # The workflows sign binaries and carry Store credentials, so a stale or
+  # withdrawn action is a real risk. These have no island constraint.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Monthly and grouped, to stay out of the way of tools/update-deps.py.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      # ISLAND_PINNED in tools/update-deps.py. Keep the two lists in step.
+      #
+      # windows-registry 0.100.x would pull windows-core into fsw-core's
+      # dependency closure, and fsw-core is shared across both islands.
+      - dependency-name: windows-registry
+      # These three are re-exported by `windows` 0.62.2; bumping one alone puts
+      # a second windows-core in fwdslash.exe.
+      - dependency-name: windows-core
+      - dependency-name: windows-future
+      - dependency-name: windows-collections
+      # Vendored from microsoft/windows-rs and patched locally via
+      # [patch.crates-io]; it is updated by re-vendoring, not by Dependabot.
+      - dependency-name: windows-reactor

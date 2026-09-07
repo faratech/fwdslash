@@ -1,0 +1,53 @@
+# CodeQL code scanning.
+#
+# `build-mode: none` is what makes this workable here: the three [[bin]] crates
+# link against Windows COM/UI Automation surfaces and need `link.exe`, so the
+# workspace cannot be built on a Linux runner at all. CodeQL supports build-less
+# extraction for Rust, so the analysis runs on ubuntu-latest and never tries.
+#
+# The `actions` language scans the workflows themselves — this repository's
+# release path signs binaries and holds Store credentials, so the workflows are
+# part of the attack surface, not just the product.
+name: code scanning
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so a newly published query still finds an idle repository.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [rust, actions]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
