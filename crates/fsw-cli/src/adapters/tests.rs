@@ -471,10 +471,10 @@ fn block_text_renders_the_guarded_form() {
     // `$a -and` guards the alias: an unresolvable %LOCALAPPDATA% renders it
     // empty, and a bare `Test-Path -LiteralPath ''` throws on every shell start.
     assert!(block.contains(
-        "if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) { if (Test-Path -LiteralPath $m) {\r\n"
+        "if (([System.IO.Directory]::Exists($p)) -or ($a -and [System.IO.File]::Exists($a))) { if ([System.IO.File]::Exists($m)) {\r\n"
     ));
     assert!(block.contains(
-        "} } elseif (Test-Path -LiteralPath $c) { Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }\r\n"
+        "} } elseif ([System.IO.File]::Exists($c)) { Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }\r\n"
     ));
     assert!(
         !block.contains("Import-Module -Name 'C:"),

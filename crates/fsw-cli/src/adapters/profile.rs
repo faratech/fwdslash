@@ -211,7 +211,7 @@ pub struct BlockParams<'a> {
 const STUB_BODY: &str = concat!(
     "$global:FswStubModule = $m\r\n",
     "function global:Import-FswStubModule {\r\n",
-    "    if (Test-Path -LiteralPath $global:FswStubModule) {\r\n",
+    "    if ([System.IO.File]::Exists($global:FswStubModule)) {\r\n",
     "        Import-Module -Name $global:FswStubModule -Global -Force\r\n",
     "        return $true\r\n",
     "    }\r\n",
@@ -337,9 +337,9 @@ pub fn block_text(params: &BlockParams) -> String {
          $p = '{probe}'\r\n\
          $a = '{alias}'\r\n\
          $c = '{controller}'\r\n\
-         if ((Test-Path -LiteralPath $p) -or ($a -and (Test-Path -LiteralPath $a))) {{ if (Test-Path -LiteralPath $m) {{\r\n\
+         if (([System.IO.Directory]::Exists($p)) -or ($a -and [System.IO.File]::Exists($a))) {{ if ([System.IO.File]::Exists($m)) {{\r\n\
          {STUB_BODY}\
-         }} }} elseif (Test-Path -LiteralPath $c) {{ Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }}\r\n\
+         }} }} elseif ([System.IO.File]::Exists($c)) {{ Start-Process -FilePath $c -ArgumentList 'uninstall','--orphaned' -WindowStyle Hidden -ErrorAction SilentlyContinue }}\r\n\
          {FENCE_CLOSE}\r\n"
     )
 }
