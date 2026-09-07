@@ -291,6 +291,31 @@ pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
     Some(())
 }
 
+/// Whether a task of this name is registered. `schtasks /query` exits 0 for a
+/// task it can show and 1 for one it cannot; a `schtasks` that cannot be found
+/// or run answers false, which the one caller (the attempt lock's orphan test)
+/// treats as "not proven alive" — the conservative answer there is to reclaim.
+#[cfg(windows)]
+#[must_use]
+pub fn task_exists(name: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    if !is_safe_task_literal(name) {
+        return false;
+    }
+    let Some(schtasks) = fsw_core::SystemBinary::Schtasks.path() else {
+        return false;
+    };
+    Command::new(schtasks)
+        .args(["/query", "/tn", name])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Removes a task and the `.cmd` [`register_and_run`] wrote for it — the exact
 /// inverse, for a task whose script never ran and so never deleted itself.
 ///

@@ -65,6 +65,17 @@ const OPEN_STORE_ACTION: &str = "Opening the Microsoft Store";
 /// The contract between the two binaries is exactly these numbers plus the
 /// one-line JSON, so name them here rather than match on bare integers.
 const UPDATE_EXIT_OK: i32 = 0;
+/// Not a CLI exit code: what this window records when it killed a
+/// `fwdslash update` child that outlived its ceiling (issue #140).
+const UPDATE_EXIT_TIMEOUT: i32 = -2;
+/// Ceiling on `fwdslash update check`: one Store or GitHub round trip, and for
+/// the GitHub flavor a download. The broker allows the same.
+const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// Ceiling on `fwdslash update install`: two bounded `WinRT` calls of up to two
+/// minutes each, the CLI's three-minute admission window, and a margin. The
+/// Store's download itself is never waited on here — the CLI hands a queued
+/// item off (`action: "queued"`) and the watchdog task owns the comeback.
+const UPDATE_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const UPDATE_EXIT_AVAILABLE: i32 = 10;
 const UPDATE_EXIT_NEEDS_USER: i32 = 11;
 const UPDATE_EXIT_NOTHING: i32 = 12;
@@ -544,6 +555,9 @@ enum Msg {
     /// the child's two streams.
     UpdateInstallFinished {
         code: i32,
+        /// The CLI reported `action: "queued"`: the Store has the update and
+        /// will finish it on its own. The window stays open for that one.
+        queued: bool,
         stdout: String,
         stderr: String,
     },
@@ -1221,8 +1235,10 @@ impl Component for SettingsModel {
                 // than yesterday's answer.
                 self.pending = Some(CHECK_ACTION);
                 context.spawn_background(|_| {
-                    let (code, stdout, _) =
-                        run_controller_code(["update", "check", "--force", "--json"]);
+                    let (code, stdout, _) = run_controller_code_bounded(
+                        ["update", "check", "--force", "--json"],
+                        UPDATE_CHECK_TIMEOUT,
+                    );
                     Msg::UpdateCheckFinished {
                         outcome: check_outcome(code, &stdout),
                         explicit: true,
@@ -1301,24 +1317,35 @@ impl Component for SettingsModel {
                     // identity-less helper, registers the relaunch watchdog and
                     // only then lets the install force this package down.
                     // `--force` because the user just asked for it explicitly.
-                    let (code, stdout, stderr) = run_controller_code([
-                        "update",
-                        "install",
-                        "--force",
-                        "--relaunch",
-                        "app",
-                        "--json",
-                    ]);
+                    let (code, stdout, stderr) = run_controller_code_bounded(
+                        [
+                            "update",
+                            "install",
+                            "--force",
+                            "--relaunch",
+                            "app",
+                            "--json",
+                        ],
+                        UPDATE_INSTALL_TIMEOUT,
+                    );
+                    let queued = install_was_queued(code, &stdout);
                     // Exit 0 hands control to the update machinery, including
                     // its watchdog restart. Every other result leaves this
                     // process alive, so restore only the broker that was
                     // resident before the attempted install. Its persisted
                     // disabled flag preserves an existing pause preference.
-                    if should_restore_broker_after_install(code, broker_window_before_install) {
+                    // A queued install counts as "alive": the Store may take
+                    // its time, and the user keeps the product meanwhile.
+                    if should_restore_broker_after_install(
+                        code,
+                        queued,
+                        broker_window_before_install,
+                    ) {
                         ensure_broker_running();
                     }
                     Msg::UpdateInstallFinished {
                         code,
+                        queued,
                         stdout,
                         stderr,
                     }
@@ -1326,6 +1353,7 @@ impl Component for SettingsModel {
             }
             Msg::UpdateInstallFinished {
                 code,
+                queued,
                 stdout,
                 stderr,
             } => {
@@ -1333,7 +1361,7 @@ impl Component for SettingsModel {
                 // The JSON line is the CLI's own record; the exit code is the
                 // contract this window acts on.
                 let _ = stdout;
-                let Some(notice) = install_notice(code, &stderr) else {
+                let Some(notice) = install_notice(code, queued, &stderr) else {
                     // The install is under way and will force this package
                     // down. Leave through the window's own close path, the
                     // reactor's only process-exit route, so the watchdog's
@@ -1696,13 +1724,28 @@ impl SettingsModel {
             None => View::empty(),
         };
         let progress: View = if self.pending.is_some() {
-            ProgressRing::new()
+            let ring: View = ProgressRing::new()
                 .is_active(true)
                 .is_indeterminate(true)
                 .width(20.0)
                 .height(20.0)
                 .horizontal_alignment(HorizontalAlignment::Left)
-                .into()
+                .into();
+            // The two update verbs can legitimately take minutes, so the
+            // ring says what it is waiting for and the caller's ceiling says
+            // for how long at most (issue #140).
+            match pending_caption(self.pending) {
+                Some(caption) => StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(8.0)
+                    .children((
+                        ring,
+                        body(caption)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .foreground(ThemeBrush::TextSecondary),
+                    )),
+                None => ring,
+            }
         } else {
             View::empty()
         };
@@ -2087,9 +2130,27 @@ impl SettingsModel {
 /// else — including "there was nothing to install after all" — leaves the user
 /// a sentence, because they pressed a button and are waiting for an answer.
 #[must_use]
-fn install_notice(code: i32, stderr: &str) -> Option<Notice> {
+fn install_notice(code: i32, queued: bool, stderr: &str) -> Option<Notice> {
     Some(match code {
+        // The Store accepted the update but has not finished it. There is no
+        // shutdown to get out of the way of yet, so the window stays and says
+        // so; the watchdog restarts the product when the version advances.
+        UPDATE_EXIT_OK if queued => Notice::new(
+            InfoBarSeverity::Informational,
+            "Installing from the Microsoft Store",
+            "The Store is installing the update in the background. Forward Slash Windows \
+             restarts on its own when it finishes; if the Store is waiting on something, \
+             its Library page shows what.",
+        )
+        .with_action(NoticeAction::OpenStore),
         UPDATE_EXIT_OK => return None,
+        UPDATE_EXIT_TIMEOUT => Notice::new(
+            InfoBarSeverity::Warning,
+            "The update is taking too long",
+            "The Microsoft Store did not answer in time. Forward Slash Windows keeps \
+             running; finish the update from the Store, or try again later.",
+        )
+        .with_action(NoticeAction::OpenStore),
         UPDATE_EXIT_AVAILABLE => Notice::new(
             InfoBarSeverity::Informational,
             "Update downloaded",
@@ -2128,8 +2189,37 @@ fn install_notice(code: i32, stderr: &str) -> Option<Notice> {
 /// watchdog. Every other CLI exit returns to this still-running UI, so only a
 /// broker that was previously serving input should be brought back.
 #[must_use]
-fn should_restore_broker_after_install(code: i32, broker_window_before_install: bool) -> bool {
-    code != UPDATE_EXIT_OK && broker_window_before_install
+fn should_restore_broker_after_install(
+    code: i32,
+    queued: bool,
+    broker_window_before_install: bool,
+) -> bool {
+    (code != UPDATE_EXIT_OK || queued) && broker_window_before_install
+}
+
+/// Whether a successful `update install` merely queued the update with the
+/// Store (`action: "queued"` on its JSON line) rather than starting an
+/// install that is about to force this package down.
+#[must_use]
+fn install_was_queued(code: i32, stdout: &str) -> bool {
+    code == UPDATE_EXIT_OK
+        && stdout
+            .lines()
+            .last()
+            .and_then(|line| json_string_field(line, "action"))
+            .is_some_and(|action| action == "queued")
+}
+
+/// What the progress ring says while an update verb runs. Only the two update
+/// actions carry a caption: the other pending phrases are over in a second and
+/// report through `show_result`.
+#[must_use]
+fn pending_caption(pending: Option<&'static str>) -> Option<&'static str> {
+    match pending {
+        Some(CHECK_ACTION) => Some("Checking for updates\u{2026}"),
+        Some(INSTALL_ACTION) => Some("Installing the update\u{2026}"),
+        _ => None,
+    }
 }
 
 /// The install banner's button label, or `None` when no banner belongs on
@@ -2320,6 +2410,92 @@ where
         ),
         Err(_) => (-1, String::new(), String::new()),
     }
+}
+
+/// [`run_controller_code`] with a ceiling. Past it the child is killed and the
+/// triple is `(UPDATE_EXIT_TIMEOUT, "", "")`: the update verbs are the only
+/// callers, and a child that outlives their ceiling is a Store call that hung,
+/// not work worth waiting for. Everything the child already committed — a
+/// queued Store item, the watchdog task — stands on its own (issue #140).
+fn run_controller_code_bounded<I, S>(
+    arguments: I,
+    timeout: std::time::Duration,
+) -> (i32, String, String)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let Some(controller) = controller_path() else {
+        return (-1, String::new(), String::new());
+    };
+    let mut command = Command::new(controller);
+    for argument in arguments {
+        command.arg(argument.as_ref());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let Ok(mut child) = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        return (-1, String::new(), String::new());
+    };
+    // Drain both pipes on their own threads so a chatty child can never
+    // block on a full pipe while this thread only polls for exit.
+    let drain = |stream: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut buffer);
+            }
+            buffer
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|stream| Box::new(stream) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|stream| Box::new(stream) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(None) => {}
+            Err(_) => break -1,
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break UPDATE_EXIT_TIMEOUT;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if code == UPDATE_EXIT_TIMEOUT {
+        return (code, String::new(), String::new());
+    }
+    (
+        code,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).trim().to_string(),
+    )
 }
 
 /// The value of one string field of the CLI's one-line update JSON, or `None`
@@ -2820,9 +2996,11 @@ fn show_startup_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecutionPolicy, InfoBarSeverity, NoticeAction, SettingsModel, UPDATE_EXIT_AVAILABLE,
-        UPDATE_EXIT_NEEDS_USER, UPDATE_EXIT_NOTHING, UPDATE_EXIT_OK, UpdateOutcome, check_outcome,
-        install_banner_label, install_notice, json_string_field, store_product_uri,
+        CHECK_ACTION, ExecutionPolicy, INSTALL_ACTION, InfoBarSeverity, NoticeAction,
+        REPAIR_ACTION, SettingsModel, UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NEEDS_USER,
+        UPDATE_EXIT_NOTHING, UPDATE_EXIT_OK, UPDATE_EXIT_TIMEOUT, UpdateOutcome, check_outcome,
+        install_banner_label, install_notice, install_was_queued, json_string_field,
+        pending_caption, store_product_uri,
     };
     use std::cell::Cell;
 
@@ -3034,26 +3212,84 @@ mod tests {
 
     #[test]
     fn a_started_install_leaves_no_notice_because_the_window_closes() {
-        assert!(install_notice(UPDATE_EXIT_OK, "").is_none());
+        assert!(install_notice(UPDATE_EXIT_OK, false, "").is_none());
+    }
+
+    #[test]
+    fn a_queued_install_keeps_the_window_and_points_at_the_store() {
+        let notice = install_notice(UPDATE_EXIT_OK, true, "");
+        assert_eq!(
+            notice.as_ref().map(|notice| notice.severity),
+            Some(InfoBarSeverity::Informational)
+        );
+        assert_eq!(
+            notice.as_ref().map(|notice| notice.action),
+            Some(Some(NoticeAction::OpenStore))
+        );
+        assert!(install_was_queued(
+            UPDATE_EXIT_OK,
+            "noise\n{\"flavor\":\"store\",\"state\":\"installing\",\"available\":\"0.0.9.0\",\"autoUpdate\":true,\"lastUpdateCheck\":1,\"route\":\"appinstall\",\"action\":\"queued\",\"detail\":null}\n"
+        ));
+        assert!(!install_was_queued(
+            UPDATE_EXIT_OK,
+            "{\"action\":\"scheduled\"}"
+        ));
+        assert!(!install_was_queued(
+            UPDATE_EXIT_AVAILABLE,
+            "{\"action\":\"queued\"}"
+        ));
+        assert!(!install_was_queued(UPDATE_EXIT_OK, ""));
+    }
+
+    #[test]
+    fn a_killed_install_child_is_a_warning_with_a_way_out() {
+        let notice = install_notice(UPDATE_EXIT_TIMEOUT, false, "");
+        assert_eq!(
+            notice.as_ref().map(|notice| notice.severity),
+            Some(InfoBarSeverity::Warning)
+        );
+        assert_eq!(
+            notice.as_ref().map(|notice| notice.action),
+            Some(Some(NoticeAction::OpenStore))
+        );
+    }
+
+    #[test]
+    fn only_the_update_verbs_caption_the_progress_ring() {
+        assert!(pending_caption(Some(CHECK_ACTION)).is_some());
+        assert!(pending_caption(Some(INSTALL_ACTION)).is_some());
+        assert!(pending_caption(Some(REPAIR_ACTION)).is_none());
+        assert!(pending_caption(None).is_none());
     }
 
     #[test]
     fn failed_or_deferred_installs_restore_only_a_previously_running_broker() {
         for code in [
             -1,
+            UPDATE_EXIT_TIMEOUT,
             UPDATE_EXIT_AVAILABLE,
             UPDATE_EXIT_NEEDS_USER,
             UPDATE_EXIT_NOTHING,
             1,
         ] {
-            assert!(super::should_restore_broker_after_install(code, true));
+            assert!(super::should_restore_broker_after_install(
+                code, false, true
+            ));
         }
         assert!(!super::should_restore_broker_after_install(
             UPDATE_EXIT_OK,
+            false,
+            true
+        ));
+        // Queued with the Store is not "about to close": the broker comes back.
+        assert!(super::should_restore_broker_after_install(
+            UPDATE_EXIT_OK,
+            true,
             true
         ));
         assert!(!super::should_restore_broker_after_install(
             UPDATE_EXIT_NOTHING,
+            false,
             false
         ));
     }
@@ -3061,12 +3297,12 @@ mod tests {
     #[test]
     fn only_the_store_hand_off_carries_an_action_button() {
         assert_eq!(
-            install_notice(UPDATE_EXIT_NEEDS_USER, "").map(|notice| notice.action),
+            install_notice(UPDATE_EXIT_NEEDS_USER, false, "").map(|notice| notice.action),
             Some(Some(NoticeAction::OpenStore))
         );
         for code in [UPDATE_EXIT_AVAILABLE, UPDATE_EXIT_NOTHING, 1] {
             assert_eq!(
-                install_notice(code, "").map(|notice| notice.action),
+                install_notice(code, false, "").map(|notice| notice.action),
                 Some(None),
                 "code {code} must not offer an action"
             );
@@ -3076,15 +3312,15 @@ mod tests {
     #[test]
     fn only_a_failure_is_an_error_bar() {
         assert_eq!(
-            install_notice(1, "").map(|notice| notice.severity),
+            install_notice(1, false, "").map(|notice| notice.severity),
             Some(InfoBarSeverity::Error)
         );
         assert_eq!(
-            install_notice(UPDATE_EXIT_NOTHING, "").map(|notice| notice.severity),
+            install_notice(UPDATE_EXIT_NOTHING, false, "").map(|notice| notice.severity),
             Some(InfoBarSeverity::Success)
         );
         assert_eq!(
-            install_notice(UPDATE_EXIT_AVAILABLE, "").map(|notice| notice.severity),
+            install_notice(UPDATE_EXIT_AVAILABLE, false, "").map(|notice| notice.severity),
             Some(InfoBarSeverity::Informational)
         );
     }
@@ -3092,11 +3328,12 @@ mod tests {
     #[test]
     fn a_failure_carries_the_controllers_own_explanation() {
         assert_eq!(
-            install_notice(1, "  ").map(|notice| notice.message),
+            install_notice(1, false, "  ").map(|notice| notice.message),
             Some("The update could not be started.".to_string())
         );
         assert_eq!(
-            install_notice(1, "The Store refused (0x80070005).\n").map(|notice| notice.message),
+            install_notice(1, false, "The Store refused (0x80070005).\n")
+                .map(|notice| notice.message),
             Some("The update could not be started. The Store refused (0x80070005).".to_string())
         );
     }

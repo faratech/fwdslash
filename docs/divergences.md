@@ -219,7 +219,7 @@ a rung is only asked about once the rung above is out.
 
 | # | Route | Precondition | Runs in | Terminates the app |
 |---|---|---|---|---|
-| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`) | always attempted first when packaged | the packaged CLI, in-process | yes, by the Store |
+| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`), watched for at most `ADMISSION_WINDOW` (3 min) | always attempted first when packaged | the packaged CLI, in-process | yes, by the Store |
 | 1b | the same call from the staged helper | 1a failed before an item was queued (`E_ACCESSDENIED` above all) | the identity-less helper, from the scheduled task | yes |
 | 2 | `StoreContext` silent download + install | route 1 unavailable and `CanSilentlyDownloadStorePackageUpdates` | the packaged CLI | yes, when deployment lands |
 | 3 | `winget upgrade --id … --source msstore --silent --force` | winget present and the network unmetered | the scheduled task | yes |
@@ -236,6 +236,31 @@ gates before it invokes the CLI at all. Route 1's phase-1a call exists because
 `AppInstallManager` activates and answers queries *inside* the package; whether
 the install itself is allowed there is only knowable at runtime, so it is tried
 and the identity-less path is the fallback, not the default.
+
+**Route 1 hands off instead of waiting (issue #140).** The packaged CLI is a
+child of the settings window or the broker, so it never polls a queued Store
+item to a conclusion. `appinstall::WaitPolicy::Foreground` leaves as soon as an
+item shows progress (a state past the download's start, a byte, a percent) or
+when the three-minute admission window runs out with the item still waiting
+its turn, and reports `installing`, exit 0, `action: "queued"`. The Store
+owns the item from there and the watchdog owns the comeback. The helper
+(`apply-store`, from the task, nobody waiting) keeps the 45-minute
+`Background` ceiling and the `paused` verdict. Before queueing, the Store's
+own `AppInstallItems` queue is reconciled: a live item for this product is
+adopted (also `queued`), a terminal leftover is cancelled so it cannot shadow
+the new request. The settings window and the broker bound the child (10 min)
+and kill it past that; a killed child leaves its queued item and its watchdog
+standing. On `queued` the window stays open with an informational bar, brings
+the broker back, and the watchdog relaunches the app when the version advances.
+
+**The Store's scan cooldown.** The install service refuses a second online
+scan for the same package family within roughly half an hour and answers from
+its cache — `Microsoft-Windows-Store/Operational` says "Online scan not
+allowed due to cooldown period", zero applicable. `install` therefore trusts a
+cached newer `AvailableUpdate` before it asks the Store at all, and `check`
+keeps a cached newer offer standing when the previous check was less than
+`STORE_SCAN_COOLDOWN_SECS` ago (`keep_cached_offer`, reported with a detail
+line). Only a check outside that window clears it.
 
 **The GitHub flavor** has a two-phase shape — `run_update_check` downloads the
 signed bundle and registers it with `-DeferRegistrationWhenPackagesAreInUse`.
@@ -265,11 +290,18 @@ immutable temporary `.cmd` and `.xml` sidecars rather than rewriting a shared
 script. The command runs the optional helper or `winget`, then polls
 `Get-AppxPackage` every 5 s for a **newer version of the exact package family**.
 Only that condition permits `--relaunch broker` (the default) or `app`; `none`
-skips it. A 45-minute timeout reports a failed handoff and does not relaunch the
-old package. The task removes only its own task and sidecars. Script literals
-are validated before they are written.
+skips it. A 45-minute timeout reports a failed handoff (`error:0x800705B4`,
+unless the helper already wrote a verdict) and then starts the **broker** if
+none is running, in every mode: the old package is still the installed
+product, and the caller closed the broker to make room for an install that did
+not land (issue #140). The task removes only its own task and sidecars. Script
+literals are validated before they are written.
 
-Each attempt owns an `update-attempt.lock` token in the updater directory.
+Each attempt owns an `update-attempt.lock` token in the updater directory. A
+token older than 65 minutes is stale; so is a younger one whose named task is
+no longer registered (`scheduled_task::task_exists`) — an attempt killed
+between registering and running left exactly that behind and used to fail
+every install for an hour with "the watchdog could not be registered".
 GitHub downloads remain `*.part` files until atomic promotion, and
 `last-result.txt` contains only the compact completed/paused/error outcome.
 `fwdslash uninstall` cancels owned tasks before sweeping updater storage, so it
