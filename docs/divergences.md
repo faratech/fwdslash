@@ -349,6 +349,25 @@ the same. It reports through `last-result.txt` in the same directory —
 it**, so one helper run is folded exactly once. Only `completed` clears the
 cached `AvailableUpdate` notice; a pause or an error leaves it standing.
 
+**Deferred work on the watchdog, recorded here now that issue #137 is closed.**
+The script below is composed on the user's machine, so it can never carry a
+signature, it sits at a predictable user-writable path, and its whole safety
+model is textual: the "no `%`, no `\"`" rule plus `is_safe_task_literal` on
+every spliced value. Nothing about it needs to be a script — a task can exec the
+already-staged, already-signed helper with argv, which `CreateProcess` delivers
+and no shell parses. Stage A of that is done: `scheduled_task::task_xml_with_arguments`
+emits `<Arguments>`, and `task_xml` is its no-arguments case. Stage B — an
+`update watchdog` helper verb, the poll loop in Rust through `PackageManager`,
+and deleting `batch_quoted_path`, the no-percent/no-quote rule and
+`assert_batch_safe` — is **deliberately not done**, for three reasons: stage A
+should soak through a release first; stage B has to be validated end to end
+across the Store, GitHub-bundle and winget routes, no-relaunch mode, a cancelled
+attempt and a machine suspended mid-window, none of which is possible until a
+newer version is published; and it rewrites the path that brings the product
+back after an update force-closes it, which is not worth destabilising while the
+install path itself is still unproven. Note also that staging the helper becomes
+a **precondition** of registering the task under stage B, which it is not today.
+
 **The watchdog** is a unique per-user task named
 `fwdslash-update-watchdog-<pid>-<sequence>`, registered before the install
 runs because a force-closed package cannot relaunch itself. Each attempt owns
