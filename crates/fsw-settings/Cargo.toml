@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 windows-reactor = "0.100.0"
-# Reads HKCU in-process the way the C++ settings app does. Sound across the
+# Reads HKCU in-process rather than parsing `fwdslash --json`. Sound across the
 # version islands because `fsw-core`'s closure contains no `windows-core` at all
 # -- see docs/dependencies.md.
 fsw-core = { path = "../fsw-core" }

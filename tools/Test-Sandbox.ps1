@@ -8,24 +8,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$architecture = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+$triple = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 $build = if ($BuildDirectory) {
     [IO.Path]::GetFullPath($BuildDirectory)
 } else {
-    Join-Path $repo ("out\user\{0}\{1}" -f $architecture, $Configuration)
+    Join-Path $repo ("target\{0}\{1}" -f $triple, $Configuration.ToLowerInvariant())
 }
 $artifacts = Join-Path $repo 'out\sandbox-artifacts'
 $results = Join-Path $repo 'out\sandbox-results'
 $generated = Join-Path $repo 'out\forward-slash-windows.wsb'
 
-if (-not (Test-Path -LiteralPath (Join-Path $build 'fswcore_tests.exe'))) {
-    throw 'Build the user-mode targets before starting Sandbox.'
+if (-not (Test-Path -LiteralPath (Join-Path $build 'fwdslash.exe'))) {
+    throw "No build in $build. Run cargo build --target $triple --workspace first."
 }
 
 New-Item -ItemType Directory -Force -Path $artifacts, $results | Out-Null
 $staleArtifacts = @(
     'fswhost.exe', 'fswhook.dll', 'fsw_hook_integration.exe',
-    'fsw_address_bar_integration.exe'
+    'fsw_address_bar_integration.exe', 'fswcore_tests.exe'
 )
 foreach ($staleArtifact in $staleArtifacts) {
     $stalePath = Join-Path $artifacts $staleArtifact
@@ -37,7 +37,6 @@ $resultFile = Join-Path $results 'sandbox-results.json'
 if (Test-Path -LiteralPath $resultFile) {
     Remove-Item -LiteralPath $resultFile
 }
-Copy-Item -LiteralPath (Join-Path $build 'fswcore_tests.exe') -Destination $artifacts -Force
 Copy-Item -LiteralPath (Join-Path $build 'fwdslash.exe') -Destination $artifacts -Force
 Copy-Item -LiteralPath (Join-Path $build 'fswbroker.exe') -Destination $artifacts -Force
 Copy-Item -LiteralPath (Join-Path $repo 'test\sandbox\bootstrap.ps1') -Destination (Join-Path $artifacts 'sandbox-bootstrap.ps1') -Force

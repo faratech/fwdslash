@@ -159,8 +159,8 @@ pub const FSW_BARE_SLASH_DISTRIBUTION_VALUE: &str = "BareSlashDistribution";
 /// `/` opens and everything non-distro resolves under. Deliberately a separate
 /// value, not a third `BareSlashMode`: both resolvers read any nonzero
 /// `BareSlashMode` DWORD as "default distribution" (docs/divergences.md,
-/// resolver 6), so a stale C++ build ignores this value and falls back to
-/// today's behavior instead of disagreeing about what `/` means.
+/// resolver 6), so an older installed version ignores this value and falls back
+/// to today's behavior instead of disagreeing about what `/` means.
 pub const FSW_BARE_SLASH_ROOT_VALUE: &str = "BareSlashRoot";
 
 /// The three values below are hand copies of `include/fsw_filter_protocol.h` —
@@ -675,9 +675,9 @@ pub fn resolve_user_target(
 /// chosen folder root (`BareSlashRoot`) owns `/`, the root owns the input
 /// entirely — a bare `/` opens the root and every segment, including ones
 /// that share a name with an installed distribution, resolves under it. A
-/// root that is absent or malformed changes nothing, so a stale C++ install
-/// (which never reads the value and still resolves registered first segments
-/// against the list) behaves differently by design on shadowed names
+/// root that is absent or malformed changes nothing, so an older installed
+/// version (which never reads the value and still resolves registered first
+/// segments against the list) behaves differently by design on shadowed names
 /// (docs/divergences.md, resolver 6).
 ///
 /// The `/mnt/<letter>` drive alias wins over all of it, identically to the
@@ -806,11 +806,9 @@ pub fn executable_directory() -> std::io::Result<PathBuf> {
 // ---------------------------------------------------------------------------
 // Integration state and broker probes.
 //
-// These mirror the helpers the C++ settings app and controller each carry
-// privately (`src/settings/main.cpp:72-134` and `src/controller/main.cpp:45-88`,
-// `:385-391`). They live here so `fswsettings.exe` can read state in-process the
-// way the C++ app does, instead of parsing `fwdslash --json`, and so there is one
-// implementation rather than one per binary.
+// These live here so `fswsettings.exe` can read state in-process instead of
+// parsing `fwdslash --json`, and so there is one implementation rather than one
+// per binary.
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
@@ -1048,8 +1046,8 @@ fn process_image_is(pid: u32, image_name: &str) -> bool {
 ///
 /// A stopped broker costs one `FindWindowW` regardless of the timeout (the
 /// send is skipped when the window is absent). The settings window uses
-/// 750 ms (`src/settings/main.cpp:827`) so a wedged broker cannot stall a
-/// refresh; the CLI uses 200 ms for the same reason.
+/// 750 ms so a wedged broker cannot stall a refresh; the CLI uses 200 ms for
+/// the same reason.
 #[must_use]
 pub fn broker_state(timeout_ms: u32) -> BrokerState {
     #[cfg(windows)]
@@ -1267,7 +1265,6 @@ pub fn filter_service_state() -> FilterServiceState {
 /// A packaged build has no install-time hook and its `windows.startupTask` only
 /// fires at logon, so opening the settings window is the first moment the broker
 /// can be started. Unpackaged installs arrange this through `fwdslash install`.
-/// Mirrors `EnsureBrokerRunning` at `src/settings/main.cpp:145-167`.
 pub fn ensure_broker_running() {
     if !has_package_identity() || broker_window_exists() {
         return;

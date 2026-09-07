@@ -1,9 +1,7 @@
 //! Behavioural contract for the resolver.
 //!
-//! Every case from the C++ `tests/core_tests.cpp` is carried over, plus the
-//! cases that suite never covered. Each row expands into its own named `#[test]`
-//! so `cargo test bare_slash_pin_preserves_casing` works — the C++ harness was a
-//! single binary with no filtering, which CLAUDE.md calls out as a gap.
+//! Each row expands into its own named `#[test]`, so a single case can be run
+//! on its own — `cargo test bare_slash_pin_preserves_casing`.
 
 use fsw_path::{
     BareSlashMode::{DefaultDistribution, DistributionList},
@@ -64,7 +62,7 @@ macro_rules! cases {
 }
 
 // ---------------------------------------------------------------------------
-// Carried over from tests/core_tests.cpp
+// Core cases
 // ---------------------------------------------------------------------------
 
 cases! {
@@ -217,7 +215,7 @@ cases! {
 }
 
 // ---------------------------------------------------------------------------
-// Cases the C++ suite never covered
+// Edge cases
 // ---------------------------------------------------------------------------
 
 cases! {
@@ -271,8 +269,9 @@ cases! {
 
 #[test]
 fn bare_slash_in_default_mode_reports_a_trailing_separator() {
-    // The C++ rewrites to "/Ubuntu/", whose trailing slash is significant to
-    // rule R6 even though R12 discards it for an empty component list.
+    // The textual equivalent rewrites to "/Ubuntu/", whose trailing slash is
+    // significant to rule R6 even though R12 discards it for an empty
+    // component list.
     let mut buf = RenderBuf::new();
     let ctx = Context {
         registry: REGISTERED,
@@ -397,7 +396,7 @@ fn render_buffer_is_reusable_and_results_are_independent() {
 }
 
 // ---------------------------------------------------------------------------
-// The rewrite optimization, validated against the C++ algorithm
+// The rewrite optimization, validated against the reference algorithm
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -466,7 +465,7 @@ fn distribution_name_validation() {
 #[test]
 fn error_names_match_the_cpp_wire_values() {
     // These strings are emitted as `reason=<name>` into the diagnostic log and
-    // must not drift from the C++ ResolveErrorName.
+    // must not drift.
     for (error, name) in [
         (ResolveError::NotASlashPath, "not_a_slash_path"),
         (ResolveError::DoubleLeadingSlash, "double_leading_slash"),
@@ -517,8 +516,8 @@ fn case_folding_matches_the_win32_simple_uppercase_table() {
 }
 
 // ---------------------------------------------------------------------------
-// The custom bare-slash root (`resolve_under_root`) — a Rust-layer feature
-// with no C++ counterpart; docs/divergences.md, resolver entry 6.
+// The custom bare-slash root (`resolve_under_root`); docs/divergences.md,
+// resolver entry 6.
 // ---------------------------------------------------------------------------
 
 /// Resolves `input` under `root` and asserts both rendered forms.

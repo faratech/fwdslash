@@ -149,7 +149,7 @@ fn begin_install(controller: &Path) -> Result<InstallState, AdapterError> {
     super::real_make_dir(&install_parent)?;
     super::real_make_dir(&state.staging)?;
     // The macro helpers the AutoRun hook calls. Keep in step with the payload
-    // lists in tools/Package.ps1 and tools/Package-Msix.ps1. fsw-autorun.cmd is
+    // lists in tools/Package-Msix.ps1 and tools/package_msix.py. fsw-autorun.cmd is
     // *generated* below rather than copied, so the product-presence probe can
     // be baked in (#37).
     for file in ["fsw-cd.cmd", "fsw-dir.cmd", "fsw-pushd.cmd"] {

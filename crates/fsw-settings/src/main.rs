@@ -1,14 +1,14 @@
 #![windows_subsystem = "windows"]
-// The reactor view DSL is designed to be glob-imported, and `State` mirrors the
-// C++ `RefreshState()` locals one for one.
+// The reactor view DSL is designed to be glob-imported, and `State` carries one
+// field per value the window renders.
 #![allow(clippy::wildcard_imports, clippy::struct_excessive_bools)]
 
 //! Settings window for Forward Slash Windows.
 //!
-//! This is a port of `src/settings/main.cpp` onto `windows-reactor`, and it is meant
-//! to be indistinguishable from it. State is read in-process, exactly as the C++ app
-//! reads it; `fwdslash.exe` is spawned only to *change* state. Anything that differs
-//! on purpose belongs in `docs/divergences.md`.
+//! Built on `windows-reactor`. State is read in-process rather than by parsing
+//! `fwdslash --json`; `fwdslash.exe` is spawned only to *change* state. Anything
+//! that differs from the documented behaviour on purpose belongs in
+//! `docs/divergences.md`.
 
 use fsw_core::update::UpdateOutcome;
 use fsw_core::{
@@ -30,10 +30,11 @@ mod folder_picker;
 mod state_watch;
 
 /// The WSL provider root. Bare `/` may resolve elsewhere depending on bare-slash mode,
-/// so "Open WSL root" targets this literally, as `src/settings/main.cpp:562` does.
+/// so "Open WSL root" targets this literally.
 const WSL_ROOT: &str = r"\\wsl.localhost";
 
-/// Icon resource id from app.rc, kept in step with `include/fsw_resources.h`.
+/// Icon resource id from app.rc, kept in step with `fsw-broker`'s app.rc and its
+/// `IDI_FSW_APP` const.
 const IDI_FSW_APP: u16 = 101;
 
 /// The `show_result` action phrase for a folder-root change. `ControllerFinished`
@@ -91,8 +92,8 @@ enum Section {
 impl Section {
     /// Maps a deep-link tag onto a page.
     ///
-    /// The three terminal integrations each have their own URI but share one page,
-    /// matching the `terminals` grouping at `src/settings/main.cpp:844-846`.
+    /// The three terminal integrations each have their own URI but share one
+    /// page, under the `terminals` grouping.
     fn from_tag(tag: &str) -> Self {
         match tag.trim_matches('/').to_ascii_lowercase().as_str() {
             "windows" => Self::Windows,
@@ -152,7 +153,7 @@ impl Integration {
         }
     }
 
-    /// The action phrase the `InfoBar` reports, per `src/settings/main.cpp:599-677`.
+    /// The action phrase the `InfoBar` reports.
     fn action(self, enabled: bool) -> &'static str {
         match (self, enabled) {
             (Self::Windows, true) => "Windows surfaces installed",
@@ -230,10 +231,9 @@ impl DriverStatus {
 
 /// Everything the window renders, read straight from HKCU and the broker window.
 ///
-/// Mirrors `RefreshState()` at `src/settings/main.cpp:754-841`. Reading in-process
-/// rather than parsing `fwdslash --json` is deliberate: it is what the C++ does, and
-/// a text contract between two binaries fails silently and totally when one field
-/// name drifts.
+/// Reading in-process rather than parsing `fwdslash --json` is deliberate: a text
+/// contract between two binaries fails silently and totally when one field name
+/// drifts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
     disabled: bool,
@@ -314,9 +314,9 @@ impl State {
             last_check: update::last_update_check(),
             distributions,
             wsl_default,
-            // 250 ms so a wedged broker cannot stall a refresh (main.cpp:827
-            // used 750; this runs off the UI thread now, but the window still
-            // waits on the result to repaint).
+            // 250 ms so a wedged broker cannot stall a refresh (this runs off
+            // the UI thread, but the window still waits on the result to
+            // repaint).
             broker: broker_state(250),
             broker_window: broker_window_exists(),
             driver: DriverStatus::read(),
@@ -376,8 +376,7 @@ impl State {
     }
 
     /// The About page's broker line. Deliberately not `status_text`'s wording:
-    /// that string is a byte-for-byte port of `src/settings/main.cpp:832-838`
-    /// and says "disabled" where this says "paused".
+    /// that string says "disabled" where this says "paused".
     fn broker_component_line(&self) -> &'static str {
         match self.broker {
             BrokerState::Active => "Broker: active",
@@ -477,11 +476,10 @@ impl State {
         self.root.is_some()
     }
 
-    /// Ported from `src/settings/main.cpp:832-838`. The broker line is
-    /// verbatim; the driver line is not. The C++ hardcodes
-    /// "not installed (production-gated)" — this reports what the machine
-    /// actually has, from the service and the filter port
-    /// (docs/divergences.md, settings window).
+    /// The driver line reports what the machine actually has, from the service
+    /// and the filter port, rather than a hardcoded
+    /// "not installed (production-gated)" (docs/divergences.md, settings
+    /// window).
     fn status_text(&self) -> String {
         let broker = if self.windows {
             match self.broker {
@@ -764,8 +762,7 @@ impl SettingsModel {
         }
     }
 
-    /// The single notification path, reproducing `ShowResult`
-    /// (`src/settings/main.cpp:874-887`). Only Success and Error are ever used.
+    /// The single notification path. Only Success and Error are ever used.
     fn show_result(&mut self, succeeded: bool, action: &str, terminal: bool, detail: &str) {
         let mut message = action.to_string();
         if succeeded && terminal {
@@ -1034,8 +1031,8 @@ impl Component for SettingsModel {
                     return;
                 }
                 self.section = section;
-                // Stands in for the C++ `window_.Activated` refresh, which reactor
-                // has no equivalent for. See docs/divergences.md. Every page,
+                // Stands in for a window-activation refresh, which reactor has
+                // no equivalent for. See docs/divergences.md. Every page,
                 // About included -- its Components card is live state, and the
                 // read is off the UI thread.
                 Self::refresh(context);
@@ -1064,8 +1061,8 @@ impl Component for SettingsModel {
 
             // Both radios share a group, so checking one unchecks the other and
             // WinUI raises the sibling's handler with `false`. Only the transition
-            // to checked is a user action, which is what the C++ `Checked` handler
-            // sees; and re-checking the already-active mode is not a change at all.
+            // to checked is a user action; and re-checking the already-active
+            // mode is not a change at all.
             Msg::BareSlashListChecked(checked) => {
                 // A folder root can coexist with either underlying mode, so
                 // the echo guard must account for it: picking this radio
@@ -1518,7 +1515,7 @@ impl Component for SettingsModel {
         );
         context.on_color_scheme(context.callback(Msg::ColorSchemeChanged));
 
-        // The C++ sets TitleBar.IconSource (main.cpp:387-392). ImageIconSource
+        // TitleBar.IconSource is the obvious route, but ImageIconSource
         // fail-fasts under the unpackaged Windows App SDK, so the icon goes in the
         // TitleBar's LeftHeader slot instead: same leading-edge position (the
         // control draws it ahead of the title), automatic drag regions because it
@@ -1526,10 +1523,10 @@ impl Component for SettingsModel {
         // embedded PNG bytes in place -- the one route that never constructs the
         // fail-fasting ImageIconSource. The window icon proper (taskbar and
         // Alt-Tab) is applied from the IDI_FSW_APP resource in app.rc via
-        // WM_SETICON, as src/settings/main.cpp does against the HWND.
+        // WM_SETICON against the HWND.
         let title_bar = TitleBar::new()
             .title("Forward Slash Windows")
-            // On the TitleBar, not the NavigationView (main.cpp:386).
+            // On the TitleBar, not the NavigationView.
             .is_pane_toggle_button_visible(false)
             .grid_row(0)
             .slot(
@@ -1543,11 +1540,11 @@ impl Component for SettingsModel {
             );
 
         let navigation = NavigationView::new()
-            // The C++ pins LeftCompact (main.cpp:396), which forces WinUI's DisplayMode
-            // to Compact and therefore SplitView CompactOverlay: opening the pane draws
+            // Pinning LeftCompact would force WinUI's DisplayMode to Compact and
+            // therefore SplitView CompactOverlay: opening the pane draws
             // it *over* the page and clips the text mid-word. `Left` forces DisplayMode
             // Expanded / SplitView CompactInline instead: same 48px icon rail while
-            // closed, content pushed aside when open. Deliberate divergence, recorded
+            // closed, content pushed aside when open. Deliberate choice, recorded
             // in docs/divergences.md.
             .pane_display_mode(NavigationViewPaneDisplayMode::Left)
             .is_back_button_visible(NavigationViewBackButtonVisible::Collapsed)
@@ -1598,8 +1595,7 @@ impl SettingsModel {
     }
 
     /// The content surface: an `InfoBar` in a fixed row above a scrolling page, so a
-    /// notification never pushes the page down or scrolls out of view
-    /// (`src/settings/main.cpp:410-422`).
+    /// notification never pushes the page down or scrolls out of view.
     fn surface(&self, context: &mut ViewContext<Self>) -> View {
         let notice: View = match &self.notice {
             Some(notice) => InfoBar::new()
@@ -2081,7 +2077,7 @@ impl SettingsModel {
 }
 
 // ---------------------------------------------------------------------------
-// Shared builders, mirroring the helpers at src/settings/main.cpp:221-298
+// Shared builders
 // ---------------------------------------------------------------------------
 
 /// What one `fwdslash update install` exit code means on screen.
@@ -2261,8 +2257,7 @@ fn integration_toggle(
 // Talking to the controller
 // ---------------------------------------------------------------------------
 
-/// `fwdslash.exe` beside this executable, as the C++ resolves it
-/// (`src/settings/main.cpp:170-171`). Deliberately no PATH fallback: a bare
+/// `fwdslash.exe` beside this executable. Deliberately no PATH fallback: a bare
 /// executable name would be resolved against the search path.
 fn controller_path() -> Option<PathBuf> {
     let controller = executable_directory().ok()?.join("fwdslash.exe");
@@ -2389,7 +2384,7 @@ fn now_unix() -> u64 {
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// Opens the WSL provider root through the shell, as `main.cpp:561-563` does.
+/// Opens the WSL provider root through the shell.
 fn open_wsl_root() -> bool {
     shell_open(WSL_ROOT)
 }
@@ -2542,7 +2537,7 @@ mod sweep_lock {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Parses the deep link, matching `InitialSection()` at `main.cpp:190-219`.
+/// Parses the deep link into the section to open.
 fn initial_section() -> Section {
     const PREFIX: &str = "fwdslash://settings/";
     let mut arguments = env::args().skip(1);

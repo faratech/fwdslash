@@ -8,12 +8,17 @@ $missing = [System.Collections.Generic.List[string]]::new()
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere)) {
-    $missing.Add('Visual Studio 2022 or 2026 with Desktop development with C++')
+    $missing.Add('Visual Studio 2022 or 2026 with Desktop development with C++ (for link.exe and the Windows SDK the *-pc-windows-msvc Rust targets link against)')
 } else {
     $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if (-not $installation) {
-        $missing.Add('MSVC x64/x86 build tools')
+        $missing.Add('MSVC x64/x86 build tools (the linker the Rust MSVC targets use)')
     }
+}
+
+# The Rust tree is the product; without cargo nothing builds at all.
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    $missing.Add('Rust toolchain (rustup; the version is pinned by rust-toolchain.toml)')
 }
 
 if ($RequireWdk) {

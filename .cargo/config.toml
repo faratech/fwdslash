@@ -7,7 +7,7 @@
 #   /DEFAULTLIB:/NODEFAULTLIB set   the /MT link recipe used by
 #                           microsoft/edit, microsoft/sudo and
 #                           microsoft/coreutils
-#   control-flow-guard      /guard:cf parity with tools/Build-UserMode.ps1
+#   control-flow-guard      /guard:cf, on for every shipped binary
 #   windows_slim_errors     windows-core's slimmer Error layout; the vendored
 #                           windows-reactor declares this cfg in its
 #                           unexpected_cfgs check-cfg list

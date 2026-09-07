@@ -27,7 +27,7 @@ Add-Type -AssemblyName System.Drawing
 # $PSScriptRoot is empty while parameter defaults are evaluated, so repo-relative
 # defaults are resolved here instead.
 $repo = Split-Path -Parent $PSScriptRoot
-if (-not $Exe) { $Exe = Join-Path $repo 'out\user\arm64\Release\fswsettings.exe' }
+if (-not $Exe) { $Exe = Join-Path $repo 'target\aarch64-pc-windows-msvc\release\fswsettings.exe' }
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repo 'out\shots' }
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 

@@ -1,9 +1,7 @@
 * text=auto
 
 *.c text eol=lf
-*.cpp text eol=lf
 *.h text eol=lf
-*.hpp text eol=lf
 *.md text eol=lf
 # Rust sources are LF in the working tree on every platform: the Windows CI job
 # regenerates crates/fsw-cli/src/update/install_control.rs and diffs it, and a
@@ -16,6 +14,7 @@
 *.cmd text eol=crlf
 *.bat text eol=crlf
 *.inf text eol=crlf
+# driver/fswfilter is the only MSBuild project left in the tree.
 *.vcxproj text eol=crlf
 *.props text eol=crlf
 *.config text eol=crlf

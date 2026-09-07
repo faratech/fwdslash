@@ -5,19 +5,16 @@ Product: **fwdslash** — Store ID `9P51CM0MTMK2`, publisher `windowsforum`.
 ## 1. Package identity
 
 These are the defaults in both packagers, so producing an uploadable bundle is
-one command once the binaries are built. **The shipping product is the Rust
-tree**, so build it first and then package with `-BinarySource Rust` (the
-`Cpp` default stages the C++ reference build, which is not what is on the
-Store):
+one command once the binaries are built:
 
 ```powershell
 cargo build --release --target aarch64-pc-windows-msvc --workspace
 cargo build --release --target x86_64-pc-windows-msvc  --workspace
-.\tools\Package-Msix.ps1 -BinarySource Rust
+.\tools\Package-Msix.ps1
 ```
 
 From WSL, `python3 tools/package_msix.py` does the same thing: it stages the
-same three Rust exes and the `shell/` payload out of the repo, and shells out
+same three exes and the `shell/` payload out of the repo, and shells out
 to `makeappx.exe`/`makepri.exe` through `wslpath`. Both read the version from
 `workspace.package.version` in the root `Cargo.toml`.
 
@@ -46,7 +43,7 @@ time — it cannot be patched into a finished package.
 signs a package with the real Store identity for local install testing:
 
 ```powershell
-.\tools\Package-Msix.ps1 -BinarySource Rust -CertificatePath C:\code\wfdiag-selfsign.pfx -CertificatePassword '<pw>'
+.\tools\Package-Msix.ps1 -CertificatePath C:\code\wfdiag-selfsign.pfx -CertificatePassword '<pw>'
 Add-AppxPackage out\msix\fwdslash-<version>.msixbundle
 ```
 

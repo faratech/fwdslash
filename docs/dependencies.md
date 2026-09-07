@@ -145,13 +145,12 @@ source rather than regenerable output.
 Automation path depends on: all 351 `UIA_*PropertyId`/`UIA_*PatternId` constants,
 `VARIANT`'s `Drop`/`Clone`/`TryFrom<&VARIANT> for BSTR`, and `Result`-shaped
 returns on COM methods without `[retval]`. Migrating it to `windows-bindgen` 0.100
-is the phase-2 size lever, after parity — a real port, not a version bump.
+is a possible future size lever, and a real port rather than a version bump.
 
 ### `fsw-core` is shared too, and that is sound
 
 `fswsettings.exe` depends on `fsw-core` so the settings window can read HKCU and
-the broker window **in-process**, exactly as `src/settings/main.cpp:754-841`
-does. The alternative — parsing `fwdslash status --json` / `integrations --json`
+the broker window **in-process**. The alternative — parsing `fwdslash status --json` / `integrations --json`
 — was tried and removed: one field-name drift (`windowsPowerShell` against
 serde's `windowsPowershell`) silently failed the whole parse and left every
 toggle reading `false`, which is a failure mode a text contract between two
@@ -259,8 +258,7 @@ into build scripts.
   `microsoft/coreutils` all independently converge on. Verify with
   `dumpbin /dependents` in CI: the `/NODEFAULTLIB:vcruntime.lib` trick breaks the
   moment something in the graph pulls a vcruntime-only symbol.
-- `-C control-flow-guard` — the `/guard:cf` parity flag. The C++ build applies it
-  to the two native binaries but not to `fswsettings.exe`; all three get it here.
+- `-C control-flow-guard` — `/guard:cf`, applied to all three binaries.
 - `--cfg=windows_slim_errors` — stores only the 4-byte HRESULT and drops COM/WinRT
   extended error info. A pure win, because the never-log-a-path rule already
   forbids surfacing rich error text.

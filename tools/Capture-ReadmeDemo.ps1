@@ -118,7 +118,7 @@ public static class ReadmeCaptureNative {
 [ReadmeCaptureNative]::SetProcessDPIAware() | Out-Null
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$bin = Join-Path $repo 'out\user\arm64\Release'
+$bin = Join-Path $repo 'target\aarch64-pc-windows-msvc\release'
 $controller = Join-Path $bin 'fwdslash.exe'
 $settings = Join-Path $bin 'fswsettings.exe'
 if (-not $OutputDirectory) {

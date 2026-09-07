@@ -3,10 +3,9 @@
 
 `[workspace.package] version` in the root `Cargo.toml` is the single source of
 truth for the product version. A dozen other files carry a hand-written copy of
-it -- the `#ifndef` VERSIONINFO fallbacks, two side-by-side manifests, the CMake
-project version, the ZIP stage directory, the About header, two docs -- and a
-release used to mean editing all of them by hand from a list in CLAUDE.md, where
-any one could be missed silently.
+it -- the `#ifndef` VERSIONINFO fallbacks, the app manifest, the lockfile
+entries, two docs -- and a release used to mean editing all of them by hand from
+a list in CLAUDE.md, where any one could be missed silently.
 
 Every copy is registered below as an explicit, anchored pattern with an expected
 match count, so that:
@@ -18,7 +17,7 @@ match count, so that:
     rather than being skipped;
   * line endings and encoding survive: only the captured version span is
     replaced, and the file is re-encoded with the codec and BOM it arrived with
-    (`tools/Package.ps1` is CRLF; a `.rc` may be UTF-16 or ANSI).
+    (`crates/*/app.rc` may be UTF-16 or ANSI; some files are CRLF).
 
 Usage:
     python3 tools/bump_version.py --check           # CI: do all copies agree?
@@ -145,48 +144,6 @@ SITES: tuple[Site, ...] = (
         what="assemblyIdentity version",
         shape="dotted4",
         pattern=r'<assemblyIdentity version="{V}" name="ForwardSlashWindows\.Settings\.app"',
-        count=1,
-    ),
-    Site(
-        path="src/settings/app.manifest",
-        what="assemblyIdentity version",
-        shape="dotted4",
-        pattern=r'<assemblyIdentity version="{V}" name="ForwardSlashWindows\.Settings\.app"',
-        count=1,
-    ),
-    Site(
-        path="src/settings/main.cpp",
-        what="About page header literal",
-        shape="dotted3",
-        pattern=r'PageHeader\(L"About", L"Forward Slash Windows {V}"\)',
-        count=1,
-    ),
-    Site(
-        path="assets/fwdslash.rc",
-        what="FILEVERSION / PRODUCTVERSION",
-        shape="commas4",
-        pattern=r"^ (?:FILEVERSION|PRODUCTVERSION) {V}\r?$",
-        count=2,
-    ),
-    Site(
-        path="assets/fwdslash.rc",
-        what='VALUE "FileVersion" / "ProductVersion"',
-        shape="dotted3",
-        pattern=r'VALUE "(?:File|Product)Version", "{V}\\0"',
-        count=2,
-    ),
-    Site(
-        path="CMakeLists.txt",
-        what="project(ForwardSlashWindows VERSION ...)",
-        shape="dotted3",
-        pattern=r"^project\(ForwardSlashWindows VERSION {V} LANGUAGES",
-        count=1,
-    ),
-    Site(
-        path="tools/Package.ps1",
-        what="ZIP stage directory name",
-        shape="dotted3",
-        pattern=r'"forward-slash-windows-{V}-\{0\}"',
         count=1,
     ),
     Site(

@@ -15,26 +15,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  user-mode:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        preset: [x64-debug, arm64-debug, x86-debug]
-    steps:
-      - uses: actions/checkout@v7
-      - name: Configure
-        shell: pwsh
-        run: cmake --preset ${{ matrix.preset }}
-      - name: Build
-        shell: pwsh
-        run: cmake --build --preset ${{ matrix.preset }}
-      - name: Test native x64
-        if: matrix.preset == 'x64-debug'
-        shell: pwsh
-        run: ctest --preset x64-debug
-
   powershell-regressions:
     runs-on: windows-latest
     timeout-minutes: 10
@@ -77,22 +57,6 @@ jobs:
       - name: Build unsigned x64 driver package
         shell: pwsh
         run: .\tools\Build-Driver.ps1 -Architecture x64 -Configuration Debug
-
-  winui-settings:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [Win32, x64, ARM64]
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build WinUI 3 settings app
-        shell: pwsh
-        run: |
-          $msbuild = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
-          & $msbuild .\src\settings\ForwardSlashWindows.Settings.vcxproj /restore /m:1 /p:UseMultiToolTask=false /p:Configuration=Release /p:Platform=${{ matrix.platform }}
-          if ($LASTEXITCODE -ne 0) { throw "MSBuild exited with $LASTEXITCODE" }
 
   # The Rust tree is the shipping product; this job is what the "CI asserts …"
   # claims in docs/dependencies.md and docs/size-baseline.md refer to.
@@ -180,7 +144,7 @@ jobs:
   # Everything that needs a real MSVC linker: the CLI's bin tests (which also
   # have to *run*, so they need a Windows host) and the release build the size
   # budget is measured against. Sizes are reported, not gated — see
-  # docs/size-baseline.md for the recorded C++ numbers to compare against.
+  # docs/size-baseline.md for the recorded size budget.
   rust-windows:
     runs-on: windows-latest
     timeout-minutes: 45
