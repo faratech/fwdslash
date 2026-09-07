@@ -129,7 +129,12 @@ only thing Store customers read: `publish-to-store.yml` derives the
 Store "What's new" by truncating the release body at the `## Downloads` marker, and this file
 is everything above that marker. Write it in plain language for someone who has never seen the
 code — one short sentence per user-visible change, no file or function names, no issue numbers,
-no internals. **Do not put a `## Downloads` heading in the file** — `release.yml` appends its own
+no internals. **`docs/release-notes/0.0.8.md` is the model**; read it before writing a new one.
+The check enforces two rules: no code identifiers in backticks, and no words that describe the
+machine rather than the person (`resolves`, `watchdog`, `registry`, `exit code`, `deferring`).
+Words a user of this product already says are fine — install, update, folder, path, scheduled
+tasks, notification area, terminal integrations — and so are backticks around what they type,
+like `cd ..`. **Do not put a `## Downloads` heading in the file** — `release.yml` appends its own
 asset table under that heading, and one in the file produces a duplicate (0.1.0 shipped exactly
 that). The generated "What's Changed" commit list still lands in the GitHub release for
 developers, but it sits *below* the marker and never reaches the Store.
