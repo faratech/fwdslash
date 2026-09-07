@@ -124,11 +124,14 @@ python3 tools/bump_version.py --check   # what CI will assert
 ```
 
 **Write `docs/release-notes/<version>.md` in the same PR.** `release.yml` refuses to publish
-without it, and it is the only thing Store customers read: `publish-to-store.yml` derives the
+without it, `python3 tools/check_release_notes.py` is a CI gate on how it reads, and it is the
+only thing Store customers read: `publish-to-store.yml` derives the
 Store "What's new" by truncating the release body at the `## Downloads` marker, and this file
 is everything above that marker. Write it in plain language for someone who has never seen the
 code — one short sentence per user-visible change, no file or function names, no issue numbers,
-no internals. The generated "What's Changed" commit list still lands in the GitHub release for
+no internals. **Do not put a `## Downloads` heading in the file** — `release.yml` appends its own
+asset table under that heading, and one in the file produces a duplicate (0.1.0 shipped exactly
+that). The generated "What's Changed" commit list still lands in the GitHub release for
 developers, but it sits *below* the marker and never reaches the Store.
 
 Open a PR with that bump, merge it, then tag the merge commit `v0.0.4` and push the tag
