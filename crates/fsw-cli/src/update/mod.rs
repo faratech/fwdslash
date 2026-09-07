@@ -35,6 +35,7 @@
 pub mod install_control;
 
 pub mod appinstall;
+pub mod gc;
 pub mod helper;
 pub mod relaunch;
 pub mod store;
@@ -628,6 +629,7 @@ fn cmd_status(options: &Options) -> i32 {
         return Report::new("disabled", EXIT_OK).emit(options, None);
     }
     let folded = fold_result_file();
+    let _ = gc::collect();
     let available = fsw_core::update::cached_update_tag();
     let state = if available.is_some() {
         "available"
@@ -647,6 +649,9 @@ fn cmd_check(options: &Options) -> i32 {
         return Report::new("disabled", EXIT_OK).emit(options, None);
     }
     let folded = fold_result_file();
+    // Every packaged check — the broker's cycle, the settings window's launch
+    // — is also the moment leftovers from earlier attempts are collected.
+    let _ = gc::collect();
 
     if !options.force
         && !fsw_core::update::check_is_due(fsw_core::update::last_update_check(), now_unix())

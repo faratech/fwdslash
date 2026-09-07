@@ -1067,69 +1067,13 @@ fn doctor_target_fields(resolved: Resolved<'_>, snap: &Snapshot) -> Vec<(&'stati
     }
 }
 
-/// A scheduler task from a current or legacy updater attempt. Matching the
-/// complete generated grammar, rather than a broad prefix, keeps uninstall
-/// from touching another product's task with a similar name.
-fn is_owned_update_task_name(name: &str) -> bool {
-    let name = name.strip_prefix('\\').unwrap_or(name);
-    if name == update::relaunch::WATCHDOG_TASK_NAME {
-        return true;
-    }
-    if !scheduled_task::is_safe_task_literal(name) {
-        return false;
-    }
-    let mut parts = name.split('-');
-    matches!(
-        (
-            parts.next(),
-            parts.next(),
-            parts.next(),
-            parts.next(),
-            parts.next(),
-            parts.next(),
-        ),
-        (Some("fwdslash"), Some("update"), Some("watchdog" | "apply"), Some(pid), Some(sequence), None)
-            if !pid.is_empty() && !sequence.is_empty()
-                && pid.bytes().all(|byte| byte.is_ascii_digit())
-                && sequence.bytes().all(|byte| byte.is_ascii_digit())
-    )
-}
-
-/// Task Scheduler CSV is locale-independent in its first (task-name) field.
-/// Our names cannot contain a quote, so this intentionally small CSV reader is
-/// safer than interpreting localized headers or command text.
-fn owned_update_task_inventory(csv: &str) -> Vec<String> {
-    csv.lines()
-        .filter_map(|line| {
-            let field = line.trim().strip_prefix('"')?;
-            let name = field.split('"').next()?;
-            is_owned_update_task_name(name).then(|| name.trim_start_matches('\\').to_string())
-        })
-        .collect()
-}
-
 fn cleanup_update_tasks_for_uninstall() -> bool {
-    use std::process::{Command, Stdio};
-
     // Do not sweep a freshly acquired attempt token from another session. The
     // guard is intentionally held only across this bounded uninstall cleanup.
     let Some(_guard) = update::relaunch::lock_update_storage_for_uninstall() else {
         return false;
     };
-    let mut names = fsw_core::SystemBinary::Schtasks
-        .path()
-        .and_then(|schtasks| {
-            Command::new(schtasks)
-                .args(["/query", "/fo", "csv", "/nh"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-        })
-        .map_or_else(Vec::new, |output| {
-            owned_update_task_inventory(&String::from_utf8_lossy(&output.stdout))
-        });
+    let mut names = update::gc::registered_update_tasks();
     // Query failure must not leave the legacy fixed watchdog behind.
     if !names
         .iter()
@@ -1153,7 +1097,7 @@ fn cleanup_update_tasks_for_uninstall() -> bool {
                 let stem = file_name
                     .strip_suffix(".cmd")
                     .or_else(|| file_name.strip_suffix(".xml"));
-                if stem.is_some_and(is_owned_update_task_name) {
+                if stem.is_some_and(update::gc::is_owned_update_task_name) {
                     let _ = std::fs::remove_file(path);
                 }
             }
@@ -1634,7 +1578,8 @@ fn broadcasts_state_change(command: &str, argc: usize) -> bool {
 // silently pass.
 #[allow(clippy::panic)]
 mod doctor_and_update_cleanup_tests {
-    use super::{doctor_target_fields, is_owned_update_task_name, owned_update_task_inventory};
+    use super::doctor_target_fields;
+    use crate::update::gc::{is_owned_update_task_name, owned_update_task_inventory};
     use fsw_core::Snapshot;
     use fsw_path::{BareSlashMode, RenderBuf};
 

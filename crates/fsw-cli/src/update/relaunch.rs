@@ -183,6 +183,32 @@ impl AttemptLock {
     }
 }
 
+/// Removes an attempt token nobody can still be using: older than the
+/// scheduler's one-hour limit, or naming a task that is no longer registered.
+/// The decision mutex makes the look-then-delete indivisible with a
+/// concurrent [`AttemptLock::acquire`]. True when a token was removed.
+#[cfg(windows)]
+pub fn reclaim_stale_attempt_lock() -> bool {
+    let Some(directory) = fsw_core::update::update_directory_path() else {
+        return false;
+    };
+    let Some(_decision) = AttemptMutex::acquire(&directory) else {
+        return false;
+    };
+    let path = directory.join("update-attempt.lock");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let aged_out = std::fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > std::time::Duration::from_mins(65));
+    let holder = text.trim();
+    let orphaned = holder.is_empty() || !crate::scheduled_task::task_exists(holder);
+    (aged_out || orphaned) && std::fs::remove_file(&path).is_ok()
+}
+
 /// Holds the same short decision mutex through uninstall's task inventory and
 /// storage sweep, preventing a fresh updater from acquiring a token between
 /// those destructive steps.

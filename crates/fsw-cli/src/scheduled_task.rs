@@ -34,7 +34,7 @@ use std::process::Command;
 
 /// `CREATE_NO_WINDOW`: no console flash for the `schtasks` children.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Whether `value` may be pasted into a `schtasks` argument or into the body of
 /// the batch file a task runs.
@@ -179,7 +179,7 @@ impl OneShotTask {
 /// The `.cmd` a task of this name runs, or `None` when `%LOCALAPPDATA%` is
 /// unset or the name is not a safe literal.
 #[cfg(windows)]
-fn script_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn script_path(name: &str) -> Option<PathBuf> {
     if !is_safe_task_literal(name) {
         return None;
     }
