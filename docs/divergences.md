@@ -242,6 +242,34 @@ reads as "about to be force-closed" — it would show no message and leave the
 broker down. On the wire an unnamed offer is the already-legal shape `state:
 "available"` with `available: null`, so no JSON field and no exit code changed.
 
+**How the Store query waits.** `check_store_offer` subscribes with
+`IAsyncOperation::when` and waits on a channel with a 60-second deadline
+(`wait_bounded`), rather than polling `Status()`. Three things make that shape
+mandatory rather than stylistic:
+
+- **The reduction happens inside the callback.** The closure's `Send` bound is
+  on the closure, and `IVectorView` is not `Send`, so the collection cannot
+  cross the channel even though `StoreContext`, `StorePackageUpdate` and
+  `StorePackageUpdateResult` all are. What crosses is one owned
+  `Vec<Option<String>>`.
+- **The apartment is never uninitialised.** `WinRT` holds a strong reference to
+  the delegate, and a timeout returns while it is still registered, so
+  `ComScope` deliberately has no `Drop`. On timeout the operation is
+  `mem::forget`-ed rather than released, so a late completion has somewhere
+  valid to land in the moments before the process exits.
+- **The install path keeps polling, and that is correct.**
+  `TrySilentDownloadAndInstallStorePackageUpdatesAsync` takes the live
+  `IVectorView` back, so reducing it to plain Rust would destroy the thing the
+  install needs. `block_on` survives for that path alone.
+
+`wait_bounded` takes the subscribe step as a closure, so the deadline is proved
+in ordinary CI by a fake that never calls back — the gap in every
+callback-driven Store updater surveyed, which hands control to `WinRT`
+correctly and then has nothing to say if the callback never arrives. A send
+after the deadline lands on a dropped receiver and is discarded; a sender
+dropped without sending is a **failure**, never an empty answer, because
+conflating those is issue #90.
+
 **The install ladder (Store flavor).** `route_for` is a pure function of five
 inputs and the single definition of precedence; the probes below it are lazy, so
 a rung is only asked about once the rung above is out.

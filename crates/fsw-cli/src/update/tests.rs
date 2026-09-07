@@ -1106,3 +1106,88 @@ fn each_install_answer_carries_the_exit_code_its_state_names() {
     assert_ne!(EXIT_NEEDS_USER, EXIT_NOTHING);
     assert_ne!(EXIT_NEEDS_USER, EXIT_OK);
 }
+
+// ---------------------------------------------------------------------------
+// The bounded wait behind the Store query
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_callback_that_never_comes_still_ends() {
+    // The gap in every callback-driven Store updater I looked at: they hand
+    // control to WinRT correctly and then have nothing to say if the callback
+    // never arrives. Ours is bounded, so prove it — without a Store, without
+    // WinRT, in ordinary CI.
+    use super::store::{Waited, wait_bounded};
+    use std::time::Duration;
+
+    let waited = wait_bounded::<u32>(
+        |sender| {
+            // Hold the sender past the deadline so this is a timeout rather
+            // than a disconnect; a dropped sender is a different verdict.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = sender.send(Ok(7));
+            });
+            Ok(())
+        },
+        Duration::from_millis(20),
+    );
+    assert_eq!(waited, Waited::TimedOut);
+    // And the late send lands on a dropped receiver without panicking, which
+    // is the normal shape of an answer that arrives after we gave up.
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+#[test]
+fn an_answer_that_is_already_there_is_taken_at_once() {
+    use super::store::{Waited, wait_bounded};
+    use std::time::Duration;
+
+    // `when` fires synchronously when the operation has already completed, so
+    // the common case must not depend on the deadline at all.
+    let waited = wait_bounded(
+        |sender| {
+            let _ = sender.send(Ok("0.1.0.0".to_string()));
+            Ok(())
+        },
+        Duration::from_secs(60),
+    );
+    assert_eq!(waited, Waited::Ready("0.1.0.0".to_string()));
+}
+
+#[test]
+fn a_failure_is_never_mistaken_for_nothing_to_install() {
+    use super::store::{Waited, wait_bounded};
+    use std::time::Duration;
+
+    // Subscribing failed outright.
+    let waited = wait_bounded::<u32>(
+        |_sender| Err("0x80070005".to_string()),
+        Duration::from_secs(60),
+    );
+    assert_eq!(waited, Waited::Failed("0x80070005".to_string()));
+
+    // The work reported a failure.
+    let waited = wait_bounded::<u32>(
+        |sender| {
+            let _ = sender.send(Err("0x80004005".to_string()));
+            Ok(())
+        },
+        Duration::from_secs(60),
+    );
+    assert_eq!(waited, Waited::Failed("0x80004005".to_string()));
+
+    // The callback was released without ever running. Not a timeout, and
+    // emphatically not an empty answer — conflating those is issue #90.
+    let waited = wait_bounded::<u32>(
+        |sender| {
+            drop(sender);
+            Ok(())
+        },
+        Duration::from_secs(60),
+    );
+    match waited {
+        Waited::Failed(detail) => assert!(detail.contains("without an answer"), "{detail}"),
+        other => panic!("a released callback must be a failure, got {other:?}"),
+    }
+}
