@@ -1,4 +1,4 @@
-Set-StrictMode -Version 2.0
+﻿Set-StrictMode -Version 2.0
 
 $script:FswController = Join-Path $PSScriptRoot 'fwdslash.exe'
 
@@ -92,6 +92,9 @@ function Resolve-ForwardSlashWindowsTarget {
         Target        = $target
         Distributions = $distributions
         Message       = ''
+        # Whether Message is an answer to a legitimate request rather than
+        # a rejection: the caller shows it with Write-Host, not Write-Error.
+        Informational = $false
     }
 }
 
@@ -223,8 +226,28 @@ function Resolve-ForwardSlashWindowsLocationTarget {
             }
         }
     }
-    if ($null -eq $slashPath -or (Test-ForwardSlashWindowsDisabled)) {
+    if (Test-ForwardSlashWindowsDisabled) {
         return $null
+    }
+    $parentOfDistribution = $false
+    if ($null -eq $slashPath) {
+        # 'cd ..' at a distribution share root. Above \\wsl.localhost\Ubuntu
+        # there is only the server name, which no provider can enter, so the
+        # native answer is "Cannot find path '\\wsl.localhost'" -- it reads
+        # like a broken install rather than "there is nothing above this".
+        # In this product '/' is what the parent of a distribution means, so
+        # resolve that instead (#132). Both checks are string work on values
+        # already in hand, and the location lookup is only reached once the
+        # arguments already look like '..', so an ordinary 'cd ..' anywhere
+        # else still pays nothing. Paused, the native error stands.
+        if (-not (Test-ForwardSlashWindowsParentReference -Arguments @($BoundParameters.Values))) {
+            return $null
+        }
+        if (-not (Get-ForwardSlashWindowsDistributionRoot)) {
+            return $null
+        }
+        $slashPath = '/'
+        $parentOfDistribution = $true
     }
     $result = Resolve-ForwardSlashWindowsTarget -Path $slashPath
     if ($null -eq $result) {
@@ -234,6 +257,11 @@ function Resolve-ForwardSlashWindowsLocationTarget {
         # Not one directory: say which distributions there are instead of
         # moving to the current drive's root.
         $result.Message = Get-ForwardSlashWindowsRootMessage -Distributions $result.Distributions
+        # Going up from a distribution is a navigation request, not a typo:
+        # the listing is the answer, so it must not be written as an error.
+        if ($parentOfDistribution) {
+            $result.Informational = $true
+        }
     }
     return $result
 }
@@ -301,26 +329,17 @@ function Invoke-ForwardSlashWindowsSetLocation {
         $forward = $PSBoundParameters
         $result = Resolve-ForwardSlashWindowsLocationTarget -BoundParameters $forward
         if ($null -eq $result) {
-        # 'cd ..' at a distribution's share root: PowerShell's own answer is
-        # "Cannot find path '\\wsl.localhost'", which reads like a broken
-        # install rather than "there is nothing above this". Both checks here
-        # are string work on arguments already in hand, and the registry read
-        # is only reached in that rare case, so an ordinary 'cd ..' still pays
-        # nothing. Paused, the native error is the honest answer.
-            if (Test-ForwardSlashWindowsParentReference -Arguments @($forward.Values)) {
-            $distribution = Get-ForwardSlashWindowsDistributionRoot
-            if ($distribution -and -not (Test-ForwardSlashWindowsDisabled)) {
-                Write-Host "Already at the root of $distribution; a distribution share has no parent directory."
-                return
-            }
-        }
             Microsoft.PowerShell.Management\Set-Location @forward
             return
         }
         if ($result.Message) {
         # A rejected input or the bare root: never fall through to the
         # native cmdlet's misleading "Cannot find path 'C:\etc'".
-            Write-Error $result.Message
+            if ($result.Informational) {
+                Write-Host $result.Message
+            } else {
+                Write-Error $result.Message
+            }
             return
         }
         # The resolver's target is filesystem data, never a wildcard pattern.
@@ -356,7 +375,11 @@ $script:FswSetLocationBody = @'
             return
         }
         if ($result.Message) {
-            Write-Error $result.Message
+            if ($result.Informational) {
+                Write-Host $result.Message
+            } else {
+                Write-Error $result.Message
+            }
             return
         }
         [void]$forward.Remove('Path')
@@ -396,7 +419,11 @@ $script:FswPushLocationBody = @'
             return
         }
         if ($result.Message) {
-            Write-Error $result.Message
+            if ($result.Informational) {
+                Write-Host $result.Message
+            } else {
+                Write-Error $result.Message
+            }
             return
         }
         [void]$forward.Remove('Path')

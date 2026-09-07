@@ -1,4 +1,4 @@
-# Native location-wrapper regression fixture for #68.
+﻿# Native location-wrapper regression fixture for #68.
 # Run with: pwsh -NoProfile -File test/powershell/ForwardSlashWindows.LocationRegression.ps1
 # It changes only a temporary local location stack. Resolver and disabled-state
 # seams are mocked inside the module; the location cmdlets are real native ones.
@@ -42,7 +42,7 @@ try {
         Set-Item -Path function:script:Test-ForwardSlashWindowsDisabled -Value { return $false }
         Set-Item -Path function:script:Resolve-ForwardSlashWindowsTarget -Value {
             param([string]$Path)
-            return [pscustomobject]@{ Kind = 'path'; Target = $script:FswTestTarget; Distributions = @(); Message = '' }
+            return [pscustomobject]@{ Kind = 'path'; Target = $script:FswTestTarget; Distributions = @(); Message = ''; Informational = $false }
         }
     } $resolved
 
@@ -115,6 +115,35 @@ try {
     Assert-Equal -Expected $native -Actual $pushPipeline[1].ProviderPath -Message 'Push-Location pipeline preserves second input order'
     Microsoft.PowerShell.Management\Pop-Location -StackName fsw-pipeline
     Microsoft.PowerShell.Management\Pop-Location -StackName fsw-pipeline
+
+    # #132: 'cd ..' at a distribution share root. Above \\wsl.localhost\Ubuntu
+    # there is only the server name, so the native cmdlet fails with "Cannot
+    # find path '\\wsl.localhost'". The wrapper resolves '/' instead, and the
+    # distribution listing is informational -- $ErrorActionPreference is Stop
+    # here, so a Write-Error would throw and fail this case.
+    & $module {
+        Set-Item -Path function:script:Get-ForwardSlashWindowsDistributionRoot -Value { return 'Ubuntu' }
+        Set-Item -Path function:script:Resolve-ForwardSlashWindowsTarget -Value {
+            param([string]$Path)
+            $script:FswTestParentProbe = $Path
+            return [pscustomobject]@{ Kind = 'root'; Target = ''; Distributions = @('Ubuntu'); Message = ''; Informational = $false }
+        }
+    }
+    Microsoft.PowerShell.Management\Set-Location -LiteralPath $base
+    Invoke-ForwardSlashWindowsSetLocation -Path '..' 6>$null
+    Assert-Location -Expected $base -Message 'cd .. at a distribution root does not move'
+    Assert-Equal -Expected '/' -Actual (& $module { $script:FswTestParentProbe }) `
+        -Message "cd .. at a distribution root resolves '/'"
+
+    Microsoft.PowerShell.Management\Set-Location -LiteralPath $base
+    Invoke-ForwardSlashWindowsPushLocation -Path '..' 6>$null
+    Assert-Location -Expected $base -Message 'pushd .. at a distribution root does not move'
+
+    # Anywhere else '..' must stay native, even with the root mock installed.
+    & $module { Set-Item -Path function:script:Get-ForwardSlashWindowsDistributionRoot -Value { return $null } }
+    Microsoft.PowerShell.Management\Set-Location -LiteralPath $base
+    Invoke-ForwardSlashWindowsSetLocation -Path '..'
+    Assert-Location -Expected $temporaryRoot -Message 'cd .. away from a distribution root stays native'
 } finally {
     Microsoft.PowerShell.Management\Set-Location -Path $originalLocation
     Remove-Module -Name ForwardSlashWindows -Force -ErrorAction SilentlyContinue
