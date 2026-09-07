@@ -25,6 +25,17 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # The Rust toolchain is pinned by rust-toolchain.toml, and this action
+      # takes its version from its own tag, so a bump here is a toolchain
+      # change wearing a CI-maintenance hat. rust-toolchain.toml says why that
+      # is deliberate: the numbers in docs/size-baseline.md are
+      # toolchain-sensitive, and bumping the pin ends with re-measuring that
+      # table on both build hosts. Dependabot cannot know any of that, and its
+      # attempt (PR #131) also broke both Rust jobs outright — the action
+      # resolved to an empty toolchain input and nothing built. Bump the pin
+      # by editing rust-toolchain.toml and this tag together, by hand.
+      - dependency-name: dtolnay/rust-toolchain
 
   # Monthly and grouped, to stay out of the way of tools/update-deps.py.
   - package-ecosystem: cargo
