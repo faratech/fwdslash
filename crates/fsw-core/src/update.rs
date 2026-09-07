@@ -58,6 +58,14 @@ pub const STORE_UPDATE_ATTEMPT_VALUE: &str = "StoreUpdateAttempt";
 /// one — so it writes one of `completed`, `paused` or `error:0x…` here and the
 /// next packaged `update check`/`update status` folds that into the registry.
 pub const UPDATE_RESULT_FILE: &str = "last-result.txt";
+/// The per-attempt ownership token in [`update_directory_path`]. The CLI owns
+/// the protocol around it; this constant is here because the settings window
+/// needs to see whether an attempt is live without depending on the CLI.
+pub const UPDATE_ATTEMPT_LOCK_FILE: &str = "update-attempt.lock";
+/// How long a live attempt's token can be trusted. Every task the updater
+/// registers carries a one-hour `ExecutionTimeLimit` in its XML, so a token
+/// older than that belongs to an attempt the scheduler has already stopped.
+pub const ATTEMPT_LIVE_WINDOW_SECS: u64 = 60 * 60;
 
 /// A security-relevant update verification failure.  The text is deliberately
 /// stable and contains no URL, filesystem path, certificate subject, or raw
@@ -530,6 +538,16 @@ pub fn explain_entries(current: &str, entries: &[Option<String>]) -> String {
     )
 }
 
+/// Whether an attempt token of this age still describes a live install.
+///
+/// `None` is "no token", which is not an attempt. Age is the whole rule: the
+/// scheduler stops every task the updater registers after an hour, so a token
+/// older than that cannot belong to one that is still running.
+#[must_use]
+pub fn attempt_token_is_live(age_secs: Option<u64>) -> bool {
+    age_secs.is_some_and(|age| age < ATTEMPT_LIVE_WINDOW_SECS)
+}
+
 /// How long an unnamed Store offer stays actionable after an install attempt
 /// that did not advance the package version.
 ///
@@ -672,6 +690,28 @@ pub mod windows_impl {
         let pending = set_store_update_pending(false);
         let attempt = crate::delete_setting(STORE_UPDATE_ATTEMPT_VALUE);
         label.and(pending).and(attempt)
+    }
+
+    /// Whether an install attempt currently owns the update.
+    ///
+    /// True while a token is present and young enough to belong to a task the
+    /// scheduler has not stopped. The settings window uses it so that
+    /// reopening during a queued install shows what is happening rather than
+    /// offering to start another one (issue #145). Route-independent on
+    /// purpose: every route takes this token before it starts.
+    #[must_use]
+    pub fn install_attempt_in_flight() -> bool {
+        let Some(path) =
+            update_directory_path().map(|dir| dir.join(super::UPDATE_ATTEMPT_LOCK_FILE))
+        else {
+            return false;
+        };
+        let age = std::fs::metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|elapsed| elapsed.as_secs());
+        super::attempt_token_is_live(age)
     }
 
     /// The offer the persisted state describes, filtered for newness. This is
@@ -1187,10 +1227,10 @@ pub mod windows_impl {
 #[cfg(windows)]
 pub use windows_impl::{
     cached_offer, cached_update_tag, clear_cached_update_tag, clear_update_offer, dismiss_update,
-    last_update_check, note_check_attempt, note_store_update_attempt, pending_bundle_path,
-    read_auto_update_enabled, run_update_check, set_auto_update_enabled, set_cached_update_tag,
-    set_store_update_pending, store_update_attempt, store_update_pending, sweep_update_directory,
-    update_directory_path,
+    install_attempt_in_flight, last_update_check, note_check_attempt, note_store_update_attempt,
+    pending_bundle_path, read_auto_update_enabled, run_update_check, set_auto_update_enabled,
+    set_cached_update_tag, set_store_update_pending, store_update_attempt, store_update_pending,
+    sweep_update_directory, update_directory_path,
 };
 
 // Non-Windows stand-ins for the three entry points other crates call
@@ -1229,6 +1269,13 @@ pub fn last_update_check() -> Option<u64> {
 #[must_use]
 pub fn cached_offer() -> Option<Offer> {
     None
+}
+
+/// No updater off Windows, so no attempt can own one.
+#[cfg(not(windows))]
+#[must_use]
+pub fn install_attempt_in_flight() -> bool {
+    false
 }
 
 /// No Store, so nothing to clear off Windows.

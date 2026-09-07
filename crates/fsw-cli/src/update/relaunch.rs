@@ -137,7 +137,7 @@ impl AttemptLock {
 
         let _decision = AttemptMutex::acquire(directory)?;
         std::fs::create_dir_all(directory).ok()?;
-        let path = directory.join("update-attempt.lock");
+        let path = directory.join(fsw_core::update::UPDATE_ATTEMPT_LOCK_FILE);
         for _ in 0..2 {
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .write(true)
@@ -195,7 +195,7 @@ pub fn reclaim_stale_attempt_lock() -> bool {
     let Some(_decision) = AttemptMutex::acquire(&directory) else {
         return false;
     };
-    let path = directory.join("update-attempt.lock");
+    let path = directory.join(fsw_core::update::UPDATE_ATTEMPT_LOCK_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return false;
     };
