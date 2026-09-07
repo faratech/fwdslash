@@ -112,12 +112,93 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Quotes one argument for a `CommandLineToArgvW` consumer.
+///
+/// The grammar is the documented one: a run of backslashes is doubled only when
+/// it is immediately followed by a quote (either an embedded one, or the closing
+/// quote of the argument); an embedded quote is escaped with a backslash; an
+/// argument that contains no space, tab or quote needs no quoting at all; and an
+/// empty argument must be written `""` or it disappears entirely.
+#[must_use]
+pub fn quote_argument(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".to_string();
+    }
+    if !value.contains([' ', '\t', '"']) {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+            }
+            '"' => {
+                // The run before a quote is doubled, then the quote is escaped:
+                // 2n+1 backslashes before a quote is how CommandLineToArgvW
+                // spells n literal backslashes plus a literal quote.
+                for _ in 0..=(backslashes * 2) {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push('"');
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    // A trailing run precedes the closing quote, so it is doubled too.
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// The `<Arguments>` string for an argv, or `None` for an empty one.
+#[must_use]
+pub fn arguments_string(arguments: &[String]) -> Option<String> {
+    if arguments.is_empty() {
+        return None;
+    }
+    Some(
+        arguments
+            .iter()
+            .map(|argument| quote_argument(argument))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 #[must_use]
 pub fn task_xml(script_path: &str, start_boundary: &str) -> String {
+    task_xml_with_arguments(script_path, None, start_boundary)
+}
+
+/// The same definition, with an optional `<Arguments>` element after
+/// `<Command>`. `None` reproduces [`task_xml`] byte for byte.
+#[must_use]
+pub fn task_xml_with_arguments(
+    command: &str,
+    arguments: Option<&str>,
+    start_boundary: &str,
+) -> String {
+    let arguments = match arguments {
+        Some(arguments) => format!("<Arguments>{}</Arguments>", xml_escape(arguments)),
+        None => String::new(),
+    };
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n  <Triggers><TimeTrigger><StartBoundary>{}</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>\r\n  <Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings>\r\n  <Actions Context=\"Author\"><Exec><Command>{}</Command></Exec></Actions>\r\n</Task>\r\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n  <Triggers><TimeTrigger><StartBoundary>{}</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>\r\n  <Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings>\r\n  <Actions Context=\"Author\"><Exec><Command>{}</Command>{}</Exec></Actions>\r\n</Task>\r\n",
         xml_escape(start_boundary),
-        xml_escape(script_path),
+        xml_escape(command),
+        arguments,
     )
 }
 
@@ -176,10 +257,48 @@ impl OneShotTask {
     }
 }
 
+/// A one-shot task that executes a binary directly, with argv.
+///
+/// Unlike [`OneShotTask`] there is no generated `.cmd`: only the `.xml`
+/// definition is written, and the command line is delivered by `CreateProcess`
+/// rather than parsed by a shell. The name is still gated by
+/// [`is_safe_task_literal`] because it reaches `schtasks /tn` and becomes the
+/// stem of that `.xml`.
+#[cfg(windows)]
+pub struct ExecTask {
+    /// Task name, and the stem of the `.xml` written into `%LOCALAPPDATA%\Temp`.
+    /// Must satisfy [`is_safe_task_literal`].
+    pub name: String,
+    /// The executable to run.
+    pub command: PathBuf,
+    /// Its arguments, one argv element each; quoted by [`quote_argument`].
+    pub arguments: Vec<String>,
+}
+
+#[cfg(windows)]
+impl ExecTask {
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[must_use]
+    pub fn new(name: &str, command: PathBuf, arguments: Vec<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            command,
+            arguments,
+        }
+    }
+}
+
 /// The `.cmd` a task of this name runs, or `None` when `%LOCALAPPDATA%` is
 /// unset or the name is not a safe literal.
 #[cfg(windows)]
 fn script_path(name: &str) -> Option<PathBuf> {
+    task_file_path(name, "cmd")
+}
+
+/// `%LOCALAPPDATA%\Temp\<name>.<extension>`, or `None` when `%LOCALAPPDATA%`
+/// is unset or the name is not a safe literal.
+#[cfg(windows)]
+fn task_file_path(name: &str, extension: &str) -> Option<PathBuf> {
     if !is_safe_task_literal(name) {
         return None;
     }
@@ -187,7 +306,7 @@ fn script_path(name: &str) -> Option<PathBuf> {
     Some(
         PathBuf::from(local_app_data)
             .join("Temp")
-            .join(format!("{name}.cmd")),
+            .join(format!("{name}.{extension}")),
     )
 }
 
@@ -200,13 +319,28 @@ fn script_path(name: &str) -> Option<PathBuf> {
 #[cfg(windows)]
 #[must_use]
 pub fn register_and_run(task: &OneShotTask) -> Option<()> {
+    register(task)?;
+    run_now(&task.name)
+}
+
+/// [`register_and_run`] for an [`ExecTask`].
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+#[must_use]
+pub fn register_and_run_exec(task: &ExecTask) -> Option<()> {
+    register_exec(task, 1)?;
+    run_now(&task.name)
+}
+
+/// Fires an already-registered task, removing it again if the launch failed:
+/// otherwise an unowned task could still run after its caller gave up.
+#[cfg(windows)]
+fn run_now(name: &str) -> Option<()> {
     use std::os::windows::process::CommandExt;
 
-    register(task)?;
-    // Fire it now; the scheduled trigger is only the backstop.
     let schtasks = fsw_core::SystemBinary::Schtasks.path()?;
     let started = Command::new(schtasks)
-        .args(["/run", "/tn", &task.name])
+        .args(["/run", "/tn", name])
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -216,9 +350,7 @@ pub fn register_and_run(task: &OneShotTask) -> Option<()> {
     if started {
         Some(())
     } else {
-        // Keep the one-minute trigger only if the immediate launch succeeded.
-        // Otherwise an unowned updater could run after its caller gave up.
-        let _ = delete_task(&task.name);
+        let _ = delete_task(name);
         None
     }
 }
@@ -241,15 +373,42 @@ pub fn register(task: &OneShotTask) -> Option<()> {
 #[cfg(windows)]
 #[must_use]
 pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
-    use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-
     let script = script_path(&task.name)?;
-    let xml = script.with_extension("xml");
     if let Some(parent) = script.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     std::fs::write(&script, &task.script).ok()?;
+
+    let boundary = boundary_after(delay_minutes)?;
+    let definition = task_xml(&script.display().to_string(), &boundary);
+    create_task(&task.name, &script.with_extension("xml"), &definition)
+}
+
+/// Registers an [`ExecTask`] after a bounded number of minutes. Only the `.xml`
+/// is written — there is no script to generate.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+#[must_use]
+pub fn register_exec(task: &ExecTask, delay_minutes: u16) -> Option<()> {
+    let xml = task_file_path(&task.name, "xml")?;
+    if let Some(parent) = xml.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let boundary = boundary_after(delay_minutes)?;
+    let arguments = arguments_string(&task.arguments);
+    let definition = task_xml_with_arguments(
+        &task.command.display().to_string(),
+        arguments.as_deref(),
+        &boundary,
+    );
+    create_task(&task.name, &xml, &definition)
+}
+
+/// The `StartBoundary` `delay_minutes` out from now, in local time.
+#[cfg(windows)]
+fn boundary_after(delay_minutes: u16) -> Option<String> {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
     // SAFETY: GetLocalTime only writes the SYSTEMTIME it is handed.
     let now = unsafe {
@@ -267,14 +426,22 @@ pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
         let minute = std::str::from_utf8(bytes.get(14..16)?).ok()?.parse().ok()?;
         boundary = task_start_boundary(year, month, day, hour, minute);
     }
-    let definition = task_xml(&script.display().to_string(), &boundary);
+    Some(boundary)
+}
+
+/// Writes `definition` as UTF-16LE with a BOM and hands it to
+/// `schtasks /create /xml`.
+#[cfg(windows)]
+fn create_task(name: &str, xml_path: &std::path::Path, definition: &str) -> Option<()> {
+    use std::os::windows::process::CommandExt;
+
     let mut utf16 = Vec::with_capacity(2 + definition.len() * 2);
     utf16.extend_from_slice(&[0xFF, 0xFE]);
     for unit in definition.encode_utf16() {
         utf16.extend_from_slice(&unit.to_le_bytes());
     }
-    std::fs::write(&xml, utf16).ok()?;
-    let args = task_xml_args(&task.name, &xml.display().to_string());
+    std::fs::write(xml_path, utf16).ok()?;
+    let args = task_xml_args(name, &xml_path.display().to_string());
 
     let schtasks = fsw_core::SystemBinary::Schtasks.path()?;
     let created = Command::new(schtasks)
@@ -332,9 +499,96 @@ pub fn delete_task(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_safe_task_literal, task_args, task_start_boundary, task_start_time, task_xml,
-        task_xml_args,
+        arguments_string, is_safe_task_literal, quote_argument, task_args, task_start_boundary,
+        task_start_time, task_xml, task_xml_args, task_xml_with_arguments,
     };
+
+    /// The exact bytes `OneShotTask` registration has always produced. Pinned so
+    /// the optional `<Arguments>` element cannot perturb the existing shape.
+    const ONE_SHOT_GOLDEN: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n",
+        "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n",
+        "  <Triggers><TimeTrigger><StartBoundary>2027-01-01T00:00:00</StartBoundary><Enabled>true</Enabled></TimeTrigger></Triggers>\r\n",
+        "  <Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n",
+        "  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT1H</ExecutionTimeLimit></Settings>\r\n",
+        "  <Actions Context=\"Author\"><Exec><Command>C:\\Temp\\fwdslash-update.cmd</Command></Exec></Actions>\r\n",
+        "</Task>\r\n",
+    );
+
+    #[test]
+    fn one_shot_xml_is_byte_identical_to_the_golden() {
+        assert_eq!(
+            task_xml(r"C:\Temp\fwdslash-update.cmd", "2027-01-01T00:00:00"),
+            ONE_SHOT_GOLDEN
+        );
+        // The no-arguments form of the new entry point is the same bytes.
+        assert_eq!(
+            task_xml_with_arguments(r"C:\Temp\fwdslash-update.cmd", None, "2027-01-01T00:00:00"),
+            ONE_SHOT_GOLDEN
+        );
+    }
+
+    #[test]
+    fn arguments_element_follows_command_and_is_escaped() {
+        let xml = task_xml_with_arguments(
+            r"C:\Program Files\a\fwdslash-helper.exe",
+            Some(r#"update watchdog --family "a&b""#),
+            "2027-01-01T00:00:00",
+        );
+        assert!(
+            xml.contains("<Command>C:\\Program Files\\a\\fwdslash-helper.exe</Command><Arguments>")
+        );
+        assert!(xml.contains(
+            "<Arguments>update watchdog --family &quot;a&amp;b&quot;</Arguments></Exec>"
+        ));
+        // Same schema, principal and settings as the golden.
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(xml.ends_with("</Task>\r\n"));
+    }
+
+    #[test]
+    fn quote_argument_implements_the_commandlinetoargvw_grammar() {
+        // Nothing to quote.
+        assert_eq!(quote_argument("update"), "update");
+        assert_eq!(quote_argument(r"C:\Temp\a.exe"), r"C:\Temp\a.exe");
+        // Empty must survive as a distinct argv element.
+        assert_eq!(quote_argument(""), "\"\"");
+        // Spaces and tabs force quoting; interior backslashes stay literal.
+        assert_eq!(
+            quote_argument(r"C:\Program Files\a\b.exe"),
+            "\"C:\\Program Files\\a\\b.exe\""
+        );
+        assert_eq!(quote_argument("a\tb"), "\"a\tb\"");
+        // A trailing backslash run precedes the closing quote, so it doubles --
+        // but only when the argument is quoted at all.
+        assert_eq!(
+            quote_argument(r"C:\dir with space\"),
+            "\"C:\\dir with space\\\\\""
+        );
+        assert_eq!(quote_argument(r"C:\dir\"), r"C:\dir\");
+        // An embedded quote is escaped, and the run before it doubles.
+        assert_eq!(quote_argument(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_argument(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quote_argument(r#"a\\"b"#), r#""a\\\\\"b""#);
+        // A bare quote alone.
+        assert_eq!(quote_argument("\""), "\"\\\"\"");
+    }
+
+    #[test]
+    fn arguments_string_joins_quoted_elements() {
+        assert_eq!(arguments_string(&[]), None);
+        assert_eq!(
+            arguments_string(&[
+                "update".to_string(),
+                "watchdog".to_string(),
+                r"C:\Program Files\a".to_string(),
+                String::new(),
+            ]),
+            Some("update watchdog \"C:\\Program Files\\a\" \"\"".to_string())
+        );
+    }
 
     #[test]
     fn safe_literals_are_names_versions_and_families_only() {
@@ -498,5 +752,62 @@ mod tests {
             fixture.marker.is_file(),
             "Task Scheduler did not execute the XML task"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an interactive Task Scheduler; run explicitly after setting the test process compatibility layer"]
+    #[allow(clippy::items_after_statements)]
+    fn exec_registration_runs_a_binary_with_arguments() {
+        use std::time::{Duration, Instant};
+
+        let name = format!("fsw-exec-test-{}", std::process::id());
+        struct Fixture {
+            name: String,
+            marker: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = super::delete_task(&self.name);
+                let _ = std::fs::remove_file(&self.marker);
+            }
+        }
+        let fixture = Fixture {
+            marker: std::env::temp_dir().join(format!("{name}.marker")),
+            name,
+        };
+        let _ = std::fs::remove_file(&fixture.marker);
+
+        // cmd.exe as the executable, with the whole command line delivered as
+        // argv -- no generated script anywhere. The marker path is passed as one
+        // argument, so a space in the profile name is quote_argument's problem
+        // and not the shell's.
+        let Some(cmd) = fsw_core::SystemBinary::Cmd.path() else {
+            return;
+        };
+        let task = super::ExecTask::new(
+            &fixture.name,
+            cmd,
+            vec![
+                "/c".to_string(),
+                format!(
+                    "echo exec-ok>{}",
+                    super::quote_argument(&fixture.marker.display().to_string())
+                ),
+            ],
+        );
+        assert!(super::register_and_run_exec(&task).is_some());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fixture.marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            fixture.marker.is_file(),
+            "Task Scheduler did not execute the ExecTask"
+        );
+        // Only the .xml was written; there is no .cmd sidecar for an ExecTask.
+        if let Some(script) = super::script_path(&fixture.name) {
+            assert!(!script.exists(), "ExecTask wrote a .cmd sidecar");
+        }
     }
 }
