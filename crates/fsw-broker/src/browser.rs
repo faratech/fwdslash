@@ -69,13 +69,6 @@ fn equals(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
-#[allow(dead_code)] // Current TrustedSurface admission owns the class predicate.
-pub fn is_candidate_window_class(class: &str) -> bool {
-    equals(class, "Chrome_WidgetWin_0")
-        || equals(class, "Chrome_WidgetWin_1")
-        || equals(class, "MozillaWindowClass")
-}
-
 pub fn family_for_executable(executable: &str) -> Option<BrowserFamily> {
     match executable.to_ascii_lowercase().as_str() {
         "msedge.exe" | "chrome.exe" | "brave.exe" | "vivaldi.exe" | "opera.exe"
@@ -647,21 +640,12 @@ mod tests {
     use super::{
         BrowserFamily, FocusEligibility, OBSERVED_BRAVE_PROFILE, OBSERVED_CHROMIUM_PROFILE,
         OBSERVED_GECKO_PROFILE, StructuralNode, control_view_chain_is_browser_chrome,
-        family_for_executable, is_candidate_window_class, observed_brave_omnibox_chain,
-        observed_gecko_urlbar_chain, registered_path_matches, transaction_is_allowed,
+        family_for_executable, observed_brave_omnibox_chain, observed_gecko_urlbar_chain,
+        registered_path_matches, transaction_is_allowed,
     };
     use windows::Win32::UI::Accessibility::{
         UIA_ComboBoxControlTypeId, UIA_DocumentControlTypeId, UIA_ToolBarControlTypeId,
     };
-
-    #[test]
-    fn candidates_exclude_web_content_documents_and_generic_edits() {
-        assert!(is_candidate_window_class("Chrome_WidgetWin_1"));
-        assert!(is_candidate_window_class("MozillaWindowClass"));
-        assert!(!is_candidate_window_class("Chrome_RenderWidgetHostHWND"));
-        assert!(!is_candidate_window_class("Document"));
-        assert!(!is_candidate_window_class("Edit"));
-    }
 
     #[test]
     fn family_names_are_candidates_not_provenance() {

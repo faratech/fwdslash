@@ -929,9 +929,19 @@ fn surface_is_current(surface: &TrustedSurface) -> bool {
     current.is_some_and(|current| current == *surface)
 }
 
+/// The window classes a browser's engine window carries.
+///
+/// One list, because there were three and they had drifted (#120 item 11):
+/// this one, an inline wide-char matcher on the discovery path, and a third in
+/// `browser.rs` that also listed `Chrome_WidgetWin_0` and was dead code. A
+/// window class the two live copies disagreed about is a window the product
+/// treats as a browser in one place and not the other.
+const BROWSER_WINDOW_CLASSES: [&str; 2] = ["Chrome_WidgetWin_1", "MozillaWindowClass"];
+
 fn browser_window_class(class: &str) -> bool {
-    class.eq_ignore_ascii_case("Chrome_WidgetWin_1")
-        || class.eq_ignore_ascii_case("MozillaWindowClass")
+    BROWSER_WINDOW_CLASSES
+        .iter()
+        .any(|name| class.eq_ignore_ascii_case(name))
 }
 
 fn address_identity(name: &str, automation_id: &str, accelerator: &str) -> (bool, bool) {
@@ -1177,7 +1187,9 @@ unsafe extern "system" fn browser_discovery_event_proc(
                     .zip(chars)
                     .all(|(e, c)| u8::try_from(*c).is_ok_and(|c| e.eq_ignore_ascii_case(&c)))
         };
-        matches_ci("Chrome_WidgetWin_1") || matches_ci("MozillaWindowClass")
+        // The same list as `browser_window_class`, matched without allocating:
+        // this runs on the discovery path with the raw wide-char buffer.
+        BROWSER_WINDOW_CLASSES.iter().copied().any(matches_ci)
     };
     if !is_browser_engine {
         return;
@@ -3887,7 +3899,17 @@ mod tests {
             super::address_identity("Search this page", "", ""),
             (false, false)
         );
+        // One list, checked here and matched wide-char on the discovery path
+        // (#120 item 11). A third copy in browser.rs listed
+        // `Chrome_WidgetWin_0` as well and was dead; it is gone.
+        assert_eq!(super::BROWSER_WINDOW_CLASSES.len(), 2);
+        assert!(!super::browser_window_class("Chrome_WidgetWin_0"));
         assert!(super::browser_window_class("Chrome_WidgetWin_1"));
+        // Coverage inherited from the deleted browser.rs copy: web content,
+        // documents and generic edits are not engine windows.
+        assert!(!super::browser_window_class("Chrome_RenderWidgetHostHWND"));
+        assert!(!super::browser_window_class("Document"));
+        assert!(!super::browser_window_class("Edit"));
         assert!(super::browser_window_class("MozillaWindowClass"));
         assert!(!super::browser_window_class("WindowsForms10.Window"));
     }
