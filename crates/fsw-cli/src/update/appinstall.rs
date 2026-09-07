@@ -23,21 +23,13 @@
 use super::install_control::{
     AppInstallManager, AppInstallOptions, AppInstallState, AppInstallationToastNotificationMode,
 };
-use super::{EXIT_AVAILABLE, EXIT_ERROR, EXIT_NOTHING, EXIT_OK, HelperResult};
+use super::{
+    EXIT_AVAILABLE, EXIT_ERROR, EXIT_NOTHING, EXIT_OK, HelperResult, Verdict, WaitPolicy, verdict,
+};
 use std::time::{Duration, Instant};
 use windows_core::HSTRING;
 use windows_future::{AsyncStatus, IAsyncOperation};
 
-/// How long the **background** helper waits for the Store to finish before
-/// giving up. The Store's own queue can be slow enough that anything shorter
-/// turns a working install into a reported failure.
-pub const INSTALL_CEILING: Duration = Duration::from_mins(45);
-/// How long the **foreground** phase-1a call watches a queued item before
-/// handing it to the Store and the watchdog. Long enough to catch the fast
-/// refusals (a licence error, a cancelled queue) and the zero-item no-op;
-/// short enough that a settings window or a broker waiting on this process is
-/// never held for the Store's own download schedule (issue #140).
-pub const ADMISSION_WINDOW: Duration = Duration::from_mins(3);
 /// How often the item statuses are re-read. One second is what winget uses.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// The entitlement and the start call are the only two awaits that must not
@@ -87,55 +79,6 @@ fn block_on<T: windows_core::RuntimeType + 'static>(
             )));
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Who is waiting on the poll loop, and therefore how long it may run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitPolicy {
-    /// The packaged CLI, with a settings window or the broker blocked on its
-    /// exit code. Hands the item off as soon as the Store starts moving it,
-    /// and no later than `admission` after it was queued.
-    Foreground { admission: Duration },
-    /// The identity-less helper, from the scheduled task, with nobody waiting.
-    /// Polls to a conclusion or to `ceiling`.
-    Background { ceiling: Duration },
-}
-
-/// What the poll loop does next when every queued item is still working.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// Read the statuses again next tick.
-    Continue,
-    /// Stop waiting and report [`Outcome::Queued`]: the Store has the item.
-    HandOff,
-    /// Stop waiting and report a pause: the ceiling passed with no conclusion.
-    TimedOut,
-}
-
-/// The wait rule, split out so both policies are testable without a Store.
-///
-/// `progressed` is whether any item has ever shown the Store actually working
-/// on it — see [`shows_progress`]. A foreground caller leaves as soon as that
-/// is true, because from that moment the Store may force-close the package at
-/// any time and the caller wants to close its window on its own terms first.
-#[must_use]
-pub fn verdict(policy: WaitPolicy, elapsed: Duration, progressed: bool) -> Verdict {
-    match policy {
-        WaitPolicy::Foreground { admission } => {
-            if progressed || elapsed >= admission {
-                Verdict::HandOff
-            } else {
-                Verdict::Continue
-            }
-        }
-        WaitPolicy::Background { ceiling } => {
-            if elapsed >= ceiling {
-                Verdict::TimedOut
-            } else {
-                Verdict::Continue
-            }
-        }
     }
 }
 

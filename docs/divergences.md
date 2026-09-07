@@ -248,7 +248,7 @@ a rung is only asked about once the rung above is out.
 
 | # | Route | Precondition | Runs in | Terminates the app |
 |---|---|---|---|---|
-| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`), watched for at most `ADMISSION_WINDOW` (3 min) | always attempted first when packaged | the packaged CLI, in-process | yes, by the Store |
+| 1a | `AppInstallManager.StartProductInstallWithOptionsAsync` (winget's own sequence: `AllowForcedAppRestart`, both toast modes `NoToast`), watched for at most `ADMISSION_WINDOW` (3 min) | **never automatically** — only `--route appinstall` or `UpdateRoute=appinstall` (issue #98) | the packaged CLI, in-process | yes, by the Store |
 | 1b | the same call from the staged helper | 1a failed before an item was queued (`E_ACCESSDENIED` above all) | the identity-less helper, from the scheduled task | yes |
 | 2 | `StoreContext` silent download + install | route 1 unavailable and `CanSilentlyDownloadStorePackageUpdates` | the packaged CLI | yes, when deployment lands |
 | 3 | `winget upgrade --id … --source msstore --silent --force` | winget present and the network unmetered | the scheduled task | yes |
@@ -265,6 +265,29 @@ gates before it invokes the CLI at all. Route 1's phase-1a call exists because
 `AppInstallManager` activates and answers queries *inside* the package; whether
 the install itself is allowed there is only knowable at runtime, so it is tried
 and the identity-less path is the fallback, not the default.
+
+**The private API is out of the automatic ladder (issue #98).** Microsoft
+documents `AppInstallManager` as gated by a private capability restricted to
+its own apps, so nothing the product decides on its own may reach it.
+`route_for` no longer takes an `appinstall_available` input at all, and the
+automatic order is Store, then winget, then notify. It stays reachable by
+name, as a hand-set diagnostic escape hatch. Before this its probe was
+`has_package_identity() || helper_path().is_some()` — true on every real
+install — so route 1 was always chosen and the two rungs below it were never
+probed even once.
+
+**The hand-off bound belongs to every route that can block, not just route 1
+(issue #140).** `WaitPolicy`, `Verdict` and `verdict` live in the update module
+root and both Store routes use them. This matters because route 2 carried the
+identical defect: `silent_download_and_install` blocked up to 45 minutes on
+`TrySilentDownloadAndInstallStorePackageUpdatesAsync` from the packaged CLI,
+with the settings window or the broker waiting on it, so promoting route 2 to
+the default without bounding it would have moved the hang rather than fixed it.
+Route 2 has no pollable progress signal — progress on an
+`IAsyncOperationWithProgress` arrives through a handler, and `GetResults` on a
+still-`Started` operation is invalid — so its foreground wait is bounded by the
+admission window alone, and it reports the same `installing` / exit 0 /
+`action: "queued"` on hand-off.
 
 **Route 1 hands off instead of waiting (issue #140).** The packaged CLI is a
 child of the settings window or the broker, so it never polls a queued Store

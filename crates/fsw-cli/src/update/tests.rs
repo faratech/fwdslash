@@ -43,29 +43,49 @@ fn argv(parts: &[&str]) -> Vec<String> {
 
 #[test]
 fn route_for_is_exhaustive_over_the_ladder() {
-    // No override: the ladder in order, over all sixteen input rows.
-    for appinstall in [false, true] {
-        for silent in [false, true] {
-            for winget in [false, true] {
-                for metered in [false, true] {
-                    let expected = if appinstall {
-                        Route::AppInstall
-                    } else if silent {
-                        Route::Store
-                    } else if winget && !metered {
-                        Route::Winget
-                    } else {
-                        Route::Notify
-                    };
-                    assert_eq!(
-                        route_for(None, appinstall, silent, winget, metered),
-                        expected,
-                        "appinstall={appinstall} silent={silent} winget={winget} metered={metered}"
-                    );
-                }
+    // No override: the ladder in order, over all eight input rows.
+    for silent in [false, true] {
+        for winget in [false, true] {
+            for metered in [false, true] {
+                let expected = if silent {
+                    Route::Store
+                } else if winget && !metered {
+                    Route::Winget
+                } else {
+                    Route::Notify
+                };
+                assert_eq!(
+                    route_for(None, silent, winget, metered),
+                    expected,
+                    "silent={silent} winget={winget} metered={metered}"
+                );
             }
         }
     }
+}
+
+#[test]
+fn the_private_api_route_is_never_selected_automatically() {
+    // Issue #98: `AppInstallManager` is documented as gated by a private
+    // capability restricted to Microsoft's own apps, so nothing the product
+    // decides on its own may reach it. It stays available as a hand-set
+    // diagnostic escape hatch, and only that.
+    for silent in [false, true] {
+        for winget in [false, true] {
+            for metered in [false, true] {
+                assert_ne!(
+                    route_for(None, silent, winget, metered),
+                    Route::AppInstall,
+                    "silent={silent} winget={winget} metered={metered}"
+                );
+            }
+        }
+    }
+    // Reachable only by asking for it by name.
+    assert_eq!(
+        route_for(Some(Route::AppInstall), true, true, false),
+        Route::AppInstall
+    );
 }
 
 #[test]
@@ -73,15 +93,14 @@ fn a_metered_network_suppresses_only_winget() {
     // winget downloads regardless of the user's data settings, so it is the
     // one rung the cost probe can veto...
     assert_eq!(
-        route_for(None, false, false, true, true),
+        route_for(None, false, true, true),
         Route::Notify,
         "metered must not reach winget"
     );
-    assert_eq!(route_for(None, false, false, true, false), Route::Winget);
-    // ...and the rungs above it are unaffected, because the Store makes its
+    assert_eq!(route_for(None, false, true, false), Route::Winget);
+    // ...and the rung above it is unaffected, because the Store makes its
     // own metered decision (`CanSilentlyDownloadStorePackageUpdates`).
-    assert_eq!(route_for(None, true, false, false, true), Route::AppInstall);
-    assert_eq!(route_for(None, false, true, false, true), Route::Store);
+    assert_eq!(route_for(None, true, false, true), Route::Store);
 }
 
 #[test]
@@ -95,8 +114,8 @@ fn an_override_wins_over_every_probe() {
         Route::Winget,
         Route::Notify,
     ] {
-        assert_eq!(route_for(Some(route), false, false, false, true), route);
-        assert_eq!(route_for(Some(route), true, true, true, false), route);
+        assert_eq!(route_for(Some(route), false, false, true), route);
+        assert_eq!(route_for(Some(route), true, true, false), route);
     }
 }
 
@@ -160,7 +179,7 @@ fn every_route_reports_nothing_to_install_the_same_way() {
     ] {
         // `route_for` still answers, because picking a rung is a separate
         // question from whether one will ever be walked.
-        assert_eq!(route_for(Some(route), false, false, false, true), route);
+        assert_eq!(route_for(Some(route), false, false, true), route);
         // ...and the precheck that gates it never sees the route.
         assert_eq!(install_precheck(false, true), Precheck::Nothing);
     }
@@ -266,7 +285,7 @@ fn all_fourteen_documented_states_are_classified() {
 
 #[test]
 fn a_foreground_wait_hands_off_on_progress_or_at_the_admission_window() {
-    use super::appinstall::{Verdict, WaitPolicy, verdict};
+    use super::{Verdict, WaitPolicy, verdict};
     use std::time::Duration;
     let policy = WaitPolicy::Foreground {
         admission: Duration::from_secs(180),
@@ -294,7 +313,7 @@ fn a_foreground_wait_hands_off_on_progress_or_at_the_admission_window() {
 
 #[test]
 fn a_background_wait_polls_to_the_ceiling_whatever_the_progress() {
-    use super::appinstall::{Verdict, WaitPolicy, verdict};
+    use super::{Verdict, WaitPolicy, verdict};
     use std::time::Duration;
     let policy = WaitPolicy::Background {
         ceiling: Duration::from_mins(45),

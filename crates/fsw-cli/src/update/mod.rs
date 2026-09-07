@@ -232,26 +232,26 @@ pub fn parse_args(arguments: &[String]) -> Option<Options> {
 /// Which rung to take. Pure, so the ladder is a truth table rather than a
 /// sequence of side effects, and so `--route` is testable without a Store.
 ///
-/// `appinstall_available` means "route 1 is attemptable at all": the packaged
-/// process can try it in-process (phase 1a) *or* the identity-less helper can
-/// be staged for it (phase 1b). `metered` suppresses only winget, because that
-/// is the one rung that downloads without consulting the user's data settings.
-// This pure truth table is intentionally exposed to the update tests with its
-// inputs named after the independently probed capabilities.
-#[allow(clippy::fn_params_excessive_bools)]
+/// **`Route::AppInstall` is deliberately absent from the automatic order**
+/// (issue #98). `AppInstallManager` is documented as gated by a private
+/// capability restricted to Microsoft's own apps, so a third-party updater may
+/// not select it on its own; it stays reachable through `--route appinstall`
+/// and the `UpdateRoute` value as a hand-set diagnostic escape hatch. Before
+/// this, its probe was `has_package_identity() || helper_path().is_some()` —
+/// true on every real install — so it was always chosen and the two rungs
+/// below were never even probed.
+///
+/// `metered` suppresses only winget, because that is the one rung that
+/// downloads without consulting the user's data settings.
 #[must_use]
 pub fn route_for(
     override_route: Option<Route>,
-    appinstall_available: bool,
     can_silently_download: bool,
     winget_available: bool,
     metered: bool,
 ) -> Route {
     if let Some(route) = override_route {
         return route;
-    }
-    if appinstall_available {
-        return Route::AppInstall;
     }
     if can_silently_download {
         return Route::Store;
@@ -272,6 +272,68 @@ pub fn route_for(
 #[must_use]
 pub fn install_moment_ok(forced: bool, settings_window_open: bool, worker_busy: bool) -> bool {
     forced || (!settings_window_open && !worker_busy)
+}
+
+// ---------------------------------------------------------------------------
+// How long an install may be watched
+// ---------------------------------------------------------------------------
+
+/// How long the **foreground** CLI watches a queued Store install before
+/// handing it off. Long enough to catch the fast refusals and the zero-item
+/// no-op; short enough that a settings window or a broker waiting on this
+/// process is never held for the Store's own download schedule (issue #140).
+pub const ADMISSION_WINDOW: std::time::Duration = std::time::Duration::from_mins(3);
+/// How long the **background** helper waits, where nothing is blocked on it.
+pub const INSTALL_CEILING: std::time::Duration = std::time::Duration::from_mins(45);
+
+/// Who is waiting on an install poll, and therefore how long it may run.
+///
+/// This is the whole of issue #140's fix, and it belongs to every route that
+/// can block: the packaged CLI is a child of the settings window or the broker,
+/// so it must never poll a queued item to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitPolicy {
+    /// The packaged CLI, with a caller blocked on its exit code.
+    Foreground { admission: std::time::Duration },
+    /// The identity-less helper, from the scheduled task, with nobody waiting.
+    Background { ceiling: std::time::Duration },
+}
+
+/// What a poll loop does next while work is still in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Read the status again next tick.
+    Continue,
+    /// Stop waiting and report the install as queued: the Store owns it now.
+    HandOff,
+    /// Stop waiting and report a pause: the ceiling passed with no conclusion.
+    TimedOut,
+}
+
+/// The wait rule, pure so both policies are testable without a Store.
+///
+/// `progressed` is whether the install has ever shown the Store actually
+/// working rather than holding it in a queue. A foreground caller leaves as
+/// soon as that is true, because from that moment the Store may force-close
+/// the package and the caller wants to close its own window first.
+#[must_use]
+pub fn verdict(policy: WaitPolicy, elapsed: std::time::Duration, progressed: bool) -> Verdict {
+    match policy {
+        WaitPolicy::Foreground { admission } => {
+            if progressed || elapsed >= admission {
+                Verdict::HandOff
+            } else {
+                Verdict::Continue
+            }
+        }
+        WaitPolicy::Background { ceiling } => {
+            if elapsed >= ceiling {
+                Verdict::TimedOut
+            } else {
+                Verdict::Continue
+            }
+        }
+    }
 }
 
 /// What `install` may act on.
@@ -830,13 +892,11 @@ fn cmd_check(options: &Options) -> i32 {
 fn resolve_route(explicit: Option<Route>) -> (Route, bool) {
     let override_route = explicit.or_else(route_override);
     let probing = override_route.is_none();
-    let appinstall = probing && helper::appinstall_available();
-    let silent = probing && !appinstall && store::can_silently_download();
-    let winget =
-        probing && !appinstall && !silent && fsw_core::SystemBinary::Winget.path().is_some();
+    let silent = probing && store::can_silently_download();
+    let winget = probing && !silent && fsw_core::SystemBinary::Winget.path().is_some();
     let metered = winget && store::network_is_metered();
     (
-        route_for(override_route, appinstall, silent, winget, metered),
+        route_for(override_route, silent, winget, metered),
         override_route.is_some(),
     )
 }
@@ -1086,8 +1146,8 @@ fn install_via_appinstall(
             .emit(options, folded);
     };
 
-    let policy = appinstall::WaitPolicy::Foreground {
-        admission: appinstall::ADMISSION_WINDOW,
+    let policy = WaitPolicy::Foreground {
+        admission: ADMISSION_WINDOW,
     };
     match appinstall::apply_store_update(fsw_core::STORE_PRODUCT_ID, policy) {
         // The Store has the item and the watchdog has the comeback. Nothing
@@ -1165,7 +1225,18 @@ fn install_via_store(
             .emit(options, folded);
     };
 
-    match store::silent_download_and_install() {
+    let policy = WaitPolicy::Foreground {
+        admission: ADMISSION_WINDOW,
+    };
+    match store::silent_download_and_install(policy) {
+        // The Store accepted it and is still working. Nothing waits on this
+        // process any longer; the watchdog owns the comeback.
+        store::Outcome::Queued => Report::new("installing", EXIT_OK)
+            .route(Route::Store)
+            .action("queued")
+            .available(available.map(str::to_owned))
+            .detail("The Store is installing the update in the background.".to_string())
+            .emit(options, folded),
         store::Outcome::Finished { code, detail } => {
             if !store_keeps_watchdog(code) {
                 watchdog.cancel();
@@ -1251,8 +1322,8 @@ fn cmd_apply_store(options: &Options) -> i32 {
         return EXIT_USAGE;
     };
     let _com = ComScope::new();
-    let policy = appinstall::WaitPolicy::Background {
-        ceiling: appinstall::INSTALL_CEILING,
+    let policy = WaitPolicy::Background {
+        ceiling: INSTALL_CEILING,
     };
     match appinstall::apply_store_update(product, policy) {
         appinstall::Outcome::Finished { code, result } => {
