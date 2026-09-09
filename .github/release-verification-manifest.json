@@ -1,0 +1,181 @@
+{
+  "repository": "faratech/fwdslash",
+  "releases": {
+    "v0.0.3": [
+      {
+        "name": "forward-slash-windows-0.0.3-arm64.zip",
+        "sha256": "4999a8ef1369f10579deedc8fa421e5e4bfabdef73d2c32b63028d734e01cb28"
+      },
+      {
+        "name": "forward-slash-windows-0.0.3-x64.zip",
+        "sha256": "f0e2f249faf96d9a14e290b1bfa171972beb719f22ff971135f70fe522704f08"
+      },
+      {
+        "name": "fwdslash-0.0.3.0-arm64.msix",
+        "sha256": "a6b5f0cd32e080e32f8a3df053683de062a186ff8c1db27ae2a73d918df2fd6e"
+      },
+      {
+        "name": "fwdslash-0.0.3.0-x64.msix",
+        "sha256": "d6f26889248b67b930d04558d8df2ffb22a56e5b07ce18f3ac4ea1b48cf82a3f"
+      },
+      {
+        "name": "fwdslash-0.0.3.0.msixbundle",
+        "sha256": "493f2e5da17abb8ab3c981520e84423df415a03be15e15dbcdc7cef43b91ca5c"
+      }
+    ],
+    "v0.0.4": [
+      {
+        "name": "forward-slash-windows-0.0.4-arm64.zip",
+        "sha256": "812ffe45ceceb386b5afa6ed7c61cf495871dd39ac5f698cd0c8c18404333758"
+      },
+      {
+        "name": "forward-slash-windows-0.0.4-x64.zip",
+        "sha256": "7006fd744aff55b88b222faf4638829c876c0382da4818f534579c8d045510f2"
+      },
+      {
+        "name": "fwdslash-0.0.4.0-arm64.msix",
+        "sha256": "ffe413a0cd9f0d30cef2b3e0a46e54f24712de64e252d56262e8196a269beed8"
+      },
+      {
+        "name": "fwdslash-0.0.4.0-x64.msix",
+        "sha256": "667ca86df9b2f3f7c56286d9d140ebeeb719982ebe4d93976e2ec5dd418ad361"
+      },
+      {
+        "name": "fwdslash-0.0.4.0.msixbundle",
+        "sha256": "9de46350fb0878c848450667c9a4377780f2e38155002c228fdda5a949d84f73"
+      }
+    ],
+    "v0.0.5": [
+      {
+        "name": "forward-slash-windows-0.0.5-arm64.zip",
+        "sha256": "378ed939c2045ec48bbfa71510c1c2e11100d8d83103ff6885880dc0f82f4030"
+      },
+      {
+        "name": "forward-slash-windows-0.0.5-x64.zip",
+        "sha256": "1f96337c1f9a74cba4825c0609ea96105486f4d7bec0d007befd3d6fb9005276"
+      },
+      {
+        "name": "fwdslash-0.0.5.0-arm64.msix",
+        "sha256": "d978d4d92f4ad1828a232ef907b7aba2e07ca31666bcf3c6294dc957cf39c257"
+      },
+      {
+        "name": "fwdslash-0.0.5.0-x64.msix",
+        "sha256": "118a7e9854dc2c138b1650582265a8fd6561994ea8ea6a2a3ac46c449863ad5b"
+      },
+      {
+        "name": "fwdslash-0.0.5.0.msixbundle",
+        "sha256": "9a8d3ded99f50f545887452df5bd5457d9c3f0454e367f20278e4dc97909f4cb"
+      }
+    ],
+    "v0.0.6": [
+      {
+        "name": "forward-slash-windows-0.0.6-arm64.zip",
+        "sha256": "6c342c2386a5a6f7775996f4661954036bdbc5e7967bf4cc86eaf449efa2f602"
+      },
+      {
+        "name": "forward-slash-windows-0.0.6-x64.zip",
+        "sha256": "1160c8d569b91e851a7e1cdae3b898aa27a017734d485d6249830b31efbd2011"
+      },
+      {
+        "name": "fwdslash-0.0.6.0-arm64.msix",
+        "sha256": "a792b844566cfb96d04ad55e73a40a38a32111917b9bceb972ce25a7218cff73"
+      },
+      {
+        "name": "fwdslash-0.0.6.0-x64.msix",
+        "sha256": "61e9578984aa99609041a7feca758124c521428deca375295e572e0f35f0cdcd"
+      },
+      {
+        "name": "fwdslash-0.0.6.0.msixbundle",
+        "sha256": "1e0e552f8bf5ed53016a9dda18720d0eeaed30d6952a89f8b73160684e1ba628"
+      }
+    ],
+    "v0.0.8": [
+      {
+        "name": "forward-slash-windows-0.0.8-arm64.zip",
+        "sha256": "6ee1b741812957ccb05c0c8a2fa8ec8efae7430deed4ce308384f9e9d4cc13b2"
+      },
+      {
+        "name": "forward-slash-windows-0.0.8-x64.zip",
+        "sha256": "15af5e66120d9d5edd04879f346b1ec418e0042377c31c579a0d5fdaf6d1caf4"
+      },
+      {
+        "name": "fwdslash-0.0.8.0-arm64.msix",
+        "sha256": "0840373a427f6b2e21a03fd30834f2e1279ea871646314730aadb2ac4d9301ee"
+      },
+      {
+        "name": "fwdslash-0.0.8.0-x64.msix",
+        "sha256": "79c1256bf4c83eed51fc39d59652b172f0286e1c006a432e4cf87f5816469c6b"
+      },
+      {
+        "name": "fwdslash-0.0.8.0.msixbundle",
+        "sha256": "678261290371d29a648a2cbb3eec668019325050f76bea84dec20fadacebf2f9"
+      }
+    ],
+    "v0.0.9": [
+      {
+        "name": "forward-slash-windows-0.0.9-arm64.zip",
+        "sha256": "ede3a4597e4a1f792f858961b291acfa34e65dc17063012c4e6544c82cce9fc0"
+      },
+      {
+        "name": "forward-slash-windows-0.0.9-x64.zip",
+        "sha256": "894076e26302666fbd6077dcae80f164f6af2a1bea734e954584c569adc995ac"
+      },
+      {
+        "name": "fwdslash-0.0.9.0-arm64.msix",
+        "sha256": "36d5036cc01675f47f15b3859388b16d2c72e8515acfb2865ac993340b99a1ed"
+      },
+      {
+        "name": "fwdslash-0.0.9.0-x64.msix",
+        "sha256": "35b64ea4fbf50f104d7254347b43e6b577d4498f89ea24ccda9a16c48d835ab3"
+      },
+      {
+        "name": "fwdslash-0.0.9.0.msixbundle",
+        "sha256": "ed3a010c526f79a138966c52f45af222e4d7508c4a8a2856d3876a35cd79947f"
+      }
+    ],
+    "v0.1.0": [
+      {
+        "name": "forward-slash-windows-0.1.0-arm64.zip",
+        "sha256": "2728873220cf6a7d6e53e9ecc30a75b56905ce607a4251c0306246da8adc2168"
+      },
+      {
+        "name": "forward-slash-windows-0.1.0-x64.zip",
+        "sha256": "d5bc0ddba05ab9dca79428f8b8238299c8429171396ddd0a952100fea0216589"
+      },
+      {
+        "name": "fwdslash-0.1.0.0-arm64.msix",
+        "sha256": "e8144f27f5afc82ca9cdb3ab333c32d64b309ec2db4aeba3d30f69670469c5e0"
+      },
+      {
+        "name": "fwdslash-0.1.0.0-x64.msix",
+        "sha256": "bd8363715756b1390454b8d0bd87c231645e249116a30f8fbc8158215b84b37a"
+      },
+      {
+        "name": "fwdslash-0.1.0.0.msixbundle",
+        "sha256": "1475e9ac26885b9efba4146471a71ffe29321032e47d965c41b10c4411ff02a5"
+      }
+    ],
+    "v0.1.1": [
+      {
+        "name": "forward-slash-windows-0.1.1-arm64.zip",
+        "sha256": "b9ac64d0cdf76fd0c36822b44ae86219fb15bb73ef3bc02b88f1da7274bcb935"
+      },
+      {
+        "name": "forward-slash-windows-0.1.1-x64.zip",
+        "sha256": "9ba3b8f66139df5447814def5a3b24de574b1beaa22695fe6e946c20f2b5de5d"
+      },
+      {
+        "name": "fwdslash-0.1.1.0-arm64.msix",
+        "sha256": "852745e981a96b916303a93e5310952639dc8e1bc1170b8e902e34676ffbcaaa"
+      },
+      {
+        "name": "fwdslash-0.1.1.0-x64.msix",
+        "sha256": "f15a59bc139a5a64d01d86626734400094576a1be47841890d2b1d11166879bb"
+      },
+      {
+        "name": "fwdslash-0.1.1.0.msixbundle",
+        "sha256": "2b664df00ca1fe2f3dc56bd581bb433a207b78251036b19f6b1bd5aecee1508a"
+      }
+    ]
+  }
+}
