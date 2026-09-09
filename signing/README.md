@@ -1,6 +1,6 @@
 # Code signing (Azure Trusted Signing)
 
-`sign.ps1` signs `.exe`/`.msi`/`.msix` artifacts through Azure Trusted Signing
+`sign.ps1` dual-signs EXE/DLL files with Fara Technologies LLC first and Mike Fara second. Other formats retain their single Mike Fara signature through Azure Trusted Signing
 (account `fara-codesigning`, certificate profile `MikeFara`, Public Trust) and
 verifies each signature. `common.ps1` locates signtool and the
 `Azure.CodeSigning` dlib and loads credentials; `install-dlib.ps1` downloads

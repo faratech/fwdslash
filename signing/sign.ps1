@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-  Sign exe/msi/msix files using Azure Trusted Signing (fara-codesigning / MikeFara).
+  Dual-sign EXE/DLL files: Fara Technologies LLC first, Mike Fara second.
+  Other formats retain the existing MikeFara package/script identity.
 
 .DESCRIPTION
   Locates signtool.exe and the Azure.CodeSigning dlib automatically, loads
@@ -73,12 +74,15 @@ process {
         foreach ($file in $resolved) {
             if (Test-Path $file -PathType Container) { continue }
 
+            $dual = [IO.Path]::GetExtension($file.Path) -in '.exe', '.dll'
+            $primaryMetadata = $metadata
+            if ($dual) { $primaryMetadata = Join-Path $PSScriptRoot 'metadata-business.json' }
             $args = @(
                 "sign", "/v",
                 "/fd", "SHA256",
                 "/tr", $SigningTimestampUrl, "/td", "SHA256",
                 "/dlib", $dlib,
-                "/dmdf", $metadata
+                "/dmdf", $primaryMetadata
             )
             if ($Description)    { $args += @("/d", $Description) }
             if ($DescriptionUrl) { $args += @("/du", $DescriptionUrl) }
@@ -91,8 +95,23 @@ process {
                 continue
             }
 
+            if ($dual) {
+                $secondArgs = @('sign', '/v', '/as', '/fd', 'SHA256',
+                    '/tr', $SigningTimestampUrl, '/td', 'SHA256',
+                    '/dlib', $dlib, '/dmdf', $metadata)
+                if ($Description) { $secondArgs += @('/d', $Description) }
+                if ($DescriptionUrl) { $secondArgs += @('/du', $DescriptionUrl) }
+                $secondArgs += $file.Path
+                & $signtool @secondArgs
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "[FAIL] Second signature failed: $($file.Path)"
+                    $failed += $file.Path
+                    continue
+                }
+            }
+
             if (-not $SkipVerify) {
-                & $signtool verify /pa /v $file.Path
+                & $signtool verify /pa /all /v $file.Path
                 if ($LASTEXITCODE -ne 0) {
                     Write-Host "[FAIL] Signature verification failed for $($file.Path)" -ForegroundColor Red
                     $failed += $file.Path

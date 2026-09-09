@@ -126,6 +126,19 @@ jobs:
           $signature = Get-AuthenticodeSignature $module
           Write-Host "$module signature status: $($signature.Status)"
 
+      - name: Dual-sign application executables before packaging
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          foreach ($target in 'aarch64-pc-windows-msvc', 'x86_64-pc-windows-msvc') {
+            foreach ($exe in 'fwdslash.exe', 'fswbroker.exe', 'fswsettings.exe') {
+              .\signing\sign.ps1 -Path "target\$target\release\$exe" -Description 'Forward Slash Windows'
+              if ($LASTEXITCODE -ne 0) { throw "Dual signing failed for $target/$exe" }
+            }
+          }
+
       - name: Package the MSIX bundle (unsigned through makeappx)
         run: |
           .\tools\Package-Msix.ps1 `
