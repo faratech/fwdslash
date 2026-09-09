@@ -1,0 +1,6 @@
+version: 1
+workflows:
+  .github/workflows/build.yml: fast
+  .github/workflows/codeql.yml: deep
+  .github/workflows/release.yml: release
+  .github/workflows/publish-to-store.yml: release

@@ -1,11 +1,14 @@
 name: build
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
+  schedule:
+    - cron: '29 3 * * 1'
 
 permissions:
   contents: read
@@ -16,6 +19,7 @@ concurrency:
 
 jobs:
   powershell-regressions:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -63,6 +67,7 @@ jobs:
   #
   # Formatting and both Windows Clippy targets must remain warning-clean.
   rust:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -155,6 +160,7 @@ jobs:
   # budget is measured against. Sizes are reported, not gated — see
   # docs/size-baseline.md for the recorded size budget.
   rust-windows:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 45
     defaults:
