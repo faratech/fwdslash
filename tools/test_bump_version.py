@@ -191,11 +191,20 @@ class BumpTests(TreeCase):
                 self.assertEqual(self.before[rel], (self.tmp / rel).read_bytes(), rel)
 
     def test_cargo_lock_touches_only_workspace_members(self):
+        lock_path = self.tmp / "Cargo.lock"
+        # A dependency may already have the bump target's version. That does
+        # not mean the bumper rewrote it; compare its original bytes instead.
+        with lock_path.open("a", encoding="utf-8", newline="") as lock_file:
+            lock_file.write(
+                f'\n[[package]]\nname = "fsw-bump-test-external"\nversion = "{NEW}"\n'
+            )
+        before = lock_path.read_text(encoding="utf-8").split("[[package]]")
         code, _out, err = self.bump()
         self.assertEqual(code, 0, err)
-        lock = (self.tmp / "Cargo.lock").read_text(encoding="utf-8")
+        after = lock_path.read_text(encoding="utf-8").split("[[package]]")
+        self.assertEqual(len(before), len(after), "package blocks changed")
         members = set(bv.workspace_members(self.tmp))
-        for block in lock.split("[[package]]"):
+        for original, block in zip(before, after):
             name = re.search(r'^name = "([^"]+)"', block.strip(), re.M)
             version = re.search(r'^version = "([^"]+)"', block.strip(), re.M)
             if not name or not version:
@@ -203,7 +212,7 @@ class BumpTests(TreeCase):
             if name[1] in members:
                 self.assertEqual(version[1], NEW, name[1])
             else:
-                self.assertNotEqual(version[1], NEW, f"{name[1]} was rewritten")
+                self.assertEqual(original, block, f"{name[1]} was rewritten")
 
     def test_check_passes_after_a_bump(self):
         self.assertEqual(self.bump()[0], 0)
