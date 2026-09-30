@@ -124,6 +124,34 @@ pub fn is_fwdslash_autorun_segment(segment: &str) -> bool {
         && lower.contains("fsw-autorun.cmd")
 }
 
+/// Split only separators the installer emits outside quoted or caret-escaped
+/// text. A legal directory name may itself contain ` & `.
+fn autorun_segments(current: &str) -> impl Iterator<Item = &str> {
+    let bytes = current.as_bytes();
+    let mut boundaries = Vec::new();
+    let mut quoted = false;
+    let mut index = 0;
+    let mut start = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'^' && !quoted {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if byte == b'"' {
+            quoted = !quoted;
+        }
+        if !quoted && bytes.get(index..index + 3) == Some(b" & ") {
+            boundaries.push(&current[start..index]);
+            index += 3;
+            start = index;
+            continue;
+        }
+        index += 1;
+    }
+    boundaries.push(&current[start..]);
+    boundaries.into_iter()
+}
+
 /// The observed `AutoRun` with every fwdslash hook segment removed, so the true
 /// third-party value is recovered even when a prior install's marker was lost
 /// but its `call "…fsw-autorun.cmd"` hook persisted (exactly the MSIX-uninstall
@@ -135,8 +163,7 @@ pub fn strip_fwdslash_autorun(current: &str) -> String {
     if current.is_empty() {
         return String::new();
     }
-    let kept: Vec<&str> = current
-        .split(" & ")
+    let kept: Vec<&str> = autorun_segments(current)
         .filter(|segment| !is_fwdslash_autorun_segment(segment))
         .collect();
     kept.join(" & ")
@@ -146,7 +173,7 @@ pub fn strip_fwdslash_autorun(current: &str) -> String {
 /// classifier `fwdslash doctor` and the self-clean probe use.
 #[must_use]
 pub fn autorun_references_fwdslash(current: &str) -> bool {
-    current.split(" & ").any(is_fwdslash_autorun_segment)
+    autorun_segments(current).any(is_fwdslash_autorun_segment)
 }
 
 /// The quoted path out of the first fwdslash hook segment, so its existence can
@@ -154,9 +181,7 @@ pub fn autorun_references_fwdslash(current: &str) -> bool {
 /// value carries no fwdslash hook or the segment is not quoted.
 #[must_use]
 pub fn fwdslash_autorun_path(current: &str) -> Option<String> {
-    let segment = current
-        .split(" & ")
-        .find(|segment| is_fwdslash_autorun_segment(segment))?;
+    let segment = autorun_segments(current).find(|segment| is_fwdslash_autorun_segment(segment))?;
     let open = segment.find('"')?;
     let rest = segment.get(open + 1..)?;
     let close = rest.find('"')?;

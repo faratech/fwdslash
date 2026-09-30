@@ -1,11 +1,12 @@
 #pragma once
 
 #define FSW_FILTER_PORT_NAME L"\\FswFilterPort"
-#define FSW_PROTOCOL_VERSION 3u
+#define FSW_PROTOCOL_VERSION 4u
 #define FSW_MAX_DISTRIBUTIONS 32u
 #define FSW_MAX_DISTRIBUTION_NAME 128u
+#define FSW_MAX_VOLUME_NAME 128u
 
-/* Mappings are exposed only below C:\\fwdslash\\<distribution>. */
+/* Mappings are exposed only below fwdslash on the explicitly bound C: volume. */
 #define FSW_NAMESPACE_ROOT L"fwdslash"
 
 typedef enum _FSW_MESSAGE_OPERATION {
@@ -36,5 +37,8 @@ typedef struct _FSW_MAPPING_MESSAGE {
   ULONG Reserved;
   ULONGLONG Generation;
   ULONG DistributionCount;
+  /* Native \\Device\\volume name, NUL-terminated within this array. Required
+   * for ReplaceMappings; Ping and ClearMappings may leave it empty. */
+  WCHAR VolumeName[FSW_MAX_VOLUME_NAME];
   WCHAR Distributions[FSW_MAX_DISTRIBUTIONS][FSW_MAX_DISTRIBUTION_NAME];
 } FSW_MAPPING_MESSAGE, *PFSW_MAPPING_MESSAGE;

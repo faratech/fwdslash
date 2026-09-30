@@ -1,6 +1,9 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use fsw_path::{BareSlashMode, Context, TargetBase, TargetKind, resolve_user_target};
+use fsw_path::{
+    BareSlashMode, Context, ResolveError, TargetBase, TargetError, TargetKind, TargetRejection,
+    resolve_user_target,
+};
 
 fn target(input: &str) -> fsw_path::UserTarget {
     resolve_user_target::<[&str]>(input, None, None, None)
@@ -167,4 +170,95 @@ fn relative_targets_require_explicit_base_namespace() {
         Some("/home/user/child.txt")
     );
     assert!(linux.to_wsl_path("Debian").is_none());
+}
+
+#[test]
+fn explicit_wsl_base_ignores_default_distribution_and_custom_root() {
+    let distributions = ["Ubuntu", "Debian"];
+    for mode in [
+        BareSlashMode::DistributionList,
+        BareSlashMode::DefaultDistribution,
+    ] {
+        let context = Context {
+            registry: &distributions[..],
+            mode,
+            preferred: Some("Debian"),
+            wsl_default: Some("Debian"),
+        };
+        for root in [None, Some(r"C:\code"), Some(r"\\server\share")] {
+            let resolved = resolve_user_target(
+                "../documents/child.txt",
+                Some(&context),
+                root,
+                Some(TargetBase::WslDistribution {
+                    distribution: "Ubuntu",
+                    linux_path: "/home/user",
+                }),
+            )
+            .unwrap();
+            assert_eq!(resolved.kind(), TargetKind::WslDistribution);
+            assert_eq!(
+                resolved.native_path(),
+                r"\\wsl.localhost\Ubuntu\home\documents\child.txt"
+            );
+            assert_eq!(
+                resolved.to_wsl_path("Ubuntu").as_deref(),
+                Some("/home/documents/child.txt")
+            );
+            assert!(resolved.to_wsl_path("Debian").is_none());
+        }
+    }
+}
+
+#[test]
+fn explicit_wsl_base_is_not_a_mounted_drive_alias() {
+    let distributions = ["mnt"];
+    let context = Context::list_mode(&distributions[..]);
+    let resolved = resolve_user_target(
+        "child.txt",
+        Some(&context),
+        None,
+        Some(TargetBase::WslDistribution {
+            distribution: "mnt",
+            linux_path: "/c",
+        }),
+    )
+    .unwrap();
+    assert_eq!(resolved.kind(), TargetKind::WslDistribution);
+    assert_eq!(resolved.native_path(), r"\\wsl.localhost\mnt\c\child.txt");
+}
+
+#[test]
+fn explicit_wsl_base_still_validates_registration_and_traversal() {
+    let distributions = ["Ubuntu"];
+    let context = Context::list_mode(&distributions[..]);
+    let resolve = |distribution, linux_path, input| {
+        resolve_user_target(
+            input,
+            Some(&context),
+            Some(r"C:\code"),
+            Some(TargetBase::WslDistribution {
+                distribution,
+                linux_path,
+            }),
+        )
+    };
+    assert_eq!(
+        resolve("Debian", "/home", "child.txt"),
+        Err(TargetError::Rejected(TargetRejection::SlashPath(
+            ResolveError::UnregisteredDistribution
+        )))
+    );
+    assert_eq!(
+        resolve("Ubuntu", "/", "../child.txt"),
+        Err(TargetError::Rejected(TargetRejection::SlashPath(
+            ResolveError::TraversalAboveRoot
+        )))
+    );
+    for distribution in ["", "Ubuntu/other", "Ubuntu\\other"] {
+        assert_eq!(
+            resolve(distribution, "/home", "child.txt"),
+            Err(TargetError::Rejected(TargetRejection::InvalidPath))
+        );
+    }
 }

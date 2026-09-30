@@ -122,7 +122,14 @@ interactive process opens drive-root path
 ```
 
 The broker connects to the Filter Manager port and publishes a complete,
-versioned distro mapping. The driver derives SID and session identity from the
+versioned distro mapping. Protocol v4 also carries the bounded native volume
+name returned by `QueryDosDeviceW("C:")`. The broker checks that `C:\fwdslash`
+does not exist, verifies that C: still names that volume after the check, and
+includes the volume in publication deduplication. The driver compares each
+request's parsed volume with the owning mapping before routing: a matching
+`D:\fwdslash\<distribution>` on a different volume keeps its native behavior.
+An unresolved/redirected C: device name or an occupied namespace closes the
+port and clears its mappings. The driver derives SID and session identity from the
 connection token; the client cannot claim another identity. Up to 16
 interactive sessions have isolated mappings. Disconnecting the owning broker
 atomically clears its slot.
@@ -135,7 +142,9 @@ allocation and name-query failure is fail-open.
 
 - User-mode integration runs as one broker per interactive desktop.
 - Shell interception accepts only known Windows navigation surfaces or classic
-  dialog windows and revalidates focus before acting.
+  dialog windows and revalidates focus, the captured text, and the hook's key
+  generation before navigation, value writes, and key replay. A successful
+  write must still contain the translated value before Enter is replayed.
 - The optional driver covers standard/elevated interactive users but excludes
   services, SYSTEM/session zero, AppContainers, and low integrity.
 - User-mode pause/uninstall always removes the hook without Explorer injection

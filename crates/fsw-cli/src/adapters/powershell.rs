@@ -15,7 +15,7 @@
 //! `PowerShell\<version>` directories stay put until an explicit
 //! `fwdslash integration <id> enable` migrates the block that names them.
 
-use super::{AdapterError, Edition, profile, reg, state};
+use super::{AdapterError, Edition, profile, reg, state, transaction::ProfileSnapshot};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Installs the adapter for `edition`. `controller` is the running
 /// `fwdslash.exe`.
 pub fn install(edition: Edition, controller: &Path) -> Result<(), AdapterError> {
+    recover_install_transaction(edition)?;
     if !controller.is_file() {
         return Err(AdapterError::new(&format!(
             "fwdslash.exe was not found: {}",
@@ -55,11 +56,15 @@ pub fn install(edition: Edition, controller: &Path) -> Result<(), AdapterError> 
     // A prior blocked/interrupted removal must be resumable from enable too.
     // Uninstall retains its marker and recovery files if it still cannot
     // modify the profile; never force the marker away to bypass that failure.
-    if read_marker_state(&marker_key(edition)).as_deref() == Some("removing") {
+    recover_unmarked_state(edition)?;
+    if matches!(
+        read_marker_state(&marker_key(edition)).as_deref(),
+        Some("prepared" | "removing")
+    ) {
         uninstall(edition)?;
     }
     // Already installed: the scripts reported it and exited 0.
-    let Some(mut transaction) = begin_install(edition)? else {
+    let Some(mut transaction) = begin_install(edition, false)? else {
         println!(
             "The {} adapter is already installed.",
             edition.display_name()
@@ -67,7 +72,11 @@ pub fn install(edition: Edition, controller: &Path) -> Result<(), AdapterError> 
         return Ok(());
     };
     if let Err(error) = commit_install(&mut transaction) {
-        transaction.undo();
+        if let Err(rollback) = transaction.undo() {
+            return Err(AdapterError::new(&format!(
+                "{error} Recovery remains pending: {rollback}"
+            )));
+        }
         return Err(error);
     }
     println!(
@@ -128,6 +137,7 @@ impl PayloadSwap {
     /// these bytes. Skipping matters: the two editions share one directory, so
     /// enabling the second must not rename a payload the first is loading.
     fn ensure(&mut self, controller: &Path) -> Result<(), AdapterError> {
+        recover_payload_swap()?;
         let module_source =
             super::payload_source_dir("powershell")?.join("ForwardSlashWindows.psm1");
         if payload_matches(&self.root, &module_source, controller) {
@@ -139,6 +149,16 @@ impl PayloadSwap {
         super::real_make_dir(&self.staging)?;
         super::real_copy_file(&module_source, &self.staging)?;
         super::real_copy_file(controller, &self.staging)?;
+        let transaction_id = self
+            .staging
+            .to_string_lossy()
+            .rsplit_once(".staging-")
+            .map(|(_, id)| id.to_owned())
+            .ok_or_else(|| AdapterError::new("invalid payload transaction path"))?;
+        super::write_atomic(
+            &install_root()?.join("payload.transaction"),
+            transaction_id.as_bytes(),
+        )?;
         if self.root.exists() {
             std::fs::rename(&self.root, &self.rollback)?;
             self.renamed = true;
@@ -149,40 +169,182 @@ impl PayloadSwap {
     }
 
     /// Drops the renamed-aside copy once the transaction has committed.
-    fn finish(&mut self) {
-        if self.renamed {
-            let _ = std::fs::remove_dir_all(&self.rollback);
+    fn finish(&mut self) -> Result<(), AdapterError> {
+        if self.renamed && self.rollback.exists() {
+            std::fs::remove_dir_all(&self.rollback)?;
             self.renamed = false;
         }
+        let root = self
+            .root
+            .parent()
+            .ok_or_else(|| AdapterError::new("invalid payload root"))?;
+        if self.owns_journal(root)? {
+            std::fs::remove_file(root.join("payload.transaction"))?;
+        }
+        Ok(())
     }
 
-    fn undo(&mut self) {
+    fn owns_journal(&self, root: &Path) -> Result<bool, AdapterError> {
+        let id = self
+            .staging
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit_once(".staging-").map(|(_, id)| id))
+            .ok_or_else(|| AdapterError::new("invalid payload transaction name"))?;
+        let active = match std::fs::read_to_string(root.join("payload.transaction")) {
+            Ok(active) => active,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(active.strip_prefix("committed\n").unwrap_or(&active) == id)
+    }
+
+    fn commit(&self) -> Result<(), AdapterError> {
+        if !self.deployed {
+            return Ok(());
+        }
+        if !self.owns_journal(&install_root()?)? {
+            return Err(AdapterError::new(
+                "The payload transaction lost its ownership record; recovery files were preserved.",
+            ));
+        }
+        let id = self
+            .staging
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit_once(".staging-").map(|(_, id)| id))
+            .ok_or_else(|| AdapterError::new("invalid payload transaction name"))?;
+        super::write_atomic(
+            &install_root()?.join("payload.transaction"),
+            format!("committed\n{id}").as_bytes(),
+        )
+    }
+
+    fn undo(&mut self) -> Result<(), AdapterError> {
         if self.deployed {
-            let _ = std::fs::remove_dir_all(&self.root);
+            std::fs::remove_dir_all(&self.root)?;
             self.deployed = false;
         }
         if self.renamed {
-            let _ = std::fs::rename(&self.rollback, &self.root);
+            std::fs::rename(&self.rollback, &self.root)?;
             self.renamed = false;
         }
         let _ = std::fs::remove_dir_all(&self.staging);
+        let root = install_root()?;
+        if self.owns_journal(&root)? {
+            let _ = std::fs::remove_file(root.join("payload.transaction"));
+        }
+        Ok(())
     }
 }
 
-/// Whether the deployed payload already is this build's: both files present and
-/// the same size as their sources. Size is what `real_copy_file` already checks
-/// for a truncated deploy, and it separates one release's exe from another's.
-fn payload_matches(root: &Path, module_source: &Path, controller: &Path) -> bool {
-    let same_size = |deployed: &Path, source: &Path| match (
-        std::fs::metadata(deployed),
-        std::fs::metadata(source),
-    ) {
-        (Ok(left), Ok(right)) => left.len() == right.len(),
-        _ => false,
+/// Concrete ownership for the one shared payload rename, independent of the
+/// edition marker (which may not yet exist on a first install).
+pub fn active_payload_paths() -> Result<Vec<PathBuf>, AdapterError> {
+    active_payload_paths_at(&install_root()?)
+}
+
+pub fn recover_all(user_initiated: bool) -> Result<(), AdapterError> {
+    for edition in [Edition::WindowsPowerShell, Edition::PowerShell] {
+        recover_install_transaction_policy(edition, user_initiated)?;
+    }
+    recover_payload_swap()
+}
+
+fn payload_swap_is_owned(root: &Path, recovery: &Path) -> Result<bool, AdapterError> {
+    let expected = match std::fs::read_to_string(recovery.join("payload.transaction-id")) {
+        Ok(id) => id,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
     };
+    let active = match std::fs::read_to_string(root.join("payload.transaction")) {
+        Ok(id) => id,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(active.strip_prefix("committed\n").unwrap_or(&active) == expected)
+}
+
+fn complete_owned_payload_swap(root: &Path, recovery: &Path) -> Result<(), AdapterError> {
+    if !payload_swap_is_owned(root, recovery)? {
+        return Ok(());
+    }
+    for path in active_payload_paths_at(root)? {
+        if path.exists() {
+            std::fs::remove_dir_all(path)?;
+        }
+    }
+    std::fs::remove_file(root.join("payload.transaction"))?;
+    Ok(())
+}
+
+fn active_payload_paths_at(root: &Path) -> Result<Vec<PathBuf>, AdapterError> {
+    let id = match std::fs::read_to_string(root.join("payload.transaction")) {
+        Ok(id) => id,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let id = id.strip_prefix("committed\n").unwrap_or(&id);
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return Err(AdapterError::new(
+            "The shared PowerShell payload transaction is invalid; all recovery files were preserved.",
+        ));
+    }
+    Ok(vec![
+        root.join(format!("payload.staging-{id}")),
+        root.join(format!("payload.removing-{id}")),
+    ])
+}
+
+pub fn has_recovery_state() -> bool {
+    install_root()
+        .is_ok_and(|root| root.join("state").is_dir() || root.join("payload.transaction").exists())
+}
+
+fn recover_payload_swap() -> Result<(), AdapterError> {
+    recover_payload_swap_at(&install_root()?)
+}
+
+fn recover_payload_swap_at(install_root: &Path) -> Result<(), AdapterError> {
+    let paths = active_payload_paths_at(install_root)?;
+    let [staging, rollback] = paths.as_slice() else {
+        return Ok(());
+    };
+    let root = install_root.join(PAYLOAD_DIR_NAME);
+    let committed = std::fs::read_to_string(install_root.join("payload.transaction"))?
+        .starts_with("committed\n");
+    if rollback.is_dir() && !committed {
+        if root.exists() {
+            std::fs::remove_dir_all(&root)?;
+        }
+        std::fs::rename(rollback, &root)?;
+    }
+    if committed && rollback.exists() {
+        std::fs::remove_dir_all(rollback)?;
+    }
+    if staging.exists() {
+        std::fs::remove_dir_all(staging)?;
+    }
+    std::fs::remove_file(install_root.join("payload.transaction"))?;
+    Ok(())
+}
+
+/// Whether the deployed payload already is this build's: both files present and
+/// byte-identical to their sources. PE alignment often gives different builds
+/// the same file length, so length alone cannot establish this.
+fn payload_matches(root: &Path, module_source: &Path, controller: &Path) -> bool {
+    let same_bytes =
+        |deployed: &Path, source: &Path| match (std::fs::read(deployed), std::fs::read(source)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        };
     root.is_dir()
-        && same_size(&root.join("ForwardSlashWindows.psm1"), module_source)
-        && same_size(&root.join("fwdslash.exe"), controller)
+        && same_bytes(&root.join("ForwardSlashWindows.psm1"), module_source)
+        && same_bytes(&root.join("fwdslash.exe"), controller)
 }
 
 // These flags independently record rollback milestones in the original script.
@@ -199,10 +361,19 @@ struct InstallTransaction {
     original_bytes: Vec<u8>,
     block_bytes: Vec<u8>,
     profile_changed: bool,
+    original_snapshot: ProfileSnapshot,
+    installed_snapshot: Option<ProfileSnapshot>,
+    previous_marker: Option<MarkerValues>,
+    state_rollback: PathBuf,
+    state_renamed: bool,
+    state_journal: PathBuf,
 }
 
 /// `None` = already installed (friendly no-op).
-fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, AdapterError> {
+fn begin_install(
+    edition: Edition,
+    replacing: bool,
+) -> Result<Option<InstallTransaction>, AdapterError> {
     let marker_key = marker_key(edition);
     let marker_state = read_marker_state(&marker_key);
     match state::decide_ps_install(
@@ -210,6 +381,7 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
         marker_state.map_or(state::MarkerState::Unknown, |text| state::classify(&text)),
     ) {
         state::InstallDecision::Proceed => {}
+        state::InstallDecision::AlreadyInstalled if replacing => {}
         state::InstallDecision::AlreadyInstalled => return Ok(None),
         state::InstallDecision::RecoverRequired => {
             return Err(AdapterError::new(&format!(
@@ -225,16 +397,13 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
     let install_root = install_root()?;
     let transaction_id = super::new_transaction_id();
 
-    let original_present = profile_path.is_file();
-    let original_bytes = if original_present {
-        std::fs::read(&profile_path)?
-    } else {
-        Vec::new()
-    };
+    let original_snapshot = ProfileSnapshot::read(&profile_path)?;
+    let original_present = original_snapshot.bytes.is_some();
+    let original_bytes = original_snapshot.bytes.clone().unwrap_or_default();
 
     Ok(Some(InstallTransaction {
         edition,
-        transaction_id,
+        transaction_id: transaction_id.clone(),
         payload: PayloadSwap::new()?,
         state_root: install_root.join("state").join(edition.folder_name()),
         state_staging: PathBuf::from(format!(
@@ -243,7 +412,7 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
                 .join("state")
                 .join(edition.folder_name())
                 .display(),
-            super::new_transaction_id()
+            transaction_id
         )),
         state_deployed: false,
         profile_path,
@@ -251,7 +420,125 @@ fn begin_install(edition: Edition) -> Result<Option<InstallTransaction>, Adapter
         original_bytes,
         block_bytes: Vec::new(),
         profile_changed: false,
+        original_snapshot,
+        installed_snapshot: None,
+        previous_marker: read_marker(&marker_key),
+        state_rollback: install_root.join("state").join(format!(
+            "{}.removing-{transaction_id}",
+            edition.folder_name()
+        )),
+        state_renamed: false,
+        state_journal: install_root
+            .join("state")
+            .join(format!("{}.transaction", edition.folder_name())),
     }))
+}
+
+fn stage_profile_recovery(
+    transaction: &mut InstallTransaction,
+) -> Result<(Vec<u8>, bool), AdapterError> {
+    // The *true* original is the profile with every prior fwdslash block
+    // stripped: installing over a profile a previous version (or a duplicate
+    // enable) already touched must not append a second block or preserve a
+    // stale one, and uninstall must be able to restore the genuine pre-fwdslash
+    // profile (#37). The raw bytes stay on the transaction for exact rollback.
+    let previous_block = transaction
+        .previous_marker
+        .as_ref()
+        .and_then(|marker| std::fs::read(marker.state_directory.join("profile.block")).ok());
+    let original_without_recorded = previous_block
+        .as_deref()
+        .and_then(|block| profile::remove_block(&transaction.original_bytes, block))
+        .unwrap_or_else(|| transaction.original_bytes.clone());
+    let true_original = profile::strip_fwdslash_blocks(&original_without_recorded);
+    let true_original_present = profile::original_profile_present(
+        transaction.original_present,
+        &transaction.original_bytes,
+        &true_original,
+    ) || (transaction.original_present
+        && transaction
+            .previous_marker
+            .as_ref()
+            .is_some_and(|marker| marker.original_present));
+
+    // State directory with the recovery files, staged then renamed.
+    if let Some(parent) = transaction.state_root.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(&transaction.state_staging)?;
+    let payload_id = transaction
+        .payload
+        .staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once(".staging-").map(|(_, id)| id))
+        .ok_or_else(|| AdapterError::new("invalid payload staging name"))?;
+    std::fs::write(
+        transaction.state_staging.join("payload.transaction-id"),
+        payload_id,
+    )?;
+    std::fs::write(
+        transaction.state_staging.join("profile.original"),
+        &true_original,
+    )?;
+    std::fs::write(
+        transaction.state_staging.join("profile.before"),
+        &transaction.original_bytes,
+    )?;
+    std::fs::write(
+        transaction.state_staging.join("profile.path"),
+        transaction.profile_path.to_string_lossy().as_bytes(),
+    )?;
+    std::fs::write(
+        transaction.state_staging.join("profile.before-present"),
+        if transaction.original_present {
+            b"1"
+        } else {
+            b"0"
+        },
+    )?;
+    std::fs::write(
+        transaction.state_staging.join("profile.original-present"),
+        if true_original_present { b"1" } else { b"0" },
+    )?;
+    let block = block_for(true_original_present)?;
+    let encoding = profile::detect_encoding(&true_original);
+    transaction.block_bytes = profile::encode(&block, encoding);
+    std::fs::write(
+        transaction.state_staging.join("profile.block"),
+        &transaction.block_bytes,
+    )?;
+    let mut installed_bytes = true_original;
+    installed_bytes.extend_from_slice(&transaction.block_bytes);
+    std::fs::write(
+        transaction.state_staging.join("profile.installed"),
+        &installed_bytes,
+    )?;
+    if let Some(previous) = &transaction.previous_marker {
+        std::fs::write(
+            transaction.state_staging.join("marker.previous-version"),
+            &previous.version,
+        )?;
+        std::fs::write(
+            transaction.state_staging.join("marker.previous-probe"),
+            &previous.product_probe,
+        )?;
+        std::fs::write(
+            transaction
+                .state_staging
+                .join("marker.previous-original-present"),
+            if previous.original_present {
+                b"1"
+            } else {
+                b"0"
+            },
+        )?;
+    }
+    super::write_atomic(
+        &transaction.state_journal,
+        transaction.transaction_id.as_bytes(),
+    )?;
+    Ok((installed_bytes, true_original_present))
 }
 
 fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterError> {
@@ -267,37 +554,10 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     // allowed to land in this process's virtualized view.
     transaction.payload.ensure(&running)?;
 
-    // The *true* original is the profile with every prior fwdslash block
-    // stripped: installing over a profile a previous version (or a duplicate
-    // enable) already touched must not append a second block or preserve a
-    // stale one, and uninstall must be able to restore the genuine pre-fwdslash
-    // profile (#37). The raw bytes stay on the transaction for exact rollback.
-    let true_original = profile::strip_fwdslash_blocks(&transaction.original_bytes);
-    let true_original_present = !true_original.is_empty();
-
-    // State directory with the recovery files, staged then renamed.
-    if let Some(parent) = transaction.state_root.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::create_dir(&transaction.state_staging)?;
-    std::fs::write(
-        transaction.state_staging.join("profile.original"),
-        &true_original,
-    )?;
+    let (installed_bytes, true_original_present) = stage_profile_recovery(transaction)?;
     let probe_path = super::product_probe_path(&running);
-    let block = block_for(true_original_present)?;
-    let encoding = profile::detect_encoding(&true_original);
-    transaction.block_bytes = profile::encode(&block, encoding);
-    std::fs::write(
-        transaction.state_staging.join("profile.block"),
-        &transaction.block_bytes,
-    )?;
-    std::fs::rename(&transaction.state_staging, &transaction.state_root)?;
-    transaction.state_deployed = true;
-
     // Marker (prepared) with the recovery locations.
     let key = marker_key(edition);
-    reg::set_string(&key, "State", "prepared")?;
     reg::set_string(&key, "Version", super::PAYLOAD_VERSION)?;
     reg::set_string(&key, "TransactionId", &transaction.transaction_id)?;
     reg::set_string(
@@ -308,34 +568,80 @@ fn commit_install(transaction: &mut InstallTransaction) -> Result<(), AdapterErr
     reg::set_string(
         &key,
         "StateDirectory",
-        &transaction.state_root.display().to_string(),
+        &transaction.state_staging.display().to_string(),
     )?;
     reg::set_string(&key, "ProductProbe", &probe_path.display().to_string())?;
-    // OriginalPresent tracks whether there is *genuine* content to restore, so
-    // a profile that was purely our own block(s) is deleted on removal, not
-    // left as an empty file.
+    // OriginalPresent also preserves an existing empty file. A profile that
+    // consisted solely of orphaned blocks has no genuine original to restore.
     reg::set_dword(&key, "OriginalPresent", u32::from(true_original_present))?;
+    reg::set_string(&key, "State", "prepared")?;
+    if transaction.state_root.exists() {
+        reg::set_string(
+            &key,
+            "PreviousStateDirectory",
+            &transaction.state_rollback.display().to_string(),
+        )?;
+        std::fs::rename(&transaction.state_root, &transaction.state_rollback)?;
+        transaction.state_renamed = true;
+    }
+    std::fs::rename(&transaction.state_staging, &transaction.state_root)?;
+    transaction.state_deployed = true;
+    reg::set_string(
+        &key,
+        "StateDirectory",
+        &transaction.state_root.display().to_string(),
+    )?;
 
     // Installed profile = true original + one current guarded block. A write
     // that would not change a byte is skipped outright: `Documents` is a
     // Controlled Folder Access target and there is nothing to gain by touching
     // it (#127).
-    let mut installed_bytes = true_original;
-    installed_bytes.extend_from_slice(&transaction.block_bytes);
     if installed_bytes != transaction.original_bytes || !transaction.original_present {
-        super::write_atomic(&transaction.profile_path, &installed_bytes).map_err(|error| {
-            super::explain_file_error(
-                &error,
-                "The PowerShell profile update",
-                &transaction.profile_path,
-            )
-        })?;
         transaction.profile_changed = true;
+        transaction.installed_snapshot = Some(
+            transaction
+                .original_snapshot
+                .replace(&transaction.profile_path, Some(&installed_bytes))
+                .map_err(|error| {
+                    super::explain_file_error(
+                        &error,
+                        "The PowerShell profile update",
+                        &transaction.profile_path,
+                    )
+                })?,
+        );
     }
 
     reg::set_string(&key, "State", "installed")?;
     verify_aliases(edition)?;
-    transaction.payload.finish();
+    super::write_atomic(
+        &transaction.state_journal,
+        format!("committed\n{}", transaction.transaction_id).as_bytes(),
+    )?;
+    // The install is committed. Obsolete files may still be locked: retain
+    // committed ownership for retry rather than failing or undoing the install.
+    let _ = finish_install_cleanup(transaction);
+    Ok(())
+}
+
+fn finish_install_cleanup(transaction: &mut InstallTransaction) -> Result<(), AdapterError> {
+    let key = marker_key(transaction.edition);
+    finish_install_cleanup_with(transaction, || {
+        reg::delete_value(&key, "PreviousStateDirectory")
+    })
+}
+
+fn finish_install_cleanup_with(
+    transaction: &mut InstallTransaction,
+    mut cleanup_marker: impl FnMut() -> Result<(), AdapterError>,
+) -> Result<(), AdapterError> {
+    transaction.payload.finish()?;
+    if transaction.state_renamed && transaction.state_rollback.exists() {
+        std::fs::remove_dir_all(&transaction.state_rollback)?;
+        transaction.state_renamed = false;
+    }
+    cleanup_marker()?;
+    std::fs::remove_file(&transaction.state_journal)?;
     Ok(())
 }
 
@@ -357,28 +663,45 @@ fn block_for(original_non_empty: bool) -> Result<String, AdapterError> {
 
 impl InstallTransaction {
     /// The script's catch block, in the same order.
-    fn undo(&mut self) {
+    fn undo(&mut self) -> Result<(), AdapterError> {
+        // A caught error and a later process restart use the same recovery.
+        // Snapshots survive until registry restoration also lands.
+        if self.state_journal.exists() {
+            return recover_install_transaction(self.edition);
+        }
         if self.profile_changed {
-            if self.original_present {
-                let _ = std::fs::write(&self.profile_path, &self.original_bytes);
-            } else {
-                let _ = std::fs::remove_file(&self.profile_path);
-            }
+            let Some(installed) = &self.installed_snapshot else {
+                return Err(AdapterError::new(
+                    "The profile write did not complete; the original profile and recovery files were retained.",
+                ));
+            };
+            installed.replace(&self.profile_path, self.original_snapshot.bytes.as_deref())?;
         }
         let key = marker_key(self.edition);
-        let _ = reg::delete_tree(&key);
         if self.state_deployed {
-            let _ = std::fs::remove_dir_all(&self.state_root);
+            std::fs::remove_dir_all(&self.state_root)?;
+        }
+        if self.state_renamed {
+            std::fs::rename(&self.state_rollback, &self.state_root)?;
+        }
+        if let Some(previous) = &self.previous_marker {
+            restore_ps_marker(&key, previous)?;
+        } else if read_marker_checked(&key)?.is_some() {
+            reg::delete_tree(&key)?;
         }
         let _ = std::fs::remove_dir_all(&self.state_staging);
-        self.payload.undo();
+        self.payload.undo()?;
+        let _ = std::fs::remove_file(&self.state_journal);
+        Ok(())
     }
 }
 
 /// Removes the adapter for `edition`, restoring the guarded profile.
 pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
+    recover_install_transaction(edition)?;
+    recover_unmarked_state(edition)?;
     let key = marker_key(edition);
-    let Some(values) = read_marker(&key) else {
+    let Some(values) = read_marker_checked(&key)? else {
         println!("The {} adapter is not installed.", edition.display_name());
         return Ok(());
     };
@@ -397,7 +720,7 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
 
     // Recovery files are mandatory: without them the profile cannot be
     // restored exactly, so refuse rather than guess.
-    let state_root = PathBuf::from(&values.state_directory);
+    let state_root = recovery_state_root(edition, &values)?;
     let original_file = state_root.join("profile.original");
     let block_file = state_root.join("profile.block");
     if !original_file.is_file() || !block_file.is_file() {
@@ -409,22 +732,45 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
     reg::set_string(&key, "State", "removing")?;
 
     let profile_removal = (|| -> Result<(), AdapterError> {
-        if !values.profile_path.try_exists()? {
+        let snapshot = ProfileSnapshot::read(&values.profile_path)?;
+        let Some(current) = snapshot.bytes.as_deref() else {
+            return Ok(());
+        };
+        if marker_state == state::MarkerState::Prepared
+            && state_root.join("profile.before").is_file()
+        {
+            let before = std::fs::read(state_root.join("profile.before"))?;
+            let installed =
+                std::fs::read(state_root.join("profile.installed")).unwrap_or_else(|_| {
+                    let mut bytes = std::fs::read(&original_file).unwrap_or_default();
+                    bytes.extend_from_slice(&block_bytes);
+                    bytes
+                });
+            if current == before {
+                return Ok(());
+            }
+            if current != installed {
+                return Err(AdapterError::new(
+                    "The profile differs from the interrupted installation. Your edits and recovery files were preserved.",
+                ));
+            }
+            let existed = std::fs::read(state_root.join("profile.before-present"))? == b"1";
+            snapshot.replace(&values.profile_path, existed.then_some(before.as_slice()))?;
             return Ok(());
         }
-        let current = std::fs::read(&values.profile_path)?;
         // Fast path: excise the exact block we recorded. Belt and braces: then
         // strip every remaining fwdslash fence (an older version, a duplicate,
         // an externally edited block) so what survives is the genuine
         // pre-fwdslash profile (#37). Stripping only ever removes our own
         // fenced regions, never third-party content, so the old
         // "changed externally" refusal is no longer needed to protect it.
-        let remaining = profile::remove_block(&current, &block_bytes).unwrap_or(current);
+        let remaining =
+            profile::remove_block(current, &block_bytes).unwrap_or_else(|| current.to_vec());
         let cleaned = profile::strip_fwdslash_blocks(&remaining);
         if profile::should_delete_profile(cleaned.len(), values.original_present) {
-            std::fs::remove_file(&values.profile_path)?;
-        } else {
-            super::write_atomic(&values.profile_path, &cleaned)?;
+            snapshot.replace(&values.profile_path, None)?;
+        } else if cleaned != current {
+            snapshot.replace(&values.profile_path, Some(&cleaned))?;
         }
         Ok(())
     })();
@@ -450,26 +796,21 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
         std::fs::remove_dir_all(&state_root)?;
     }
 
+    cleanup_removed_payload(edition, &values)
+}
+
+fn cleanup_removed_payload(edition: Edition, values: &MarkerValues) -> Result<(), AdapterError> {
     // The shared payload goes away with this edition unless the other edition
     // still has a marker. Both the version-free `payload` directory and any
     // legacy `PowerShell\<version>` directory this install deployed are
     // considered: an upgrade removes the directory it actually created.
-    let deployed_version = marker_version(&values);
+    let root = install_root()?;
     let other_marker = marker_key(state::other_edition(edition));
-    let other = read_marker(&other_marker);
-    let other_version = other.as_ref().map(marker_version).map(str::to_owned);
-    if state::remove_shared_module(other_version.as_deref(), deployed_version) {
-        let module_root = install_root()?.join(deployed_version);
-        if module_root.exists() {
-            std::fs::remove_dir_all(&module_root)?;
-        }
-    }
-    if other.is_none() {
-        let payload_root = install_root()?.join(PAYLOAD_DIR_NAME);
-        if payload_root.exists() {
-            std::fs::remove_dir_all(&payload_root)?;
-        }
-    }
+    cleanup_shared_payload_at(
+        &root,
+        marker_version(values),
+        read_marker_checked(&other_marker),
+    )?;
     // Belt and braces: a version directory no marker names must never survive
     // an uninstall or an upgrade.
     prune_orphaned_module_dirs();
@@ -480,8 +821,253 @@ pub fn uninstall(edition: Edition) -> Result<(), AdapterError> {
     Ok(())
 }
 
+fn cleanup_shared_payload_at(
+    root: &Path,
+    deployed_version: &str,
+    other: Result<Option<MarkerValues>, AdapterError>,
+) -> Result<(), AdapterError> {
+    let other = other?;
+    let other_version = other.as_ref().map(marker_version).map(str::to_owned);
+    if state::remove_shared_module(other_version.as_deref(), deployed_version) {
+        let module_root = root.join(deployed_version);
+        if module_root.exists() {
+            std::fs::remove_dir_all(&module_root)?;
+        }
+    }
+    if other.is_none() {
+        let payload_root = root.join(PAYLOAD_DIR_NAME);
+        if payload_root.exists() {
+            std::fs::remove_dir_all(&payload_root)?;
+        }
+    }
+    Ok(())
+}
+
 fn marker_key(edition: Edition) -> String {
     format!("{MARKER_ROOT}\\{}", edition.registry_leaf())
+}
+
+fn recovery_state_root(edition: Edition, values: &MarkerValues) -> Result<PathBuf, AdapterError> {
+    let canonical = install_root()?.join("state").join(edition.folder_name());
+    let recorded = &values.state_directory;
+    let owned = recorded == &canonical
+        || (recorded.parent() == canonical.parent()
+            && recorded.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(&format!("{}.staging-", edition.folder_name()))
+            }));
+    if !owned {
+        return Err(AdapterError::new(
+            "The PowerShell recovery directory is not adapter-owned; no files were changed.",
+        ));
+    }
+    if recorded.is_dir() {
+        return Ok(recorded.clone());
+    }
+    // A crash between publishing the state directory and updating its marker
+    // leaves the recorded staging name absent and the complete final name live.
+    Ok(canonical)
+}
+
+#[allow(clippy::type_complexity)]
+fn state_transaction_paths(
+    root: &Path,
+    edition: Edition,
+) -> Result<Option<(bool, PathBuf, PathBuf, PathBuf)>, AdapterError> {
+    let state = root.join("state");
+    let journal = state.join(format!("{}.transaction", edition.folder_name()));
+    let text = match std::fs::read_to_string(&journal) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let (committed, id) = text
+        .strip_prefix("committed\n")
+        .or_else(|| text.strip_prefix("rolled-back\n"))
+        .map_or((false, text.as_str()), |id| (true, id));
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return Err(AdapterError::new(
+            "The PowerShell transaction record is invalid; recovery data was preserved.",
+        ));
+    }
+    Ok(Some((
+        committed,
+        state.join(format!("{}.staging-{id}", edition.folder_name())),
+        state.join(format!("{}.removing-{id}", edition.folder_name())),
+        journal,
+    )))
+}
+
+fn recover_install_transaction(edition: Edition) -> Result<(), AdapterError> {
+    recover_install_transaction_policy(edition, true)
+}
+
+fn recover_install_transaction_policy(
+    edition: Edition,
+    user_initiated: bool,
+) -> Result<(), AdapterError> {
+    let root = install_root()?;
+    let Some((_, staging, _, _)) = state_transaction_paths(&root, edition)? else {
+        return Ok(());
+    };
+    let path = {
+        let recovery = if staging.is_dir() {
+            staging
+        } else {
+            root.join("state").join(edition.folder_name())
+        };
+        std::fs::read_to_string(recovery.join("profile.path"))
+            .ok()
+            .map(PathBuf::from)
+    };
+    let path = match path {
+        Some(path) => path,
+        None => super::documents_dir()?
+            .join(edition.folder_name())
+            .join("profile.ps1"),
+    };
+    recover_install_transaction_at_policy(&root, edition, &path, user_initiated, |previous| {
+        let key = marker_key(edition);
+        if let Some(previous) = previous {
+            restore_ps_marker(&key, &previous)
+        } else if read_marker_checked(&key)?.is_some() {
+            reg::delete_tree(&key)
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(test)]
+fn recover_install_transaction_at(
+    root: &Path,
+    edition: Edition,
+    path: &Path,
+    restore_marker: impl FnMut(Option<MarkerValues>) -> Result<(), AdapterError>,
+) -> Result<(), AdapterError> {
+    recover_install_transaction_at_policy(root, edition, path, true, restore_marker)
+}
+
+fn recover_install_transaction_at_policy(
+    root: &Path,
+    edition: Edition,
+    path: &Path,
+    user_initiated: bool,
+    mut restore_marker: impl FnMut(Option<MarkerValues>) -> Result<(), AdapterError>,
+) -> Result<(), AdapterError> {
+    let Some((committed, staging, rollback, journal)) = state_transaction_paths(root, edition)?
+    else {
+        return Ok(());
+    };
+    let canonical = root.join("state").join(edition.folder_name());
+    if committed {
+        complete_owned_payload_swap(root, &canonical)?;
+        if rollback.exists() {
+            std::fs::remove_dir_all(&rollback)?;
+        }
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::remove_file(journal)?;
+        return Ok(());
+    }
+    let published = !staging.is_dir();
+    let recovery = if published { &canonical } else { &staging };
+    let before = std::fs::read(recovery.join("profile.before"))?;
+    let before_present = std::fs::read(recovery.join("profile.before-present"))? == b"1";
+    let installed = std::fs::read(recovery.join("profile.installed"))?;
+    let snapshot = ProfileSnapshot::read(path)?;
+    if snapshot.bytes.as_deref() != before_present.then_some(before.as_slice()) {
+        if snapshot.bytes.as_deref() != Some(installed.as_slice()) {
+            return Err(AdapterError::new(
+                "The profile changed during an interrupted transaction. Your edits and recovery files were preserved.",
+            ));
+        }
+        if !user_initiated {
+            return Err(AdapterError::needs_confirmation(&format!(
+                "The interrupted {} integration needs to restore your PowerShell profile. Run \"fwdslash integration {} enable\" to finish recovery. Your profile and recovery files were preserved.",
+                edition.display_name(),
+                edition.cli_id()
+            )));
+        }
+        snapshot.replace(path, before_present.then_some(before.as_slice()))?;
+    }
+    let previous = match std::fs::read_to_string(recovery.join("marker.previous-version")) {
+        Ok(version) => Some(MarkerValues {
+            state: "installed".to_owned(),
+            version,
+            profile_path: path.to_path_buf(),
+            state_directory: canonical.clone(),
+            original_present: std::fs::read(recovery.join("marker.previous-original-present"))?
+                == b"1",
+            product_probe: std::fs::read_to_string(recovery.join("marker.previous-probe"))?,
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if published {
+        std::fs::rename(&canonical, &staging)?;
+    }
+    if rollback.exists() {
+        std::fs::rename(&rollback, &canonical)?;
+    }
+    restore_marker(previous)?;
+    if payload_swap_is_owned(root, &staging)? {
+        recover_payload_swap_at(root)?;
+    }
+    let id = journal
+        .file_name()
+        .and_then(|_| staging.file_name())
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once(".staging-").map(|(_, id)| id))
+        .ok_or_else(|| AdapterError::new("invalid recovery transaction path"))?;
+    super::write_atomic(&journal, format!("rolled-back\n{id}").as_bytes())?;
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    std::fs::remove_file(journal)?;
+    Ok(())
+}
+
+/// Adopt the concrete snapshots left by older installs that published their
+/// edition directory before creating the marker. Never discard that directory
+/// merely because another edition already keeps the shared tree installed.
+fn recover_unmarked_state(edition: Edition) -> Result<(), AdapterError> {
+    let key = marker_key(edition);
+    if read_marker_checked(&key)?.is_some() {
+        return Ok(());
+    }
+    let state_root = install_root()?.join("state").join(edition.folder_name());
+    if !state_root.exists() {
+        return Ok(());
+    }
+    let original = std::fs::read(state_root.join("profile.original")).map_err(|_| AdapterError::new("An unmarked PowerShell recovery directory exists but its snapshots are incomplete; it was preserved."))?;
+    let block = std::fs::read(state_root.join("profile.block"))?;
+    if !state_root.join("profile.before").is_file() {
+        std::fs::write(state_root.join("profile.before"), &original)?;
+        // Older orphan snapshots cannot prove an empty file was absent. Keep
+        // it, rather than deleting an existing empty original again (#66).
+        std::fs::write(state_root.join("profile.before-present"), b"1")?;
+    }
+    if !state_root.join("profile.installed").is_file() {
+        let mut installed = original.clone();
+        installed.extend_from_slice(&block);
+        std::fs::write(state_root.join("profile.installed"), installed)?;
+    }
+    let profile_path = super::documents_dir()?
+        .join(edition.folder_name())
+        .join("profile.ps1");
+    reg::set_string(&key, "ProfilePath", &profile_path.display().to_string())?;
+    reg::set_string(&key, "StateDirectory", &state_root.display().to_string())?;
+    let original_present = std::fs::read(state_root.join("profile.original-present"))
+        .map_or(true, |bytes| bytes == b"1");
+    reg::set_dword(&key, "OriginalPresent", u32::from(original_present))?;
+    reg::set_string(&key, "Version", super::PAYLOAD_VERSION)?;
+    reg::set_string(&key, "State", "prepared")
 }
 
 /// The payload version a marker deployed. Markers written before the `Version`
@@ -617,20 +1203,44 @@ pub fn prune_orphaned_module_dirs() {
 }
 
 fn read_marker(key: &str) -> Option<MarkerValues> {
+    read_marker_checked(key).ok().flatten()
+}
+
+fn read_marker_checked(key: &str) -> Result<Option<MarkerValues>, AdapterError> {
     use windows_registry::CURRENT_USER;
 
     // An absent marker key means "not installed" — not an error.
-    let Ok(key) = CURRENT_USER.open(key) else {
-        return None;
+    let key = match CURRENT_USER.open(key) {
+        Ok(key) => key,
+        Err(error) if error.code().0.cast_unsigned() == 0x8007_0002 => return Ok(None),
+        Err(error) => return Err(super::registry_error(error)),
     };
-    Some(MarkerValues {
+    Ok(Some(MarkerValues {
         state: key.get_string("State").unwrap_or_default(),
         version: key.get_string("Version").unwrap_or_default(),
         profile_path: PathBuf::from(key.get_string("ProfilePath").unwrap_or_default()),
         state_directory: PathBuf::from(key.get_string("StateDirectory").unwrap_or_default()),
         original_present: key.get_u32("OriginalPresent").unwrap_or(0) != 0,
         product_probe: key.get_string("ProductProbe").unwrap_or_default(),
-    })
+    }))
+}
+
+fn restore_ps_marker(key: &str, values: &MarkerValues) -> Result<(), AdapterError> {
+    reg::set_string(key, "Version", &values.version)?;
+    reg::set_string(
+        key,
+        "ProfilePath",
+        &values.profile_path.display().to_string(),
+    )?;
+    reg::set_string(
+        key,
+        "StateDirectory",
+        &values.state_directory.display().to_string(),
+    )?;
+    reg::set_dword(key, "OriginalPresent", u32::from(values.original_present))?;
+    reg::set_string(key, "ProductProbe", &values.product_probe)?;
+    reg::delete_value(key, "PreviousStateDirectory")?;
+    reg::set_string(key, "State", &values.state)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -778,7 +1388,7 @@ pub fn repair(
         profile::ProfileAction::Nothing | profile::ProfileAction::NeedsConfirmation => {}
         profile::ProfileAction::RemoveBlocks => remove_blocks_from_profile(&inspection)?,
         // Both "write one current block" and "reinstall" mean the adapter
-        // should be installed: the transactional uninstall+install strips the
+        // should be installed: one replacement transaction strips the
         // true original, redeploys the module when it is missing, writes
         // exactly one current guarded block and refreshes the marker/state.
         profile::ProfileAction::WriteCurrentBlock | profile::ProfileAction::Reinstall => {
@@ -794,27 +1404,32 @@ fn remove_blocks_from_profile(inspection: &Inspection) -> Result<(), AdapterErro
     if !inspection.profile_exists {
         return Ok(());
     }
-    let current = std::fs::read(&inspection.profile_path)?;
-    let cleaned = profile::strip_fwdslash_blocks(&current);
+    let snapshot = ProfileSnapshot::read(&inspection.profile_path)?;
+    let current = snapshot.bytes.as_deref().unwrap_or_default();
+    let cleaned = profile::strip_fwdslash_blocks(current);
     if cleaned == current {
         return Ok(());
     }
     if cleaned.is_empty() {
-        std::fs::remove_file(&inspection.profile_path).map_err(|error| {
-            super::explain_file_error(
-                &AdapterError::from(error),
-                "The PowerShell profile update",
-                &inspection.profile_path,
-            )
-        })?;
+        snapshot
+            .replace(&inspection.profile_path, None)
+            .map_err(|error| {
+                super::explain_file_error(
+                    &error,
+                    "The PowerShell profile update",
+                    &inspection.profile_path,
+                )
+            })?;
     } else {
-        super::write_atomic(&inspection.profile_path, &cleaned).map_err(|error| {
-            super::explain_file_error(
-                &error,
-                "The PowerShell profile update",
-                &inspection.profile_path,
-            )
-        })?;
+        snapshot
+            .replace(&inspection.profile_path, Some(&cleaned))
+            .map_err(|error| {
+                super::explain_file_error(
+                    &error,
+                    "The PowerShell profile update",
+                    &inspection.profile_path,
+                )
+            })?;
     }
     Ok(())
 }
@@ -843,8 +1458,9 @@ pub fn upgrade(
     controller: &Path,
     user_initiated: bool,
 ) -> Result<UpgradeOutcome, AdapterError> {
+    recover_install_transaction_policy(edition, user_initiated)?;
     let key = marker_key(edition);
-    let Some(values) = read_marker(&key) else {
+    let Some(values) = read_marker_checked(&key)? else {
         // No marker to upgrade from: a plain install is the whole job.
         return install(edition, controller).map(|()| UpgradeOutcome::Upgraded);
     };
@@ -873,10 +1489,13 @@ pub fn upgrade(
     // written, so Controlled Folder Access is never consulted.
     let mut payload = PayloadSwap::new()?;
     if let Err(error) = payload.ensure(controller) {
-        payload.undo();
+        if let Err(rollback) = payload.undo() {
+            return Err(AdapterError::new(&format!(
+                "{error} Recovery remains pending: {rollback}"
+            )));
+        }
         return Err(error);
     }
-    payload.finish();
 
     // Keep the recovery copy of the block in step so uninstall still excises
     // exactly what is deployed. It lives in %LOCALAPPDATA%, not Documents.
@@ -884,12 +1503,16 @@ pub fn upgrade(
         std::fs::write(values.state_directory.join("profile.block"), &desired)?;
     }
     let running = std::env::current_exe().unwrap_or_else(|_| controller.to_path_buf());
+    // Promote before publishing the version. Restart cleanup must retain the
+    // new bytes even if metadata succeeds but the process dies before finish.
+    payload.commit()?;
     reg::set_string(&key, "Version", super::PAYLOAD_VERSION)?;
     reg::set_string(
         &key,
         "ProductProbe",
         &super::product_probe_path(&running).display().to_string(),
     )?;
+    let _ = payload.finish();
     println!(
         "The {} adapter payload is now on {}. Your PowerShell profile was not modified.",
         edition.display_name(),
@@ -899,7 +1522,7 @@ pub fn upgrade(
 }
 
 /// The one remaining `Documents` write: rewrites a legacy versioned block to
-/// the stable form, through the ordinary transactional uninstall+install so the
+/// the stable form, through a single recoverable replacement transaction so the
 /// byte-exact snapshot and restore guarantees are unchanged. Only ever called
 /// for an explicit user action (#127).
 pub fn migrate(edition: Edition, controller: &Path) -> Result<(), AdapterError> {
@@ -909,8 +1532,24 @@ pub fn migrate(edition: Edition, controller: &Path) -> Result<(), AdapterError> 
 /// Reinstall only after successful removal. A blocked removal must retain its
 /// marker and recovery files rather than orphaning the still-active profile.
 fn reinstall(edition: Edition, controller: &Path) -> Result<(), AdapterError> {
-    uninstall(edition)?;
-    install(edition, controller)
+    if let Some(error) = execution_policy_refusal(edition) {
+        return Err(error);
+    }
+    if !controller.is_file() {
+        return Err(AdapterError::new("fwdslash.exe was not found."));
+    }
+    let Some(mut transaction) = begin_install(edition, true)? else {
+        return Ok(());
+    };
+    if let Err(error) = commit_install(&mut transaction) {
+        if let Err(rollback) = transaction.undo() {
+            return Err(AdapterError::new(&format!(
+                "{error} Recovery remains pending: {rollback}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// The executable that *is* `edition`, for both the alias verification and the
@@ -1007,17 +1646,10 @@ fn verify_aliases(edition: Edition) -> Result<(), AdapterError> {
     };
 
     let encoded = profile::base64_utf16le(profile::VERIFY_SCRIPT);
-    let mut child = Command::new(&shell)
-        .args(["-NoLogo", "-NonInteractive", "-EncodedCommand", &encoded])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            AdapterError::new(&format!(
-                "verification shell could not be started ({error})."
-            ))
-        })?;
+    let mut child = spawn_verification_shell(
+        &shell,
+        &["-NoLogo", "-NonInteractive", "-EncodedCommand", &encoded],
+    )?;
 
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     while deadline > Instant::now() {
@@ -1026,12 +1658,6 @@ fn verify_aliases(edition: Edition) -> Result<(), AdapterError> {
                 if status.success() {
                     return Ok(());
                 }
-                // Exit 42 is the script's own catch block: the profile threw
-                // rather than loading the wrong aliases. A blocking execution
-                // policy is the usual cause and the generic message says
-                // nothing useful about it, so re-ask the shell and explain
-                // (#45). The preflight normally gets here first; this covers a
-                // policy that changed mid-install or differs by scope.
                 if status.code() == Some(42)
                     && let Some(block) = execution_policy_verdict(edition)
                         .as_ref()
@@ -1047,6 +1673,7 @@ fn verify_aliases(edition: Edition) -> Result<(), AdapterError> {
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(error) => {
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(AdapterError::new(&format!(
                     "verification shell failed ({error})."
                 )));
@@ -1059,6 +1686,24 @@ fn verify_aliases(edition: Edition) -> Result<(), AdapterError> {
         "{} profile verification timed out. The installation was rolled back.",
         edition.display_name()
     )))
+}
+
+fn spawn_verification_shell(
+    shell: &str,
+    arguments: &[&str],
+) -> Result<std::process::Child, AdapterError> {
+    Command::new(shell)
+        .args(arguments)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            AdapterError::new(&format!(
+                "verification shell could not be started ({error})."
+            ))
+        })
 }
 
 fn search_path(file: &str) -> Option<String> {
@@ -1075,4 +1720,477 @@ fn search_path(file: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod regression_tests {
+    use super::*;
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fsw-adapter-regression-{}",
+                super::super::new_transaction_id()
+            ));
+            std::fs::create_dir(&path).expect("fixture");
+            Self(path)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn equal_length_payload_changes_are_deployed_and_identical_bytes_are_skipped() {
+        let fixture = Fixture::new();
+        let root = fixture.0.join("payload");
+        std::fs::create_dir(&root).expect("payload");
+        let module = fixture.0.join("ForwardSlashWindows.psm1");
+        let controller = fixture.0.join("fwdslash.exe");
+        std::fs::write(&module, b"module new").expect("module source");
+        std::fs::write(&controller, b"binary new").expect("binary source");
+        std::fs::write(root.join("ForwardSlashWindows.psm1"), b"module old").expect("old module");
+        std::fs::write(root.join("fwdslash.exe"), b"binary old").expect("old binary");
+        assert!(!payload_matches(&root, &module, &controller));
+        std::fs::copy(&module, root.join("ForwardSlashWindows.psm1")).expect("module upgrade");
+        assert!(!payload_matches(&root, &module, &controller));
+        std::fs::copy(&controller, root.join("fwdslash.exe")).expect("binary upgrade");
+        assert!(payload_matches(&root, &module, &controller));
+    }
+
+    fn pending_fixture(root: &Path, published: bool, replaced_profile: bool) -> PathBuf {
+        let edition = Edition::PowerShell;
+        let state = root.join("state");
+        let staging = state.join(format!("{}.staging-ab-cd", edition.folder_name()));
+        let canonical = state.join(edition.folder_name());
+        let rollback = state.join(format!("{}.removing-ab-cd", edition.folder_name()));
+        std::fs::create_dir_all(&staging).expect("state staging");
+        for (name, bytes) in [
+            ("profile.before", b"user original".as_slice()),
+            ("profile.before-present", b"1"),
+            ("profile.installed", b"user original + new block"),
+            ("marker.previous-version", b"0.0.9"),
+            ("marker.previous-probe", b"old probe"),
+            ("marker.previous-original-present", b"1"),
+        ] {
+            std::fs::write(staging.join(name), bytes).expect("snapshot");
+        }
+        std::fs::write(
+            state.join(format!("{}.transaction", edition.folder_name())),
+            b"ab-cd",
+        )
+        .expect("journal");
+        std::fs::create_dir_all(&canonical).expect("previous state");
+        std::fs::write(canonical.join("profile.original"), b"old recovery")
+            .expect("previous snapshot");
+        if published {
+            std::fs::rename(&canonical, &rollback).expect("old state rename");
+            std::fs::rename(&staging, &canonical).expect("new state publish");
+        }
+        let profile = root.join("profile.ps1");
+        std::fs::write(
+            &profile,
+            if replaced_profile {
+                b"user original + new block".as_slice()
+            } else {
+                b"user original"
+            },
+        )
+        .expect("profile");
+        profile
+    }
+
+    #[test]
+    fn interrupted_install_recovers_before_and_after_state_publication_and_profile_write() {
+        for (published, replaced) in [(false, false), (true, false), (true, true)] {
+            let fixture = Fixture::new();
+            let profile = pending_fixture(&fixture.0, published, replaced);
+            let mut restored = false;
+            recover_install_transaction_at(&fixture.0, Edition::PowerShell, &profile, |previous| {
+                let previous = previous.expect("previous marker");
+                assert_eq!(previous.version, "0.0.9");
+                assert_eq!(previous.state, "installed");
+                restored = true;
+                Ok(())
+            })
+            .expect("recover");
+            assert!(restored);
+            assert_eq!(std::fs::read(&profile).expect("profile"), b"user original");
+            assert_eq!(
+                std::fs::read(fixture.0.join("state/PowerShell/profile.original"))
+                    .expect("old recovery"),
+                b"old recovery"
+            );
+            assert!(!fixture.0.join("state/PowerShell.transaction").exists());
+        }
+    }
+
+    #[test]
+    fn failed_marker_restoration_keeps_snapshots_for_a_second_recovery_attempt() {
+        let fixture = Fixture::new();
+        let profile = pending_fixture(&fixture.0, true, true);
+        assert!(
+            recover_install_transaction_at(&fixture.0, Edition::PowerShell, &profile, |_| Err(
+                AdapterError::new("simulated registry failure")
+            ))
+            .is_err()
+        );
+        assert!(fixture.0.join("state/PowerShell.transaction").exists());
+        assert!(
+            fixture
+                .0
+                .join("state/PowerShell.staging-ab-cd/profile.before")
+                .is_file()
+        );
+        recover_install_transaction_at(&fixture.0, Edition::PowerShell, &profile, |_| Ok(()))
+            .expect("retry");
+        assert!(!fixture.0.join("state/PowerShell.transaction").exists());
+        assert_eq!(std::fs::read(&profile).expect("profile"), b"user original");
+    }
+
+    #[test]
+    fn failed_profile_restore_preserves_external_edits_and_all_recovery_files() {
+        let fixture = Fixture::new();
+        let profile = pending_fixture(&fixture.0, true, true);
+        std::fs::write(&profile, b"external user edit").expect("external edit");
+        let mut registry_called = false;
+        assert!(
+            recover_install_transaction_at(&fixture.0, Edition::PowerShell, &profile, |_| {
+                registry_called = true;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(!registry_called);
+        assert_eq!(
+            std::fs::read(&profile).expect("profile"),
+            b"external user edit"
+        );
+        assert!(fixture.0.join("state/PowerShell/profile.before").is_file());
+        assert!(
+            fixture
+                .0
+                .join("state/PowerShell.removing-ab-cd/profile.original")
+                .is_file()
+        );
+        assert!(fixture.0.join("state/PowerShell.transaction").is_file());
+    }
+
+    #[test]
+    fn verification_output_larger_than_pipe_capacity_does_not_block() {
+        let shell = fsw_core::SystemBinary::PowerShell
+            .path()
+            .expect("PowerShell");
+        let script =
+            "$s = 'x' * 1048576; [Console]::Out.Write($s); [Console]::Error.Write($s); exit 0";
+        let mut child = spawn_verification_shell(
+            &shell.to_string_lossy(),
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+        )
+        .expect("child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                assert!(
+                    Instant::now() < deadline,
+                    "output stalled the verification child"
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn unknown_other_edition_ownership_preserves_shared_and_legacy_payloads() {
+        let fixture = Fixture::new();
+        for name in ["payload", "0.0.9"] {
+            std::fs::create_dir(fixture.0.join(name)).expect("payload");
+            std::fs::write(fixture.0.join(name).join("fwdslash.exe"), b"working").expect("binary");
+        }
+        assert!(
+            cleanup_shared_payload_at(
+                &fixture.0,
+                "0.0.9",
+                Err(AdapterError::new("simulated marker access denied"))
+            )
+            .is_err()
+        );
+        assert!(fixture.0.join("payload/fwdslash.exe").is_file());
+        assert!(fixture.0.join("0.0.9/fwdslash.exe").is_file());
+    }
+
+    #[test]
+    fn empty_original_existence_survives_the_production_reinstall_snapshot_path() {
+        let fixture = Fixture::new();
+        let profile = fixture.0.join("profile.ps1");
+        let old_state = fixture.0.join("old-state");
+        std::fs::create_dir(&old_state).expect("old state");
+        let old_block = block_for(true).expect("old block").into_bytes();
+        std::fs::write(&profile, &old_block).expect("installed profile");
+        std::fs::write(old_state.join("profile.block"), &old_block).expect("old block snapshot");
+        let mut transaction = InstallTransaction {
+            edition: Edition::PowerShell,
+            transaction_id: "ab-cd".to_owned(),
+            payload: PayloadSwap {
+                root: fixture.0.join("payload"),
+                staging: fixture.0.join("payload.staging-ab-cd"),
+                rollback: fixture.0.join("payload.removing-ab-cd"),
+                deployed: false,
+                renamed: false,
+            },
+            state_root: fixture.0.join("state"),
+            state_staging: fixture.0.join("state.staging-ab-cd"),
+            state_deployed: false,
+            profile_path: profile.clone(),
+            original_present: true,
+            original_bytes: old_block,
+            block_bytes: Vec::new(),
+            profile_changed: false,
+            original_snapshot: ProfileSnapshot::read(&profile).expect("snapshot"),
+            installed_snapshot: None,
+            previous_marker: Some(MarkerValues {
+                original_present: true,
+                state_directory: old_state,
+                ..MarkerValues::default()
+            }),
+            state_rollback: fixture.0.join("state.removing-ab-cd"),
+            state_renamed: false,
+            state_journal: fixture.0.join("state.transaction"),
+        };
+        let (_, original_present) =
+            stage_profile_recovery(&mut transaction).expect("production reinstall staging");
+        assert!(original_present);
+        assert!(
+            std::fs::read(transaction.state_staging.join("profile.original"))
+                .expect("empty original")
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read(transaction.state_staging.join("profile.original-present"))
+                .expect("presence"),
+            b"1"
+        );
+    }
+
+    #[test]
+    fn rolled_back_cleanup_retries_after_snapshot_directory_has_been_removed() {
+        let fixture = Fixture::new();
+        let profile = pending_fixture(&fixture.0, true, true);
+        recover_install_transaction_at(&fixture.0, Edition::PowerShell, &profile, |_| Ok(()))
+            .expect("rollback");
+        std::fs::write(
+            fixture.0.join("state/PowerShell.transaction"),
+            b"rolled-back\nab-cd",
+        )
+        .expect("cleanup phase persisted before interrupted journal deletion");
+        recover_install_transaction_at(&fixture.0, Edition::PowerShell, &profile, |_| {
+            Err(AdapterError::new("must not restore metadata again"))
+        })
+        .expect("cleanup-only retry");
+        assert_eq!(
+            std::fs::read(&profile).expect("original profile"),
+            b"user original"
+        );
+        assert!(!fixture.0.join("state/PowerShell.transaction").exists());
+    }
+
+    #[test]
+    fn committed_edition_cannot_consume_another_editions_pending_payload_journal() {
+        let fixture = Fixture::new();
+        let profile_b = pending_fixture(&fixture.0, true, true);
+        let state_a = fixture.0.join("state/WindowsPowerShell");
+        std::fs::create_dir(&state_a).expect("A committed state");
+        std::fs::write(state_a.join("payload.transaction-id"), b"a-a").expect("A owner");
+        std::fs::write(
+            fixture.0.join("state/WindowsPowerShell.transaction"),
+            b"committed\na-a",
+        )
+        .expect("A committed cleanup");
+        std::fs::write(
+            fixture.0.join("state/PowerShell/payload.transaction-id"),
+            b"b-b",
+        )
+        .expect("B owner");
+        std::fs::write(fixture.0.join("payload.transaction"), b"b-b").expect("B pending payload");
+        std::fs::create_dir(fixture.0.join("payload")).expect("B new payload");
+        std::fs::write(fixture.0.join("payload/fwdslash.exe"), b"B new").expect("B binary");
+        std::fs::create_dir(fixture.0.join("payload.removing-b-b")).expect("B rollback payload");
+        std::fs::write(
+            fixture.0.join("payload.removing-b-b/fwdslash.exe"),
+            b"A working",
+        )
+        .expect("A working binary");
+        recover_install_transaction_at(
+            &fixture.0,
+            Edition::WindowsPowerShell,
+            &fixture.0.join("A-profile"),
+            |_| Ok(()),
+        )
+        .expect("A cleanup");
+        assert!(fixture.0.join("payload.transaction").is_file());
+        assert!(
+            fixture
+                .0
+                .join("payload.removing-b-b/fwdslash.exe")
+                .is_file()
+        );
+        recover_install_transaction_at(&fixture.0, Edition::PowerShell, &profile_b, |_| Ok(()))
+            .expect("B rollback");
+        assert_eq!(
+            std::fs::read(fixture.0.join("payload/fwdslash.exe")).expect("restored A payload"),
+            b"A working"
+        );
+        assert!(!fixture.0.join("payload.transaction").exists());
+    }
+
+    #[test]
+    fn committed_payload_only_upgrade_keeps_new_bytes_when_version_was_published_before_cleanup() {
+        let fixture = Fixture::new();
+        std::fs::create_dir(fixture.0.join("payload")).expect("new payload");
+        std::fs::write(
+            fixture.0.join("payload/fwdslash.exe"),
+            b"new current-version binary",
+        )
+        .expect("new binary");
+        std::fs::create_dir(fixture.0.join("payload.removing-ab-cd")).expect("old payload");
+        std::fs::write(
+            fixture.0.join("payload.removing-ab-cd/fwdslash.exe"),
+            b"old binary",
+        )
+        .expect("old binary");
+        std::fs::write(fixture.0.join("payload.transaction"), b"committed\nab-cd")
+            .expect("promotion before marker version update");
+        recover_payload_swap_at(&fixture.0).expect("restart cleanup");
+        assert_eq!(
+            std::fs::read(fixture.0.join("payload/fwdslash.exe")).expect("current binary"),
+            b"new current-version binary"
+        );
+        assert!(!fixture.0.join("payload.removing-ab-cd").exists());
+    }
+
+    #[test]
+    fn background_recovery_never_writes_the_profile_and_retains_the_pending_transaction() {
+        let fixture = Fixture::new();
+        let profile = pending_fixture(&fixture.0, true, true);
+        let mut registry_called = false;
+        let error = recover_install_transaction_at_policy(
+            &fixture.0,
+            Edition::PowerShell,
+            &profile,
+            false,
+            |_| {
+                registry_called = true;
+                Ok(())
+            },
+        )
+        .expect_err("confirmation required");
+        assert!(error.confirmation);
+        assert!(!registry_called);
+        assert_eq!(
+            std::fs::read(&profile).expect("unchanged profile"),
+            b"user original + new block"
+        );
+        assert!(fixture.0.join("state/PowerShell.transaction").is_file());
+        assert!(
+            fixture
+                .0
+                .join("state/PowerShell.removing-ab-cd/profile.original")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn locked_obsolete_backups_retain_committed_journals_until_cleanup_retry_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        let fixture = Fixture::new();
+        let profile = pending_fixture(&fixture.0, true, true);
+        let state_root = fixture.0.join("state/PowerShell");
+        let state_rollback = fixture.0.join("state/PowerShell.removing-ab-cd");
+        let state_journal = fixture.0.join("state/PowerShell.transaction");
+        std::fs::write(&state_journal, b"committed\nab-cd").expect("committed state phase");
+        std::fs::write(state_root.join("payload.transaction-id"), b"b-b").expect("payload owner");
+        std::fs::create_dir(fixture.0.join("payload")).expect("current payload");
+        std::fs::write(
+            fixture.0.join("payload/fwdslash.exe"),
+            b"current working binary",
+        )
+        .expect("current binary");
+        let payload_rollback = fixture.0.join("payload.removing-b-b");
+        std::fs::create_dir(&payload_rollback).expect("old payload");
+        std::fs::write(payload_rollback.join("fwdslash.exe"), b"obsolete binary")
+            .expect("obsolete binary");
+        std::fs::write(fixture.0.join("payload.transaction"), b"committed\nb-b")
+            .expect("committed payload phase");
+        let mut transaction = InstallTransaction {
+            edition: Edition::PowerShell,
+            transaction_id: "ab-cd".to_owned(),
+            payload: PayloadSwap {
+                root: fixture.0.join("payload"),
+                staging: fixture.0.join("payload.staging-b-b"),
+                rollback: payload_rollback.clone(),
+                deployed: true,
+                renamed: true,
+            },
+            state_root,
+            state_staging: fixture.0.join("state/PowerShell.staging-ab-cd"),
+            state_deployed: true,
+            profile_path: profile.clone(),
+            original_present: true,
+            original_bytes: b"user original".to_vec(),
+            block_bytes: Vec::new(),
+            profile_changed: true,
+            original_snapshot: ProfileSnapshot::read(&profile).expect("snapshot"),
+            installed_snapshot: None,
+            previous_marker: None,
+            state_rollback: state_rollback.clone(),
+            state_renamed: true,
+            state_journal: state_journal.clone(),
+        };
+        let payload_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(payload_rollback.join("fwdslash.exe"))
+            .expect("hold obsolete payload");
+        assert!(finish_install_cleanup_with(&mut transaction, || Ok(())).is_err());
+        assert!(state_journal.is_file());
+        assert!(fixture.0.join("payload.transaction").is_file());
+        drop(payload_lock);
+        let state_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(state_rollback.join("profile.original"))
+            .expect("hold obsolete state");
+        assert!(finish_install_cleanup_with(&mut transaction, || Ok(())).is_err());
+        assert!(state_journal.is_file());
+        assert!(!fixture.0.join("payload.transaction").exists());
+        drop(state_lock);
+        recover_install_transaction_at(&fixture.0, Edition::PowerShell, &profile, |_| {
+            Err(AdapterError::new(
+                "committed cleanup must not roll back metadata",
+            ))
+        })
+        .expect("committed cleanup retry");
+        assert!(!state_journal.exists());
+        assert!(!state_rollback.exists());
+        assert_eq!(
+            std::fs::read(fixture.0.join("payload/fwdslash.exe")).expect("working binary"),
+            b"current working binary"
+        );
+        assert_eq!(
+            std::fs::read(&profile).expect("installed profile"),
+            b"user original + new block"
+        );
+    }
 }

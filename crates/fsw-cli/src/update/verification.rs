@@ -68,8 +68,12 @@ impl VerifiedBundle {
 pub fn verify_staged_bundle(bundle: &Path) -> Result<VerifiedBundle, UpdateVerificationError> {
     let tag =
         fsw_core::update::cached_update_tag().ok_or(UpdateVerificationError::VersionMismatch)?;
-    let expected =
-        fsw_core::update::pending_bundle_path().ok_or(UpdateVerificationError::IoFailure)?;
+    let directory =
+        fsw_core::update::update_directory_path().ok_or(UpdateVerificationError::IoFailure)?;
+    // This verifier runs from the identity-less copy, whose installed package
+    // probe intentionally returns no bundle and must never clean HKCU. Derive
+    // the path read-only from the strict release tag and this helper's build.
+    let expected = expected_staged_candidate(&directory, fsw_core::FSW_VERSION, &tag)?;
     if bundle != expected {
         return Err(UpdateVerificationError::AssetNameMismatch);
     }
@@ -87,6 +91,17 @@ pub fn verify_staged_bundle(bundle: &Path) -> Result<VerifiedBundle, UpdateVerif
         _digest_file: digest_file,
         path: expected,
     })
+}
+
+fn expected_staged_candidate(
+    directory: &Path,
+    helper_version: &str,
+    tag: &str,
+) -> Result<PathBuf, UpdateVerificationError> {
+    if !fsw_core::update::is_newer_github_release(helper_version, tag) {
+        return Err(UpdateVerificationError::VersionMismatch);
+    }
+    Ok(directory.join(fsw_core::update::bundle_name(tag)))
 }
 
 fn wide(path: &Path) -> Vec<u16> {
@@ -450,6 +465,31 @@ mod tests {
             "0.0.7.0",
             APPX_PACKAGE_ARCHITECTURE_X64.0 as u32,
         )
+    }
+
+    #[test]
+    fn identity_less_helper_derives_its_candidate_without_packaged_cache_cleanup() {
+        // The same decision called by verify_staged_bundle; it accepts the
+        // identity-less helper's build version without invoking a packaged UI
+        // probe, accessing HKCU, or requiring a live installed package.
+        let directory = Path::new(r"C:\Users\fixture\AppData\Local\ForwardSlashWindows\update");
+        assert_eq!(
+            expected_staged_candidate(directory, "0.1.1", "v0.1.2"),
+            Ok(directory.join("fwdslash-0.1.2.0.msixbundle")),
+        );
+        for tag in [
+            "v0.1.1",
+            "v0.1.0",
+            "0.1.2.0",
+            "V0.1.2",
+            "v0.1.2-beta",
+            "../v0.1.2",
+        ] {
+            assert_eq!(
+                expected_staged_candidate(directory, "0.1.1", tag),
+                Err(UpdateVerificationError::VersionMismatch),
+            );
+        }
     }
 
     #[test]

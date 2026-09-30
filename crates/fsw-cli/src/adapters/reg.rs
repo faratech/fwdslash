@@ -86,6 +86,20 @@ mod tests {
             Some("reg.exe")
         );
     }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn removing_an_absent_autorun_value_is_retryable() {
+        let key = format!(
+            "Software\\FswAdapterRegression\\{}",
+            super::super::new_transaction_id()
+        );
+        assert!(super::delete_value(&key, "AutoRun").is_ok());
+        super::set_string(&key, "AutoRun", "fixture").expect("temporary value");
+        super::delete_value(&key, "AutoRun").expect("first removal");
+        super::delete_value(&key, "AutoRun").expect("interrupted removal retry");
+        super::delete_tree(&key).expect("temporary key cleanup");
+    }
 }
 
 fn run(arguments: &[&str]) -> Result<(), AdapterError> {
@@ -164,7 +178,40 @@ pub fn set_dword(subkey: &str, name: &str, value: u32) -> Result<(), AdapterErro
 
 /// Deletes a value; deleting an absent value succeeds.
 pub fn delete_value(subkey: &str, name: &str) -> Result<(), AdapterError> {
-    run(&["delete", &format!("HKCU\\{subkey}"), "/v", name, "/f"])
+    if !value_present(subkey, name)? {
+        return Ok(());
+    }
+    let result = run(&["delete", &format!("HKCU\\{subkey}"), "/v", name, "/f"]);
+    if result.is_err() && !value_present(subkey, name)? {
+        return Ok(());
+    }
+    result
+}
+
+fn value_present(subkey: &str, name: &str) -> Result<bool, AdapterError> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_ANY, RegGetValueW};
+
+    let subkey = to_wide(subkey);
+    let name = to_wide(name);
+    let mut size = 0;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_ANY | RRF_NOEXPAND,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut size,
+        )
+    };
+    match status {
+        0 | 234 => Ok(true),
+        2 => Ok(false),
+        other => Err(AdapterError::new(&format!(
+            "registry read failed with error {other}"
+        ))),
+    }
 }
 
 /// Deletes a key and everything under it.

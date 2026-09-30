@@ -163,14 +163,15 @@ pub const FSW_BARE_SLASH_DISTRIBUTION_VALUE: &str = "BareSlashDistribution";
 /// to today's behavior instead of disagreeing about what `/` means.
 pub const FSW_BARE_SLASH_ROOT_VALUE: &str = "BareSlashRoot";
 
-/// The three values below are hand copies of `include/fsw_filter_protocol.h` —
+/// These values are hand copies of `include/fsw_filter_protocol.h` —
 /// the only contract the broker shares with the minifilter, which Rust cannot
 /// `#include`. The driver validates all of them (`fswfilter.c` message
 /// dispatch): a wrong port, version, size or a non-zero Reserved silently
 /// fails the publish, so if you touch the header, touch these.
 pub const FSW_FILTER_PORT_NAME: &str = "\\FswFilterPort";
-pub const FSW_FILTER_PROTOCOL_VERSION: u32 = 3;
+pub const FSW_FILTER_PROTOCOL_VERSION: u32 = 4;
 pub const FSW_FILTER_MAX_DISTRIBUTIONS: usize = 32;
+pub const FSW_FILTER_MAX_VOLUME_NAME: usize = 128;
 
 pub const LXSS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";

@@ -535,6 +535,7 @@ enum Msg {
     UpdateCheckFinished {
         outcome: update::UpdateOutcome,
         explicit: bool,
+        bundle_ready: bool,
     },
     /// The Check now button.
     CheckForUpdates,
@@ -687,7 +688,7 @@ struct SettingsModel {
     color_scheme: ColorScheme,
     state: State,
     /// The `TextBox` draft for the custom root; committed only by Apply.
-    root_draft: String,
+    root_draft: RootDraft,
     /// The folder radio is selected but not yet committed (no root stored).
     /// UI intent only — the stored root is what survives a restart.
     folder_selected: bool,
@@ -717,7 +718,42 @@ struct SettingsModel {
     external_reads: state_watch::ReadCoalescer,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RootDraft {
+    text: String,
+    dirty: bool,
+}
+
+impl RootDraft {
+    fn from_stored(root: Option<&str>) -> Self {
+        Self {
+            text: root.unwrap_or_default().to_owned(),
+            dirty: false,
+        }
+    }
+
+    fn edit(&mut self, text: String, stored: Option<&str>) {
+        self.dirty = text.trim() != stored.unwrap_or_default();
+        self.text = text;
+    }
+
+    fn refresh(&mut self, stored: Option<&str>) {
+        if !self.dirty {
+            stored.unwrap_or_default().clone_into(&mut self.text);
+        }
+    }
+
+    fn committed(&mut self) {
+        self.text = self.text.trim().to_owned();
+        self.dirty = false;
+    }
+}
+
 impl SettingsModel {
+    fn receive_state(&mut self, state: State) {
+        self.root_draft.refresh(state.root.as_deref());
+        self.state = state;
+    }
     /// Whether state-mutating controls accept input right now.
     fn controls_enabled(&self) -> bool {
         self.pending.is_none()
@@ -1001,17 +1037,20 @@ impl Component for SettingsModel {
                 Msg::UpdateCheckFinished {
                     outcome: check_outcome(code, &stdout),
                     explicit: false,
+                    bundle_ready: update::pending_bundle_path().is_some(),
                 }
             });
         }
+        let state = State::read();
+        let root_draft = RootDraft::from_stored(state.root.as_deref());
         let mut model = Self {
             section: *input,
             pane_open: false,
             color_scheme: ColorScheme::Dark,
             // The only synchronous read: the first frame has nothing to show
             // without it.
-            state: State::read(),
-            root_draft: String::new(),
+            state,
+            root_draft,
             folder_selected: false,
             notice_is_update: false,
             notice: None,
@@ -1129,17 +1168,18 @@ impl Component for SettingsModel {
                 Self::refresh(context);
             }
             Msg::RootTextChanged(text) => {
-                if self.root_draft == text {
+                if self.root_draft.text == text {
                     return;
                 }
-                self.root_draft = text;
+                self.root_draft.edit(text, self.state.root.as_deref());
             }
             Msg::BrowseRoot => {
                 // Modal picker on the UI thread; it pumps its own messages.
                 let Some(path) = folder_picker::pick_folder() else {
                     return; // cancelled
                 };
-                self.root_draft.clone_from(&path);
+                self.root_draft
+                    .edit(path.clone(), self.state.root.as_deref());
                 self.folder_selected = true;
                 if !is_valid_windows_root(&path)
                     || Some(path.as_str()) == self.state.root.as_deref()
@@ -1156,8 +1196,9 @@ impl Component for SettingsModel {
             Msg::ApplyRoot => {
                 // Echo guard: re-pressing Apply with an unchanged draft must
                 // not re-invoke the controller (divergences #5).
-                let candidate = self.root_draft.trim();
+                let candidate = self.root_draft.text.trim();
                 if Some(candidate) == self.state.root.as_deref() {
+                    self.root_draft.committed();
                     return;
                 }
                 if !is_valid_windows_root(candidate) {
@@ -1246,10 +1287,15 @@ impl Component for SettingsModel {
                     Msg::UpdateCheckFinished {
                         outcome: check_outcome(code, &stdout),
                         explicit: true,
+                        bundle_ready: update::pending_bundle_path().is_some(),
                     }
                 });
             }
-            Msg::UpdateCheckFinished { outcome, explicit } => {
+            Msg::UpdateCheckFinished {
+                outcome,
+                explicit,
+                bundle_ready,
+            } => {
                 if explicit {
                     self.pending = None;
                 }
@@ -1259,18 +1305,7 @@ impl Component for SettingsModel {
                         self.notice = Some(Notice::new(
                             InfoBarSeverity::Informational,
                             "Update available",
-                            if self.state.store_flavor {
-                                format!(
-                                    "Version {short} is available in the Microsoft Store. \
-                                     Install it now, or let the Store install it on its own \
-                                     schedule."
-                                )
-                            } else {
-                                format!(
-                                    "Version {short} was downloaded. It applies after you sign \
-                                     out and back in, or restart Forward Slash Windows now."
-                                )
-                            },
+                            named_update_message(short, self.state.store_flavor, bundle_ready),
                         ));
                         self.notice_is_update = true;
                     }
@@ -1499,12 +1534,13 @@ impl Component for SettingsModel {
                 }
                 if succeeded && action == ROOT_ACTION {
                     self.folder_selected = false;
+                    self.root_draft.committed();
                 }
                 self.show_result(succeeded, action, terminal, &detail);
                 Self::refresh(context);
             }
             Msg::StateLoaded(state) => {
-                self.state = state;
+                self.receive_state(state);
                 self.maybe_start_upgrade(context);
             }
             Msg::LaunchSweepFinished(state) => {
@@ -1513,7 +1549,7 @@ impl Component for SettingsModel {
                     sweep_lock::release();
                     self.sweep_held = false;
                 }
-                self.state = state;
+                self.receive_state(state);
                 self.maybe_start_upgrade(context);
             }
 
@@ -1541,7 +1577,7 @@ impl Component for SettingsModel {
                 if state == self.state {
                     return;
                 }
-                self.state = state;
+                self.receive_state(state);
                 self.maybe_start_upgrade(context);
             }
             Msg::BrokerProbed => Self::refresh(context),
@@ -1731,7 +1767,7 @@ impl SettingsModel {
                         TextBox::new()
                             .min_width(240.0)
                             .placeholder_text(r"C:\code or \\wsl.localhost\Ubuntu\home")
-                            .text(self.root_draft.clone())
+                            .text(self.root_draft.text.clone())
                             .is_enabled(self.controls_enabled())
                             .on_text_changed(context.callback(Msg::RootTextChanged)),
                         Button::new()
@@ -2250,14 +2286,33 @@ fn pending_caption(pending: Option<&'static str>) -> Option<&'static str> {
     }
 }
 
+/// A recorded GitHub label is not proof that a bundle remains staged: old
+/// releases could record offers without downloading them.
+fn named_update_message(short: &str, store_flavor: bool, bundle_ready: bool) -> String {
+    if store_flavor {
+        format!(
+            "Version {short} is available in the Microsoft Store. Install it now, \
+                 or let the Store install it on its own schedule."
+        )
+    } else if bundle_ready {
+        format!(
+            "Version {short} was downloaded. It applies after you sign out and back in, \
+                 or restart Forward Slash Windows now."
+        )
+    } else {
+        format!("Version {short} is available. Use Check now to download it.")
+    }
+}
+
 /// The install banner's button label, or `None` when no banner belongs on
 /// screen.
 ///
 /// Unpackaged builds never show it — there is nothing they could install, and
 /// a dev build must not offer to replace itself. `bundle_ready` is the GitHub
 /// flavor's downloaded `.msixbundle`; `update_available` is the version the
-/// last check recorded, which is all the Store flavor ever has locally. Either
-/// one is enough: the CLI decides what "install" actually means.
+/// last check recorded, which is all the Store flavor ever has locally. The
+/// GitHub route requires the downloaded bundle; a recorded offer alone cannot
+/// be installed.
 #[must_use]
 #[allow(clippy::fn_params_excessive_bools)] // These flags mirror the independently readable update state.
 fn install_banner_label(
@@ -2266,7 +2321,12 @@ fn install_banner_label(
     bundle_ready: bool,
     update_available: bool,
 ) -> Option<&'static str> {
-    if !packaged || !(bundle_ready || update_available) {
+    let installable = if store_flavor {
+        update_available
+    } else {
+        bundle_ready
+    };
+    if !packaged || !installable {
         return None;
     }
     // The Store's installer force-closes the app and the Store's own restart
@@ -3070,6 +3130,52 @@ mod tests {
     }
 
     #[test]
+    fn folder_draft_starts_from_persisted_root_and_tracks_external_changes() {
+        let mut draft = super::RootDraft::from_stored(Some(r"C:\code"));
+        assert_eq!(draft.text, r"C:\code");
+        assert!(!draft.dirty);
+        draft.refresh(Some(r"D:\work"));
+        assert_eq!(draft.text, r"D:\work");
+        draft.refresh(None);
+        assert!(draft.text.is_empty());
+    }
+
+    #[test]
+    fn folder_refresh_preserves_unsaved_edits_and_failed_apply() {
+        let mut draft = super::RootDraft::from_stored(Some(r"C:\code"));
+        draft.edit(r"D:\draft".to_owned(), Some(r"C:\code"));
+        draft.refresh(Some(r"E:\external"));
+        assert_eq!(draft.text, r"D:\draft");
+        assert!(draft.dirty);
+        // A failed apply has no committed transition; its refresh retains the
+        // draft so the user can correct and retry it.
+        draft.refresh(Some(r"C:\code"));
+        assert_eq!(draft.text, r"D:\draft");
+    }
+
+    #[test]
+    fn successful_apply_or_browse_commit_rejoins_persisted_state() {
+        let mut draft = super::RootDraft::from_stored(None);
+        draft.edit(r" D:\picked ".to_owned(), None);
+        draft.committed();
+        assert_eq!(draft.text, r"D:\picked");
+        assert!(!draft.dirty);
+        draft.refresh(Some(r"D:\picked"));
+        draft.refresh(Some(r"E:\external"));
+        assert_eq!(draft.text, r"E:\external");
+    }
+
+    #[test]
+    fn returning_to_stored_root_discards_draft_dirty_state() {
+        let mut draft = super::RootDraft::from_stored(Some(r"C:\code"));
+        draft.edit(r"D:\draft".to_owned(), Some(r"C:\code"));
+        draft.edit(r"C:\code".to_owned(), Some(r"C:\code"));
+        assert!(!draft.dirty);
+        draft.refresh(Some(r"E:\external"));
+        assert_eq!(draft.text, r"E:\external");
+    }
+
+    #[test]
     fn windows_powershell_enable_preflights_once_before_dispatch() {
         let probes = Cell::new(0);
         let result = SettingsModel::preflight_windows_powershell_enable(
@@ -3302,6 +3408,18 @@ mod tests {
             install_banner_label(true, false, true, true),
             Some("Restart to update")
         );
+        // A legacy cached GitHub offer, or a deleted bundle, cannot be
+        // installed until Check now has actually staged it.
+        assert_eq!(install_banner_label(true, false, false, true), None);
+    }
+
+    #[test]
+    fn update_notice_claims_download_only_for_a_staged_github_bundle() {
+        assert!(super::named_update_message("0.1.2", false, true).contains("was downloaded"));
+        let missing = super::named_update_message("0.1.2", false, false);
+        assert!(missing.contains("Check now"));
+        assert!(!missing.contains("was downloaded"));
+        assert!(super::named_update_message("0.1.2", true, false).contains("Microsoft Store"));
     }
 
     // -- install exit code to what the window shows ------------------------

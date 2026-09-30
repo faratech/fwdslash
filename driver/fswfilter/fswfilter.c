@@ -2,6 +2,12 @@
 
 #define FSW_MAX_INTERACTIVE_SESSIONS 16u
 
+// The user-mode sender and lab harness assert these same v4 offsets.
+C_ASSERT(FIELD_OFFSET(FSW_MAPPING_MESSAGE, Generation) == 16);
+C_ASSERT(FIELD_OFFSET(FSW_MAPPING_MESSAGE, VolumeName) == 28);
+C_ASSERT(FIELD_OFFSET(FSW_MAPPING_MESSAGE, Distributions) == 284);
+C_ASSERT(sizeof(FSW_MAPPING_MESSAGE) == 8480);
+
 typedef struct _FSW_CONNECTION_CONTEXT {
   PFLT_PORT ClientPort;
   ULONG SessionId;
@@ -20,6 +26,7 @@ typedef struct _FSW_SESSION_MAPPINGS {
   UCHAR Sid[SECURITY_MAX_SID_SIZE];
   ULONGLONG Generation;
   ULONG DistributionCount;
+  WCHAR VolumeName[FSW_MAX_VOLUME_NAME];
   WCHAR Distributions[FSW_MAX_DISTRIBUTIONS][FSW_MAX_DISTRIBUTION_NAME];
 } FSW_SESSION_MAPPINGS, *PFSW_SESSION_MAPPINGS;
 
@@ -81,6 +88,10 @@ _Must_inspect_result_
 _IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN FswIsValidDistributionName(
     _In_reads_(FSW_MAX_DISTRIBUTION_NAME) const WCHAR* Name);
+_Must_inspect_result_
+_IRQL_requires_max_(APC_LEVEL)
+static BOOLEAN FswIsValidVolumeName(
+    _In_reads_(FSW_MAX_VOLUME_NAME) const WCHAR* Name);
 _IRQL_requires_max_(APC_LEVEL)
 static VOID FswClearMappingsForOwner(_In_ PFSW_CONNECTION_CONTEXT Owner);
 _Must_inspect_result_
@@ -99,6 +110,7 @@ static BOOLEAN FswIsCandidateDistribution(
 _Must_inspect_result_
 _IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN FswOwnsDistribution(_In_ PFSW_REQUESTOR_IDENTITY Identity,
+                                   _In_ PCUNICODE_STRING Volume,
                                    _In_ PCUNICODE_STRING FirstComponent);
 _Must_inspect_result_
 _IRQL_requires_max_(APC_LEVEL)
@@ -125,6 +137,7 @@ CONST FLT_REGISTRATION Registration = {
 #pragma alloc_text(PAGE, FswPortMessage)
 #pragma alloc_text(PAGE, FswQueryRequestorIdentity)
 #pragma alloc_text(PAGE, FswIsValidDistributionName)
+#pragma alloc_text(PAGE, FswIsValidVolumeName)
 #pragma alloc_text(PAGE, FswClearMappingsForOwner)
 #pragma alloc_text(PAGE, FswBuildPortSecurityDescriptor)
 #pragma alloc_text(PAGE, FswSplitNamespace)
@@ -483,7 +496,35 @@ FswIsCandidateDistribution(_In_ PCUNICODE_STRING FirstComponent) {
 _Must_inspect_result_
 _IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN
+FswIsValidVolumeName(_In_reads_(FSW_MAX_VOLUME_NAME) const WCHAR* Name) {
+  const UNICODE_STRING prefix = RTL_CONSTANT_STRING(L"\\Device\\");
+  UNICODE_STRING suppliedPrefix;
+  const ULONG prefixChars = prefix.Length / sizeof(WCHAR);
+
+  PAGED_CODE();
+  suppliedPrefix.Buffer = (PWCHAR)Name;
+  suppliedPrefix.Length = prefix.Length;
+  suppliedPrefix.MaximumLength = prefix.Length;
+  if (!RtlEqualUnicodeString(&prefix, &suppliedPrefix, TRUE)) {
+    return FALSE;
+  }
+  for (ULONG index = prefixChars; index < FSW_MAX_VOLUME_NAME; ++index) {
+    if (Name[index] == L'\0') {
+      return index > prefixChars;
+    }
+    if (Name[index] < L' ' || Name[index] == L'\\' ||
+        Name[index] == L'/' || Name[index] == L':') {
+      return FALSE;
+    }
+  }
+  return FALSE;
+}
+
+_Must_inspect_result_
+_IRQL_requires_max_(APC_LEVEL)
+static BOOLEAN
 FswOwnsDistribution(_In_ PFSW_REQUESTOR_IDENTITY Identity,
+                    _In_ PCUNICODE_STRING Volume,
                     _In_ PCUNICODE_STRING FirstComponent) {
   BOOLEAN found = FALSE;
 
@@ -500,6 +541,11 @@ FswOwnsDistribution(_In_ PFSW_REQUESTOR_IDENTITY Identity,
         slot->SidLength != Identity->SidLength ||
         !RtlEqualSid((PSID)slot->Sid, (PSID)Identity->Sid)) {
       continue;
+    }
+    UNICODE_STRING mappedVolume;
+    RtlInitUnicodeString(&mappedVolume, slot->VolumeName);
+    if (!RtlEqualUnicodeString(&mappedVolume, Volume, TRUE)) {
+      break;
     }
     for (ULONG index = 0; index < slot->DistributionCount; ++index) {
       UNICODE_STRING name;
@@ -694,7 +740,8 @@ FswPreCreate(_Inout_ PFLT_CALLBACK_DATA Data,
   process = FltGetRequestorProcess(Data);
   if (process == NULL ||
       !NT_SUCCESS(FswQueryRequestorIdentity(process, &identity, &eligible)) ||
-      !eligible || !FswOwnsDistribution(&identity, &firstComponent)) {
+      !eligible ||
+      !FswOwnsDistribution(&identity, &nameInfo->Volume, &firstComponent)) {
     FltReleaseFileNameInformation(nameInfo);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
   }
@@ -854,6 +901,11 @@ FswPortMessage(_In_opt_ PVOID PortCookie,
     ExFreePoolWithTag(message, FSW_POOL_TAG);
     return STATUS_INVALID_PARAMETER;
   }
+  if (message->Operation == FswOperationReplaceMappings &&
+      !FswIsValidVolumeName(message->VolumeName)) {
+    ExFreePoolWithTag(message, FSW_POOL_TAG);
+    return STATUS_INVALID_PARAMETER;
+  }
   for (ULONG index = 0; index < message->DistributionCount; ++index) {
     if (!FswIsValidDistributionName(message->Distributions[index])) {
       ExFreePoolWithTag(message, FSW_POOL_TAG);
@@ -920,6 +972,8 @@ FswPortMessage(_In_opt_ PVOID PortCookie,
     RtlCopyMemory(slot->Sid, context->Sid, context->SidLength);
     slot->Generation = message->Generation;
     slot->DistributionCount = message->DistributionCount;
+    RtlCopyMemory(slot->VolumeName, message->VolumeName,
+                  sizeof(slot->VolumeName));
     //
     //  Only the validated prefix is stored, so every name the create path can
     //  read is known to be NUL-terminated inside its array.
