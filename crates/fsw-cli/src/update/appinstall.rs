@@ -202,6 +202,17 @@ fn install_options() -> Result<AppInstallOptions, Outcome> {
 }
 
 pub fn apply_store_update(product_id: &str, policy: WaitPolicy) -> Outcome {
+    apply_store_update_with_start(product_id, policy, || Ok(()))
+}
+
+/// Runs the packaged caller's admission callback only after preflight, at the
+/// point an installer request can start. The identity-less helper uses the
+/// wrapper above and therefore never writes the packaged caller's settings.
+pub fn apply_store_update_with_start(
+    product_id: &str,
+    policy: WaitPolicy,
+    before_start: impl FnOnce() -> Result<(), String>,
+) -> Outcome {
     // One clock for the whole attempt (issue #144). Before this each await
     // carried its own `CALL_TIMEOUT` and the poll loop started a third budget
     // of its own, so a foreground caller promised a three-minute hand-off
@@ -234,6 +245,9 @@ pub fn apply_store_update(product_id: &str, policy: WaitPolicy) -> Outcome {
     };
 
     let clientid = HSTRING::from("fwdslash");
+    if let Err(detail) = before_start() {
+        return Outcome::NotStarted(detail);
+    }
     let operation = match manager
         .StartProductInstallWithOptionsAsync(&product, &empty, &clientid, &empty, &options)
     {

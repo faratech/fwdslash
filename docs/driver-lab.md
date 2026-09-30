@@ -9,6 +9,18 @@ Nothing here should ever be run on a physical workstation. Every script in the
 lab set refuses to run on hardware that does not look like a virtual machine
 unless `-Force` is passed, and every script's header says so.
 
+Protocol v4 binds each mapping to the native C: volume; the broker and driver
+must both be rebuilt. The broker declines an old protocol at Ping. The v4
+runtime gate is pending: compiling the driver does not validate filesystem
+routing. In the checkpointed guest, prepare a real
+`D:\fwdslash\<distribution>` directory on a separate disk volume before running
+`Test-Driver.ps1`; its final opened NT path must remain on D:. The harness also
+checks malformed volume fields and stale/equal/new generations on one live
+owner connection. The rename/move/hard-link follow-up remains open as issue #49.
+`tools/Test-DriverProtocol.ps1` checks the lab packet layout and generation,
+Ping and Clear encoding on the host without opening a driver port. These checks
+complement the VM gate; they do not run filesystem callbacks.
+
 ## Why not Windows Sandbox
 
 `tools/Test-Sandbox.ps1` exists and works, but it tests *user-mode* binaries.

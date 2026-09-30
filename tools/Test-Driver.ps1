@@ -290,6 +290,8 @@ namespace FswLab {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint GetFileAttributesW(string name);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandleW(IntPtr handle, StringBuilder name, uint capacity, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool MoveFileExW(string existing, string replacement, uint flags);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLinkW(string link, string existing, IntPtr sa);
@@ -309,6 +311,19 @@ namespace FswLab {
     private static readonly IntPtr Invalid = new IntPtr(-1);
     private const int FileRenameInformation = 10;
     private const int FileLinkInformation = 11;
+
+    public static string OpenedNativePath(string path) {
+      IntPtr handle = CreateFileW(path, 0, ShareAll, IntPtr.Zero, OpenExisting, BackupSemantics, IntPtr.Zero);
+      if (handle == Invalid) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+      try {
+        var name = new StringBuilder(32768);
+        uint length = GetFinalPathNameByHandleW(handle, name, (uint)name.Capacity, 2); // VOLUME_NAME_NT
+        if (length == 0 || length >= name.Capacity) {
+          throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        }
+        return name.ToString();
+      } finally { CloseHandle(handle); }
+    }
 
     // 0 on success, else the Win32 error. Comparing the error code as well as
     // success is what makes an alias-versus-UNC comparison meaningful.
@@ -409,11 +424,15 @@ namespace FswLab {
     public uint Reserved;
     public ulong Generation;
     public uint DistributionCount;
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 128)]
+    public ushort[] VolumeName;
     [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32 * 128)]
     public ushort[] Distributions;
   }
 
   public static class Port {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint QueryDosDeviceW(string device, StringBuilder target, uint capacity);
     [DllImport("fltlib.dll", CharSet = CharSet.Unicode)]
     private static extern int FilterConnectCommunicationPort(string portName, uint options,
         IntPtr context, ushort contextSize, IntPtr security, out IntPtr port);
@@ -424,6 +443,43 @@ namespace FswLab {
     private static extern bool CloseHandle(IntPtr handle);
 
     public static int MessageSize { get { return Marshal.SizeOf(typeof(MappingMessage)); } }
+
+    public static string NativeCVolume() {
+      return NativeVolume("C:");
+    }
+
+    public static string NativeVolume(string drive) {
+      var target = new StringBuilder(128);
+      if (QueryDosDeviceW(drive, target, 128) == 0) {
+        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+      }
+      string name = target.ToString();
+      if (!name.StartsWith(@"\Device\", StringComparison.OrdinalIgnoreCase) ||
+          name.Length <= 8 || name.Length >= 128 || name.IndexOf('\\', 8) >= 0) {
+        throw new InvalidOperationException("drive did not resolve to a bounded native volume root");
+      }
+      return name;
+    }
+
+    // Keep one owner throughout: fresh connections cannot check regression.
+    public static int[] SendSequence(string portName, byte[][] buffers) {
+      IntPtr handle;
+      int hr = FilterConnectCommunicationPort(portName, 0, IntPtr.Zero, 0, IntPtr.Zero, out handle);
+      if (hr < 0) { throw new InvalidOperationException("connect failed: " + hr); }
+      var results = new int[buffers.Length];
+      try {
+        for (int i = 0; i < buffers.Length; i++) {
+          byte[] buffer = buffers[i];
+          IntPtr native = Marshal.AllocHGlobal(buffer.Length);
+          try {
+            Marshal.Copy(buffer, 0, native, buffer.Length);
+            uint returned;
+            results[i] = FilterSendMessage(handle, native, (uint)buffer.Length, IntPtr.Zero, 0, out returned);
+          } finally { Marshal.FreeHGlobal(native); }
+        }
+      } finally { CloseHandle(handle); }
+      return results;
+    }
 
     // Sequential connect/close. Returns the HRESULT of the last attempt, or the
     // first failure. A driver that leaks a slot per connection fails here.
@@ -484,17 +540,18 @@ namespace FswLab {
 
 # Builds an FSW_MAPPING_MESSAGE by hand. Field offsets follow the struct in
 # include/fsw_filter_protocol.h: Version 0, Size 4, Operation 8, Reserved 12,
-# Generation 16, DistributionCount 24, Distributions 28. The total size comes
+# Generation 16, DistributionCount 24, VolumeName 28, Distributions 284. The total size comes
 # from Marshal.SizeOf so the padding after the name array stays correct.
 function New-MappingBuffer {
     param(
-        [uint32]$Version = 3,
+        [uint32]$Version = 4,
         [uint32]$Size = 0,
         [uint32]$Operation = 1,
         [uint32]$Reserved = 0,
         [uint64]$Generation = 1,
         [uint32]$Count = 1,
-        [string]$FirstName = 'Ubuntu'
+        [string]$FirstName = 'Ubuntu',
+        [string]$VolumeName = [FswLab.Port]::NativeCVolume()
     )
     $total = [FswLab.Port]::MessageSize
     if ($Size -eq 0) { $Size = [uint32]$total }
@@ -505,8 +562,10 @@ function New-MappingBuffer {
     [BitConverter]::GetBytes($Reserved).CopyTo($buffer, 12)
     [BitConverter]::GetBytes($Generation).CopyTo($buffer, 16)
     [BitConverter]::GetBytes($Count).CopyTo($buffer, 24)
+    $volumeBytes = [Text.Encoding]::Unicode.GetBytes($VolumeName)
+    [Array]::Copy($volumeBytes, 0, $buffer, 28, [Math]::Min($volumeBytes.Length, 254))
     $nameBytes = [Text.Encoding]::Unicode.GetBytes($FirstName)
-    [Array]::Copy($nameBytes, 0, $buffer, 28, [Math]::Min($nameBytes.Length, 254))
+    [Array]::Copy($nameBytes, 0, $buffer, 284, [Math]::Min($nameBytes.Length, 254))
     return $buffer
 }
 
@@ -728,8 +787,25 @@ Invoke-Step 'ping protocol version' {
         Add-Skip 'ping reports the loaded protocol version' 'the driver returned no output for the ping (pre-reply-contract build)'
     } else {
         Write-Host "   loaded driver protocol: v$protocol"
-        Assert-True ($protocol -eq 3) 'ping reports protocol v3' "(got v$protocol)" | Out-Null
+        Assert-True ($protocol -eq 4) 'ping reports protocol v4' "(got v$protocol)" | Out-Null
     }
+}
+
+Invoke-Step 'non-C volume namespace passes through' {
+    $otherRoot = 'D:\fwdslash\' + $Distribution
+    if (-not (Test-Path -LiteralPath $otherRoot -PathType Container)) {
+        Add-Skip 'a real D:\fwdslash distribution root stays on D:' 'prepare a real root on a distinct D: disk volume in the checkpointed VM'
+        return
+    }
+    $cVolume = [FswLab.Port]::NativeCVolume()
+    $dVolume = [FswLab.Port]::NativeVolume('D:')
+    if ($cVolume -ieq $dVolume) {
+        Add-Skip 'a real D:\fwdslash distribution root stays on D:' 'D: aliases the same native volume as C:'
+        return
+    }
+    $opened = [FswLab.Native]::OpenedNativePath($otherRoot)
+    Assert-True ($opened.StartsWith($dVolume + '\fwdslash\', [StringComparison]::OrdinalIgnoreCase)) `
+        'a real D:\fwdslash distribution root stays on D:' | Out-Null
 }
 
 # ================================================== c. alias-vs-UNC parity ====
@@ -1275,6 +1351,20 @@ Invoke-Step 'broker lifecycle' {
         @{ Name = 'DistributionCount > 32';   Buffer = (New-MappingBuffer -Count 33); Declared = $messageSize },
         @{ Name = 'name contains a backslash'; Buffer = (New-MappingBuffer -FirstName 'Ub\untu'); Declared = $messageSize }
     )
+    $malformed += @(
+        @{ Name = 'old protocol version'; Buffer = (New-MappingBuffer -Version 3); Declared = $messageSize },
+        @{ Name = 'volume name is empty'; Buffer = (New-MappingBuffer -VolumeName ''); Declared = $messageSize },
+        @{ Name = 'volume is a DOS redirect'; Buffer = (New-MappingBuffer -VolumeName '\??\C:\folder'); Declared = $messageSize },
+        @{ Name = 'volume includes a folder'; Buffer = (New-MappingBuffer -VolumeName '\Device\HarddiskVolume3\folder'); Declared = $messageSize }
+    )
+    $unterminatedVolume = New-MappingBuffer
+    for ($offset = 28; $offset -lt 284; $offset += 2) {
+        $unterminatedVolume[$offset] = [byte][char]'x'
+        $unterminatedVolume[$offset + 1] = 0
+    }
+    $prefixBytes = [Text.Encoding]::Unicode.GetBytes('\Device\')
+    $prefixBytes.CopyTo($unterminatedVolume, 28)
+    $malformed += @{ Name = 'volume is not terminated'; Buffer = $unterminatedVolume; Declared = $messageSize }
     $portReachable = $true
     foreach ($case in $malformed) {
         $hr = 0
@@ -1304,6 +1394,34 @@ Invoke-Step 'broker lifecycle' {
         # closed before the next - every one must succeed; a driver that leaked
         # a slot per connection would fail at the 17th.
         Assert-True ($hr -ge 0) 'the 17th sequential connection still succeeds (no slot leak)' ("(hr=0x{0:X8})" -f $hr) | Out-Null
+    }
+}
+
+Invoke-Step 'mapping generations on one owner connection' {
+    if ($null -eq $script:Cli) {
+        Add-Skip 'mapping generations are monotonic within one owner' 'no CLI to release the broker slot'
+        return
+    }
+    Invoke-Native -FilePath $script:Cli -Arguments @('stop') | Out-Null
+    try {
+        $cleared = Wait-ForCondition -TimeoutSeconds 10 -Condition { (Test-AliasResolves) -eq $script:AliasNativeBaseline }
+        if (-not $cleared) { throw 'the broker did not release its mappings' }
+        $buffers = [byte[][]]@(
+            (New-MappingBuffer -Generation 10 -FirstName $Distribution),
+            (New-MappingBuffer -Generation 9 -FirstName $Distribution -VolumeName '\Device\FswLabOtherVolume'),
+            (New-MappingBuffer -Generation 10 -FirstName $Distribution),
+            (New-MappingBuffer -Generation 11 -FirstName $Distribution),
+            (New-MappingBuffer -Operation 2 -Generation 12 -Count 0 -FirstName '' -VolumeName '')
+        )
+        $results = [FswLab.Port]::SendSequence($script:PortName, $buffers)
+        Assert-True ($results[0] -ge 0) 'initial mapping generation accepted' | Out-Null
+        Assert-True ($results[1] -lt 0) 'older mapping generation cannot replace the volume binding' | Out-Null
+        Assert-True ($results[2] -ge 0) 'same generation can be resent by its owner' | Out-Null
+        Assert-True ($results[3] -ge 0) 'newer mapping generation accepted' | Out-Null
+        Assert-True ($results[4] -ge 0) 'clear accepts an empty volume field' | Out-Null
+    } finally {
+        Invoke-Native -FilePath $script:Cli -Arguments @('start') | Out-Null
+        Wait-ForCondition -TimeoutSeconds 15 -Condition { Test-AliasResolves } | Out-Null
     }
 }
 

@@ -24,6 +24,8 @@ pub mod reg;
 pub mod state;
 #[cfg(test)]
 mod tests;
+#[cfg(windows)]
+mod transaction;
 
 pub use state::Edition;
 #[cfg(windows)]
@@ -55,6 +57,7 @@ pub const PAYLOAD_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct AdapterError {
     message: String,
     blocked: bool,
+    confirmation: bool,
 }
 
 impl AdapterError {
@@ -62,6 +65,7 @@ impl AdapterError {
         Self {
             message: message.to_string(),
             blocked: false,
+            confirmation: false,
         }
     }
 
@@ -70,12 +74,21 @@ impl AdapterError {
         Self {
             message: message.to_string(),
             blocked: true,
+            confirmation: false,
         }
     }
 
     #[must_use]
     pub fn is_blocked(&self) -> bool {
         self.blocked
+    }
+
+    pub fn needs_confirmation(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+            blocked: false,
+            confirmation: true,
+        }
     }
 }
 
@@ -132,6 +145,15 @@ pub fn registry_error(error: impl core::fmt::Display) -> AdapterError {
 pub fn set_integration(id: &str, enabled: bool, user_initiated: bool) -> i32 {
     #[cfg(windows)]
     {
+        let _transaction = match transaction::AdapterTransaction::acquire() {
+            Ok(guard) => guard,
+            Err(error) => return report_adapter_error(&error),
+        };
+        if let Err(error) =
+            powershell::recover_all(user_initiated).and_then(|()| cmd::recover_upgrade())
+        {
+            return report_adapter_error(&error);
+        }
         let edition = match id {
             "cmd" => None,
             "windows-powershell" => Some(state::Edition::WindowsPowerShell),
@@ -160,13 +182,18 @@ pub fn set_integration(id: &str, enabled: bool, user_initiated: bool) -> i32 {
             None => "cmd",
             Some(edition) => edition.display_name(),
         };
+        if edition.is_none()
+            && let Err(error) = cmd::recover_upgrade()
+        {
+            return report_adapter_error(&error);
+        }
 
         // Idempotence applies to enabled, installed adapters only. Disable
         // must reach uninstall for prepared/removing markers so an interrupted
         // transaction can recover. Uninstall handles an absent marker itself.
         // An exception to the enable no-op is an
         // `installed` marker naming an older payload than this build ships.
-        // The existing upgrade path uninstalls and then installs separately.
+        // Both adapters stage and retain the working deployment through upgrade.
         let mut upgrading = false;
         if enabled && fsw_core::adapter_installed(&marker_key) {
             let installed_version = fsw_core::adapter_version(&marker_key);
@@ -216,16 +243,15 @@ pub fn set_integration(id: &str, enabled: bool, user_initiated: bool) -> i32 {
             };
         }
 
-        // An upgrade is the old payload's uninstall followed by this one's
-        // install; `upgrading` is only ever set on the enable path, and for
-        // PowerShell it already returned above.
-        let removal = if upgrading { cmd::uninstall() } else { Ok(()) };
-        let result = removal.and_then(|()| match (edition, enabled) {
+        // Cmd upgrades preserve the working hook and original snapshot while
+        // replacing its payload; PowerShell already returned above.
+        let result = match (edition, enabled) {
+            (None, true) if upgrading => cmd::upgrade(&controller),
             (None, true) => cmd::install(&controller),
             (None, false) => cmd::uninstall(),
             (Some(edition), true) => powershell::install(edition, &controller),
             (Some(edition), false) => powershell::uninstall(edition),
-        });
+        };
 
         match result {
             Ok(()) => {
@@ -264,21 +290,14 @@ pub const MIGRATION_PENDING_MESSAGE: &str = "The PowerShell integration needs a 
 /// action pays for it (#127).
 #[cfg(windows)]
 fn current_version_noop(edition: state::Edition, user_initiated: bool) -> i32 {
-    // `UpdatePending` is the same situation as a legacy block for this purpose:
-    // the deployed block's *content* is not what this build writes (#134), and
-    // replacing it is the same `Documents` write.
-    if matches!(
-        powershell::profile_health(edition),
-        profile::ProfileHealth::MigrationPending(_) | profile::ProfileHealth::UpdatePending
-    ) {
-        if !user_initiated {
+    let controller = std::env::current_exe().unwrap_or_default();
+    match powershell::upgrade(edition, &controller, user_initiated) {
+        Ok(powershell::UpgradeOutcome::Upgraded) => {}
+        Ok(powershell::UpgradeOutcome::NeedsConfirmation) => {
             eprintln!("{MIGRATION_PENDING_MESSAGE}");
             return EXIT_NEEDS_CONFIRMATION;
         }
-        let controller = std::env::current_exe().unwrap_or_default();
-        if let Err(error) = powershell::migrate(edition, &controller) {
-            return report_adapter_error(&error);
-        }
+        Err(error) => return report_adapter_error(&error),
     }
     powershell::prune_orphaned_module_dirs();
     prune_leftover_dirs();
@@ -291,12 +310,27 @@ fn current_version_noop(edition: state::Edition, user_initiated: bool) -> i32 {
 #[cfg(windows)]
 fn report_adapter_error(error: &AdapterError) -> i32 {
     eprintln!("{error}");
-    if error.is_blocked() { EXIT_BLOCKED } else { 1 }
+    if error.confirmation {
+        EXIT_NEEDS_CONFIRMATION
+    } else if error.is_blocked() {
+        EXIT_BLOCKED
+    } else {
+        1
+    }
 }
 
 /// Best-effort removal of every shell adapter during `fwdslash uninstall`.
 /// Individual failures are reported but do not stop the others.
 pub fn sweep_uninstall() -> i32 {
+    #[cfg(windows)]
+    let _transaction = match transaction::AdapterTransaction::acquire() {
+        Ok(guard) => guard,
+        Err(error) => return report_adapter_error(&error),
+    };
+    #[cfg(windows)]
+    if let Err(error) = powershell::recover_all(true).and_then(|()| cmd::recover_upgrade()) {
+        return report_adapter_error(&error);
+    }
     let mut worst = 0;
     #[cfg(windows)]
     for (id, label) in [
@@ -304,20 +338,8 @@ pub fn sweep_uninstall() -> i32 {
         ("windows-powershell", "Windows PowerShell"),
         ("powershell", "PowerShell 7"),
     ] {
-        let installed = match id {
-            "cmd" => fsw_core::adapter_installed(fsw_core::CMD_ADAPTER_KEY),
-            "windows-powershell" => fsw_core::adapter_installed(&format!(
-                "{}WindowsPowerShell",
-                fsw_core::POWERSHELL_ADAPTER_ROOT
-            )),
-            _ => fsw_core::adapter_installed(&format!(
-                "{}PowerShell",
-                fsw_core::POWERSHELL_ADAPTER_ROOT
-            )),
-        };
-        if !installed {
-            continue;
-        }
+        // Prepared/removing records need the same recovery as installed ones.
+        // Both uninstallers treat an absent marker as a successful no-op.
         let code = set_integration(id, false, true);
         if code != 0 {
             println!("The {label} adapter could not be removed automatically.");
@@ -480,6 +502,13 @@ fn cmd_health_status() -> String {
 pub fn repair_integration(id: &str) -> i32 {
     #[cfg(windows)]
     {
+        let _transaction = match transaction::AdapterTransaction::acquire() {
+            Ok(guard) => guard,
+            Err(error) => return report_adapter_error(&error),
+        };
+        if let Err(error) = powershell::recover_all(true).and_then(|()| cmd::recover_upgrade()) {
+            return report_adapter_error(&error);
+        }
         // `fwdslash integration <id> repair` is typed by a person, so the
         // profile write it may need is authorised (#127).
         let controller = std::env::current_exe().unwrap_or_default();
@@ -559,6 +588,13 @@ fn report_ps_repair(label: &str, edition: state::Edition, controller: &Path) {
 pub fn repair_all() -> i32 {
     #[cfg(windows)]
     {
+        let _transaction = match transaction::AdapterTransaction::acquire() {
+            Ok(guard) => guard,
+            Err(error) => return report_adapter_error(&error),
+        };
+        if let Err(error) = powershell::recover_all(false).and_then(|()| cmd::recover_upgrade()) {
+            return report_adapter_error(&error);
+        }
         let controller = std::env::current_exe().unwrap_or_default();
         let _ = cmd::repair();
         // `user_initiated = false`: this is the background sweep, and it may
@@ -605,6 +641,13 @@ pub fn repair_all() -> i32 {
 pub fn cleanup_orphaned() -> i32 {
     #[cfg(windows)]
     {
+        let _transaction = match transaction::AdapterTransaction::acquire() {
+            Ok(guard) => guard,
+            Err(error) => return report_adapter_error(&error),
+        };
+        if let Err(error) = powershell::recover_all(true).and_then(|()| cmd::recover_upgrade()) {
+            return report_adapter_error(&error);
+        }
         // Slow confirm: the cheap probe already failed for the hook to call us,
         // so re-check every signal. A transient alias blip during an in-flight
         // update must never destroy a live install.
@@ -628,7 +671,9 @@ pub fn cleanup_orphaned() -> i32 {
         // through the transactional sweep (cmd still refuses if a third party
         // changed AutoRun), then belt-and-braces strip anything a refused or
         // missing-recovery uninstall could have left behind.
-        let _ = sweep_uninstall();
+        if sweep_uninstall() != 0 {
+            return 1;
+        }
         strip_all_ps_profiles();
         // The cmd analogue: a refused uninstall leaves our `call` in AutoRun,
         // and deleting the payload under it would break every console start.
@@ -692,17 +737,20 @@ fn strip_all_ps_profiles() {
     };
     for folder in ["WindowsPowerShell", "PowerShell"] {
         let path = documents.join(folder).join("profile.ps1");
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(snapshot) = transaction::ProfileSnapshot::read(&path) else {
             continue;
         };
-        let cleaned = profile::strip_fwdslash_blocks(&bytes);
+        let Some(bytes) = snapshot.bytes.as_deref() else {
+            continue;
+        };
+        let cleaned = profile::strip_fwdslash_blocks(bytes);
         if cleaned == bytes {
             continue;
         }
         if cleaned.is_empty() {
-            let _ = std::fs::remove_file(&path);
+            let _ = snapshot.replace(&path, None);
         } else {
-            let _ = write_atomic(&path, &cleaned);
+            let _ = snapshot.replace(&path, Some(&cleaned));
         }
     }
 }
@@ -744,8 +792,7 @@ pub fn cleanup_script_body(
          \"{ping}\" -n 3 127.0.0.1 >nul\r\n\
          rd /s /q \"{payload_dir}\\cmd\"\r\n\
          rd /s /q \"{payload_dir}\\PowerShell\"\r\n\
-         for /d %%D in (\"{payload_dir}\\.cmd-staging-*\") do rd /s /q \"%%~fD\"\r\n\
-         for /d %%D in (\"{payload_dir}\\.powershell-staging-*\") do rd /s /q \"%%~fD\"\r\n\
+         rd \"{payload_dir}\" 2>nul\r\n\
          \"{schtasks}\" /delete /tn \"{task_name}\" /f >nul 2>&1\r\n\
          del /q \"%~f0\"\r\n"
     ))
@@ -796,13 +843,27 @@ fn schedule_payload_delete() {
     if !is_payload_tree(&payload, &local_app_data) {
         return;
     }
+    // Delayed deletion must never name a directory a fresh enable will reuse.
+    // Retire the currently orphaned trees while the transaction mutex is held.
+    let retired = payload.join(format!(".orphan-cleanup-{}", new_transaction_id()));
+    if std::fs::create_dir(&retired).is_err() {
+        return;
+    }
+    for name in ["cmd", "PowerShell"] {
+        let live = payload.join(name);
+        if live.exists() {
+            // Loaded images that cannot move remain for a later locked sweep.
+            // No delayed helper is permitted to delete their stable names.
+            let _ = std::fs::rename(&live, retired.join(name));
+        }
+    }
     let Some(ping) = fsw_core::SystemBinary::Ping.path() else {
         return;
     };
     let Some(schtasks) = fsw_core::SystemBinary::Schtasks.path() else {
         return;
     };
-    let Some(script) = cleanup_script_body(&payload, CLEANUP_TASK_NAME, &ping, &schtasks) else {
+    let Some(script) = cleanup_script_body(&retired, CLEANUP_TASK_NAME, &ping, &schtasks) else {
         return;
     };
     let task = crate::scheduled_task::OneShotTask::new(CLEANUP_TASK_NAME, script);
@@ -812,7 +873,7 @@ fn schedule_payload_delete() {
     // No usable Task Scheduler: fall back to a detached child. Try to break
     // away from any job first; if that is refused, spawn plainly — which still
     // works for an ordinary interactive shell.
-    spawn_detached_delete(&payload);
+    spawn_detached_delete(&retired);
 }
 
 /// The pre-scheduled-task fallback: a detached `cmd.exe` that waits, then
@@ -836,8 +897,7 @@ fn spawn_detached_delete(payload: &Path) {
     let command = format!(
         "\"{}\" -n 3 127.0.0.1 >nul & rd /s /q \"{payload}\\cmd\" & \
          rd /s /q \"{payload}\\PowerShell\" & \
-         for /d %D in (\"{payload}\\.cmd-staging-*\") do rd /s /q \"%~fD\" & \
-         for /d %D in (\"{payload}\\.powershell-staging-*\") do rd /s /q \"%~fD\"",
+         rd \"{payload}\" 2>nul",
         ping.display()
     );
     for flags in [
@@ -863,17 +923,16 @@ fn spawn_detached_delete(payload: &Path) {
 #[cfg(windows)]
 fn any_adapter_marker_present() -> bool {
     use windows_registry::CURRENT_USER;
-
-    CURRENT_USER.open(fsw_core::CMD_ADAPTER_KEY).is_ok()
-        || CURRENT_USER
-            .open(format!(
-                "{}WindowsPowerShell",
-                fsw_core::POWERSHELL_ADAPTER_ROOT
-            ))
-            .is_ok()
-        || CURRENT_USER
-            .open(format!("{}PowerShell", fsw_core::POWERSHELL_ADAPTER_ROOT))
-            .is_ok()
+    [
+        fsw_core::CMD_ADAPTER_KEY.to_owned(),
+        format!("{}WindowsPowerShell", fsw_core::POWERSHELL_ADAPTER_ROOT),
+        format!("{}PowerShell", fsw_core::POWERSHELL_ADAPTER_ROOT),
+    ]
+    .iter()
+    .any(|path| match CURRENT_USER.open(path) {
+        Ok(_) => true,
+        Err(error) => error.code().0.cast_unsigned() != 0x8007_0002,
+    })
 }
 
 /// Belt and braces for a deferred delete that never completed: when no adapter
@@ -882,7 +941,16 @@ fn any_adapter_marker_present() -> bool {
 /// and silent; never touches a tree any marker still names.
 #[cfg(windows)]
 pub fn prune_orphaned_payload_tree() {
-    if any_adapter_marker_present() {
+    let Ok(_transaction) = transaction::AdapterTransaction::acquire() else {
+        return;
+    };
+    if powershell::recover_all(false)
+        .and_then(|()| cmd::recover_upgrade())
+        .is_err()
+    {
+        return;
+    }
+    if any_adapter_marker_present() || powershell::has_recovery_state() {
         return;
     }
     let Ok(local_app_data) = local_app_data() else {
@@ -929,11 +997,12 @@ fn prune_adapter_directories(payload: &Path) {
 /// Deliberately narrow — only names the adapters themselves generate.
 #[must_use]
 pub fn is_prunable_leftover(name: &str, in_powershell_dir: bool) -> bool {
-    const ROOT_PREFIXES: [&str; 4] = [
+    const ROOT_PREFIXES: [&str; 5] = [
         "cmd.removing-",
         "cmd.rollback-",
         ".cmd-staging-",
         ".cmd-rollback-",
+        ".orphan-cleanup-",
     ];
     const POWERSHELL_INFIXES: [&str; 3] = [".removing-", ".staging-", ".rollback-"];
 
@@ -960,6 +1029,15 @@ pub fn is_prunable_leftover(name: &str, in_powershell_dir: bool) -> bool {
 /// debris. Best effort and silent throughout; no path is ever logged.
 #[cfg(windows)]
 pub fn prune_leftover_dirs() {
+    let Ok(_transaction) = transaction::AdapterTransaction::acquire() else {
+        return;
+    };
+    if powershell::recover_all(false)
+        .and_then(|()| cmd::recover_upgrade())
+        .is_err()
+    {
+        return;
+    }
     let Ok(local_app_data) = local_app_data() else {
         return;
     };
@@ -968,6 +1046,10 @@ pub fn prune_leftover_dirs() {
         return;
     }
     let in_flight = cmd::active_removal_path();
+    let Ok(mut protected) = powershell::active_payload_paths() else {
+        return;
+    };
+    protected.extend(cmd::active_upgrade_paths());
     let sweep = |directory: &Path, in_powershell_dir: bool| {
         let Ok(entries) = std::fs::read_dir(directory) else {
             return;
@@ -989,6 +1071,9 @@ pub fn prune_leftover_dirs() {
                 .as_deref()
                 .is_some_and(|active| Path::new(active) == path)
             {
+                continue;
+            }
+            if protected.iter().any(|active| active == &path) {
                 continue;
             }
             let _ = std::fs::remove_dir_all(&path);
@@ -1144,8 +1229,13 @@ pub fn documents_dir() -> Result<PathBuf, AdapterError> {
 #[cfg(windows)]
 pub fn new_transaction_id() -> String {
     use windows_sys::Win32::System::SystemInformation::GetTickCount64;
-
-    format!("{:x}-{:x}", unsafe { GetTickCount64() }, std::process::id())
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{:x}-{:x}-{:x}",
+        unsafe { GetTickCount64() },
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// Creates a directory through `cmd.exe` — a real process, so the directory
@@ -1256,7 +1346,9 @@ pub fn explain_file_error(error: &AdapterError, what: &str, target: &Path) -> Ad
     if looks_like_blocked_write(&text, parent_exists) {
         return AdapterError::blocked(&format!("{what} {BLOCKED_WRITE_GUIDANCE}"));
     }
-    if error.is_blocked() {
+    if error.confirmation {
+        return AdapterError::needs_confirmation(&text);
+    } else if error.is_blocked() {
         return AdapterError::blocked(&text);
     }
     AdapterError::new(&text)

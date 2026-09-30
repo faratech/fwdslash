@@ -5,9 +5,10 @@ mod browser;
 use fsw_core::navigation::NavigationAction;
 use fsw_core::{
     BrokerState, CMD_ADAPTER_KEY, FSW_ADAPTER_SWEEP_MUTEX, FSW_BROKER_WINDOW_CLASS,
-    FSW_FILTER_MAX_DISTRIBUTIONS, FSW_FILTER_PORT_NAME, FSW_FILTER_PROTOCOL_VERSION, FSW_VERSION,
-    FSW_WM_QUERY_STATE, FSW_WM_SET_PAUSED, FSW_WM_SHOW_SETTINGS, POWERSHELL_ADAPTER_ROOT, Snapshot,
-    adapter_outdated, executable_directory, has_package_identity, is_disabled, is_store_flavor,
+    FSW_FILTER_MAX_DISTRIBUTIONS, FSW_FILTER_MAX_VOLUME_NAME, FSW_FILTER_PORT_NAME,
+    FSW_FILTER_PROTOCOL_VERSION, FSW_VERSION, FSW_WM_QUERY_STATE, FSW_WM_SET_PAUSED,
+    FSW_WM_SHOW_SETTINGS, POWERSHELL_ADAPTER_ROOT, Snapshot, adapter_outdated,
+    executable_directory, has_package_identity, is_disabled, is_store_flavor,
     list_registered_distributions, package_version, persist_disabled, resolve_user_slash_path,
     resolve_user_target, state_changed_message, sync_settings_to_real_hive, update,
 };
@@ -42,6 +43,7 @@ use windows_sys::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_MANDATORY_LABEL,
     TOKEN_QUERY, TokenIntegrityLevel,
 };
+use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows_sys::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
@@ -246,6 +248,7 @@ struct FswMappingMessage {
     reserved: u32,
     generation: u64,
     distribution_count: u32,
+    volume_name: [u16; FSW_FILTER_MAX_VOLUME_NAME],
     distributions: [[u16; FSW_MAX_DISTRIBUTION_NAME]; FSW_FILTER_MAX_DISTRIBUTIONS],
 }
 
@@ -902,7 +905,7 @@ fn set_pattern_value(pattern: &IUIAutomationValuePattern, value: &str) -> bool {
 /// seconds. `SEE_MASK_ASYNCOK` lets the shell finish the launch on its own
 /// thread and `SEE_MASK_FLAG_NO_UI` keeps a failure from parking a modal
 /// error box on a window nobody can see.
-fn open_resolved_path(path: &str) -> bool {
+fn open_resolved_path_if(path: &str, is_current: impl FnOnce() -> bool) -> bool {
     unsafe {
         let wide_verb = to_u16_vec("open");
         let wide_file = to_u16_vec(path);
@@ -915,6 +918,9 @@ fn open_resolved_path(path: &str) -> bool {
         exec.lpVerb = wide_verb.as_ptr();
         exec.lpFile = wide_file.as_ptr();
         exec.nShow = SW_SHOWNORMAL;
+        if !is_current() {
+            return false;
+        }
         ShellExecuteExW(&raw mut exec) != 0
     }
 }
@@ -1318,6 +1324,8 @@ fn navigate_explorer_window(
     focused: &IUIAutomationElement,
     surface: &TrustedSurface,
     path: &str,
+    input: &str,
+    generation: u64,
 ) -> bool {
     unsafe {
         let Ok(shell_windows) =
@@ -1335,11 +1343,11 @@ fn navigate_explorer_window(
                 && let Ok(hwnd) = browser.HWND()
                 && hwnd.0 == surface.foreground as isize
             {
-                if !request_control_is_current(automation, focused, surface) {
-                    return false;
-                }
                 let target = VARIANT::from(path);
                 let empty = VARIANT::default();
+                if !request_input_is_current(automation, focused, surface, input, generation) {
+                    return false;
+                }
                 return browser
                     .Navigate2(
                         &raw const target,
@@ -1420,16 +1428,74 @@ fn request_control_is_current(
         log_diagnostic("event=enter_dropped_control_changed");
         return false;
     }
-    // The same UIA element can change its role or writable state while a
-    // path is being resolved. Browser navigation must re-prove the complete
-    // address-bar predicate at each sink, not merely its PID/HWND ancestry.
-    if surface.kind == SurfaceKind::Browser
-        && trusted_editable_value_pattern(&current, surface).is_none()
-    {
-        log_diagnostic("event=enter_dropped_browser_control_rejected");
+    // The same UIA element can change its role, password flag or writable
+    // state while a path is being resolved. Re-prove the surface's complete
+    // editable-path predicate before sampling text or using a sink.
+    if trusted_editable_value_pattern(&current, surface).is_none() {
+        log_diagnostic("event=enter_dropped_control_rejected");
         return false;
     }
     surface_is_current(surface)
+}
+
+/// Sample after control attestation (which can block), and check the key
+/// generation again after the provider returns. A provider can leave the
+/// focused element unchanged while the user edits its value.
+fn current_enter_input(
+    expected_input: &str,
+    expected_generation: u64,
+    read_generation: impl Fn() -> u64,
+    control_is_current: impl Fn() -> bool,
+    read_value: impl Fn() -> Option<String>,
+) -> bool {
+    if read_generation() != expected_generation || !control_is_current() {
+        return false;
+    }
+    let value = read_value();
+    value.as_deref() == Some(expected_input)
+        && control_is_current()
+        && read_value().as_deref() == Some(expected_input)
+        && read_generation() == expected_generation
+}
+
+fn request_input_is_current(
+    automation: &IUIAutomation,
+    focused: &IUIAutomationElement,
+    surface: &TrustedSurface,
+    input: &str,
+    generation: u64,
+) -> bool {
+    let current =
+        current_enter_input(
+            input,
+            generation,
+            || KEYDOWN_GENERATION.load(Ordering::Acquire),
+            || request_control_is_current(automation, focused, surface),
+            || read_focused_value(focused),
+        ) && request_target_is_current(surface.foreground, unsafe { GetForegroundWindow() });
+    if !current {
+        log_diagnostic("event=enter_dropped_request_changed");
+    }
+    current
+}
+
+/// The post-write check authorizes the value actually left in the control.
+/// A declined write hands back the user's Enter only if the original text
+/// remains current; a partial write cannot submit an unexpected value.
+fn apply_translated_enter(
+    input: &str,
+    translated: &str,
+    mut is_current: impl FnMut(&str) -> bool,
+    write_value: impl FnOnce() -> bool,
+    replay: impl FnOnce(),
+) {
+    if !is_current(input) {
+        return;
+    }
+    let expected = if write_value() { translated } else { input };
+    if is_current(expected) {
+        replay();
+    }
 }
 
 /// The hook swallowed the key-down before the worker ever saw it, so a worker
@@ -1449,11 +1515,12 @@ fn replay_enter_if_current(
     automation: &IUIAutomation,
     focused: &IUIAutomationElement,
     surface: &TrustedSurface,
+    generation: u64,
 ) {
     // Returning the user's Enter does not grant permission to rewrite text.
     // Webpage controls may belong to a renderer process and must retain their
     // ordinary Enter behavior even though they fail the address-bar gate.
-    if !surface_is_current(surface) {
+    if generation != KEYDOWN_GENERATION.load(Ordering::Acquire) || !surface_is_current(surface) {
         return;
     }
     let Ok(current) = (unsafe { automation.GetFocusedElement() }) else {
@@ -1461,6 +1528,7 @@ fn replay_enter_if_current(
     };
     if unsafe { automation.CompareElements(focused, &current) }.is_ok_and(BOOL::as_bool)
         && surface_is_current(surface)
+        && generation == KEYDOWN_GENERATION.load(Ordering::Acquire)
     {
         replay_enter();
     }
@@ -1631,17 +1699,17 @@ fn process_browser_enter_request(surface: &TrustedSurface, generation: u64) {
         // password fields). They are not navigation targets, but the broker
         // already swallowed the physical Enter, so return it to the unchanged
         // focused control rather than turning Enter into a dead key.
-        replay_enter_if_current(&automation, &focused, surface);
+        replay_enter_if_current(&automation, &focused, surface, generation);
         return;
     };
     let browser::FocusEligibility::Eligible { family, profile } =
         browser::focused_field_eligibility(&automation, &focused, surface.foreground)
     else {
-        replay_enter_if_current(&automation, &focused, surface);
+        replay_enter_if_current(&automation, &focused, surface, generation);
         return;
     };
     if !browser::plain_browser_enter_is_safe(surface.foreground) {
-        replay_enter_if_current(&automation, &focused, surface);
+        replay_enter_if_current(&automation, &focused, surface, generation);
         return;
     }
     let Some(input) = capture_stable_browser_input(&automation, surface, profile, generation)
@@ -1744,20 +1812,22 @@ fn process_enter_request(surface: &TrustedSurface, generation: u64) {
         return;
     };
     if !request_control_is_current(&automation, &focused, surface) {
-        replay_enter_if_current(&automation, &focused, surface);
+        replay_enter_if_current(&automation, &focused, surface, generation);
         return;
     }
     let Some(pattern) = trusted_editable_value_pattern(&focused, surface) else {
         log_diagnostic("event=surface_rejected");
-        replay_enter_if_current(&automation, &focused, surface);
+        replay_enter_if_current(&automation, &focused, surface, generation);
         return;
     };
     let Some(input) = read_focused_value(&focused) else {
-        replay_enter_if_current(&automation, &focused, surface);
+        replay_enter_if_current(&automation, &focused, surface, generation);
         return;
     };
     if !input.starts_with('/') {
-        replay_enter_if_current(&automation, &focused, surface);
+        if request_input_is_current(&automation, &focused, surface, &input, generation) {
+            replay_enter();
+        }
         return;
     }
     let snapshot = Snapshot::current();
@@ -1765,6 +1835,9 @@ fn process_enter_request(surface: &TrustedSurface, generation: u64) {
     let resolved = match resolve_user_slash_path(&input, &snapshot, &mut buffer) {
         Ok(resolved) => resolved,
         Err(error) => {
+            if !request_input_is_current(&automation, &focused, surface, &input, generation) {
+                return;
+            }
             log_diagnostic(&format!("event=path_rejected reason={}", error.name()));
             show_notification(
                 &format_resolve_error(error, &snapshot.distributions),
@@ -1790,13 +1863,12 @@ fn process_enter_request(surface: &TrustedSurface, generation: u64) {
     // box and replaying Enter runs a *search* for the text. The sink is a shell
     // open plus an Escape to dismiss the flyout the user is done with.
     if surface.kind == SurfaceKind::Search {
-        if !request_control_is_current(&automation, &focused, surface) {
-            return;
-        }
-        if !open_resolved_path(&translated) {
+        let is_current =
+            || request_input_is_current(&automation, &focused, surface, &input, generation);
+        if !open_resolved_path_if(&translated, is_current) && is_current() {
             show_notification("Windows could not open the location.", NIIF_ERROR);
         }
-        if request_control_is_current(&automation, &focused, surface) {
+        if is_current() {
             send_virtual_key(VK_ESCAPE);
         }
         return;
@@ -1807,7 +1879,7 @@ fn process_enter_request(surface: &TrustedSurface, generation: u64) {
     // leaving the old filesystem address visible.
     if surface.kind == SurfaceKind::Explorer
         && resolved.is_provider_root()
-        && navigate_explorer_window(&automation, &focused, surface, path)
+        && navigate_explorer_window(&automation, &focused, surface, path, &input, generation)
     {
         return;
     }
@@ -1817,15 +1889,19 @@ fn process_enter_request(surface: &TrustedSurface, generation: u64) {
     // receives the translated value and handles Enter exactly as it normally
     // would. Security comes from authenticating and revalidating the surface,
     // not from replacing native path traversal with a second policy engine.
-    if !request_control_is_current(&automation, &focused, surface) {
-        return;
-    }
-    if !set_pattern_value(&pattern, &translated) {
-        log_diagnostic("event=value_write_failed");
-    }
-    // A failed write passes the original Enter through; there is no broker-side
-    // ShellExecute fallback.
-    replay_enter_if_current(&automation, &focused, surface);
+    apply_translated_enter(
+        &input,
+        &translated,
+        |expected| request_input_is_current(&automation, &focused, surface, expected, generation),
+        || {
+            let written = set_pattern_value(&pattern, &translated);
+            if !written {
+                log_diagnostic("event=value_write_failed");
+            }
+            written
+        },
+        replay_enter,
+    );
 }
 
 #[must_use]
@@ -2039,7 +2115,7 @@ fn rearm_hook(window: HWND) {
 fn disconnect_filter() {
     // The next connection starts with an empty driver-side table, so drop the
     // cache to guarantee the following publish actually sends.
-    if let Ok(mut published) = PUBLISHED_DISTRIBUTIONS.lock() {
+    if let Ok(mut published) = PUBLISHED_MAPPINGS.lock() {
         *published = None;
     }
     let port = FILTER_PORT.swap(-1, Ordering::Relaxed) as HANDLE;
@@ -2056,15 +2132,21 @@ fn disconnect_filter() {
 /// without user action, so it is worth exactly one line per process.
 static DRIVER_PREFLIGHT_REJECTED: AtomicBool = AtomicBool::new(false);
 
-static PUBLISHED_DISTRIBUTIONS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilterMappings {
+    volume_name: String,
+    distributions: Vec<String>,
+}
+
+static PUBLISHED_MAPPINGS: Mutex<Option<FilterMappings>> = Mutex::new(None);
 
 /// The list most recently enumerated for publication, accepted or not.
 ///
-/// `PUBLISHED_DISTRIBUTIONS` alone can never short-circuit anything while no
+/// `PUBLISHED_MAPPINGS` alone can never short-circuit anything while no
 /// driver is loaded — the shipping configuration — because it is only written
 /// after a successful `FilterSendMessage`. Recording the attempt is what makes
 /// the compare-only path engage with the port absent.
-static ATTEMPTED_DISTRIBUTIONS: Mutex<Option<Vec<String>>> = Mutex::new(None);
+static ATTEMPTED_MAPPINGS: Mutex<Option<FilterMappings>> = Mutex::new(None);
 
 /// Opens the filter port if it is not open already. Returns whether a port is
 /// available afterwards.
@@ -2129,7 +2211,7 @@ fn verify_filter_protocol(port: HANDLE) -> bool {
             &raw mut returned,
         )
     };
-    if sent >= 0 && returned == REPORTED_SIZE && reported == FSW_FILTER_PROTOCOL_VERSION {
+    if filter_protocol_reply_is_current(sent, returned, reported) {
         return true;
     }
     if sent < 0 {
@@ -2140,6 +2222,10 @@ fn verify_filter_protocol(port: HANDLE) -> bool {
         ));
     }
     false
+}
+
+fn filter_protocol_reply_is_current(sent: i32, returned: u32, reported: u32) -> bool {
+    sent >= 0 && returned == 4 && reported == FSW_FILTER_PROTOCOL_VERSION
 }
 
 /// Re-times the health timer. `SetTimer` with an existing id replaces the
@@ -2189,8 +2275,78 @@ fn validate_driver_namespace_root() -> Result<(), String> {
     }
 }
 
+/// `QueryDosDevice` may return a redirected DOS path (for example a SUBST drive).
+/// Only a bounded native volume root can be compared with nameInfo.Volume.
+fn native_volume_name(buffer: &[u16]) -> Option<String> {
+    let length = buffer.iter().position(|ch| *ch == 0)?;
+    if length == 0 || length >= FSW_FILTER_MAX_VOLUME_NAME {
+        return None;
+    }
+    let name = String::from_utf16(buffer.get(..length)?).ok()?;
+    let prefix = r"\Device\";
+    let root = name.get(prefix.len()..)?;
+    if !name.get(..prefix.len())?.eq_ignore_ascii_case(prefix)
+        || root.is_empty()
+        || root
+            .chars()
+            .any(|ch| ch < ' ' || matches!(ch, '\\' | '/' | ':'))
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn native_c_volume_name() -> Option<String> {
+    let drive = to_u16_vec("C:");
+    let mut buffer = [0u16; FSW_FILTER_MAX_VOLUME_NAME];
+    let capacity = u32::try_from(buffer.len()).ok()?;
+    let length = unsafe { QueryDosDeviceW(drive.as_ptr(), buffer.as_mut_ptr(), capacity) };
+    if length == 0 {
+        return None;
+    }
+    let length = usize::try_from(length).ok()?;
+    native_volume_name(buffer.get(..length)?)
+}
+
+fn guarded_driver_volume() -> Option<String> {
+    let before = native_c_volume_name()?;
+    validate_driver_namespace_root().ok()?;
+    // Do not publish against a drive assignment that changed during preflight.
+    (native_c_volume_name().as_ref() == Some(&before)).then_some(before)
+}
+
+fn filter_mapping_message(mappings: &FilterMappings, generation: u64) -> Option<FswMappingMessage> {
+    let mut msg: FswMappingMessage = unsafe { std::mem::zeroed() };
+    msg.version = FSW_FILTER_PROTOCOL_VERSION;
+    msg.size = fixed_size_u32::<FswMappingMessage>()?;
+    msg.operation = FSW_OPERATION_REPLACE_MAPPINGS;
+    msg.generation = generation;
+    let volume = to_u16_vec(&mappings.volume_name);
+    if native_volume_name(&volume).as_ref() != Some(&mappings.volume_name) {
+        return None;
+    }
+    for (destination, ch) in msg.volume_name.iter_mut().zip(volume) {
+        *destination = ch;
+    }
+    let count = mappings
+        .distributions
+        .len()
+        .min(FSW_FILTER_MAX_DISTRIBUTIONS);
+    msg.distribution_count = u32::try_from(count).ok()?;
+    for (destination, name) in msg.distributions.iter_mut().zip(&mappings.distributions) {
+        let wide = to_u16_vec(name);
+        // Preserve the existing bounded distribution publication contract.
+        let truncated = wide.len() >= destination.len();
+        copy_wide_truncated(destination, &wide);
+        if truncated {
+            log_diagnostic("event=filter_distribution_name_truncated");
+        }
+    }
+    Some(msg)
+}
+
 fn publish_filter_mappings(force: bool) {
-    if let Err(_reason) = validate_driver_namespace_root() {
+    let Some(volume_name) = guarded_driver_volume() else {
         // GUI subsystem: `eprintln!` went nowhere, and the health timer
         // repeated it every tick. One category-only line per process, and
         // never the path (issue #126).
@@ -2202,11 +2358,11 @@ fn publish_filter_mappings(force: bool) {
         // remain active after a later health-timer check.
         disconnect_filter();
         set_health_interval(false);
-        if let Ok(mut published) = PUBLISHED_DISTRIBUTIONS.lock() {
+        if let Ok(mut published) = PUBLISHED_MAPPINGS.lock() {
             *published = None;
         }
         return;
-    }
+    };
 
     // The connect attempt comes first: whether anything is listening decides
     // both the tick interval and whether enumerating Lxss buys anything.
@@ -2233,11 +2389,15 @@ fn publish_filter_mappings(force: bool) {
         distros
     };
 
-    let unchanged = match ATTEMPTED_DISTRIBUTIONS.lock() {
+    let mappings = FilterMappings {
+        volume_name,
+        distributions,
+    };
+    let unchanged = match ATTEMPTED_MAPPINGS.lock() {
         Ok(mut attempted) => {
-            let same = attempted.as_ref() == Some(&distributions);
+            let same = attempted.as_ref() == Some(&mappings);
             if !same {
-                *attempted = Some(distributions.clone());
+                *attempted = Some(mappings.clone());
             }
             same
         }
@@ -2254,51 +2414,25 @@ fn publish_filter_mappings(force: bool) {
     // round-trip.
     if !force
         && unchanged
-        && PUBLISHED_DISTRIBUTIONS
+        && PUBLISHED_MAPPINGS
             .lock()
-            .is_ok_and(|published| published.as_ref() == Some(&distributions))
+            .is_ok_and(|published| published.as_ref() == Some(&mappings))
     {
         return;
     }
 
     let port = FILTER_PORT.load(Ordering::Relaxed) as HANDLE;
     unsafe {
-        let mut msg: FswMappingMessage = std::mem::zeroed();
-        msg.version = FSW_FILTER_PROTOCOL_VERSION;
-        let Some(message_size) = fixed_size_u32::<FswMappingMessage>() else {
-            log_diagnostic("event=filter_message_size_unrepresentable");
+        let Some(msg) = filter_mapping_message(&mappings, GetTickCount64()) else {
+            log_diagnostic("event=filter_message_rejected");
+            disconnect_filter();
             return;
         };
-        msg.size = message_size;
-        msg.operation = FSW_OPERATION_REPLACE_MAPPINGS;
-        msg.reserved = 0; // the driver requires zero; explicit, not padding luck
-        msg.generation = GetTickCount64();
-        let count = distributions.len().min(FSW_FILTER_MAX_DISTRIBUTIONS);
-        let Ok(distribution_count) = u32::try_from(count) else {
-            log_diagnostic("event=distribution_count_unrepresentable");
-            return;
-        };
-        msg.distribution_count = distribution_count;
-
-        for (i, d) in distributions.iter().take(count).enumerate() {
-            let wide = to_u16_vec(d);
-            if let Some(destination) = msg.distributions.get_mut(i) {
-                // A name the 128-unit slot cannot hold is published truncated,
-                // which no longer equals the registry name and can never match.
-                // Say so instead of failing silently.
-                let truncated = wide.len() >= destination.len();
-                copy_wide_truncated(destination, &wide);
-                if truncated {
-                    log_diagnostic("event=filter_distribution_name_truncated");
-                }
-            }
-        }
-
         let mut returned = 0u32;
         let sent = FilterSendMessage(
             port,
             (&raw const msg).cast(),
-            message_size,
+            msg.size,
             std::ptr::null_mut(),
             0,
             &raw mut returned,
@@ -2310,8 +2444,8 @@ fn publish_filter_mappings(force: bool) {
         }
     }
 
-    if let Ok(mut published) = PUBLISHED_DISTRIBUTIONS.lock() {
-        *published = Some(distributions);
+    if let Ok(mut published) = PUBLISHED_MAPPINGS.lock() {
+        *published = Some(mappings);
     }
 }
 
@@ -3888,6 +4022,251 @@ fn main() {
 // the user is typing in an address bar.
 #[cfg(test)]
 mod tests {
+    struct DelayedEnterProvider {
+        value: std::cell::RefCell<String>,
+        generation: std::cell::Cell<u64>,
+    }
+
+    impl DelayedEnterProvider {
+        fn new() -> Self {
+            Self {
+                value: std::cell::RefCell::new("/Ubuntu/etc".to_owned()),
+                generation: std::cell::Cell::new(7),
+            }
+        }
+
+        fn is_current(&self, expected: &str) -> bool {
+            super::current_enter_input(
+                expected,
+                7,
+                || self.generation.get(),
+                || true, // Same foreground window and focused control throughout.
+                || Some(self.value.borrow().clone()),
+            )
+        }
+    }
+
+    #[test]
+    fn delayed_resolution_cannot_write_open_navigate_escape_or_replay_a_changed_request() {
+        for change_generation in [false, true] {
+            let provider = DelayedEnterProvider::new();
+            let captured = provider.value.borrow().clone();
+            // Completion of a delayed resolver/native provider after the user
+            // has typed in the very same control, or another Enter was queued.
+            if change_generation {
+                provider.generation.set(8);
+            } else {
+                *provider.value.borrow_mut() = "/Ubuntu/home".to_owned();
+            }
+            let sinks = std::cell::Cell::new(0);
+            super::apply_translated_enter(
+                &captured,
+                r"\\wsl.localhost\Ubuntu\etc",
+                |expected| provider.is_current(expected),
+                || {
+                    sinks.set(sinks.get() + 1);
+                    true
+                },
+                || sinks.set(sinks.get() + 1),
+            );
+            for _ in [
+                "Search open",
+                "Search Escape",
+                "Explorer Navigate2",
+                "unchanged Enter",
+            ] {
+                if provider.is_current(&captured) {
+                    sinks.set(sinks.get() + 1);
+                }
+            }
+            assert_eq!(sinks.get(), 0);
+        }
+    }
+
+    #[test]
+    fn provider_delay_during_attestation_or_value_read_is_rechecked() {
+        let provider = DelayedEnterProvider::new();
+        assert!(!super::current_enter_input(
+            "/Ubuntu/etc",
+            7,
+            || provider.generation.get(),
+            || {
+                *provider.value.borrow_mut() = "/Ubuntu/home".to_owned();
+                true
+            },
+            || Some(provider.value.borrow().clone()),
+        ));
+        *provider.value.borrow_mut() = "/Ubuntu/etc".to_owned();
+        assert!(!super::current_enter_input(
+            "/Ubuntu/etc",
+            7,
+            || provider.generation.get(),
+            || true,
+            || {
+                provider.generation.set(8);
+                Some(provider.value.borrow().clone())
+            },
+        ));
+    }
+
+    #[test]
+    fn unchanged_non_slash_text_keeps_its_native_enter() {
+        let provider = DelayedEnterProvider::new();
+        *provider.value.borrow_mut() = r"C:\Users".to_owned();
+        assert!(provider.is_current(r"C:\Users"));
+        // Captured text is not rewritten just to authorize the fail-open key.
+        assert_eq!(&*provider.value.borrow(), r"C:\Users");
+        provider.generation.set(8);
+        assert!(!provider.is_current(r"C:\Users"));
+    }
+
+    #[test]
+    fn unchanged_request_replays_the_translated_value_once() {
+        let provider = DelayedEnterProvider::new();
+        let replays = std::cell::Cell::new(0);
+        let translated = r"\\wsl.localhost\Ubuntu\etc";
+        super::apply_translated_enter(
+            "/Ubuntu/etc",
+            translated,
+            |expected| provider.is_current(expected),
+            || {
+                *provider.value.borrow_mut() = translated.to_owned();
+                true
+            },
+            || replays.set(replays.get() + 1),
+        );
+        assert_eq!(&*provider.value.borrow(), translated);
+        assert_eq!(replays.get(), 1);
+        assert!(provider.is_current(translated));
+    }
+
+    #[test]
+    fn failed_write_replays_only_the_unchanged_original_value() {
+        for partial_write in [false, true] {
+            let provider = DelayedEnterProvider::new();
+            let replays = std::cell::Cell::new(0);
+            super::apply_translated_enter(
+                "/Ubuntu/etc",
+                r"\\wsl.localhost\Ubuntu\etc",
+                |expected| provider.is_current(expected),
+                || {
+                    if partial_write {
+                        *provider.value.borrow_mut() = "partial".to_owned();
+                    }
+                    false
+                },
+                || replays.set(replays.get() + 1),
+            );
+            assert_eq!(replays.get(), u32::from(!partial_write));
+        }
+    }
+
+    #[test]
+    fn successful_write_does_not_replay_after_an_edit_or_new_generation() {
+        for change_generation in [false, true] {
+            let provider = DelayedEnterProvider::new();
+            let replays = std::cell::Cell::new(0);
+            super::apply_translated_enter(
+                "/Ubuntu/etc",
+                r"\\wsl.localhost\Ubuntu\etc",
+                |expected| provider.is_current(expected),
+                || {
+                    *provider.value.borrow_mut() = if change_generation {
+                        provider.generation.set(8);
+                        r"\\wsl.localhost\Ubuntu\etc".to_owned()
+                    } else {
+                        "/Ubuntu/home".to_owned()
+                    };
+                    true
+                },
+                || replays.set(replays.get() + 1),
+            );
+            assert_eq!(replays.get(), 0);
+        }
+    }
+
+    #[test]
+    fn filter_v4_layout_and_ping_reply_match_the_c_contract() {
+        use super::FswMappingMessage;
+        assert_eq!(super::FSW_FILTER_PROTOCOL_VERSION, 4);
+        assert_eq!(std::mem::offset_of!(FswMappingMessage, generation), 16);
+        assert_eq!(std::mem::offset_of!(FswMappingMessage, volume_name), 28);
+        assert_eq!(std::mem::offset_of!(FswMappingMessage, distributions), 284);
+        assert_eq!(std::mem::size_of::<FswMappingMessage>(), 8480);
+        assert!(super::filter_protocol_reply_is_current(0, 4, 4));
+        assert!(!super::filter_protocol_reply_is_current(0, 4, 3));
+        assert!(!super::filter_protocol_reply_is_current(0, 0, 4));
+        assert!(!super::filter_protocol_reply_is_current(-1, 4, 4));
+    }
+
+    #[test]
+    fn filter_publication_dedupe_includes_the_native_volume() {
+        let first = super::FilterMappings {
+            volume_name: r"\Device\HarddiskVolume3".to_owned(),
+            distributions: vec!["Ubuntu".to_owned()],
+        };
+        assert_eq!(first, first.clone());
+        let mut reassigned = first.clone();
+        reassigned.volume_name = r"\Device\HarddiskVolume4".to_owned();
+        assert_ne!(first, reassigned);
+    }
+
+    #[test]
+    fn filter_mapping_builder_encodes_volume_and_generation_without_truncating_identity()
+    -> Result<(), &'static str> {
+        let mut mappings = super::FilterMappings {
+            volume_name: r"\Device\HarddiskVolume3".to_owned(),
+            distributions: vec!["Ubuntu".to_owned()],
+        };
+        let message = super::filter_mapping_message(&mappings, 42)
+            .ok_or("valid native volume must produce a message")?;
+        assert_eq!(message.generation, 42);
+        assert_eq!(message.reserved, 0);
+        assert_eq!(message.distribution_count, 1);
+        assert_eq!(
+            super::native_volume_name(&message.volume_name),
+            Some(mappings.volume_name.clone())
+        );
+        assert_eq!(
+            String::from_utf16_lossy(&message.distributions[0]).trim_end_matches('\0'),
+            "Ubuntu"
+        );
+        mappings.volume_name = format!(
+            "\\Device\\{}",
+            "x".repeat(super::FSW_FILTER_MAX_VOLUME_NAME)
+        );
+        assert!(super::filter_mapping_message(&mappings, 43).is_none());
+        mappings.volume_name = r"\??\C:\folder".to_owned();
+        assert!(super::filter_mapping_message(&mappings, 44).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn native_volume_identity_requires_a_bounded_terminated_device_root() {
+        for valid in [r"\Device\HarddiskVolume3", r"\device\HarddiskVolume4"] {
+            assert_eq!(
+                super::native_volume_name(&super::to_u16_vec(valid)).as_deref(),
+                Some(valid)
+            );
+        }
+        for invalid in [
+            "",
+            r"\Device\",
+            r"\??\C:\folder",
+            r"\Device\HarddiskVolume3\folder",
+            r"C:",
+        ] {
+            assert!(super::native_volume_name(&super::to_u16_vec(invalid)).is_none());
+        }
+        let unterminated: Vec<u16> = r"\Device\HarddiskVolume3".encode_utf16().collect();
+        assert!(super::native_volume_name(&unterminated).is_none());
+        let long = format!(
+            "\\Device\\{}",
+            "x".repeat(super::FSW_FILTER_MAX_VOLUME_NAME)
+        );
+        assert!(super::native_volume_name(&super::to_u16_vec(&long)).is_none());
+    }
+
     #[test]
     fn browser_identity_is_independent_of_localized_labels() {
         assert_eq!(super::address_identity("", "", "Ctrl+L"), (true, false));

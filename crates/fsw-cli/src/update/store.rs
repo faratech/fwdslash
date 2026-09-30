@@ -332,7 +332,10 @@ pub fn can_silently_download() -> bool {
 /// Deployment terminates this process when it lands, so in the successful case
 /// this function does not return at all — the watchdog task registered before
 /// the call is what brings the product back.
-pub fn silent_download_and_install(policy: super::WaitPolicy) -> Outcome {
+pub fn silent_download_and_install(
+    policy: super::WaitPolicy,
+    before_start: impl FnOnce() -> Result<(), String>,
+) -> Outcome {
     let context = match StoreContext::GetDefault() {
         Ok(context) => context,
         Err(error) => return Outcome::NotStarted(hex(&error)),
@@ -372,6 +375,9 @@ pub fn silent_download_and_install(policy: super::WaitPolicy) -> Outcome {
     };
     if !can_silently_download {
         return Outcome::NotStarted("0x80070005".to_string());
+    }
+    if let Err(detail) = before_start() {
+        return Outcome::NotStarted(detail);
     }
     let operation = match context.TrySilentDownloadAndInstallStorePackageUpdatesAsync(&updates) {
         Ok(operation) => operation,

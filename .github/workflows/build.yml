@@ -38,6 +38,11 @@ jobs:
         run: |
           & pwsh -NoProfile -File .\test\powershell\ForwardSlashWindows.LocationRegression.ps1
           if ($LASTEXITCODE -ne 0) { throw "PowerShell 7 location regression fixture failed with $LASTEXITCODE" }
+      - name: Test driver protocol layout without loading a driver
+        shell: powershell
+        run: |
+          & "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File .\tools\Test-DriverProtocol.ps1
+          if ($LASTEXITCODE -ne 0) { throw "driver protocol fixture failed with $LASTEXITCODE" }
       - name: Test installer runtime architecture selection
         shell: powershell
         run: |
@@ -83,6 +88,9 @@ jobs:
 
       - name: Test the version bumper
         run: python3 -m unittest tools.test_bump_version
+
+      - name: Test the bindings generator helper launch
+        run: python3 -m unittest tools.test_regen_install_control
 
       # The notes file is the only thing Store customers read. 0.1.0 shipped
       # notes naming internal routes, a watchdog and an issue number, and they

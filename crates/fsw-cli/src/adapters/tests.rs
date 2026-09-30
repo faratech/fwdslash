@@ -1053,6 +1053,43 @@ fn autorun_reference_and_path_helpers() {
 }
 
 #[test]
+fn autorun_parser_preserves_quoted_and_caret_escaped_separators() {
+    let path = r"C:\Users\Mike & Jane\AppData\Local\ForwardSlashWindows\cmd\fsw-autorun.cmd";
+    let hook = format!("call \"{path}\"");
+    let original = r#"echo "left & right" & echo escaped ^& text"#;
+    let installed = state::installed_autorun(original, &hook);
+    assert!(state::autorun_references_fwdslash(&installed));
+    assert_eq!(
+        state::fwdslash_autorun_path(&installed).as_deref(),
+        Some(path)
+    );
+    assert_eq!(state::strip_fwdslash_autorun(&installed), original);
+    assert_eq!(
+        state::strip_fwdslash_autorun(&format!("{hook} & {original}")),
+        original
+    );
+}
+
+#[test]
+fn edited_fences_preserve_separators_between_user_lines_and_at_eof() {
+    for newline in ["\r\n", "\n", "\r"] {
+        let block = format!(
+            "# >>> Forward Slash Windows >>>{newline}edited body{newline}# <<< Forward Slash Windows <<<{newline}"
+        );
+        let middle = format!("Write-Host before{newline}{block}Write-Host after{newline}");
+        assert_eq!(
+            profile::strip_fwdslash_blocks(middle.as_bytes()),
+            format!("Write-Host before{newline}Write-Host after{newline}").as_bytes()
+        );
+        let end = format!("Write-Host before{newline}{block}");
+        assert_eq!(
+            profile::strip_fwdslash_blocks(end.as_bytes()),
+            format!("Write-Host before{newline}").as_bytes()
+        );
+    }
+}
+
+#[test]
 fn product_confirmed_gone_requires_both_checks_absent() {
     assert!(state::product_confirmed_gone(false, false));
     assert!(!state::product_confirmed_gone(true, false));
@@ -1080,7 +1117,7 @@ fn task_start_time_formats_and_wraps_at_midnight() {
 fn cleanup_script_quotes_every_path_and_self_destructs() {
     use std::path::Path;
 
-    let dir = Path::new(r"C:\Users\a b\AppData\Local\ForwardSlashWindows");
+    let dir = Path::new(r"C:\Users\a b\AppData\Local\ForwardSlashWindows\.orphan-cleanup-ab-cd");
     let ping = Path::new(r"C:\Windows\System32\ping.exe");
     let schtasks = Path::new(r"C:\Windows\System32\schtasks.exe");
     let body = super::cleanup_script_body(dir, super::CLEANUP_TASK_NAME, ping, schtasks)
@@ -1089,14 +1126,8 @@ fn cleanup_script_quotes_every_path_and_self_destructs() {
     assert!(!body.contains(&format!("rd /s /q \"{}\"\r\n", dir.display())));
     assert!(body.contains(&format!("rd /s /q \"{}\\cmd\"\r\n", dir.display())));
     assert!(body.contains(&format!("rd /s /q \"{}\\PowerShell\"\r\n", dir.display())));
-    assert!(body.contains(&format!(
-        "for /d %%D in (\"{}\\.cmd-staging-*\")",
-        dir.display()
-    )));
-    assert!(body.contains(&format!(
-        "for /d %%D in (\"{}\\.powershell-staging-*\")",
-        dir.display()
-    )));
+    assert!(!body.contains('*'));
+    assert!(body.contains(".orphan-cleanup-ab-cd"));
     assert!(!body.contains(&format!("rd /s /q \"{}\\update\"", dir.display())));
     // It waits for the launching process to exit before deleting.
     assert!(body.contains("\"C:\\Windows\\System32\\ping.exe\" -n 3 127.0.0.1 >nul\r\n"));

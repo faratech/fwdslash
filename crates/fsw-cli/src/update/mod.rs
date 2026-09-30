@@ -1006,6 +1006,76 @@ fn cached_offer() -> Option<fsw_core::update::Offer> {
     fsw_core::update::cached_offer()
 }
 
+/// Tentative backoff state belongs to the packaged process, never its helper.
+/// It is written at the last admission point before an installer may close us.
+/// A definite refusal restores the previous stamp; queued or uncertain work
+/// keeps it even if this process returns an error or never returns at all.
+struct StoreAttempt {
+    unnamed: bool,
+    previous: Option<u64>,
+    stamped: bool,
+}
+
+impl StoreAttempt {
+    fn start_with(
+        &mut self,
+        now: u64,
+        mut write: impl FnMut(Option<u64>) -> Result<(), u32>,
+    ) -> Result<(), u32> {
+        if self.unnamed && !self.stamped {
+            // The settings writer can fail after writing one hive. Mark this
+            // tentative first so a refusal still attempts to restore both.
+            self.stamped = true;
+            write(Some(now))?;
+        }
+        Ok(())
+    }
+
+    fn cancel_with(
+        &mut self,
+        mut write: impl FnMut(Option<u64>) -> Result<(), u32>,
+    ) -> Result<(), u32> {
+        if self.stamped {
+            write(self.previous)?;
+            self.stamped = false;
+        }
+        Ok(())
+    }
+
+    fn start(&mut self) -> Result<(), String> {
+        self.start_with(now_unix(), write_store_attempt)
+            .map_err(|_| "The update attempt could not be recorded.".to_owned())
+    }
+
+    fn cancel(&mut self) -> Result<(), u32> {
+        self.cancel_with(write_store_attempt)
+    }
+}
+
+fn write_store_attempt(stamp: Option<u64>) -> Result<(), u32> {
+    match stamp {
+        Some(stamp) => {
+            fsw_core::set_setting_u64(fsw_core::update::STORE_UPDATE_ATTEMPT_VALUE, stamp)
+        }
+        None => fsw_core::delete_setting(fsw_core::update::STORE_UPDATE_ATTEMPT_VALUE),
+    }
+}
+
+fn cancel_store_attempt(
+    attempt: &mut StoreAttempt,
+    route: Route,
+    available: Option<&str>,
+) -> Option<Rung> {
+    attempt.cancel().err().map(|_| {
+        Rung::Done(
+            Report::new("error", EXIT_ERROR)
+                .route(route)
+                .available(available.map(str::to_owned))
+                .detail("The previous update attempt state could not be restored.".to_owned()),
+        )
+    })
+}
+
 fn cmd_install(options: &Options) -> i32 {
     if !fsw_core::has_package_identity() {
         return Report::new("disabled", EXIT_NOTHING).emit(options, None);
@@ -1068,18 +1138,17 @@ fn cmd_install(options: &Options) -> i32 {
         InstallAnswer::Proceed => {}
     }
 
-    // An unnamed offer may be a repair package that never advances the
-    // version. Stamp the attempt before starting, so a failure backs off
-    // instead of looping every cycle.
-    if matches!(
-        availability,
-        Availability::Offer(fsw_core::update::Offer::Unnamed)
-    ) {
-        let _ = fsw_core::update::note_store_update_attempt();
-    }
+    let mut attempt = StoreAttempt {
+        unnamed: matches!(
+            availability,
+            Availability::Offer(fsw_core::update::Offer::Unnamed)
+        ),
+        previous: fsw_core::update::store_update_attempt(),
+        stamped: false,
+    };
 
     let (ladder, _forced) = resolve_route(options.route);
-    install_via_ladder(&ladder, options, label.as_deref(), folded)
+    install_via_ladder(&ladder, options, label.as_deref(), folded, &mut attempt)
 }
 
 /// GitHub flavor: the bundle is already downloaded and deferred-registered, so
@@ -1139,7 +1208,7 @@ enum Rung {
 }
 
 /// Route 1: `AppInstallManager`, phases 1a and 1b.
-fn try_appinstall(options: &Options, available: Option<&str>) -> Rung {
+fn try_appinstall(options: &Options, available: Option<&str>, attempt: &mut StoreAttempt) -> Rung {
     let previous = previous_version();
     // Registered but deliberately NOT run yet. Its backstop trigger is a minute
     // out, which is longer than the 1a/1b decision takes, so the script 1b may
@@ -1156,7 +1225,9 @@ fn try_appinstall(options: &Options, available: Option<&str>) -> Rung {
     let policy = WaitPolicy::Foreground {
         admission: ADMISSION_WINDOW,
     };
-    match appinstall::apply_store_update(fsw_core::STORE_PRODUCT_ID, policy) {
+    match appinstall::apply_store_update_with_start(fsw_core::STORE_PRODUCT_ID, policy, || {
+        attempt.start()
+    }) {
         // The Store has the item and the watchdog has the comeback. Nothing
         // waits on this process any longer: the settings window and the
         // broker both key on this exit and go on with their day.
@@ -1187,12 +1258,20 @@ fn try_appinstall(options: &Options, available: Option<&str>) -> Rung {
         }
         appinstall::Outcome::NotStarted(detail) => {
             watchdog.cancel();
+            if let Some(failure) = cancel_store_attempt(attempt, Route::AppInstall, available) {
+                return failure;
+            }
             // Phase 1b: the same call from the identity-less helper, which is
             // the context the API may accept when the packaged one is refused.
             if let Some(helper) = helper::stage_helper() {
                 let command =
                     helper::apply_store_command(&helper, fsw_core::STORE_PRODUCT_ID, &previous);
-                if relaunch::schedule_apply(&command, options.relaunch, &previous) {
+                if relaunch::schedule_apply_with_start(
+                    &command,
+                    options.relaunch,
+                    &previous,
+                    || attempt.start(),
+                ) {
                     return Rung::Done(
                         Report::new("installing", EXIT_OK)
                             .route(Route::AppInstall)
@@ -1201,6 +1280,9 @@ fn try_appinstall(options: &Options, available: Option<&str>) -> Rung {
                             .detail(format!("In-process install unavailable ({detail}).")),
                     );
                 }
+                if let Some(failure) = cancel_store_attempt(attempt, Route::AppInstall, available) {
+                    return failure;
+                }
             }
             Rung::Declined(detail)
         }
@@ -1208,7 +1290,7 @@ fn try_appinstall(options: &Options, available: Option<&str>) -> Rung {
 }
 
 /// Route 2: `StoreContext`'s own silent download and install.
-fn try_store(options: &Options, available: Option<&str>) -> Rung {
+fn try_store(options: &Options, available: Option<&str>, attempt: &mut StoreAttempt) -> Rung {
     let previous = previous_version();
     // This one can terminate the package the moment deployment starts, so its
     // watchdog runs immediately rather than waiting for the backstop trigger.
@@ -1224,7 +1306,7 @@ fn try_store(options: &Options, available: Option<&str>) -> Rung {
     let policy = WaitPolicy::Foreground {
         admission: ADMISSION_WINDOW,
     };
-    match store::silent_download_and_install(policy) {
+    match store::silent_download_and_install(policy, || attempt.start()) {
         // The Store accepted it and is still working. Nothing waits on this
         // process any longer; the watchdog owns the comeback.
         store::Outcome::Queued => Rung::Done(
@@ -1247,6 +1329,9 @@ fn try_store(options: &Options, available: Option<&str>) -> Rung {
         }
         store::Outcome::NotStarted(detail) => {
             watchdog.cancel();
+            if let Some(failure) = cancel_store_attempt(attempt, Route::Store, available) {
+                return failure;
+            }
             Rung::Declined(detail)
         }
     }
@@ -1254,7 +1339,7 @@ fn try_store(options: &Options, available: Option<&str>) -> Rung {
 
 /// Route 3: hand the whole thing to `winget`, from the scheduled task so it
 /// survives the package going down.
-fn try_winget(options: &Options, available: Option<&str>) -> Rung {
+fn try_winget(options: &Options, available: Option<&str>, attempt: &mut StoreAttempt) -> Rung {
     let Some(command) = relaunch::winget_command(fsw_core::STORE_PRODUCT_ID) else {
         return Rung::Declined("the Windows App Installer alias is unavailable".to_string());
     };
@@ -1270,7 +1355,9 @@ fn try_winget(options: &Options, available: Option<&str>) -> Rung {
         );
     }
     let previous = previous_version();
-    if relaunch::schedule_apply(&command, options.relaunch, &previous) {
+    if relaunch::schedule_apply_with_start(&command, options.relaunch, &previous, || {
+        attempt.start()
+    }) {
         Rung::Done(
             Report::new("installing", EXIT_OK)
                 .route(Route::Winget)
@@ -1278,16 +1365,24 @@ fn try_winget(options: &Options, available: Option<&str>) -> Rung {
                 .available(available.map(str::to_owned)),
         )
     } else {
+        if let Some(failure) = cancel_store_attempt(attempt, Route::Winget, available) {
+            return failure;
+        }
         Rung::Declined("the update task could not be registered".to_string())
     }
 }
 
 /// Runs one rung by name.
-fn try_route(route: Route, options: &Options, available: Option<&str>) -> Rung {
+fn try_route(
+    route: Route,
+    options: &Options,
+    available: Option<&str>,
+    attempt: &mut StoreAttempt,
+) -> Rung {
     match route {
-        Route::AppInstall => try_appinstall(options, available),
-        Route::Store => try_store(options, available),
-        Route::Winget => try_winget(options, available),
+        Route::AppInstall => try_appinstall(options, available, attempt),
+        Route::Store => try_store(options, available, attempt),
+        Route::Winget => try_winget(options, available, attempt),
         Route::Notify => Rung::Done(
             Report::new("needsUser", EXIT_NEEDS_USER)
                 .route(Route::Notify)
@@ -1303,10 +1398,11 @@ fn install_via_ladder(
     options: &Options,
     available: Option<&str>,
     folded: Option<String>,
+    attempt: &mut StoreAttempt,
 ) -> i32 {
     let mut declined = Vec::new();
     for route in ladder {
-        match try_route(*route, options, available) {
+        match try_route(*route, options, available, attempt) {
             Rung::Done(report) => return report.emit(options, folded),
             Rung::Declined(detail) => declined.push(format!("{}: {detail}", route.name())),
         }

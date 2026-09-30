@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use super::{
     BareSlashMode, Context, Registry, RenderBuf, ResolveError, Resolved, WSL_ROOT_UNC,
-    is_valid_windows_root, resolve, resolve_under_root,
+    is_valid_distribution_name, is_valid_windows_root, resolve, resolve_strict, resolve_under_root,
 };
 
 /// The destination family a caller must hand to the Windows shell.
@@ -103,8 +103,9 @@ impl UserTarget {
 ///
 /// `context` supplies the existing registered-distribution semantics. It is
 /// required for slash aliases other than `/mnt/<drive>`, and for relative WSL
-/// bases. `custom_root` has exactly the same precedence as the core legacy
-/// slash resolver. No branch probes the filesystem or expands shell variables.
+/// bases. `custom_root` has the core legacy slash precedence for slash inputs;
+/// an explicit relative base determines its own namespace. No branch probes
+/// the filesystem or expands shell variables.
 pub fn resolve_user_target<R: Registry + ?Sized>(
     input: &str,
     context: Option<&Context<'_, R>>,
@@ -129,7 +130,7 @@ pub fn resolve_user_target<R: Registry + ?Sized>(
     if input.starts_with('/') {
         return resolve_slash_target(input, context, custom_root);
     }
-    resolve_relative(input, context, custom_root, base)
+    resolve_relative(input, context, base)
 }
 
 fn resolve_slash_target<R: Registry + ?Sized>(
@@ -180,7 +181,6 @@ fn resolve_slash_target<R: Registry + ?Sized>(
 fn resolve_relative<R: Registry + ?Sized>(
     input: &str,
     context: Option<&Context<'_, R>>,
-    custom_root: Option<&str>,
     base: Option<TargetBase<'_>>,
 ) -> Result<UserTarget, TargetError> {
     let Some(base) = base else {
@@ -203,16 +203,26 @@ fn resolve_relative<R: Registry + ?Sized>(
             distribution,
             linux_path,
         } => {
-            if !linux_path.starts_with('/') || linux_path.contains('\\') {
+            if !is_valid_distribution_name(distribution)
+                || !linux_path.starts_with('/')
+                || linux_path.contains('\\')
+            {
                 return Err(TargetError::Rejected(TargetRejection::InvalidPath));
             }
+            let context = context.ok_or(TargetError::NeedsContext)?;
             let suffix = linux_path.trim_end_matches('/');
             let full_input = if suffix.is_empty() {
                 format!("/{distribution}/{input}")
             } else {
                 format!("/{distribution}{suffix}/{input}")
             };
-            resolve_slash_target(&full_input, context, custom_root)
+            // A supplied distribution is a namespace, not a bare-slash
+            // preference. Strict resolution also avoids interpreting a real
+            // distribution named `mnt` as the `/mnt/<drive>` shortcut.
+            let mut render_buf = RenderBuf::new();
+            let resolved = resolve_strict(&full_input, context.registry, &mut render_buf)
+                .map_err(rejected_slash)?;
+            target_from_resolved(resolved)
         }
     }
 }

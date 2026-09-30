@@ -564,6 +564,16 @@ pub fn unnamed_offer_actionable(last_attempt: Option<u64>, now: u64) -> bool {
     last_attempt.is_none_or(|last| now.saturating_sub(last) >= UNNAMED_RETRY_BACKOFF_SECS)
 }
 
+/// The local download name matching the release pipeline's four-part asset.
+/// Trust-boundary callers validate the release tag before using this name.
+#[must_use]
+pub fn bundle_name(tag: &str) -> String {
+    match expected_bundle_version(tag) {
+        Some(version) => format!("fwdslash-{version}.msixbundle"),
+        None => format!("fwdslash-{tag}.msixbundle"),
+    }
+}
+
 /// The outcome of one update-check attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -576,8 +586,8 @@ pub enum UpdateOutcome {
     VerificationFailed(UpdateVerificationError),
     /// The running version is current.
     UpToDate,
-    /// A newer release exists; the tag names it. With auto-update on the
-    /// bundle was already downloaded and registered.
+    /// A newer release exists; the tag names it. The GitHub route only emits
+    /// this after staging the verified bundle and recording its tag.
     Ready(String),
     /// An update exists but the check could not name it — the Store's answer
     /// when its offer carries no version worth repeating (issue #97). Never
@@ -585,13 +595,297 @@ pub enum UpdateOutcome {
     ReadyUnnamed,
 }
 
+#[cfg(any(windows, test))]
+#[allow(clippy::struct_excessive_bools)] // Independent identity, flavor, preference and explicit request.
+struct GithubCheckContext<'a> {
+    packaged: bool,
+    store_flavor: bool,
+    auto_update: bool,
+    force: bool,
+    last_check: Option<u64>,
+    now: u64,
+    running_version: &'a str,
+}
+
+/// The check and staging sequence is shared by the real Windows transport and
+/// offline tests. In particular, an admitted manual check must not stop after
+/// finding an offer just because unattended updates are disabled.
+#[cfg(any(windows, test))]
+trait GithubCheckIo {
+    fn note_attempt(&mut self);
+    fn fetch_release(&mut self) -> Option<String>;
+    fn clear_stale(&mut self);
+    fn stage_bundle(
+        &mut self,
+        url: &str,
+        tag: &str,
+        digest: &str,
+    ) -> Result<(), UpdateVerificationError>;
+    fn cache_ready(&mut self, tag: &str) -> Result<(), u32>;
+}
+
+#[cfg(any(windows, test))]
+fn run_github_check(
+    context: &GithubCheckContext<'_>,
+    io: &mut impl GithubCheckIo,
+) -> UpdateOutcome {
+    if context.store_flavor
+        || !context.packaged
+        || !(context.force || context.auto_update)
+        || (!context.force && !check_is_due(context.last_check, context.now))
+    {
+        return UpdateOutcome::NotDue;
+    }
+    io.note_attempt();
+    let Some(release_json) = io.fetch_release() else {
+        return UpdateOutcome::Unavailable;
+    };
+    let Some(tag) = extract_tag_name(&release_json).filter(|tag| parse_release_tag(tag).is_some())
+    else {
+        return UpdateOutcome::VerificationFailed(UpdateVerificationError::VersionMismatch);
+    };
+    if !is_newer_version(&normalize_running_version(context.running_version), tag) {
+        io.clear_stale();
+        return UpdateOutcome::UpToDate;
+    }
+    let Some(url) = expected_bundle_url(tag).filter(|url| release_json.contains(url.as_str()))
+    else {
+        return UpdateOutcome::VerificationFailed(UpdateVerificationError::AssetNameMismatch);
+    };
+    let Some(digest) = extract_bundle_digest(&release_json, &url) else {
+        return UpdateOutcome::VerificationFailed(UpdateVerificationError::DigestMismatch);
+    };
+    if let Err(error) = io.stage_bundle(&url, tag, digest) {
+        return UpdateOutcome::VerificationFailed(error);
+    }
+    if io.cache_ready(tag).is_err() {
+        return UpdateOutcome::VerificationFailed(UpdateVerificationError::IoFailure);
+    }
+    UpdateOutcome::Ready(tag.to_string())
+}
+
+/// Store offers share the label slot, but never own GitHub bundle staging.
+/// Skip all staging reads and cleanup on that track so a named Store version
+/// cannot be mistaken for an invalid or spent GitHub release tag.
+#[cfg(any(windows, test))]
+fn find_pending_github_bundle<T>(
+    packaged: bool,
+    store_flavor: bool,
+    current: &str,
+    read_tag: impl FnOnce() -> Option<String>,
+    clear_stale: impl FnOnce(),
+    locate_bundle: impl FnOnce(&str) -> Option<T>,
+) -> Option<T> {
+    if !packaged || store_flavor {
+        return None;
+    }
+    let tag = read_tag()?;
+    if !is_newer_github_release(current, &tag) {
+        clear_stale();
+        return None;
+    }
+    locate_bundle(&tag)
+}
+
+#[cfg(test)]
+mod github_check_tests {
+    use super::{
+        GithubCheckContext, GithubCheckIo, UpdateOutcome, UpdateVerificationError, run_github_check,
+    };
+
+    #[derive(Default)]
+    struct OfflineIo {
+        events: Vec<&'static str>,
+        stage_error: Option<UpdateVerificationError>,
+        cache_error: bool,
+        tag: Option<String>,
+    }
+
+    impl GithubCheckIo for OfflineIo {
+        fn note_attempt(&mut self) {
+            self.events.push("attempt");
+        }
+
+        fn fetch_release(&mut self) -> Option<String> {
+            self.events.push("fetch");
+            Some(r#"{"tag_name":"v0.1.2","assets":[{"browser_download_url":"https://github.com/faratech/fwdslash/releases/download/v0.1.2/fwdslash-0.1.2.0.msixbundle","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#.to_owned())
+        }
+
+        fn clear_stale(&mut self) {
+            self.events.push("clear");
+        }
+
+        fn stage_bundle(
+            &mut self,
+            url: &str,
+            tag: &str,
+            digest: &str,
+        ) -> Result<(), UpdateVerificationError> {
+            self.events.push("stage");
+            assert_eq!(tag, "v0.1.2");
+            assert_eq!(
+                url,
+                "https://github.com/faratech/fwdslash/releases/download/v0.1.2/fwdslash-0.1.2.0.msixbundle"
+            );
+            assert_eq!(digest, "a".repeat(64));
+            self.stage_error.map_or(Ok(()), Err)
+        }
+
+        fn cache_ready(&mut self, tag: &str) -> Result<(), u32> {
+            self.events.push("cache");
+            if self.cache_error {
+                Err(5)
+            } else {
+                self.tag = Some(tag.to_owned());
+                Ok(())
+            }
+        }
+    }
+
+    fn context(force: bool) -> GithubCheckContext<'static> {
+        GithubCheckContext {
+            packaged: true,
+            store_flavor: false,
+            auto_update: false,
+            force,
+            last_check: Some(100),
+            now: 101,
+            running_version: "0.1.1.0",
+        }
+    }
+
+    #[test]
+    fn explicit_check_stages_before_publishing_with_auto_updates_off() {
+        let mut io = OfflineIo::default();
+        assert_eq!(
+            run_github_check(&context(true), &mut io),
+            UpdateOutcome::Ready("v0.1.2".to_owned())
+        );
+        assert_eq!(io.events, ["attempt", "fetch", "stage", "cache"]);
+        assert_eq!(io.tag.as_deref(), Some("v0.1.2"));
+    }
+
+    #[test]
+    fn unattended_disabled_checks_do_not_contact_or_stage_anything() {
+        let mut io = OfflineIo::default();
+        assert_eq!(
+            run_github_check(&context(false), &mut io),
+            UpdateOutcome::NotDue
+        );
+        assert!(io.events.is_empty());
+    }
+
+    #[test]
+    fn force_never_bypasses_package_or_distribution_track() {
+        for (packaged, store_flavor) in [(false, false), (true, true)] {
+            let mut context = context(true);
+            context.packaged = packaged;
+            context.store_flavor = store_flavor;
+            let mut io = OfflineIo::default();
+            assert_eq!(run_github_check(&context, &mut io), UpdateOutcome::NotDue);
+            assert!(io.events.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_download_or_cache_never_advertises_a_ready_bundle() {
+        let mut io = OfflineIo {
+            stage_error: Some(UpdateVerificationError::DigestMismatch),
+            ..OfflineIo::default()
+        };
+        assert_eq!(
+            run_github_check(&context(true), &mut io),
+            UpdateOutcome::VerificationFailed(UpdateVerificationError::DigestMismatch)
+        );
+        assert_eq!(io.events, ["attempt", "fetch", "stage"]);
+        assert!(io.tag.is_none());
+        let mut io = OfflineIo {
+            cache_error: true,
+            ..OfflineIo::default()
+        };
+        assert_eq!(
+            run_github_check(&context(true), &mut io),
+            UpdateOutcome::VerificationFailed(UpdateVerificationError::IoFailure)
+        );
+        assert!(io.tag.is_none());
+    }
+
+    #[test]
+    fn store_named_offer_survives_a_pending_bundle_probe_without_io() {
+        let label = std::cell::RefCell::new(Some("0.1.2.0".to_owned()));
+        let reads = std::cell::Cell::new(0);
+        let bundle = super::find_pending_github_bundle(
+            true,
+            true,
+            "0.1.1.0",
+            || {
+                reads.set(reads.get() + 1);
+                label.borrow().clone()
+            },
+            || {
+                *label.borrow_mut() = None;
+            },
+            |_| Some("unexpected bundle lookup"),
+        );
+        assert_eq!(bundle, None);
+        assert_eq!(reads.get(), 0);
+        assert_eq!(label.borrow().as_deref(), Some("0.1.2.0"));
+    }
+
+    #[test]
+    fn pending_bundle_probe_cleans_only_spent_github_tags() {
+        let cleared = std::cell::Cell::new(false);
+        assert_eq!(
+            super::find_pending_github_bundle(
+                true,
+                false,
+                "0.1.1.0",
+                || Some("v0.1.1".to_owned()),
+                || cleared.set(true),
+                |_| Some("bundle")
+            ),
+            None,
+        );
+        assert!(cleared.get());
+        cleared.set(false);
+        assert_eq!(
+            super::find_pending_github_bundle(
+                true,
+                false,
+                "0.1.1.0",
+                || Some("v0.1.2".to_owned()),
+                || cleared.set(true),
+                |_| Some("bundle")
+            ),
+            Some("bundle"),
+        );
+        assert!(!cleared.get());
+    }
+
+    #[test]
+    fn identity_less_bundle_probe_does_not_touch_packaged_update_state() {
+        let label = std::cell::RefCell::new(Some("v0.1.1".to_owned()));
+        let result = super::find_pending_github_bundle(
+            false,
+            false,
+            "0.1.1.0",
+            || label.borrow().clone(),
+            || {
+                *label.borrow_mut() = None;
+            },
+            |_| Some("bundle"),
+        );
+        assert_eq!(result, None);
+        assert_eq!(label.borrow().as_deref(), Some("v0.1.1"));
+    }
+}
+
 #[cfg(windows)]
 pub mod windows_impl {
     use super::{
         AUTO_UPDATE_VALUE, AVAILABLE_UPDATE_VALUE, LAST_UPDATE_CHECK_VALUE,
         STORE_UPDATE_ATTEMPT_VALUE, STORE_UPDATE_PENDING_VALUE, UpdateOutcome,
-        UpdateVerificationError, expected_bundle_url, extract_bundle_digest, extract_tag_name,
-        is_newer_version, update_check_allowed,
+        UpdateVerificationError, bundle_name, expected_bundle_url,
     };
     use crate::{FSW_SETTINGS_KEY, is_store_flavor, package_version};
     use std::path::{Path, PathBuf};
@@ -1023,15 +1317,6 @@ pub mod windows_impl {
             .map(|dir| dir.join("ForwardSlashWindows").join("update"))
     }
 
-    /// The local download name for a tag's bundle: the same four-part form the
-    /// release pipeline attaches and `expected_bundle_url` fetches.
-    fn bundle_name(tag: &str) -> String {
-        match super::expected_bundle_version(tag) {
-            Some(version) => format!("fwdslash-{version}.msixbundle"),
-            None => format!("fwdslash-{tag}.msixbundle"),
-        }
-    }
-
     /// Deletes every `*.msixbundle` in the update directory except `keep`.
     /// One release's bundle is ~10 MB and nothing else prunes them.
     /// `keep = None` deletes all of them.
@@ -1087,18 +1372,23 @@ pub mod windows_impl {
     /// disk. The settings app offers "Restart to update" only for this.
     #[must_use]
     pub fn pending_bundle_path() -> Option<PathBuf> {
-        let tag = cached_update_tag()?;
         let current = package_version().unwrap_or_else(|| crate::FSW_VERSION.to_string());
-        if !super::is_newer_github_release(&current, &tag) {
-            // A prior version may have left a bundle behind after its package
-            // was already applied. Remove both the stale notice and every
-            // staged bundle before a caller can create the detached helper.
-            let _ = clear_cached_update_tag();
-            discard_downloaded_bundles();
-            return None;
-        }
-        let bundle = update_directory_path()?.join(bundle_name(&tag));
-        bundle.is_file().then_some(bundle)
+        super::find_pending_github_bundle(
+            crate::has_package_identity(),
+            is_store_flavor(),
+            &current,
+            cached_update_tag,
+            || {
+                // A GitHub release already applied is spent; Store labels
+                // must never reach this cleanup.
+                let _ = clear_cached_update_tag();
+                discard_downloaded_bundles();
+            },
+            |tag| {
+                let bundle = update_directory_path()?.join(bundle_name(tag));
+                bundle.is_file().then_some(bundle)
+            },
+        )
     }
 
     fn download_bundle(
@@ -1144,75 +1434,52 @@ pub mod windows_impl {
         Ok(destination)
     }
 
-    /// Runs one update-check attempt. Never blocks longer than the curl
-    /// timeouts; never surfaces an error to the caller — failures are
-    /// `Unavailable`.
-    /// `force` is the user pressing "Check now": it bypasses the daily
-    /// cadence and the Automatic updates switch, but never the two facts —
-    /// packaged, and not the Store flavor — that decide whether this route
-    /// exists at all.
-    #[must_use]
-    pub fn run_update_check(force: bool) -> UpdateOutcome {
-        let packaged = crate::has_package_identity();
-        let auto_update = read_auto_update_enabled();
-        // The gate no longer knows about flavors, so the flavor test the
-        // GitHub route needs is spelled out here: this function downloads a
-        // bundle from GitHub, which the Store flavor must never do.
-        if is_store_flavor()
-            || !(packaged && (force || update_check_allowed(packaged, auto_update)))
-        {
-            return UpdateOutcome::NotDue;
-        }
-        // Throttle first: even an offline or rate-limited attempt counts.
-        let last = last_update_check();
-        if !force && !super::check_is_due(last, now_unix()) {
-            return UpdateOutcome::NotDue;
-        }
-        let _ = note_check_attempt();
+    struct WindowsGithubIo;
 
-        let Some(release_json) = fetch_release_json() else {
-            return UpdateOutcome::Unavailable;
-        };
-        let Some(tag) =
-            extract_tag_name(&release_json).filter(|tag| super::parse_release_tag(tag).is_some())
-        else {
-            return UpdateOutcome::VerificationFailed(UpdateVerificationError::VersionMismatch);
-        };
-        // `package_version()` is the four-part MSIX version; release tags are
-        // three-part, and `parse_version` rejects four groups.
-        let running_version = super::normalize_running_version(
-            &package_version().unwrap_or_else(|| crate::FSW_VERSION.to_string()),
-        );
-        if !is_newer_version(&running_version, tag) {
-            // A stale notice from an older check is no longer relevant, and a
-            // bundle still on disk has either been applied (this process IS
-            // the version it delivered) or names a release we are already past
-            // — either way nothing can register it again.
+    impl super::GithubCheckIo for WindowsGithubIo {
+        fn note_attempt(&mut self) {
+            let _ = note_check_attempt();
+        }
+
+        fn fetch_release(&mut self) -> Option<String> {
+            fetch_release_json()
+        }
+
+        fn clear_stale(&mut self) {
             let _ = clear_cached_update_tag();
             discard_downloaded_bundles();
-            return UpdateOutcome::UpToDate;
         }
 
-        let Some(url) = expected_bundle_url(tag).filter(|url| release_json.contains(url.as_str()))
-        else {
-            return UpdateOutcome::VerificationFailed(UpdateVerificationError::AssetNameMismatch);
-        };
-        let Some(digest) = extract_bundle_digest(&release_json, &url) else {
-            return UpdateOutcome::VerificationFailed(UpdateVerificationError::DigestMismatch);
-        };
-        if auto_update {
-            return match download_bundle(&url, tag, digest) {
-                Ok(_) => {
-                    // Registration is deferred, so retain the verified bundle
-                    // and its exact release tag until the helper applies it.
-                    let _ = set_cached_update_tag(tag);
-                    UpdateOutcome::Ready(tag.to_string())
-                }
-                Err(error) => UpdateOutcome::VerificationFailed(error),
-            };
+        fn stage_bundle(
+            &mut self,
+            url: &str,
+            tag: &str,
+            digest: &str,
+        ) -> Result<(), UpdateVerificationError> {
+            download_bundle(url, tag, digest).map(|_| ())
         }
-        let _ = set_cached_update_tag(tag);
-        UpdateOutcome::Ready(tag.to_string())
+
+        fn cache_ready(&mut self, tag: &str) -> Result<(), u32> {
+            set_cached_update_tag(tag)
+        }
+    }
+
+    /// Runs one bounded update check and stages its verified bundle. `force`
+    /// is the user pressing "Check now": it bypasses cadence and Automatic
+    /// updates, while package identity and the GitHub flavor remain required.
+    #[must_use]
+    pub fn run_update_check(force: bool) -> UpdateOutcome {
+        let running_version = package_version().unwrap_or_else(|| crate::FSW_VERSION.to_string());
+        let context = super::GithubCheckContext {
+            packaged: crate::has_package_identity(),
+            store_flavor: is_store_flavor(),
+            auto_update: read_auto_update_enabled(),
+            force,
+            last_check: last_update_check(),
+            now: now_unix(),
+            running_version: &running_version,
+        };
+        super::run_github_check(&context, &mut WindowsGithubIo)
     }
 
     /// Records the tag (GitHub) or version (Store) an update would move to.

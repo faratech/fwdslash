@@ -136,9 +136,11 @@ HEADER_TEMPLATE = '''\
 
 '''
 
+# Keep the executable name neutral: Windows installer detection can otherwise
+# require elevation merely because an unmanifested helper is named "install".
 DRIVER_CARGO_TOML = f'''\
 [package]
-name = "fsw-install-control-bindgen"
+name = "fsw-bindings-helper"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -251,7 +253,7 @@ def generate(verbose: bool) -> str:
         print(f"toolchain {toolchain}: {probe.stdout.strip()}")
         print(f"metadata:  {winmd}")
 
-    with tempfile.TemporaryDirectory(prefix="fsw-install-control-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="fsw-bindings-") as scratch:
         crate = Path(scratch)
         (crate / "src").mkdir()
         (crate / "Cargo.toml").write_text(DRIVER_CARGO_TOML, encoding="utf-8")

@@ -792,8 +792,14 @@ list of its behaviour.
   synchronous persistence write on the hook-owning thread.
 - **A stale request is dropped, not replayed.** If the foreground window or the
   exact focused control changed while the request was queued or a blocking UIA/
-  COM call was in progress, the worker logs
-  `event=enter_dropped_foreground_changed` and returns. Replaying Enter into
+  COM call was in progress, the worker logs a category and returns. Once text
+  is captured from an eligible navigation control, an edit in that same
+  control or a new hook key generation also drops the request. Search open and
+  Escape, Explorer provider navigation, value writes and replay each recheck
+  the original text and generation; after a successful write, replay instead
+  checks the translated text. A declined write replays only if the original
+  text remains intact. Text/generation changes log
+  `event=enter_dropped_request_changed`. Replaying Enter into
   whatever the user switched to would send a half-written message or run a
   half-typed command.
 - **`#32770` is narrowed twice.** In the hook, a dialog outside `explorer.exe`
@@ -927,6 +933,7 @@ list of its behaviour.
   many six-hour cycles see it.
 - **Diagnostic categories** (category-only, per `PRIVACY.md`):
   `event=enter_dropped_foreground_changed`, `event=surface_rejected`,
+  `event=enter_dropped_request_changed`, `event=enter_dropped_control_rejected`,
   `event=hook_rearmed`, `event=persist_disabled_failed`,
   `event=win32_normalization_hazard`, `event=tray_icon_add_failed`,
   `event=worker_start_failed`, `event=worker_detached`,

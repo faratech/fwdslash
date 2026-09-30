@@ -466,12 +466,11 @@ fn strip_fence_regions(text: &str) -> String {
         };
         match region {
             Some(last) => {
-                // Swallow the terminator of the preceding line (keeping its
-                // content), which is exactly the blank-line prefix block_text
-                // added — or, for a no-trailing-newline original, the newline
-                // it introduced.
-                let start = if i > 0 {
-                    lines[i - 1].content_end
+                // Only an empty preceding line identifies the blank-line
+                // prefix. Never consume the separator after user content when
+                // another user line follows the fenced region.
+                let start = if i > 0 && lines[i - 1].start == lines[i - 1].content_end {
+                    lines[i - 1].start
                 } else {
                     lines[i].start
                 };

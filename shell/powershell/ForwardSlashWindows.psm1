@@ -109,8 +109,22 @@ function Get-ForwardSlashWindowsPathIndex {
 }
 
 function Invoke-ForwardSlashWindowsChildItem {
+    $original = @($args)
     $forward = @($args)
     $pathIndexes = Get-ForwardSlashWindowsPathIndex -Arguments $forward
+    # This passthrough wrapper has no parameter binder of its own. Preserve
+    # the caller's common error action when reporting a resolver rejection,
+    # including native aliases, unambiguous abbreviations and colon syntax.
+    $errorParameters = @{}
+    for ($index = 0; $index -lt $original.Count - 1; $index++) {
+        if ($original[$index] -isnot [string]) { continue }
+        $flag = $original[$index].TrimEnd(':')
+        if ($flag -eq '-ea' -or
+            ($flag.Length -ge 7 -and '-ErrorAction'.StartsWith($flag, [StringComparison]::OrdinalIgnoreCase))) {
+            $errorParameters.ErrorAction = $original[$index + 1]
+            $index++
+        }
+    }
 
     # No slash argument: never spawn the controller, never read a setting.
     # The global pause is decided by shell-resolve itself -- it answers
@@ -123,15 +137,22 @@ function Invoke-ForwardSlashWindowsChildItem {
     }
 
     $rootDistributions = $null
+    $pathValueCount = 0
+    $nativeFallback = $false
     foreach ($index in $pathIndexes) {
         $value = $forward[$index]
         if ($value -is [string]) {
+            $pathValueCount++
             if (-not $value.StartsWith('/')) {
                 continue
             }
             $result = Resolve-ForwardSlashWindowsTarget -Path $value
-            if ($null -eq $result -or $result.Kind -eq 'error') {
-                Microsoft.PowerShell.Management\Get-ChildItem @forward
+            if ($null -eq $result) {
+                $nativeFallback = $true
+                continue
+            }
+            if ($result.Kind -eq 'error') {
+                Write-Error -Message $result.Message -Category InvalidArgument -TargetObject $value @errorParameters
                 return
             }
             if ($result.Kind -eq 'root') {
@@ -146,10 +167,16 @@ function Invoke-ForwardSlashWindowsChildItem {
         if ($value -is [System.Collections.IEnumerable]) {
             $replacement = @()
             foreach ($item in $value) {
+                $pathValueCount++
                 if ($item -is [string] -and $item.StartsWith('/')) {
                     $result = Resolve-ForwardSlashWindowsTarget -Path $item
-                    if ($null -eq $result -or $result.Kind -eq 'error') {
-                        Microsoft.PowerShell.Management\Get-ChildItem @forward
+                    if ($null -eq $result) {
+                        $nativeFallback = $true
+                        $replacement += $item
+                        continue
+                    }
+                    if ($result.Kind -eq 'error') {
+                        Write-Error -Message $result.Message -Category InvalidArgument -TargetObject $item @errorParameters
                         return
                     }
                     if ($result.Kind -eq 'root') {
@@ -165,10 +192,17 @@ function Invoke-ForwardSlashWindowsChildItem {
         }
     }
 
+    # Preflight every value before enumerating anything. A rejection must not
+    # become a native listing, even when another value requested passthrough.
+    if ($null -ne $rootDistributions -and $pathValueCount -ne 1) {
+        throw "Bare '/' cannot be combined with other Get-ChildItem arguments. Use 'fwdslash list /' for advanced root queries."
+    }
+    if ($nativeFallback) {
+        Microsoft.PowerShell.Management\Get-ChildItem @original
+        return
+    }
+
     if ($null -ne $rootDistributions) {
-        if ($pathIndexes.Count -ne 1) {
-            throw "Bare '/' cannot be combined with other Get-ChildItem arguments. Use 'fwdslash list /' for advanced root queries."
-        }
         foreach ($distribution in @($rootDistributions)) {
             [pscustomobject]@{
                 PSTypeName   = 'ForwardSlashWindows.Distribution'

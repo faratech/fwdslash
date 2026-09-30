@@ -17,6 +17,20 @@ function Assert-Location {
         -Actual (Get-Location).ProviderPath -Message $Message
 }
 
+function Assert-ListingRejected {
+    param([object[]]$ArgumentList, [string]$ExpectedMessage)
+    $produced = New-Object System.Collections.Generic.List[object]
+    $caught = $false
+    try {
+        Invoke-ForwardSlashWindowsChildItem @ArgumentList | ForEach-Object { $produced.Add($_) }
+    } catch {
+        if (-not $_.Exception.Message.Contains($ExpectedMessage)) { throw }
+        $caught = $true
+    }
+    Assert-Equal -Expected $true -Actual $caught -Message 'listing reports the intended rejection'
+    Assert-Equal -Expected 0 -Actual $produced.Count -Message 'rejected listing emits no partial results'
+}
+
 $modulePath = Join-Path $PSScriptRoot '../../shell/powershell/ForwardSlashWindows.psm1'
 $originalLocation = Get-Location
 $temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("fsw-location-{0}" -f [guid]::NewGuid())
@@ -190,6 +204,69 @@ try {
     Assert-Equal -Expected $native -Actual $pushPipeline[1].ProviderPath -Message 'Push-Location pipeline preserves second input order'
     Microsoft.PowerShell.Management\Pop-Location -StackName fsw-pipeline
     Microsoft.PowerShell.Management\Pop-Location -StackName fsw-pipeline
+
+    # Listing preflights scalar and array values before it emits any entries.
+    # Resolver rejection must never be reinterpreted as a current-drive path.
+    [System.IO.File]::WriteAllText((Join-Path $native 'native-entry.txt'), 'native')
+    [System.IO.File]::WriteAllText((Join-Path $resolved 'resolved-entry.txt'), 'resolved')
+    $nativeSlash = $native.Substring(2).Replace('\', '/')
+    & $module {
+        param([string]$Passthrough)
+        $script:FswTestPassthrough = $Passthrough
+        Set-Item -Path function:script:Resolve-ForwardSlashWindowsTarget -Value {
+            param([string]$Path)
+            if ($Path -eq '/rejected') {
+                return [pscustomobject]@{ Kind = 'error'; Message = 'controlled resolver rejection' }
+            }
+            if ($Path -eq $script:FswTestPassthrough) { return $null }
+            if ($Path -eq '/') {
+                return [pscustomobject]@{ Kind = 'root'; Distributions = @('Ubuntu', 'Debian') }
+            }
+            return [pscustomobject]@{ Kind = 'path'; Target = $script:FswTestTarget }
+        }
+    } $nativeSlash
+    Microsoft.PowerShell.Management\Set-Location -LiteralPath $base
+    $nativeListing = @(Invoke-ForwardSlashWindowsChildItem -LiteralPath $native)
+    Assert-Equal -Expected 'native-entry.txt' -Actual $nativeListing[0].Name -Message 'native listing remains unchanged'
+    $pausedListing = @(Invoke-ForwardSlashWindowsChildItem -LiteralPath $nativeSlash)
+    Assert-Equal -Expected 'native-entry.txt' -Actual $pausedListing[0].Name -Message 'controller passthrough stays native'
+    $resolvedListing = @(Invoke-ForwardSlashWindowsChildItem -LiteralPath '/Ubuntu')
+    Assert-Equal -Expected 'resolved-entry.txt' -Actual $resolvedListing[0].Name -Message 'resolved listing reaches its exact target'
+    $mixedListing = @(Invoke-ForwardSlashWindowsChildItem -Path @('/Ubuntu', $native))
+    Assert-Equal -Expected 2 -Actual $mixedListing.Count -Message 'non-root arrays enumerate all targets'
+    foreach ($rootListing in @(
+        @(Invoke-ForwardSlashWindowsChildItem -Path '/'),
+        @(Invoke-ForwardSlashWindowsChildItem -LiteralPath @('/'))
+    )) {
+        Assert-Equal -Expected 2 -Actual $rootListing.Count -Message 'a singleton root lists every distribution'
+        Assert-Equal -Expected '/Ubuntu' -Actual $rootListing[0].Name -Message 'root entries retain distribution names'
+    }
+    foreach ($paths in @(@('/', '/Ubuntu'), @('/Ubuntu', '/'), @('/', $native), @('/', $nativeSlash), @($nativeSlash, '/'))) {
+        Assert-ListingRejected -ArgumentList @('-Path', $paths) -ExpectedMessage "Bare '/' cannot be combined"
+        Assert-ListingRejected -ArgumentList @('-LiteralPath', $paths) -ExpectedMessage "Bare '/' cannot be combined"
+    }
+    Assert-ListingRejected -ArgumentList @('/rejected') -ExpectedMessage 'controlled resolver rejection'
+    foreach ($paths in @(@('/Ubuntu', '/rejected'), @($native, '/rejected'), @($nativeSlash, '/rejected'))) {
+        Assert-ListingRejected -ArgumentList @('-Path', $paths) -ExpectedMessage 'controlled resolver rejection'
+    }
+    $listingPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        foreach ($errorActionFlag in @('-ErrorAction', '-EA', '-ErrorAc', '-ErrorAction:')) {
+            Assert-ListingRejected -ArgumentList @('-LiteralPath', '/rejected', $errorActionFlag, 'Stop') `
+                -ExpectedMessage 'controlled resolver rejection'
+        }
+        Assert-ListingRejected -ArgumentList @('-Path', @('/Ubuntu', '/rejected'), '-EA', 'Stop') `
+            -ExpectedMessage 'controlled resolver rejection'
+        foreach ($suppressedAction in @('SilentlyContinue', 'Ignore')) {
+            $suppressedListing = @(Invoke-ForwardSlashWindowsChildItem -LiteralPath '/rejected' -ErrorAction $suppressedAction 2>&1)
+            Assert-Equal -Expected 0 -Actual $suppressedListing.Count -Message 'listing rejection honors suppressed error actions'
+            $suppressedArray = @(Invoke-ForwardSlashWindowsChildItem -Path @('/Ubuntu', '/rejected') -EA $suppressedAction 2>&1)
+            Assert-Equal -Expected 0 -Actual $suppressedArray.Count -Message 'array rejection honors suppressed error actions without partial output'
+        }
+    } finally {
+        $ErrorActionPreference = $listingPreference
+    }
 
     # #132: 'cd ..' at a distribution share root. Above \\wsl.localhost\Ubuntu
     # there is only the server name, so the native cmdlet fails with "Cannot

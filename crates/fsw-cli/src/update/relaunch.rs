@@ -44,6 +44,29 @@ struct AttemptLock {
     owner: String,
 }
 
+fn token_owner(text: &str) -> &str {
+    text.lines().next().unwrap_or_default().trim()
+}
+
+fn token_has_pending_lease(text: &str) -> bool {
+    text.lines().skip(1).any(|line| !line.trim().is_empty())
+}
+
+fn token_is_reclaimable(
+    path: &Path,
+    stale_after: std::time::Duration,
+    owner_alive: &dyn Fn(&str) -> bool,
+) -> bool {
+    let aged_out = std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age > stale_after);
+    let orphaned = std::fs::read_to_string(path)
+        .is_ok_and(|text| !token_has_pending_lease(&text) && !owner_alive(token_owner(&text)));
+    aged_out || orphaned
+}
+
 /// A cross-session, per-user serialization gate for decisions about the lock
 /// file. The file survives the updater process so tasks can own an attempt;
 /// the mutex deliberately does not. Its only job is making create/reclaim and
@@ -121,7 +144,7 @@ impl AttemptLock {
     }
 
     /// `owner_alive` answers whether the task named in an existing token is
-    /// still registered. A token whose task is gone is an orphan — the
+    /// still registered. An acknowledged token whose task is gone is an orphan — the
     /// attempt was killed between registering and running, or the script
     /// ran under a cancelled task and never reached its `findstr` line — and
     /// it is reclaimed at once rather than after `stale_after`, which used to
@@ -153,21 +176,36 @@ impl AttemptLock {
             // The XML limits every task to an hour. This mutex keeps the
             // stale observation, removal and replacement together so a
             // second contender cannot delete our fresh token.
-            let aged_out = std::fs::metadata(&path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age > stale_after);
-            let orphaned = std::fs::read_to_string(&path)
-                .ok()
-                .map(|text| text.trim().to_string())
-                .is_some_and(|holder| !holder.is_empty() && !owner_alive(&holder));
-            if !aged_out && !orphaned {
+            if !token_is_reclaimable(&path, stale_after, owner_alive) {
                 return None;
             }
             let _ = std::fs::remove_file(&path);
         }
         None
+    }
+
+    /// A second line marks a submitted request whose result is not yet known.
+    /// Replace atomically under the decision mutex, so a crash cannot erase
+    /// ownership between the normal and leased representations.
+    fn set_pending(&self, pending: bool) -> bool {
+        let Some(directory) = self.path.parent() else {
+            return false;
+        };
+        let Some(_decision) = AttemptMutex::acquire(directory) else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return false;
+        };
+        if token_owner(&text) != self.owner {
+            return false;
+        }
+        let text = if pending {
+            format!("{}\npending", self.owner)
+        } else {
+            self.owner.clone()
+        };
+        crate::adapters::write_atomic(&self.path, text.as_bytes()).is_ok()
     }
 
     fn release(self) {
@@ -177,14 +215,16 @@ impl AttemptLock {
         let Some(_decision) = AttemptMutex::acquire(directory) else {
             return;
         };
-        if std::fs::read_to_string(&self.path).ok().as_deref() == Some(self.owner.as_str()) {
+        if std::fs::read_to_string(&self.path).is_ok_and(|text| token_owner(&text) == self.owner) {
             let _ = std::fs::remove_file(self.path);
         }
     }
 }
 
 /// Removes an attempt token nobody can still be using: older than the
-/// scheduler's one-hour limit, or naming a task that is no longer registered.
+/// scheduler's one-hour limit, or an acknowledged token naming a task that is
+/// no longer registered. An uncertain admission retains its lease until it is
+/// released by its task or reaches that age limit.
 /// The decision mutex makes the look-then-delete indivisible with a
 /// concurrent [`AttemptLock::acquire`]. True when a token was removed.
 #[cfg(windows)]
@@ -192,21 +232,23 @@ pub fn reclaim_stale_attempt_lock() -> bool {
     let Some(directory) = fsw_core::update::update_directory_path() else {
         return false;
     };
-    let Some(_decision) = AttemptMutex::acquire(&directory) else {
+    reclaim_attempt_lock_in(
+        &directory,
+        std::time::Duration::from_mins(65),
+        &crate::scheduled_task::task_exists,
+    )
+}
+
+fn reclaim_attempt_lock_in(
+    directory: &Path,
+    stale_after: std::time::Duration,
+    owner_alive: &dyn Fn(&str) -> bool,
+) -> bool {
+    let Some(_decision) = AttemptMutex::acquire(directory) else {
         return false;
     };
     let path = directory.join(fsw_core::update::UPDATE_ATTEMPT_LOCK_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let aged_out = std::fs::metadata(&path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.elapsed().ok())
-        .is_some_and(|age| age > std::time::Duration::from_mins(65));
-    let holder = text.trim();
-    let orphaned = holder.is_empty() || !crate::scheduled_task::task_exists(holder);
-    (aged_out || orphaned) && std::fs::remove_file(&path).is_ok()
+    token_is_reclaimable(&path, stale_after, owner_alive) && std::fs::remove_file(path).is_ok()
 }
 
 /// Holds the same short decision mutex through uninstall's task inventory and
@@ -570,6 +612,8 @@ pub fn schedule_watchdog(
     previous_version: &str,
     run_now: bool,
 ) -> Option<Watchdog> {
+    use crate::scheduled_task::{TaskLaunch, TaskRegistration};
+
     if mode == RelaunchMode::None {
         return Some(Watchdog {
             name: None,
@@ -603,13 +647,31 @@ pub fn schedule_watchdog(
     };
     let task = OneShotTask::new(&name, script);
     let scheduled = if run_now {
-        crate::scheduled_task::register_and_run(&task).is_some()
+        crate::scheduled_task::register_and_run_with_lease(&task, |pending| {
+            lock.set_pending(pending)
+        })
     } else {
-        crate::scheduled_task::register_after(&task, WATCHDOG_DELAY_MINUTES).is_some()
+        match crate::scheduled_task::register_after_with_lease(
+            &task,
+            WATCHDOG_DELAY_MINUTES,
+            &mut |pending| lock.set_pending(pending),
+        ) {
+            TaskRegistration::NotRegistered => TaskLaunch::NotStarted,
+            TaskRegistration::Registered => TaskLaunch::Started,
+            TaskRegistration::Unknown => TaskLaunch::Pending,
+        }
     };
-    if !scheduled {
-        lock.release();
-        return None;
+    match scheduled {
+        TaskLaunch::NotStarted => {
+            lock.release();
+            return None;
+        }
+        TaskLaunch::Pending => {
+            // Preserve attempt ownership, but do not start a force-closing
+            // installer without an acknowledged comeback task.
+            return None;
+        }
+        TaskLaunch::Started => {}
     }
     Some(Watchdog {
         name: Some(name),
@@ -621,6 +683,18 @@ pub fn schedule_watchdog(
 /// command it leads with is the install, and nothing else is going to start it.
 #[cfg(windows)]
 pub fn schedule_apply(command: &str, mode: RelaunchMode, previous_version: &str) -> bool {
+    schedule_apply_with_start(command, mode, previous_version, || Ok(()))
+}
+
+/// Performs preflight before the caller records an installation attempt, then
+/// records it before Task Scheduler can run a force-closing installer.
+#[cfg(windows)]
+pub fn schedule_apply_with_start(
+    command: &str,
+    mode: RelaunchMode,
+    previous_version: &str,
+    before_start: impl FnOnce() -> Result<(), String>,
+) -> bool {
     let powershell = if mode == RelaunchMode::None {
         None
     } else {
@@ -654,11 +728,20 @@ pub fn schedule_apply(command: &str, mode: RelaunchMode, previous_version: &str)
         return false;
     };
     let task = OneShotTask::new(&name, script);
-    if crate::scheduled_task::register_and_run(&task).is_some() {
-        true
-    } else {
+    if before_start().is_err() {
         lock.release();
-        false
+        return false;
+    }
+    match crate::scheduled_task::register_and_run_with_lease(&task, |pending| {
+        lock.set_pending(pending)
+    }) {
+        crate::scheduled_task::TaskLaunch::Started | crate::scheduled_task::TaskLaunch::Pending => {
+            true
+        }
+        crate::scheduled_task::TaskLaunch::NotStarted => {
+            lock.release();
+            false
+        }
     }
 }
 
@@ -851,6 +934,66 @@ mod attempt_lock_tests {
         );
         lock.release();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn uncertain_submission_survives_gone_task_and_gc_then_acknowledgement_restores_orphan_recovery()
+     {
+        let directory = directory("uncertain");
+        let stale_after = Duration::from_hours(1);
+        let owner = AttemptLock::acquire_in(&directory.0, "owner-a", stale_after, &|_| true)
+            .unwrap_or_else(|| panic!("initial owner"));
+        assert!(owner.set_pending(true));
+        assert_eq!(
+            std::fs::read_to_string(&owner.path).unwrap_or_else(|error| panic!("lease: {error}")),
+            "owner-a\npending"
+        );
+        // A crash or unacknowledged request may leave no definition to query.
+        // Both actual ownership entry points must preserve the fresh lease.
+        for _ in 0..2 {
+            assert!(
+                AttemptLock::acquire_in(&directory.0, "owner-b", stale_after, &|_| {
+                    panic!("uncertain task absence must not license another installer")
+                })
+                .is_none()
+            );
+            assert!(!super::reclaim_attempt_lock_in(
+                &directory.0,
+                stale_after,
+                &|_| { panic!("GC must not reclaim an uncertain admission by query") }
+            ));
+        }
+        assert!(owner.set_pending(false));
+        let next = AttemptLock::acquire_in(&directory.0, "owner-b", stale_after, &|name| {
+            assert_eq!(name, "owner-a");
+            false
+        })
+        .unwrap_or_else(|| panic!("acknowledged orphan is reclaimed"));
+        owner.release();
+        assert!(next.path.exists());
+        next.release();
+    }
+
+    #[test]
+    fn uncertain_lease_expires_at_the_same_age_bound_and_owner_can_release_it() {
+        let directory = directory("lease-expiry");
+        let stale_after = Duration::from_hours(1);
+        let owner = AttemptLock::acquire_in(&directory.0, "owner-a", stale_after, &|_| true)
+            .unwrap_or_else(|| panic!("initial owner"));
+        assert!(owner.set_pending(true));
+        make_genuinely_old(&owner.path);
+        assert!(super::reclaim_attempt_lock_in(
+            &directory.0,
+            stale_after,
+            &|_| true
+        ));
+        let next = AttemptLock::acquire_in(&directory.0, "owner-b", stale_after, &|_| true)
+            .unwrap_or_else(|| panic!("replacement owner"));
+        assert!(next.set_pending(true));
+        owner.release();
+        assert!(next.path.exists());
+        next.release();
+        assert!(!directory.0.join("update-attempt.lock").exists());
     }
 
     #[test]

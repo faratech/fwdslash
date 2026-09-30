@@ -33,6 +33,109 @@ const IDENTITY: &str = "32827MikeFara.fwdslash";
 const PREVIOUS: &str = "0.0.4.0";
 const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 
+#[test]
+fn unnamed_attempt_is_stamped_only_at_admission_and_refusals_restore_it() {
+    for previous in [None, Some(40)] {
+        let mut attempt = super::StoreAttempt {
+            unnamed: true,
+            previous,
+            stamped: false,
+        };
+        let mut writes = Vec::new();
+        // Notify, metered deferral and failed watchdog preflight never admit
+        // an install: cancelling these leaves the persistence boundary alone.
+        assert_eq!(
+            attempt.cancel_with(|stamp| {
+                writes.push(stamp);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert!(writes.is_empty());
+        assert_eq!(
+            attempt.start_with(100, |stamp| {
+                writes.push(stamp);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(writes, [Some(100)]);
+        // Definite API refusal or failed registration restores absence or the
+        // earlier attempt. The next fallback can then admit its own request.
+        assert_eq!(
+            attempt.cancel_with(|stamp| {
+                writes.push(stamp);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(writes, [Some(100), previous]);
+        assert_eq!(
+            attempt.start_with(101, |stamp| {
+                writes.push(stamp);
+                Ok(())
+            }),
+            Ok(())
+        );
+        assert_eq!(writes.last(), Some(&Some(101)));
+    }
+}
+
+#[test]
+fn queued_or_uncertain_work_keeps_the_stamp_without_rewriting_it() {
+    let mut attempt = super::StoreAttempt {
+        unnamed: true,
+        previous: None,
+        stamped: false,
+    };
+    let mut persisted = None;
+    assert_eq!(
+        attempt.start_with(100, |stamp| {
+            persisted = stamp;
+            Ok(())
+        }),
+        Ok(())
+    );
+    // No cancellation is authorized once an operation exists; another start
+    // callback on the same admission must not extend its retry window.
+    assert_eq!(attempt.start_with(101, |_| Err(5)), Ok(()));
+    assert_eq!(persisted, Some(100));
+}
+
+#[test]
+fn named_offers_and_failed_preflight_do_not_write_attempt_backoff() {
+    let mut named = super::StoreAttempt {
+        unnamed: false,
+        previous: None,
+        stamped: false,
+    };
+    assert_eq!(named.start_with(100, |_| Err(5)), Ok(()));
+    assert_eq!(named.cancel_with(|_| Err(5)), Ok(()));
+}
+
+#[test]
+fn partial_attempt_writes_and_failed_restore_retain_recovery_state() {
+    let mut attempt = super::StoreAttempt {
+        unnamed: true,
+        previous: Some(40),
+        stamped: false,
+    };
+    assert_eq!(attempt.start_with(100, |_| Err(5)), Err(5));
+    assert!(attempt.stamped);
+    assert_eq!(attempt.cancel_with(|_| Err(5)), Err(5));
+    assert!(attempt.stamped);
+    let mut restored = None;
+    assert_eq!(
+        attempt.cancel_with(|stamp| {
+            restored = stamp;
+            Ok(())
+        }),
+        Ok(())
+    );
+    assert_eq!(restored, Some(40));
+    assert!(!attempt.stamped);
+}
+
 fn argv(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|part| (*part).to_string()).collect()
 }

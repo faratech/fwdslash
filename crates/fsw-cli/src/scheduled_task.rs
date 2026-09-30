@@ -219,35 +219,116 @@ pub(crate) fn script_path(name: &str) -> Option<PathBuf> {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskLaunch {
+    NotStarted,
+    Started,
+    /// Admission was not acknowledged or cancellation did not prove the task
+    /// gone. Its delayed trigger or work already admitted can still run.
+    Pending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskRegistration {
+    NotRegistered,
+    Registered,
+    /// The creation command started, but could not attest its result.
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskRun {
+    Started,
+    /// The request process never started; only the backstop can still run.
+    Refused,
+    /// The request process started, but did not attest successful admission.
+    Unknown,
+}
+
+fn launch_registered_task(
+    register: impl FnOnce() -> TaskRegistration,
+    run: impl FnOnce() -> TaskRun,
+) -> TaskLaunch {
+    match register() {
+        TaskRegistration::NotRegistered => return TaskLaunch::NotStarted,
+        TaskRegistration::Unknown => return TaskLaunch::Pending,
+        TaskRegistration::Registered => {}
+    }
+    match run() {
+        TaskRun::Started => TaskLaunch::Started,
+        TaskRun::Refused | TaskRun::Unknown => {
+            // Removing the definition does not prove admitted work stopped;
+            // registration already queued the backstop, even if /run could
+            // not be submitted. Keep that work and its ownership.
+            TaskLaunch::Pending
+        }
+    }
+}
+
 /// Writes the script, registers the task and fires it immediately.
 ///
-/// `None` when anything at all refused — an unsafe name, no `%LOCALAPPDATA%`, an
-/// unwritable directory, a missing or hardened Task Scheduler — so the caller
-/// can fall back. The immediate `/run` is what makes this useful; the one-minute
-/// trigger is only the backstop for a machine that stops first.
+/// `None` only when no runnable task remains, so the caller can fall back.
+/// An unacknowledged `/create` or `/run` still owns the attempt: the one-minute
+/// backstop or work already admitted can start the installer.
 #[cfg(windows)]
 #[must_use]
 pub fn register_and_run(task: &OneShotTask) -> Option<()> {
+    match register_and_run_status(task) {
+        TaskLaunch::NotStarted => None,
+        TaskLaunch::Started | TaskLaunch::Pending => Some(()),
+    }
+}
+
+#[cfg(windows)]
+#[must_use]
+pub fn register_and_run_status(task: &OneShotTask) -> TaskLaunch {
+    register_and_run_with_lease(task, |_| true)
+}
+
+/// The updater persists its admission lease before each native submission and
+/// clears it after an acknowledged phase. A failed lease write prevents the
+/// submission; a failed clear conservatively leaves the lease in place.
+#[cfg(windows)]
+#[must_use]
+pub fn register_and_run_with_lease(
+    task: &OneShotTask,
+    update_lease: impl FnMut(bool) -> bool,
+) -> TaskLaunch {
     use std::os::windows::process::CommandExt;
 
-    register(task)?;
-    // Fire it now; the scheduled trigger is only the backstop.
-    let schtasks = fsw_core::SystemBinary::Schtasks.path()?;
-    let started = Command::new(schtasks)
-        .args(["/run", "/tn", &task.name])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if started {
-        Some(())
-    } else {
-        // Keep the one-minute trigger only if the immediate launch succeeded.
-        // Otherwise an unowned updater could run after its caller gave up.
-        let _ = delete_task(&task.name);
-        None
+    let Some(schtasks) = fsw_core::SystemBinary::Schtasks.path() else {
+        return TaskLaunch::NotStarted;
+    };
+    let update_lease = std::cell::RefCell::new(update_lease);
+    launch_registered_task(
+        || register_after_with_lease(task, 1, &mut *update_lease.borrow_mut()),
+        || {
+            submit_task_run(
+                Command::new(schtasks)
+                    .args(["/run", "/tn", &task.name])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+                &mut *update_lease.borrow_mut(),
+            )
+        },
+    )
+}
+
+fn submit_task_run(command: &mut Command, update_lease: &mut impl FnMut(bool) -> bool) -> TaskRun {
+    if !update_lease(true) {
+        return TaskRun::Refused;
+    }
+    let Ok(mut child) = command.spawn() else {
+        return TaskRun::Refused;
+    };
+    match child.wait() {
+        Ok(status) if status.success() => {
+            let _ = update_lease(false);
+            TaskRun::Started
+        }
+        Ok(_) | Err(_) => TaskRun::Unknown,
     }
 }
 
@@ -260,15 +341,21 @@ pub fn register_and_run(task: &OneShotTask) -> Option<()> {
 /// `cmd.exe` has the file open. A minute is far longer than that decision takes.
 #[cfg(windows)]
 #[must_use]
-pub fn register(task: &OneShotTask) -> Option<()> {
-    register_after(task, 1)
+pub fn register_after_with_lease(
+    task: &OneShotTask,
+    delay_minutes: u16,
+    update_lease: &mut impl FnMut(bool) -> bool,
+) -> TaskRegistration {
+    prepare_registration(task, delay_minutes, update_lease)
+        .unwrap_or(TaskRegistration::NotRegistered)
 }
 
-/// Registers after a bounded number of minutes. The updater uses five minutes
-/// for admission watchdogs because its `WinRT` calls can each take two minutes.
 #[cfg(windows)]
-#[must_use]
-pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
+fn prepare_registration(
+    task: &OneShotTask,
+    delay_minutes: u16,
+    update_lease: &mut impl FnMut(bool) -> bool,
+) -> Option<TaskRegistration> {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
@@ -305,43 +392,115 @@ pub fn register_after(task: &OneShotTask, delay_minutes: u16) -> Option<()> {
     let args = task_xml_args(&task.name, &xml.display().to_string());
 
     let schtasks = fsw_core::SystemBinary::Schtasks.path()?;
-    let created = Command::new(schtasks)
-        .args(&args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?;
-    if !created.success() {
-        return None;
-    }
-    Some(())
+    Some(submit_registration(
+        Command::new(schtasks)
+            .args(&args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        update_lease,
+    ))
 }
 
-/// Whether a task of this name is registered. `schtasks /query` exits 0 for a
-/// task it can show and 1 for one it cannot; a `schtasks` that cannot be found
-/// or run answers false, which the one caller (the attempt lock's orphan test)
-/// treats as "not proven alive" — the conservative answer there is to reclaim.
+fn submit_registration(
+    command: &mut Command,
+    update_lease: &mut impl FnMut(bool) -> bool,
+) -> TaskRegistration {
+    if !update_lease(true) {
+        return TaskRegistration::NotRegistered;
+    }
+    let Ok(mut child) = command.spawn() else {
+        let _ = update_lease(false);
+        return TaskRegistration::NotRegistered;
+    };
+    match child.wait() {
+        Ok(status) if status.success() => {
+            let _ = update_lease(false);
+            TaskRegistration::Registered
+        }
+        // A request can admit the task before its command reports an error or
+        // disappears. Neither a nonzero exit nor an unobserved wait is proof
+        // that the task's delayed trigger cannot run.
+        Ok(_) | Err(_) => TaskRegistration::Unknown,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskPresence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+fn task_query_script(name: &str) -> Option<String> {
+    if !is_safe_task_literal(name) {
+        return None;
+    }
+    // Only a missing *task* is definitive absence. A failure connecting to
+    // the service or obtaining its root folder cannot establish ownership.
+    // GetTask returns an HRESULT; ERROR_FILE_NOT_FOUND is 0x80070002.
+    Some(format!(
+        "$ErrorActionPreference = 'Stop'; \
+         try {{ $service = New-Object -ComObject Schedule.Service; \
+         $service.Connect(); $folder = $service.GetFolder('\\'); }} catch {{ exit 4 }}; \
+         try {{ $null = $folder.GetTask('{name}'); exit 0 }} catch {{ \
+         $failure = $_.Exception; \
+         while ($failure.InnerException) {{ $failure = $failure.InnerException }}; \
+         if ($failure.HResult -eq -2147024894) {{ exit 3 }}; exit 4 }}"
+    ))
+}
+
+fn probe_task_presence(command: &mut Command, timeout: std::time::Duration) -> TaskPresence {
+    let Ok(mut child) = command.spawn() else {
+        return TaskPresence::Unknown;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return match status.code() {
+                    Some(0) => TaskPresence::Present,
+                    Some(3) => TaskPresence::Absent,
+                    _ => TaskPresence::Unknown,
+                };
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return TaskPresence::Unknown;
+            }
+        }
+    }
+}
+
+/// Whether a task may still own work. A confirmed missing task is false;
+/// access, service, process or timeout failures conservatively answer true.
+/// This lets acknowledged orphan tokens recover immediately without allowing
+/// a failed query to license another installer.
 #[cfg(windows)]
 #[must_use]
 pub fn task_exists(name: &str) -> bool {
     use std::os::windows::process::CommandExt;
 
-    if !is_safe_task_literal(name) {
-        return false;
-    }
-    let Some(schtasks) = fsw_core::SystemBinary::Schtasks.path() else {
-        return false;
+    let Some(script) = task_query_script(name) else {
+        return true;
     };
-    Command::new(schtasks)
-        .args(["/query", "/tn", name])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let Some(powershell) = fsw_core::SystemBinary::PowerShell.path() else {
+        return true;
+    };
+    probe_task_presence(
+        Command::new(powershell)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        std::time::Duration::from_secs(10),
+    ) != TaskPresence::Absent
 }
 
 /// Removes a task and the `.cmd` [`register_and_run`] wrote for it — the exact
@@ -384,6 +543,273 @@ pub fn delete_task(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registration_failure_never_runs_a_task() {
+        assert_eq!(
+            super::launch_registered_task(
+                || super::TaskRegistration::NotRegistered,
+                || unreachable!()
+            ),
+            super::TaskLaunch::NotStarted,
+        );
+    }
+
+    #[test]
+    fn acknowledged_task_launch_does_not_cancel_it() {
+        assert_eq!(
+            super::launch_registered_task(
+                || super::TaskRegistration::Registered,
+                || super::TaskRun::Started
+            ),
+            super::TaskLaunch::Started,
+        );
+    }
+
+    #[test]
+    fn refused_immediate_run_keeps_the_registered_backstop_and_never_licenses_fallback() {
+        assert_eq!(
+            super::launch_registered_task(
+                || super::TaskRegistration::Registered,
+                || super::TaskRun::Refused
+            ),
+            super::TaskLaunch::Pending,
+        );
+    }
+
+    #[test]
+    fn unacknowledged_task_run_keeps_its_backstop_and_ownership() {
+        assert_eq!(
+            super::launch_registered_task(
+                || super::TaskRegistration::Registered,
+                || super::TaskRun::Unknown
+            ),
+            super::TaskLaunch::Pending,
+        );
+    }
+
+    #[test]
+    fn unacknowledged_registration_never_runs_or_licenses_fallback() {
+        assert_eq!(
+            super::launch_registered_task(|| super::TaskRegistration::Unknown, || unreachable!()),
+            super::TaskLaunch::Pending,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registration_spawn_failure_proves_no_submission() {
+        let missing = std::env::temp_dir().join(format!(
+            "fsw-registration-missing-{}.exe",
+            std::process::id()
+        ));
+        assert!(!missing.exists());
+        let mut phases = Vec::new();
+        assert_eq!(
+            super::submit_registration(&mut std::process::Command::new(&missing), &mut |pending| {
+                phases.push(pending);
+                true
+            }),
+            super::TaskRegistration::NotRegistered,
+        );
+        assert_eq!(phases, [true, false]);
+        phases.clear();
+        let run =
+            super::submit_task_run(&mut std::process::Command::new(&missing), &mut |pending| {
+                phases.push(pending);
+                true
+            });
+        assert_eq!(run, super::TaskRun::Refused);
+        assert_eq!(phases, [true]);
+        assert_eq!(
+            super::launch_registered_task(|| super::TaskRegistration::Registered, || run),
+            super::TaskLaunch::Pending,
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn helper_can_admit_work_before_registration_command_reports_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::process::CommandExt;
+
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0.join("register.ps1"));
+                let _ = std::fs::remove_file(self.0.join("admitted.txt"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "fsw-registration-helper-{}-{nonce}",
+            std::process::id()
+        )));
+        std::fs::create_dir(&fixture.0)?;
+        let script = fixture.0.join("register.ps1");
+        let marker = fixture.0.join("admitted.txt");
+        std::fs::write(
+            &script,
+            "param([string]$MarkerPath, [int]$ExitCode)\n[System.IO.File]::WriteAllText($MarkerPath, 'admitted')\nexit $ExitCode\n",
+        )?;
+        let powershell = fsw_core::SystemBinary::PowerShell
+            .path()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        // No Task Scheduler or product state is touched. The fixture proves
+        // the same native spawn/wait boundary can observe an error only after
+        // the child has admitted work.
+        let command = |exit_code: i32| {
+            let mut command = std::process::Command::new(&powershell);
+            command
+                .args(["-NoProfile", "-NonInteractive", "-File"])
+                .arg(&script)
+                .arg("-MarkerPath")
+                .arg(&marker)
+                .arg("-ExitCode")
+                .arg(exit_code.to_string())
+                .creation_flags(super::CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        };
+        let lease = std::cell::Cell::new(false);
+        let registration = super::submit_registration(&mut command(9), &mut |pending| {
+            lease.set(pending);
+            true
+        });
+        assert_eq!(std::fs::read_to_string(&marker)?, "admitted");
+        assert_eq!(registration, super::TaskRegistration::Unknown);
+        assert!(lease.get());
+        assert_eq!(
+            super::launch_registered_task(|| registration, || unreachable!()),
+            super::TaskLaunch::Pending,
+        );
+        std::fs::remove_file(&marker)?;
+        let run = super::submit_task_run(&mut command(9), &mut |pending| {
+            lease.set(pending);
+            true
+        });
+        assert_eq!(std::fs::read_to_string(&marker)?, "admitted");
+        assert_eq!(run, super::TaskRun::Unknown);
+        assert!(lease.get());
+        assert_eq!(
+            super::launch_registered_task(|| super::TaskRegistration::Registered, || run),
+            super::TaskLaunch::Pending,
+        );
+        std::fs::remove_file(&marker)?;
+        assert_eq!(
+            super::submit_registration(&mut command(9), &mut |_| false),
+            super::TaskRegistration::NotRegistered,
+        );
+        assert!(!marker.exists());
+        assert_eq!(
+            super::submit_task_run(&mut command(9), &mut |_| false),
+            super::TaskRun::Refused,
+        );
+        assert!(!marker.exists());
+        let mut phases = Vec::new();
+        assert_eq!(
+            super::submit_registration(&mut command(0), &mut |pending| {
+                phases.push(pending);
+                true
+            }),
+            super::TaskRegistration::Registered,
+        );
+        assert_eq!(phases, [true, false]);
+        phases.clear();
+        assert_eq!(
+            super::submit_task_run(&mut command(0), &mut |pending| {
+                phases.push(pending);
+                true
+            }),
+            super::TaskRun::Started,
+        );
+        assert_eq!(phases, [true, false]);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn generated_task_probe_distinguishes_absence_from_query_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::windows::process::CommandExt;
+
+        let powershell = fsw_core::SystemBinary::PowerShell
+            .path()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        let probe = super::task_query_script("fwdslash-update-test")
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let common = "\
+            $global:TaskFolder = [pscustomobject]@{}; \
+            $global:TaskService = [pscustomobject]@{}; \
+            $global:TaskService | Add-Member ScriptMethod Connect {}; \
+            $global:TaskService | Add-Member ScriptMethod GetFolder { $global:TaskFolder }; \
+            function New-Object { param([string]$ComObject); $global:TaskService }; ";
+        for (mock, expected) in [
+            (
+                "$global:TaskFolder | Add-Member ScriptMethod GetTask { param($Name); [pscustomobject]@{} }; ",
+                super::TaskPresence::Present,
+            ),
+            (
+                "$global:TaskFolder | Add-Member ScriptMethod GetTask { param($Name); throw [System.Runtime.InteropServices.COMException]::new('missing', -2147024894) }; ",
+                super::TaskPresence::Absent,
+            ),
+            (
+                "$global:TaskFolder | Add-Member ScriptMethod GetTask { param($Name); throw [System.Runtime.InteropServices.COMException]::new('access denied', -2147024891) }; ",
+                super::TaskPresence::Unknown,
+            ),
+            (
+                "$global:TaskService | Add-Member -Force ScriptMethod Connect { throw [System.Runtime.InteropServices.COMException]::new('service unavailable', -2147024894) }; ",
+                super::TaskPresence::Unknown,
+            ),
+        ] {
+            let script = format!("{common}{mock}{probe}");
+            assert_eq!(
+                super::probe_task_presence(
+                    std::process::Command::new(&powershell)
+                        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                        .creation_flags(super::CREATE_NO_WINDOW)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null()),
+                    std::time::Duration::from_secs(10),
+                ),
+                expected,
+                "{mock}",
+            );
+        }
+        let missing = std::env::temp_dir().join("fsw-task-probe-missing.exe");
+        assert!(!missing.exists());
+        assert_eq!(
+            super::probe_task_presence(
+                &mut std::process::Command::new(missing),
+                std::time::Duration::from_secs(1)
+            ),
+            super::TaskPresence::Unknown,
+        );
+        assert_eq!(
+            super::probe_task_presence(
+                std::process::Command::new(&powershell)
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "Start-Sleep -Seconds 5"
+                    ])
+                    .creation_flags(super::CREATE_NO_WINDOW)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+                std::time::Duration::from_millis(50),
+            ),
+            super::TaskPresence::Unknown,
+        );
+        assert!(super::task_query_script("unsafe'task").is_none());
+        Ok(())
+    }
     use super::{
         is_safe_task_literal, task_args, task_start_boundary, task_start_time, task_xml,
         task_xml_args, task_xml_with_arguments,
