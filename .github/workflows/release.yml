@@ -64,10 +64,10 @@ jobs:
       # must match it exactly for the package to install.
       TS_PUBLISHER: 'CN=Mike Fara, O=Mike Fara, L=White Plains, S=ny, C=US'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@1.98.1
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           targets: aarch64-pc-windows-msvc,x86_64-pc-windows-msvc
 
