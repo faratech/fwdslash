@@ -25,6 +25,13 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # build.yml selects the Rust toolchain by the action's branch name
+      # (dtolnay/rust-toolchain@1.98.1). Dependabot reads that as an action
+      # version and proposes toolchains that do not exist yet (1.120.0), which
+      # breaks the build. The toolchain is bumped deliberately, with
+      # tools/update-deps.py, not by Dependabot.
+      - dependency-name: "dtolnay/rust-toolchain"
 
   # Monthly and grouped, to stay out of the way of tools/update-deps.py.
   - package-ecosystem: cargo
