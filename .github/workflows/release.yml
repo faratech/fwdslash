@@ -21,7 +21,11 @@
 # something a user installs) and, once the release exists, the `publish-to-store`
 # job dispatches `publish-to-store.yml` to upload it.
 #
-# Required repository secrets (Settings > Secrets and variables > Actions):
+# Only code on main reaches the signing steps: a tag must point at a commit on
+# main, and a manual run must start from main or from such a tag. The job runs
+# in the `release` environment, which is where the signing secrets belong.
+#
+# Required secrets (the `release` environment; Settings > Environments):
 #   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the
 #   windowsforum-codesigning-sp service principal for fara-codesigning. The
 #   same Azure AD application is authorized on Partner Center, so
@@ -41,9 +45,7 @@ on:
         default: true
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -53,9 +55,15 @@ jobs:
   release:
     runs-on: windows-latest
     timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     outputs:
       short: ${{ steps.version.outputs.short }}
       released: ${{ steps.publish.outputs.released }}
+      attested: ${{ steps.attest.outcome == 'success' }}
     defaults:
       run:
         shell: pwsh
@@ -64,11 +72,29 @@ jobs:
       # must match it exactly for the package to install.
       TS_PUBLISHER: 'CN=Mike Fara, O=Mike Fara, L=White Plains, S=ny, C=US'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0  # the main-ancestry check below needs history
+
+      - name: Require a release source on main
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and
+              $env:GITHUB_REF -ne 'refs/heads/main' -and
+              $env:GITHUB_REF -notlike 'refs/tags/v*') {
+              throw "Dispatch this workflow from main or a v* tag, not $env:GITHUB_REF."
+          }
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch main.' }
+          git merge-base --is-ancestor $env:SOURCE_SHA refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) { throw "$env:GITHUB_REF ($env:SOURCE_SHA) is not on main." }
+          Write-Host "$env:GITHUB_REF ($env:SOURCE_SHA) is on main."
 
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@1.98.1
+        uses: dtolnay/rust-toolchain@a2627de80e5819949c7e1c83ed99b29085fc9bc4 # 1.98.1 branch; toolchain set explicitly
         with:
+          toolchain: 1.98.1
           targets: aarch64-pc-windows-msvc,x86_64-pc-windows-msvc
 
       - name: Derive the package version and validate a tag, if present
@@ -198,9 +224,12 @@ jobs:
 
       # Provenance is best-effort by policy (an attestation outage must not
       # block a signed release), marked here so the tolerance is visibly
-      # deliberate rather than accidental.
+      # deliberate rather than accidental. The Store path is the exception:
+      # publish-to-store.yml verifies the Store bundle against this
+      # attestation, so without it nothing is submitted (see below).
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v4
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         continue-on-error: true
         with:
           subject-path: |
@@ -210,7 +239,7 @@ jobs:
             out\package\*.zip
 
       - name: Upload workflow artifacts (always, for inspection)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fwdslash-release
           path: |
@@ -271,6 +300,13 @@ jobs:
 
           "released=true" >> $env:GITHUB_OUTPUT
 
+      - name: Refuse to submit an unattested Store bundle
+        if: steps.publish.outputs.released == 'true' && steps.attest.outcome != 'success'
+        run: |
+          throw ('The build-provenance attestation failed, so the Store bundle has nothing ' +
+                 'to be verified against. The GitHub release is published; the Store ' +
+                 'submission is not dispatched.')
+
   # Hands the finished release to publish-to-store.yml. Split into its own job
   # because the dispatch needs `actions: write`, which the release job (holding
   # contents: write and the attestation permissions) should not also carry.
@@ -279,7 +315,7 @@ jobs:
   # publish-to-store.yml has to be merged to main before a tag can trigger it.
   publish-to-store:
     needs: release
-    if: needs.release.outputs.released == 'true'
+    if: needs.release.outputs.released == 'true' && needs.release.outputs.attested == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read

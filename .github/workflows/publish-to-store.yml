@@ -15,7 +15,12 @@
 # workflow will be for the next version bump; re-publishing a version the Store
 # already has is rejected by Partner Center, not by anything here.
 #
-# Required repository secrets (Settings > Secrets and variables > Actions):
+# Before anything is uploaded, the downloaded bundle must match the build
+# provenance attestation release.yml made for that tag: release assets are
+# mutable, and Partner Center re-signs whatever it is given. The job runs only
+# from main, in the `store` environment, which is where the secrets belong.
+#
+# Required secrets (the `store` environment; Settings > Environments):
 #   STORE_TENANT_ID / STORE_CLIENT_ID / STORE_CLIENT_SECRET — the Azure AD
 #     application associated with the Partner Center account (Account
 #     settings > User management > Azure AD applications, Manager role).
@@ -52,6 +57,7 @@ env:
 
 permissions:
   contents: read
+  attestations: read
 
 concurrency:
   group: microsoft-store-submission
@@ -61,12 +67,18 @@ jobs:
   publish-to-store:
     runs-on: windows-latest
     timeout-minutes: 60
+    environment: store
     defaults:
       run:
         shell: pwsh
     steps:
       - name: Validate release tag
         run: |
+          # The workflow file that runs is the dispatched ref's copy; only
+          # main's copy is reviewed (release.yml dispatches on main).
+          if ($env:GITHUB_REF -ne 'refs/heads/main') {
+            throw "Dispatch this workflow from main, not $env:GITHUB_REF."
+          }
           if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
             throw "Invalid release tag '$env:RELEASE_TAG'. Expected v<major>.<minor>.<patch>."
           }
@@ -116,8 +128,45 @@ jobs:
           }
           Write-Host "Downloaded: $($downloaded[0].Name) ($($downloaded[0].Length) bytes)"
 
-      - name: Setup Microsoft Store CLI
-        uses: microsoft/setup-msstore-cli@v1
+      # Release assets can be replaced after the fact. Only the exact bytes
+      # release.yml built and attested for this tag, on a GitHub-hosted
+      # runner, may reach Partner Center.
+      - name: Verify the bundle against release.yml's build attestation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $bundle = "fwdslash-$version.0-store-unsigned.msixbundle"
+          gh attestation verify $bundle `
+            --repo $env:GITHUB_REPOSITORY `
+            --signer-workflow "$env:GITHUB_REPOSITORY/.github/workflows/release.yml" `
+            --source-ref "refs/tags/$env:RELEASE_TAG" `
+            --deny-self-hosted-runners
+          if ($LASTEXITCODE -ne 0) {
+            throw "$bundle has no build attestation from release.yml for $env:RELEASE_TAG; refusing to submit it."
+          }
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $bundle).Hash.ToLowerInvariant()
+          Write-Host "Verified $bundle (sha256:$digest) against release.yml's attestation for $env:RELEASE_TAG."
+
+      # A pinned, hash-checked CLI instead of microsoft/setup-msstore-cli,
+      # which fetches whatever release is newest and receives the client
+      # secret. Bump both values together from the msstore-cli release page.
+      - name: Install the Microsoft Store CLI (pinned)
+        env:
+          MSSTORE_CLI_VERSION: v0.4.3
+          MSSTORE_CLI_SHA256: c5fb008b616f96b1b55f1d52e4e0a5dd8f6c156129b5f52f9b97ec0eed11bd57
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'MSStoreCLI-win-x64.zip'
+          $url = "https://github.com/microsoft/msstore-cli/releases/download/$env:MSSTORE_CLI_VERSION/MSStoreCLI-win-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
+          if ($actual -ne $env:MSSTORE_CLI_SHA256) {
+            throw "msstore CLI $env:MSSTORE_CLI_VERSION hash mismatch: got $actual."
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'msstore-cli'
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          if (-not (Test-Path -LiteralPath (Join-Path $dir 'msstore.exe'))) { throw 'msstore.exe not found in the CLI archive.' }
+          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Configure Store credentials
         env:

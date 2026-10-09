@@ -12,7 +12,10 @@
 # given ID as the active pending submission, so it can never delete the live
 # listing.
 #
-# Required repository secrets (Settings > Secrets and variables > Actions):
+# Runs only from main, in the `store` environment, which is where the
+# secrets belong.
+#
+# Required secrets (the `store` environment; Settings > Environments):
 #   STORE_TENANT_ID / STORE_CLIENT_ID / STORE_CLIENT_SECRET, falling back to
 #   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET — the same pair
 #   publish-to-store.yml resolves, in the same order. Whichever one is used,
@@ -45,7 +48,17 @@ permissions:
 jobs:
   check-submission:
     runs-on: ubuntu-latest
+    environment: store
     steps:
+      - name: Require dispatch from main
+        run: |
+          # The workflow file that runs is the dispatched ref's copy; only
+          # main's copy is reviewed.
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Dispatch this workflow from main, not $GITHUB_REF"
+            exit 1
+          fi
+
       - name: Query Partner Center submission status
         env:
           APP_ID: ${{ github.event.inputs.app_id }}
