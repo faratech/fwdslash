@@ -23,7 +23,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       # These fixtures import the adapter but never install it, use no profile,
       # and mock every installer/network/package action. Invoke the Windows
       # PowerShell 5.1 executable explicitly: pwsh has different binding and
@@ -62,7 +62,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Build unsigned x64 driver package
         shell: pwsh
         run: .\tools\Build-Driver.ps1 -Architecture x64 -Configuration Debug
@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       # Every version literal outside the workspace manifest is registered in
       # tools/bump_version.py; --check fails the job the moment one drifts.
@@ -175,7 +175,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: Install Rust toolchain (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.98.1
         with:
