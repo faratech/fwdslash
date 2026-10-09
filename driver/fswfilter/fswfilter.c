@@ -2,6 +2,17 @@
 
 #define FSW_MAX_INTERACTIVE_SESSIONS 16u
 
+//
+//  Live port connections one session may hold: its broker, a restarted broker
+//  whose predecessor has not disconnected yet, and short-lived availability
+//  probes. The port admits that many for every session, and the cap is
+//  enforced at connect time, so idle connections opened in one session can no
+//  longer use up the port and lock other sessions' brokers out.
+//
+#define FSW_MAX_CONNECTIONS_PER_SESSION 4u
+#define FSW_MAX_CONNECTIONS \
+  (FSW_MAX_INTERACTIVE_SESSIONS * FSW_MAX_CONNECTIONS_PER_SESSION)
+
 // The user-mode sender and lab harness assert these same v4 offsets.
 C_ASSERT(FIELD_OFFSET(FSW_MAPPING_MESSAGE, Generation) == 16);
 C_ASSERT(FIELD_OFFSET(FSW_MAPPING_MESSAGE, VolumeName) == 28);
@@ -48,6 +59,8 @@ typedef struct _FSW_GLOBALS {
   PFLT_PORT ServerPort;
   EX_PUSH_LOCK MappingsLock;
   FSW_SESSION_MAPPINGS Mappings[FSW_MAX_INTERACTIVE_SESSIONS];
+  //  Every live connection, guarded by MappingsLock.
+  PFSW_CONNECTION_CONTEXT Connections[FSW_MAX_CONNECTIONS];
 } FSW_GLOBALS;
 
 FSW_GLOBALS Globals;
@@ -95,6 +108,11 @@ static BOOLEAN FswIsValidVolumeName(
 _IRQL_requires_max_(APC_LEVEL)
 static VOID FswClearMappingsForOwner(_In_ PFSW_CONNECTION_CONTEXT Owner);
 _Must_inspect_result_
+_IRQL_requires_max_(APC_LEVEL)
+static NTSTATUS FswRegisterConnection(_In_ PFSW_CONNECTION_CONTEXT Connection);
+_IRQL_requires_max_(APC_LEVEL)
+static VOID FswForgetConnection(_In_ PFSW_CONNECTION_CONTEXT Connection);
+_Must_inspect_result_
 _IRQL_requires_max_(PASSIVE_LEVEL)
 static NTSTATUS FswBuildPortSecurityDescriptor(
     _Outptr_result_maybenull_ PSECURITY_DESCRIPTOR* Descriptor);
@@ -139,6 +157,8 @@ CONST FLT_REGISTRATION Registration = {
 #pragma alloc_text(PAGE, FswIsValidDistributionName)
 #pragma alloc_text(PAGE, FswIsValidVolumeName)
 #pragma alloc_text(PAGE, FswClearMappingsForOwner)
+#pragma alloc_text(PAGE, FswRegisterConnection)
+#pragma alloc_text(PAGE, FswForgetConnection)
 #pragma alloc_text(PAGE, FswBuildPortSecurityDescriptor)
 #pragma alloc_text(PAGE, FswSplitNamespace)
 #pragma alloc_text(PAGE, FswIsCandidateDistribution)
@@ -299,6 +319,56 @@ FswClearMappingsForOwner(_In_ PFSW_CONNECTION_CONTEXT Owner) {
     if (Globals.Mappings[index].Owner == Owner) {
       RtlZeroMemory(&Globals.Mappings[index],
                     sizeof(Globals.Mappings[index]));
+      break;
+    }
+  }
+  ExReleasePushLockExclusive(&Globals.MappingsLock);
+  KeLeaveCriticalRegion();
+}
+
+//
+//  Admits a new connection unless its session already holds
+//  FSW_MAX_CONNECTIONS_PER_SESSION live ones.
+//
+_Must_inspect_result_
+_IRQL_requires_max_(APC_LEVEL)
+static NTSTATUS
+FswRegisterConnection(_In_ PFSW_CONNECTION_CONTEXT Connection) {
+  PFSW_CONNECTION_CONTEXT* freeEntry = NULL;
+  ULONG sessionConnections = 0;
+  NTSTATUS status = STATUS_CONNECTION_COUNT_LIMIT;
+  PAGED_CODE();
+  KeEnterCriticalRegion();
+  ExAcquirePushLockExclusive(&Globals.MappingsLock);
+  for (ULONG index = 0; index < FSW_MAX_CONNECTIONS; ++index) {
+    PFSW_CONNECTION_CONTEXT live = Globals.Connections[index];
+    if (live == NULL) {
+      if (freeEntry == NULL) {
+        freeEntry = &Globals.Connections[index];
+      }
+    } else if (live->SessionId == Connection->SessionId) {
+      ++sessionConnections;
+    }
+  }
+  if (freeEntry != NULL &&
+      sessionConnections < FSW_MAX_CONNECTIONS_PER_SESSION) {
+    *freeEntry = Connection;
+    status = STATUS_SUCCESS;
+  }
+  ExReleasePushLockExclusive(&Globals.MappingsLock);
+  KeLeaveCriticalRegion();
+  return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static VOID
+FswForgetConnection(_In_ PFSW_CONNECTION_CONTEXT Connection) {
+  PAGED_CODE();
+  KeEnterCriticalRegion();
+  ExAcquirePushLockExclusive(&Globals.MappingsLock);
+  for (ULONG index = 0; index < FSW_MAX_CONNECTIONS; ++index) {
+    if (Globals.Connections[index] == Connection) {
+      Globals.Connections[index] = NULL;
       break;
     }
   }
@@ -804,6 +874,11 @@ FswPortConnect(_In_ PFLT_PORT ClientPort,
   context->IntegrityLevel = identity.IntegrityLevel;
   context->SidLength = identity.SidLength;
   RtlCopyMemory(context->Sid, identity.Sid, identity.SidLength);
+  status = FswRegisterConnection(context);
+  if (!NT_SUCCESS(status)) {
+    ExFreePoolWithTag(context, FSW_POOL_TAG);
+    return status;
+  }
   *ConnectionPortCookie = context;
   return STATUS_SUCCESS;
 }
@@ -817,6 +892,7 @@ FswPortDisconnect(_In_opt_ PVOID ConnectionCookie) {
     return;
   }
   FswClearMappingsForOwner(context);
+  FswForgetConnection(context);
   FltCloseClientPort(Globals.Filter, &context->ClientPort);
   ExFreePoolWithTag(context, FSW_POOL_TAG);
 }
@@ -1022,7 +1098,7 @@ DriverEntry(_In_ PDRIVER_OBJECT DriverObject,
                              securityDescriptor);
   status = FltCreateCommunicationPort(
       Globals.Filter, &Globals.ServerPort, &attributes, NULL, FswPortConnect,
-      FswPortDisconnect, FswPortMessage, FSW_MAX_INTERACTIVE_SESSIONS);
+      FswPortDisconnect, FswPortMessage, FSW_MAX_CONNECTIONS);
   ExFreePoolWithTag(securityDescriptor, FSW_POOL_TAG);
   if (!NT_SUCCESS(status)) {
     FltUnregisterFilter(Globals.Filter);
