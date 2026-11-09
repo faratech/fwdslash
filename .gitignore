@@ -98,3 +98,4 @@ $RECYCLE.BIN/
 # Windows-style "out\msix-store" path under bash, which collapses the backslash.
 .zcode/
 outmsix-store/
+.claude/settings.local.json
